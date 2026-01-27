@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>amor | Writeup</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+  <nav class="top-nav">
+    <div class="container">
+      <div class="nav-content">
+        <div class="nav-left">
+          <a href="../../index.html" class="back-link" title="Back to home">←</a>
+          <h1 data-i18n="site-title">KDW_LABS</h1>
+        </div>
+        <div class="nav-controls">
+          <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+            <span class="theme-icon">🌙</span>
+          </button>
+          <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+            <span>EN</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="machine-header">
+      <h1 class="machine-title">amor</h1>
+      <div class="machine-meta">
+        <span class="badge badge-platform">DockerLabs</span>
+        <span class="badge badge-difficulty-easy">easy</span>
+      </div>
+    </header>
+
+    <article class="machine-content">
+      <div id="content-en" class="lang-content" style="display:none;">
+        <div class="machine-summary">
+          <h2 data-i18n="summary-title">Exploitation Summary</h2>
+          <p><strong>Exploitation process:</strong> Identified the users <code>carlota</code> and <code>juan</code>
+            through a basic web page. An SSH brute-force attack was performed against the <code>carlota</code> user
+            using Hydra, leading to initial access. Inside the system, an image was found containing a base64-encoded
+            secret hidden with steganography. After extracting the secret using <code>steghide</code>, the password for
+            the user <code>oscar</code> was obtained. Finally, since <code>oscar</code> had sudo permissions to run
+            Ruby, privilege escalation to root was achieved via a simple Ruby script.</p>
+          <p><strong>Technologies/Exploits:</strong> SSH Brute Force, Steganography, Ruby Sudo Exploitation.</p>
+        </div>
+        <hr class="summary-divider">
+        <p>Nmap:</p>
+        <p><img src="./media/image6.png" alt="Nmap Results" /></p>
+        <p>Gobuster doesn't find anything relevant.</p>
+        <p>The website is very basic, but we see two names, Carlota and Juan. We can use these for an SSH brute-force
+          attempt.</p>
+        <p><img src="./media/image2.png" alt="Web Homepage" /></p>
+        <p>I perform a brute-force attack with Hydra on <code>carlota</code> and find the password:</p>
+        <p><img src="./media/image7.png" alt="Hydra Success" /></p>
+        <p>At this path, we find an image:</p>
+        <p><img src="./media/image1.png" alt="Image Path" /></p>
+        <p>I start a Python web server and download the image to my machine for analysis:</p>
+        <p><img src="./media/image4.png" alt="File Transfer" /></p>
+        <p>Using <code>steghide</code>, I find a base64-encoded secret inside the image, which reveals a password:</p>
+        <p><img src="./media/image3.png" alt="Steghide Extraction" /></p>
+        <p>With this password, I escalate to the user <code>oscar</code>. This user can execute Ruby code as root via
+          sudo.</p>
+        <p>I create a simple script to get a root bash:</p>
+        <p><img src="./media/image5.png" alt="Privilege Escalation" /></p>
+      </div>
+
+      <div id="content-es" class="lang-content">
+        <div class="machine-summary">
+          <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+          <p><strong>Resumen del proceso:</strong> Se identificaron los usuarios <code>carlota</code> y
+            <code>juan</code> a través de una página web básica. Se realizó un ataque de fuerza bruta por SSH contra el
+            usuario <code>carlota</code> utilizando Hydra, logrando el acceso. Dentro del sistema se encontró una imagen
+            que contenía un secreto en base64 oculto mediante esteganografía. Tras extraer el secreto con
+            <code>steghide</code>, se obtuvo la contraseña del usuario <code>oscar</code>. Finalmente, se aprovechó que
+            <code>oscar</code> tenía permisos de sudo para ejecutar Ruby, logrando elevar privilegios a root mediante un
+            script sencillo.</p>
+          <p><strong>Tecnologías/Exploits:</strong> SSH Brute Force, Steganography, Ruby Sudo Exploitation.</p>
+        </div>
+        <hr class="summary-divider">
+        <p>Nmap:</p>
+        <p><img src="./media/image6.png" alt="Resultados de Nmap" /></p>
+        <p>Gobuster no encuentra nada relevante.</p>
+        <p>La web es muy básica pero vemos 2 nombres, Carlota y Juan, con esto podríamos probar SSH.</p>
+        <p><img src="./media/image2.png" alt="Página de Inicio Web" /></p>
+        <p>Hago fuerza bruta con Hydra con <code>carlota</code> y me encuentra la contraseña:</p>
+        <p><img src="./media/image7.png" alt="Éxito de Hydra" /></p>
+        <p>En esta ruta encontramos una imagen:</p>
+        <p><img src="./media/image1.png" alt="Ruta de la Imagen" /></p>
+        <p>Monto un servidor en Python y cojo la imagen desde mi máquina para analizarla:</p>
+        <p><img src="./media/image4.png" alt="Transferencia de Archivos" /></p>
+        <p>Con <code>steghide</code> veo que dentro de la imagen hay un secreto en base64 y encuentro una contraseña:
+        </p>
+        <p><img src="./media/image3.png" alt="Extracción con Steghide" /></p>
+        <p>Con la contraseña escalo al usuario <code>oscar</code>. Este usuario puede ejecutar código Ruby como root
+          mediante sudo.</p>
+        <p>Creo un script simple para conseguir una bash como root:</p>
+        <p><img src="./media/image5.png" alt="Escalada de Privilegios" /></p>
+      </div>
+    </article>
+  </main>
+  <script src="../../index.js"></script>
+</body>
+
+</html>

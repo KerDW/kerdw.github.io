@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>editor | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">editor</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> Found a virtual host <code>editor.htb</code> and its
+                        subdomain <code>wiki.editor.htb</code>. Exploited an RCE in XWiki (CVE-2025-24893) to get
+                        initial access as <code>xwiki</code>. Escalated to <code>oliver</code> by reusing credentials
+                        found in a configuration file. Finally, escalated to <code>root</code> by exploiting a path
+                        hijacking vulnerability in a Netdata component (<code>ndsudo</code>) that was vulnerable to
+                        CVE-2024-32019.</p>
+                    <p><strong>Technologies/Exploits:</strong> XWiki RCE (CVE-2025-24893), Netdata Privilege Escalation
+                        (CVE-2024-32019), Chisel for port forwarding.</p>
+                </div>
+                <hr class="summary-divider">
+                <p>Nmap:</p>
+                <p><img src="./media/image13.png" alt="Nmap Results" /></p>
+                <p>It reveals a virtual host, editor.htb, which I add to /etc/hosts.</p>
+                <p>On port 80, there is a web page where I can download some .deb and .exe installers using these
+                    buttons:</p>
+                <p><img src="./media/image16.png" alt="Web Page" /></p>
+                <p>Clicking on Docs takes me to the subdomain wiki.editor.htb, which I also add to /etc/hosts. On this
+                    page, I also find this login panel:</p>
+                <p><img src="./media/image6.png" alt="Login Panel" /></p>
+                <p>On port 8080, it is the same or similar to wiki.editor.htb; both have the same version, 15.10.8,
+                    which can be observed at the bottom of the page:</p>
+                <p><img src="./media/image12.png" alt="XWiki Version" /></p>
+                <p>I see interesting information in the login panel that has a forgot password option that requests a
+                    username to start the process.</p>
+                <p>On editor.htb, I see the email <a href="mailto:contact@editor.htb">contact@editor.htb</a>.</p>
+                <p>On wiki.editor.htb, I see a user named Neal Bagwell, whose username appears to be just "neal," but it
+                    does not work in the mentioned panel.</p>
+                <p>It seems that the xwiki version of the target would be vulnerable to CVE-2025-24893 with this
+                    exploit: <a
+                        href="https://www.exploit-db.com/exploit/52136">https://www.exploit-db.com/exploits/52136</a>;
+                    I download it with searchsploit.</p>
+                <p>I try to execute it with the Python script, but I get an error due to too many redirects.
+                    Nevertheless, the exploit is simply making a GET request to a path that contains the command to
+                    inject.</p>
+                <p>I visit the path with the test command <code class="language-bash">cat /etc/passwd</code> and it
+                    downloads a file where
+                    there is a long string of text where the output can be observed:</p>
+                <p><img src="./media/image17.png" alt="RCE PoC" /></p>
+                <p>So we have RCE; I will reproduce the same but with a reverse shell to gain access to the machine.</p>
+                <p>I have to try several times because not all commands work well with URL encoding at times, but I
+                    succeed with busybox.</p>
+                <p>I log in as user xwiki, sanitize the tty, and in /home I see the user oliver.</p>
+                <p>I see some weird things in the output to look for SUID binaries, but there doesn't seem to be
+                    anything promising at first:</p>
+                <p><img src="./media/image15.png" alt="SUID Search" /></p>
+                <p>With <code class="language-bash">sudo -l</code> I see this:</p>
+                <pre><code class="language-bash">xwiki@editor:/usr/lib/xwiki-jetty$ sudo -l
+sudo: The "no new privileges" flag is set, which prevents sudo from running as root.
+
+sudo: If sudo is running in a container, you may need to adjust the container configuration to disable the flag.</code></pre>
+                <p>Now that I know about the user oliver and that port 22 with SSH is open, I try brute-forcing with
+                    hydra on the user oliver, but it doesn't seem viable.</p>
+                <p>With <code class="language-bash">ss -tuln</code> I see that there are several open ports locally:</p>
+                <p><img src="./media/image14.png" alt="Local Ports" /></p>
+                <p>I see that oliver is in the netdata group:</p>
+                <p><img src="./media/image4.png" alt="Groups" /></p>
+                <p>I try to get in with a webshell through the app on port 8080, but the result is the same; I am the
+                    user xwiki in the same directory.</p>
+                <p>From the common uses for the locally accessible ports on the target machine, the one that catches my
+                    attention is 19999, which might be running a web dashboard for Netdata, which I have seen several
+                    times on this machine.</p>
+                <p><img src="./media/image9.png" alt="Netdata Recognition" /></p>
+                <p>Since I do not have SSH access and the machine does not have internet access, I set up a Python HTTP
+                    server on my machine to fetch chisel from my machine to the target machine to do local port
+                    forwarding and access port 19999 from my machine.</p>
+                <p>Using <code class="language-bash">find / -type d -user xwiki 2&gt;/dev/null</code> to find a
+                    directory where I can write to
+                    collect the files, and:</p>
+                <p>On my machine:<br />
+                    <code class="language-bash">./chisel server -p 1234 --reverse</code>
+                </p>
+                <p>On the target:<br />
+                    <code class="language-bash">./chisel client 10.10.14.65:1234 R:19999:127.0.0.1:19999</code>
+                </p>
+                <p>I access and enter this dashboard:</p>
+                <p><img src="./media/image11.png" alt="Netdata Dashboard" /></p>
+                <p>I see that the version it uses is 1.45.2 and that this banner requests an urgent update:</p>
+                <p><img src="./media/image10.png" alt="Netdata Version" /></p>
+                <p>For this version, I found a CVE with its corresponding PoC to exploit it:</p>
+                <p><a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2024-32019">https://nvd.nist.gov/vuln/detail/CVE-2024-32019</a>
+                </p>
+                <p><a
+                        href="https://github.com/netdata/netdata/security/advisories/GHSA-pmhq-4cxq-wj93">https://github.com/netdata/netdata/security/advisories/GHSA-pmhq-4cxq-wj93</a>
+                </p>
+                <p>What you need to do is find what commands you can run with <code class="language-bash">ndsudo</code>;
+                    one common command
+                    seems to be <code class="language-bash">nvme</code>, and then create a malicious version of that
+                    binary in a directory
+                    that is first in your <code class="language-bash">$PATH</code>; this way it will execute that binary
+                    instead of
+                    <code class="language-bash">nvme</code> or whichever.
+                </p>
+                <p>I try to do this but it seems that I cannot execute <code class="language-bash">ndsudo</code> with my
+                    current user because
+                    I don't have execution permissions. However, from what I've seen, I should be able to with the user
+                    oliver since he belongs to the netdata group which can execute it:</p>
+                <p><img src="./media/image7.png" alt="ndsudo permissions" /></p>
+                <p>So, once I escalate to oliver, I have the escalation to root sorted out.</p>
+                <p>With chisel, I do port forwarding from MySQL's port 3306 to see if I could brute-force with the user
+                    oliver here, but just like with SSH, no luck.</p>
+                <p>I have been using the rockyou for brute-forcing; perhaps I could build a dictionary for it, but I
+                    don't think that's the case with this machine. It seems more likely that oliver's password should be
+                    in some config, but I can't find it.</p>
+                <p>After searching for a while, I find these hardcoded credentials in
+                    <code class="language-xml">/usr/lib/xwiki/WEB-INF/hibernate.cfg.xml</code>:
+                </p>
+                <p><img src="./media/image8.png" alt="DB Credentials" /></p>
+                <p>I enter MySQL, but there are only xwiki tables that do not contain useful information; I try to do
+                    <code class="language-bash">su oliver</code> with the pass to check for credential reuse, but it
+                    tells me:
+                </p>
+                <p>su: Authentication failure</p>
+                <p>Nonetheless, with SSH and the password, it does work and I’m in as oliver:</p>
+                <p><img src="./media/image1.png" alt="SSH login" /></p>
+                <p>Now, as I had researched earlier, I’m going for <code class="language-bash">ndsudo</code>, and I see
+                    that it accepts the
+                    command <code class="language-bash">nvme</code>:</p>
+                <p><img src="./media/image5.png" alt="ndsudo allowed commands" /></p>
+                <p>I create the fake <code class="language-bash">nvme</code>, give it execution permissions, and add the
+                    directory
+                    <code class="language-bash">~/.cache/</code> to the beginning of my <code
+                        class="language-bash">$PATH</code>:
+                </p>
+                <p><img src="./media/image2.png" alt="Path modification" /></p>
+                <p>This "works" but gives me a bash as oliver and not as root; it also doesn't let me execute other bash
+                    commands as root this way.</p>
+                <p>I keep investigating and see that what needs to be done is compile a real binary instead of just
+                    putting a simple bash script; I assume that if not, the SUID doesn’t recognize it as a binary and
+                    doesn’t execute it as root or something like that.</p>
+                <p>I create the binary in C with this code and compile it with gcc:</p>
+                <p><img src="./media/image3.png" alt="C exploit code" /></p>
+                <p>I expose it from my machine with a Python server, collect it on the vulnerable machine, give it
+                    execution permissions with <code class="language-bash">chmod +x</code>, and now yes, I execute the
+                    command with
+                    <code class="language-bash">nvme-list</code> and escalate to root:
+                </p>
+                <p><img src="./media/image18.png" alt="Root access" /></p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> Se encontró el virtual host <code>editor.htb</code> y el
+                        subdominio <code>wiki.editor.htb</code>. Se explotó un RCE en XWiki (CVE-2025-24893) para
+                        obtener acceso inicial como <code>xwiki</code>. Se escaló al usuario <code>oliver</code>
+                        mediante la reutilización de credenciales encontradas en un archivo de configuración.
+                        Finalmente, se escaló a <code>root</code> explotando una vulnerabilidad de path hijacking en un
+                        componente de Netdata (<code>ndsudo</code>) vulnerable a CVE-2024-32019.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> XWiki RCE (CVE-2025-24893), Netdata Privilege Escalation
+                        (CVE-2024-32019), Chisel para port forwarding.</p>
+                </div>
+                <hr class="summary-divider">
+                <p>Nmap:</p>
+                <p><img src="./media/image13.png" alt="Resultados de Nmap" /></p>
+                <p>Revela un virtual host, editor.htb, que añado a /etc/hosts.</p>
+                <p>En el puerto 80, hay una página web donde puedo descargar unos instaladores .deb y .exe usando estos
+                    botones:</p>
+                <p><img src="./media/image16.png" alt="Página web" /></p>
+                <p>Al hacer clic en Docs, me lleva al subdominio wiki.editor.htb, que también añado a /etc/hosts. En
+                    esta página, también encuentro este panel de login:</p>
+                <p><img src="./media/image6.png" alt="Panel de Login" /></p>
+                <p>En el 8080, está igual o parecido a wiki.editor.htb; ambas tienen la misma versión, 15.10.8, que se
+                    observa al pie de la página:</p>
+                <p><img src="./media/image12.png" alt="Versión de XWiki" /></p>
+                <p>Veo información interesante en el panel de login que tiene una opción de olvidé mi contraseña que
+                    solicita un nombre de usuario para iniciar el proceso.</p>
+                <p>En editor.htb, veo el correo <a href="mailto:contact@editor.htb">contact@editor.htb</a>.</p>
+                <p>En wiki.editor.htb, veo un usuario llamado Neal Bagwell, cuyo nombre de usuario parece ser solo
+                    "neal", pero no funciona en el panel mencionado.</p>
+                <p>Parece que la versión de xwiki del objetivo sería vulnerable a CVE-2025-24893 con este exploit: <a
+                        href="https://www.exploit-db.com/exploits/52136">https://www.exploit-db.com/exploits/52136</a>;
+                    lo descargo con searchsploit.</p>
+                <p>Intento ejecutarlo con el script de python, pero me da un error de demasiados redirects. Sin embargo,
+                    el exploit es simplemente hacer una solicitud GET a una ruta que contiene el comando a inyectar.</p>
+                <p>Visito la ruta con el comando de prueba <code>cat /etc/passwd</code> y me descarga un archivo donde
+                    hay una cadena larga de texto donde se puede observar la salida:</p>
+                <p><img src="./media/image17.png" alt="PoC de RCE" /></p>
+                <p>Así que tenemos RCE; intentaré reproducir lo mismo pero con una reverse shell para obtener acceso a
+                    la máquina.</p>
+                <p>Tengo que intentarlo varias veces porque no todos los comandos funcionan bien con encoding de URL a
+                    veces, pero lo consigo con busybox.</p>
+                <p>Entro como usuario xwiki, sanitizo la tty y en /home veo al usuario oliver.</p>
+                <p>Veo algunas cosas raras en la salida para buscar binarios SUID, pero no parece haber nada prometedor
+                    al principio:</p>
+                <p><img src="./media/image15.png" alt="Búsqueda de SUID" /></p>
+                <p>Con <code>sudo -l</code> veo esto:</p>
+                <pre><code>xwiki@editor:/usr/lib/xwiki-jetty$ sudo -l
+sudo: The "no new privileges" flag is set, which prevents sudo from running as root.
+
+sudo: If sudo is running in a container, you may need to adjust the container configuration to disable the flag.</code></pre>
+                <p>Ahora que conozco al usuario oliver y que el puerto 22 con SSH está abierto, intento hacer fuerza
+                    bruta con hydra al usuario oliver, pero no parece viable.</p>
+                <p>Con <code>ss -tuln</code> veo que hay varios puertos abiertos localmente:</p>
+                <p><img src="./media/image14.png" alt="Puertos locales" /></p>
+                <p>Veo que oliver está en el grupo netdata:</p>
+                <p><img src="./media/image4.png" alt="Grupos" /></p>
+                <p>Intento entrar con una webshell por la app en el puerto 8080, pero el resultado es el mismo, soy el
+                    usuario xwiki en el mismo directorio.</p>
+                <p>De los usos comunes para los puertos accesibles localmente en la máquina víctima, el que me llama la
+                    atención es el 19999, que podría correr un web dashboard para Netdata, que he visto en varias
+                    ocasiones en la máquina.</p>
+                <p><img src="./media/image9.png" alt="Reconocimiento Netdata" /></p>
+                <p>Como no tengo acceso SSH y la máquina no tiene acceso a internet, monto un servidor python http en mi
+                    máquina para recoger chisel de mi máquina a la máquina víctima para hacer un local port forwarding y
+                    acceder al puerto 19999 desde mi máquina.</p>
+                <p>Uso <code>find / -type d -user xwiki 2&gt;/dev/null</code> para encontrar un directorio donde pueda
+                    escribir para recoger los archivos y:</p>
+                <p>En mi máquina:<br />
+                    <code>./chisel server -p 1234 --reverse</code>
+                </p>
+                <p>En la víctima:<br />
+                    <code>./chisel client 10.10.14.65:1234 R:19999:127.0.0.1:19999</code>
+                </p>
+                <p>Accedo y entro a este dashboard:</p>
+                <p><img src="./media/image11.png" alt="Dashboard de Netdata" /></p>
+                <p>Veo que la versión que usa es la 1.45.2 y que este banner pide actualización urgente:</p>
+                <p><img src="./media/image10.png" alt="Versión de Netdata" /></p>
+                <p>Para esta versión, he encontrado un CVE y su correspondiente PoC para explotarlo:</p>
+                <p><a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2024-32019">https://nvd.nist.gov/vuln/detail/CVE-2024-32019</a>
+                </p>
+                <p><a
+                        href="https://github.com/netdata/netdata/security/advisories/GHSA-pmhq-4cxq-wj93">https://github.com/netdata/netdata/security/advisories/GHSA-pmhq-4cxq-wj93</a>
+                </p>
+                <p>Lo que hay que hacer es encontrar qué comandos puedes ejecutar con <code>ndsudo</code>; uno común
+                    parece ser <code>nvme</code>, y entonces crear una versión maliciosa de ese binario en un directorio
+                    que sea el primero en tu <code>$PATH</code>, de esta manera ejecutará ese binario en lugar de
+                    <code>nvme</code> o del que sea.
+                </p>
+                <p>Intento hacer esto pero parece que no puedo ejecutar <code>ndsudo</code> con mi usuario actual porque
+                    no tiene permisos de ejecución, pero según lo que he visto, con el usuario oliver sí que podré, ya
+                    que pertenece al grupo netdata, que puede ejecutarlo:</p>
+                <p><img src="./media/image7.png" alt="permisos ndsudo" /></p>
+                <p>Así que una vez haga la escalada a oliver, ya tengo hecha la escalada a root.</p>
+                <p>Con chisel hago port forwarding del puerto 3306 de mysql para ver si podría hacer fuerza bruta con el
+                    usuario oliver aquí, pero igual que con SSH, no hay suerte.</p>
+                <p>He estado usando el rockyou para hacer fuerza bruta; quizás podría construir un diccionario para
+                    hacerlo, pero no me parece que sea el caso en esta máquina. Me parece más bien que la contraseña de
+                    oliver debería estar en alguna configuración, pero no la encuentro.</p>
+                <p>Después de buscar un rato, encuentro estas credenciales hardcoded en
+                    <code>/usr/lib/xwiki/WEB-INF/hibernate.cfg.xml</code>:
+                </p>
+                <p><img src="./media/image8.png" alt="Credenciales DB" /></p>
+                <p>Entro a mysql, pero solo hay tablas de xwiki que no contienen información útil; pruebo a hacer
+                    <code>su oliver</code> con la contraseña para comprobar si hay reutilización de credenciales, pero
+                    me dice:
+                </p>
+                <p>su: Authentication failure</p>
+                <p>Aún así, con SSH y la contraseña, sí que me funciona y estoy dentro como oliver:</p>
+                <p><img src="./media/image1.png" alt="Login SSH" /></p>
+                <p>Ahora, como había investigado antes, voy a por el <code>ndsudo</code> y veo que el comando
+                    <code>nvme</code> lo acepta:
+                </p>
+                <p><img src="./media/image5.png" alt="comandos ndsudo permitidos" /></p>
+                <p>Creo el <code>nvme</code> falso, le doy permisos de ejecución y añado el directorio
+                    <code>~/.cache/</code> al inicio de mi <code>$PATH</code>:
+                </p>
+                <p><img src="./media/image2.png" alt="Modificación Path" /></p>
+                <p>Esto "funciona" pero me da una bash como oliver y no como root; tampoco me deja ejecutar otros
+                    comandos bash como root de esta manera.</p>
+                <p>Sigo investigando y veo que lo que hay que hacer es compilar un binario de verdad en lugar de poner
+                    un simple script en bash; supongo que si no, el SUID no lo reconoce como un binario y no lo ejecuta
+                    como root o algo por el estilo.</p>
+                <p>Creo el binario en C con este código y lo compilo con gcc:</p>
+                <p><img src="./media/image3.png" alt="Código exploit C" /></p>
+                <p>Lo expongo desde mi máquina con un servidor python, lo recojo en la máquina vulnerable y le doy
+                    permisos de ejecución con <code>chmod +x</code> y ahora sí, ejecuto el comando con
+                    <code>nvme-list</code> y escalo a root:
+                </p>
+                <p><img src="./media/image18.png" alt="Acceso root" /></p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

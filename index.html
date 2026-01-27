@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="title">KDW | Writeups</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <h1 data-i18n="site-title">Cybersecurity Writeups</h1>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <section class="intro-section">
+            <h2 data-i18n="intro-title">Hey there! 👋</h2>
+            <p data-i18n="intro-text">
+                Documenting my progress in HTB, DockerLabs and other platforms. These writeups are summaries made
+                with LLMs from notes I've been taking while doing the machines.
+            </p>
+            <p class="disclaimer" data-i18n="disclaimer">
+            </p>
+        </section>
+
+        <section class="filters">
+            <h2 data-i18n="browse-title">Browse Writeups</h2>
+            <div class="filter-controls">
+                <div class="filter-group">
+                    <label for="platform-filter" data-i18n="platform-label">Platform:</label>
+                    <select id="platform-filter">
+                        <option value="all" data-i18n="all-platforms">All Platforms</option>
+                        <option value="htb" data-i18n="htb">Hack The Box</option>
+                        <option value="dockerlabs" data-i18n="dockerlabs">DockerLabs</option>
+                        <option value="other" data-i18n="other">Other</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="difficulty-filter" data-i18n="difficulty-label">Difficulty:</label>
+                    <select id="difficulty-filter">
+                        <option value="all" data-i18n="all-difficulties">All Difficulties</option>
+                        <option value="easy" data-i18n="easy">Easy</option>
+                        <option value="medium" data-i18n="medium">Medium</option>
+                        <option value="hard" data-i18n="hard">Hard</option>
+                        <option value="insane" data-i18n="insane">Insane</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="technique-filter" data-i18n="technique-label">Technique:</label>
+                    <input type="text" id="technique-filter" data-i18n-placeholder="technique-placeholder"
+                        placeholder="Search techniques (e.g., SQLi, XSS, RCE)">
+                </div>
+            </div>
+        </section>
+
+        <section class="writeups">
+            <div id="writeups-container">
+                <p class="placeholder" data-i18n="placeholder-text">Loading writeups... 🚀</p>
+            </div>
+        </section>
+    </main>
+
+    <script src="machines/machines.js"></script>
+    <script src="index.js"></script>
+</body>
+
+</html>
