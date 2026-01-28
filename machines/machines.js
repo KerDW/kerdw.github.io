@@ -82,7 +82,7 @@ const MACHINES_DATA = [
         ],
         "folder": "backend"
     }
-,
+    ,
     {
         "name": "pollution",
         "platform": "htb",
@@ -95,5 +95,17 @@ const MACHINES_DATA = [
             "Node.js Prototype Pollution RCE"
         ],
         "folder": "pollution"
+    }
+,
+    {
+        "name": "meta",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "exiftool command injection CVE",
+            "ImageMagick XXE CVE",
+            "sudo env_keep abuse + gtfobins"
+        ],
+        "folder": "meta"
     }
 ];
