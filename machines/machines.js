@@ -51,4 +51,15 @@ const MACHINES_DATA = [
         ],
         "folder": "epsilon"
     }
+,
+    {
+        "name": "broker",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "ActiveMQ",
+            "sudo nginx"
+        ],
+        "folder": "broker"
+    }
 ];
