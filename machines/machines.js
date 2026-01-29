@@ -86,7 +86,7 @@ const MACHINES_DATA = [
         ],
         "folder": "instant"
     }
-,
+    ,
     {
         "name": "environment",
         "platform": "htb",
@@ -99,7 +99,7 @@ const MACHINES_DATA = [
         ],
         "folder": "environment"
     }
-,
+    ,
     {
         "name": "codify",
         "platform": "htb",
@@ -110,7 +110,7 @@ const MACHINES_DATA = [
         ],
         "folder": "codify"
     }
-,
+    ,
     {
         "name": "guardian",
         "platform": "htb",
@@ -123,7 +123,7 @@ const MACHINES_DATA = [
         ],
         "folder": "guardian"
     }
-,
+    ,
     {
         "name": "broscience",
         "platform": "htb",
@@ -136,7 +136,7 @@ const MACHINES_DATA = [
         ],
         "folder": "broscience"
     }
-,
+    ,
     {
         "name": "investigation",
         "platform": "htb",
@@ -149,7 +149,7 @@ const MACHINES_DATA = [
         ],
         "folder": "investigation"
     }
-,
+    ,
     {
         "name": "previous",
         "platform": "htb",
@@ -161,7 +161,7 @@ const MACHINES_DATA = [
         ],
         "folder": "previous"
     }
-,
+    ,
     {
         "name": "faculty",
         "platform": "htb",
@@ -174,7 +174,7 @@ const MACHINES_DATA = [
         ],
         "folder": "faculty"
     }
-,
+    ,
     {
         "name": "formulax",
         "platform": "htb",
@@ -186,5 +186,30 @@ const MACHINES_DATA = [
             "libreoffice UNO server RCE"
         ],
         "folder": "formulax"
+    }
+    ,
+    {
+        "name": "headless",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "XSS",
+            "Command Injection",
+            "Relative Path Abuse"
+        ],
+        "folder": "headless"
+    }
+,
+    {
+        "name": "updown",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "exposed .git",
+            "ZIP+PHAR+LFI RCE",
+            "SUID+python library hijack PYTHONPATH",
+            "easy_install gtfobin"
+        ],
+        "folder": "updown"
     }
 ];
