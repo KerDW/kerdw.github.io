@@ -123,4 +123,17 @@ const MACHINES_DATA = [
         ],
         "folder": "guardian"
     }
+,
+    {
+        "name": "broscience",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "path traversal",
+            "custom activation code cracking",
+            "PHP deserialization attack RCE",
+            "openssl command injection expansion abuse"
+        ],
+        "folder": "broscience"
+    }
 ];

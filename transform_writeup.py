@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/guardian - htb hard (php wrappers, XSS, CSRF, apachectl)/index.html"
+SOURCE_HTML = "converted_writeups/broscience - htb medium (path traversal, custom activation code cracking, PHP deserialization attack RCE, openssl command injection expansion abuse)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 
@@ -94,7 +94,7 @@ CRITICAL REQUIREMENTS:
    - Write a NARRATIVE summary (like telling a story), NOT a bullet-point list
    - Explain the attack chain in a flowing, connected way
    - Should be engaging to read, not just a dry list of steps
-   - Do not make it too long or detailed, it is a summary so it has to cover everything in a summarized way
+   - Do not make it too long or detailed, it is a summary so it has to cover everything in a summarized way, but use paragraphs to avoid walls of text
 
 6. **Formatting**:
    - Remove ALL timestamps from command outputs

