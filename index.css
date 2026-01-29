@@ -15,14 +15,14 @@
     --font-sans: 'Inter', sans-serif;
     --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 
-    /* Code Highlighting - Light */
-    --code-keyword: #cf222e;
-    --code-string: #0a3069;
-    --code-number: #0550ae;
-    --code-comment: #57606a;
-    --code-function: #8250df;
-    --code-attr: #24292e;
-    --code-builtin: #953800;
+    /* Code Highlighting - Light (Vibrant & High Contrast) */
+    --code-keyword: #d32f2f;
+    --code-string: #15803d;
+    --code-number: #b45309;
+    --code-comment: #64748b;
+    --code-function: #7c3aed;
+    --code-attr: #1d4ed8;
+    --code-builtin: #0891b2;
 }
 
 [data-theme="dark"] {
@@ -191,7 +191,7 @@ main {
 
 /* Introduction Section */
 .intro-section {
-    margin-bottom: 4rem;
+    margin-bottom: 2rem;
 }
 
 .intro-section h2 {
@@ -294,6 +294,7 @@ main {
     position: relative;
     overflow: hidden;
     border-radius: var(--border-radius);
+    cursor: pointer;
 }
 
 .writeup-card:hover {

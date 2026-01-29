@@ -4,13 +4,12 @@ const translations = {
         'title': 'KDW | Writeups',
         'site-title': 'KDW_LABS',
         'intro-title': 'System.root.welcome()',
-        'intro-text': 'Documenting my progress in HTB, DockerLabs and other platforms. These writeups are summaries made with LLMs from notes I\'ve been taking while doing the machines.',
+        'intro-text': 'Documenting my progress in HTB and other platforms. These writeups are summaries made with LLMs from notes I\'ve been taking while doing the machines.',
         'disclaimer': 'All documented processes have been performed in authorized environments.',
         'browse-title': 'ls ./writeups',
         'platform-label': 'PLATFORM',
         'all-platforms': 'All',
         'htb': 'HTB',
-        'dockerlabs': 'DockerLabs',
         'other': 'Other',
         'difficulty-label': 'DIFFICULTY',
         'all-difficulties': 'All',
@@ -18,8 +17,8 @@ const translations = {
         'medium': 'Medium',
         'hard': 'Hard',
         'insane': 'Insane',
-        'technique-label': 'TECHNIQUE',
-        'technique-placeholder': 'Search: SQLi, RCE, Enum...',
+        'technique-label': 'SEARCH',
+        'technique-placeholder': 'Search machines or techniques',
         'placeholder-text': 'Initializing writeups... 🚀',
         'placeholder-note': '',
         'no-results': 'No matches found.',
@@ -33,13 +32,12 @@ const translations = {
         'title': 'KDW | Writeups',
         'site-title': 'KDW_LABS',
         'intro-title': 'System.root.welcome()',
-        'intro-text': 'Documentando mi progreso en HTB, DockerLabs y otras plataformas. Estos writeups son resúmenes hechos con LLMs a partir de apuntes que he ido tomando mientras hacía las máquinas.',
+        'intro-text': 'Documentando mi progreso en HTB y otras plataformas. Estos writeups son resúmenes hechos con LLMs a partir de apuntes que he ido tomando mientras hacía las máquinas.',
         'disclaimer': 'Todos los procesos documentados se han realizado en entornos autorizados.',
         'browse-title': 'ls ./writeups',
         'platform-label': 'PLATAFORMA',
         'all-platforms': 'Todas',
         'htb': 'HTB',
-        'dockerlabs': 'DockerLabs',
         'other': 'Otras',
         'difficulty-label': 'DIFICULTAD',
         'all-difficulties': 'Todas',
@@ -47,8 +45,8 @@ const translations = {
         'medium': 'Medio',
         'hard': 'Difícil',
         'insane': 'Insane',
-        'technique-label': 'TÉCNICA',
-        'technique-placeholder': 'Buscar: SQLi, RCE, Enum...',
+        'technique-label': 'BUSCAR',
+        'technique-placeholder': 'Busca máquinas o técnicas',
         'placeholder-text': 'Inicializando writeups... 🚀',
         'placeholder-note': '',
         'no-results': 'No hay coincidencias.',
@@ -225,7 +223,6 @@ function displayMachines(machines) {
 
     const platformDisplay = {
         'htb': translations[currentLang]['htb'],
-        'dockerlabs': translations[currentLang]['dockerlabs'],
         'other': translations[currentLang]['other']
     };
 
@@ -247,7 +244,7 @@ function displayMachines(machines) {
         ).join('');
 
         return `
-            <div class="writeup-card">
+            <div class="writeup-card" onclick="window.location.href='machines/${machine.folder}/index.html'">
                 <h3><a href="machines/${machine.folder}/index.html">${escapeHtml(machine.name)}</a></h3>
                 <div class="meta">
                     <span class="badge badge-platform">${escapeHtml(platform)}</span>

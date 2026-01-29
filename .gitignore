@@ -3,3 +3,4 @@ docs/*
 .env
 *.sh
 *.py
+!transform_writeup.py
