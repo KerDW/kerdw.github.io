@@ -216,6 +216,12 @@ function displayMachines(machines) {
     const container = document.getElementById('writeups-container');
     if (!container) return;
 
+    // Update count
+    const countElement = document.getElementById('machines-count');
+    if (countElement) {
+        countElement.textContent = `total ${machines.length}`;
+    }
+
     if (machines.length === 0) {
         container.innerHTML = `<p class="placeholder">${translations[currentLang]['no-results']}</p>`;
         return;

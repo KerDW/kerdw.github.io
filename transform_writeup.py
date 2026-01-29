@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/updown - htb medium (exposed .git, ZIP+PHAR+LFI RCE, SUID+python library hijack PYTHONPATH, easy_install gtfobin)/index.html"
+SOURCE_HTML = "converted_writeups/vessel - htb hard (exposed .git, mysqljs sqli login bypass, OWA 1.7.3 CVE RCE, python .exe extract+decompile, password generation rev eng, CRI-O CVE privesc)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

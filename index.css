@@ -237,6 +237,26 @@ main {
     font-weight: 700;
 }
 
+.browse-header {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+    margin-bottom: 1.5rem;
+}
+
+.browse-header h2 {
+    margin-bottom: 0;
+}
+
+.machines-count {
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    opacity: 0.8;
+    margin-left: 0.2rem;
+}
+
 .filter-controls {
     display: flex;
     flex-wrap: wrap;

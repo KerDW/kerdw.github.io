@@ -199,7 +199,7 @@ const MACHINES_DATA = [
         ],
         "folder": "headless"
     }
-,
+    ,
     {
         "name": "updown",
         "platform": "htb",
@@ -211,5 +211,20 @@ const MACHINES_DATA = [
             "easy_install gtfobin"
         ],
         "folder": "updown"
+    }
+    ,
+    {
+        "name": "vessel",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "exposed .git",
+            "mysqljs sqli login bypass",
+            "OWA 1.7.3 CVE RCE",
+            "python .exe extract+decompile",
+            "password generation reverse engineering",
+            "CRI-O CVE privesc"
+        ],
+        "folder": "vessel"
     }
 ];
