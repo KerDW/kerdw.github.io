@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/environment - htb medium (laravel environment swap cve, unisharp image upload RCE, gpg decrypt, privileged envs abuse)/index.html"
+SOURCE_HTML = "converted_writeups/guardian - htb hard (php wrappers, XSS, CSRF, apachectl)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

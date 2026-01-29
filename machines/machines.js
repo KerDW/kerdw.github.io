@@ -110,4 +110,17 @@ const MACHINES_DATA = [
         ],
         "folder": "codify"
     }
+,
+    {
+        "name": "guardian",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "php wrappers",
+            "XSS",
+            "CSRF",
+            "apachectl"
+        ],
+        "folder": "guardian"
+    }
 ];
