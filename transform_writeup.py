@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/eureka - htb hard (spring boot heapdump analysis, netflix-eureka SSRF, Shell arithmetic abuse)/index.html"
+SOURCE_HTML = "converted_writeups/environment - htb medium (laravel environment swap cve, unisharp image upload RCE, gpg decrypt, privileged envs abuse)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

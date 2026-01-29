@@ -51,7 +51,7 @@ const MACHINES_DATA = [
         ],
         "folder": "epsilon"
     }
-,
+    ,
     {
         "name": "broker",
         "platform": "htb",
@@ -62,7 +62,7 @@ const MACHINES_DATA = [
         ],
         "folder": "broker"
     }
-,
+    ,
     {
         "name": "eureka",
         "platform": "htb",
@@ -73,5 +73,30 @@ const MACHINES_DATA = [
             "Shell arithmetic abuse"
         ],
         "folder": "eureka"
+    }
+    ,
+    {
+        "name": "instant",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "apktool",
+            "LFI",
+            "SolarPuTTY decrypt"
+        ],
+        "folder": "instant"
+    }
+,
+    {
+        "name": "environment",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "laravel environment swap cve",
+            "unisharp image upload RCE",
+            "gpg decrypt",
+            "privileged envs abuse"
+        ],
+        "folder": "environment"
     }
 ];
