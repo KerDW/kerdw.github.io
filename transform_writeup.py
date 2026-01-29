@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/previous - htb medium (next.js, LFI, terraform)/index.html"
+SOURCE_HTML = "converted_writeups/formulax - htb hard (XSS socket.io data exfiltration, simple-git RCE CVE, LibreNMS Stored XSS RCE, libreoffice UNO server RCE)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

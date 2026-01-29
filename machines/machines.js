@@ -161,4 +161,30 @@ const MACHINES_DATA = [
         ],
         "folder": "previous"
     }
+,
+    {
+        "name": "faculty",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "boolean-based blind SQLi",
+            "mpdf path traversal",
+            "meta-git CVE RCE",
+            "gdb cap_sys_ptrace+ep cap abuse"
+        ],
+        "folder": "faculty"
+    }
+,
+    {
+        "name": "formulax",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "XSS socket.io data exfiltration",
+            "simple-git RCE CVE",
+            "LibreNMS Stored XSS RCE",
+            "libreoffice UNO server RCE"
+        ],
+        "folder": "formulax"
+    }
 ];

