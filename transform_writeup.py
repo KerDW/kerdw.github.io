@@ -5,11 +5,11 @@ Generic script to transform any writeup using Claude API
 import argparse
 import os
 import re
+import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/broker - htb easy (ActiveMQ, sudo nginx)/index.html"
-OUTPUT_HTML = "machines/broker/index.html"
+SOURCE_HTML = "converted_writeups/eureka - htb hard (spring boot heapdump analysis, netflix-eureka SSRF, Shell arithmetic abuse)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 
@@ -146,6 +146,39 @@ def transform_writeup(api_key):
     print(f"  Platform: {machine_info['platform']}")
     print(f"  Difficulty: {machine_info['difficulty']}")
     print(f"  Techniques: {machine_info['techniques']}")
+
+    # Setup directories and move media
+    machine_name = machine_info['name']
+    target_dir = os.path.join("machines", machine_name)
+    # Update OUTPUT_HTML to be inside the new directory
+    # This shadows the global variable for use within this function
+    OUTPUT_HTML = os.path.join(target_dir, "index.html")
+    
+    print(f"\nSetting up directory: {target_dir}")
+    os.makedirs(target_dir, exist_ok=True)
+    
+    # Create empty index.html
+    if not os.path.exists(OUTPUT_HTML):
+        open(OUTPUT_HTML, 'w').close()
+        print(f"Created empty {OUTPUT_HTML}")
+        
+    # Move media content
+    source_dir = os.path.dirname(SOURCE_HTML)
+    source_media = os.path.join(source_dir, "media")
+    target_media = os.path.join(target_dir, "media")
+    
+    if os.path.exists(source_media):
+        if not os.path.exists(target_media):
+            print(f"Moving media from {source_media} to {target_media}")
+            try:
+                shutil.move(source_media, target_media)
+                print("✓ Media folder moved successfully")
+            except Exception as e:
+                print(f"⚠ Error moving media folder: {e}")
+        else:
+            print(f"Target media directory {target_media} already exists, skipping move.")
+    else:
+        print(f"⚠ Source media directory {source_media} not found.")
     
     print("\nReading source HTML...")
     source_content = read_file(SOURCE_HTML)
@@ -289,15 +322,17 @@ def update_machines_js(machine_info, output_html):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Transform writeup using Claude API. Edit SOURCE_HTML and OUTPUT_HTML variables at the top of this file.",
+        description="Transform writeup using Claude API. Edit SOURCE_HTML variable at the top of this file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Usage:
-  1. Edit SOURCE_HTML and OUTPUT_HTML variables at the top of this file
+  1. Edit SOURCE_HTML variable at the top of this file
   2. Run: python transform_writeup.py YOUR_API_KEY
   
 The script will automatically:
   - Extract machine info from the source path
+  - Setup the output directory and empty index.html
+  - Move the media folder
   - Transform the HTML using Claude API
   - Update machines.js with the new machine
   

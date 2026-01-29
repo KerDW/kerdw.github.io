@@ -62,4 +62,16 @@ const MACHINES_DATA = [
         ],
         "folder": "broker"
     }
+,
+    {
+        "name": "eureka",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "spring boot heapdump analysis",
+            "netflix-eureka SSRF",
+            "Shell arithmetic abuse"
+        ],
+        "folder": "eureka"
+    }
 ];
