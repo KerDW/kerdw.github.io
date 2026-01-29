@@ -136,4 +136,29 @@ const MACHINES_DATA = [
         ],
         "folder": "broscience"
     }
+,
+    {
+        "name": "investigation",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "exiftool CVE RCE",
+            ".msg_.eml file extraction",
+            "MS Event Log file analysis credential leak",
+            "binary analysis & sudo privilege abuse"
+        ],
+        "folder": "investigation"
+    }
+,
+    {
+        "name": "previous",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "next.js",
+            "LFI",
+            "terraform"
+        ],
+        "folder": "previous"
+    }
 ];

