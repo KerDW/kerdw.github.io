@@ -99,4 +99,15 @@ const MACHINES_DATA = [
         ],
         "folder": "environment"
     }
+,
+    {
+        "name": "codify",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "node editor limitation bypass",
+            "insecure bash comparison abuse"
+        ],
+        "folder": "codify"
+    }
 ];
