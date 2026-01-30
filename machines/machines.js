@@ -442,4 +442,53 @@ const MACHINES_DATA = [
         ],
         "folder": "devvortex"
     }
+,
+    {
+        "name": "zipping",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "zip symlink path traversal",
+            "PHP preg_match ._ bypass SQLi file write",
+            "LFI",
+            "binary shared library hijack"
+        ],
+        "folder": "zipping"
+    }
+,
+    {
+        "name": "strutted",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "struts2",
+            "sudo tcpdump"
+        ],
+        "folder": "strutted"
+    }
+,
+    {
+        "name": "paper",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "rocket.chat bot",
+            "linpeas",
+            "polkit cve privesc"
+        ],
+        "folder": "paper"
+    }
+,
+    {
+        "name": "support (windows)",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "smb share access",
+            "exe analysis",
+            "bloodhound organization analysis",
+            "GenericAll abuse"
+        ],
+        "folder": "support (windows)"
+    }
 ];

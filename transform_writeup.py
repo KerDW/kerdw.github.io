@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/devvortex - htb easy (joomla)/index.html"
+SOURCE_HTML = "converted_writeups/support (windows) - htb easy (smb share access, exe analysis, bloodhound organization analysis, GenericAll abuse)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

