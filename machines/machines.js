@@ -227,4 +227,102 @@ const MACHINES_DATA = [
         ],
         "folder": "vessel"
     }
+,
+    {
+        "name": "imagery",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "XSS",
+            "LFI",
+            "Charcol cron"
+        ],
+        "folder": "imagery"
+    }
+,
+    {
+        "name": "bagel",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "path traversal",
+            "ws service unsafe .NET TypeNameHandling serialization file read"
+        ],
+        "folder": "bagel"
+    }
+,
+    {
+        "name": "linkvortex",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "git dumper",
+            "ghost cms arbitrary file read cve",
+            "sudo env var abuse"
+        ],
+        "folder": "linkvortex"
+    }
+,
+    {
+        "name": "metatwo",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "WP bookingpress plugin SQLi CVE",
+            "WP XXE CVE",
+            "passpie GPG key cracking"
+        ],
+        "folder": "metatwo"
+    }
+,
+    {
+        "name": "monitored",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "snmp 161 credentials leakage",
+            "nagiosxi SQLi CVE",
+            "nagiosxi admin RCE",
+            "nagiosxi script abuse privesc"
+        ],
+        "folder": "monitored"
+    }
+,
+    {
+        "name": "monitors",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "wordpress plugin RFI",
+            "cacti SQLi RCE exploit",
+            "Apache OFBiz deserialization RCE",
+            "CAP_SYS_MODULE container breakout"
+        ],
+        "folder": "monitors"
+    }
+,
+    {
+        "name": "monitorstwo",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "cacti RCE CVE",
+            "password cracking",
+            "capsh SUID",
+            "docker bad permissions abuse"
+        ],
+        "folder": "monitorstwo"
+    }
+,
+    {
+        "name": "monitorsthree",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "boolean-based sqli",
+            "cacti authenticated RCE exploit",
+            "duplicati auth bypass"
+        ],
+        "folder": "monitorsthree"
+    }
 ];

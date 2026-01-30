@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>monitorstwo | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">monitorstwo</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running Cacti version 1.2.22 on
+                        port 80, which is vulnerable to CVE-2022-46169, a command injection vulnerability in the
+                        <code>/remote_agent.php</code> endpoint. By exploiting this vulnerability, I gained initial
+                        access as the <code>www-data</code> user inside a Docker container.</p>
+                    <p>Once inside the container, I discovered MySQL credentials in the Cacti configuration file and
+                        connected to the database running in another container. I extracted password hashes for two
+                        users and successfully cracked the hash for user <code>marcus</code> using hashcat, which
+                        allowed me to SSH into the host machine and retrieve the user flag.</p>
+                    <p>For privilege escalation, I identified that the Docker version (20.10.5) was vulnerable to
+                        CVE-2021-41091, which allows accessing Docker container filesystems from the host with improper
+                        permissions. Inside the container, I found the <code>capsh</code> binary with SUID permissions
+                        and used it to escalate to root within the container. I then set the SUID bit on
+                        <code>/bin/bash</code> inside the container, accessed the container's filesystem from the host
+                        machine as <code>marcus</code>, and executed the SUID bash to gain root access on the host.</p>
+                    <p><strong>Technologies/Exploits:</strong> Cacti RCE via command injection (CVE-2022-46169), MySQL
+                        credential extraction, bcrypt password cracking with hashcat, Docker overlay2 filesystem
+                        permissions abuse (CVE-2021-41091), capsh SUID privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image1.png"
+                        alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals that the machine is running SSH on port 22 and an HTTP service on port 80. Let's
+                    investigate the web service further.</p>
+
+                <h2>Web Enumeration - Cacti Monitoring Platform</h2>
+                <p>Navigating to port 80, I discover a Cacti installation, which is a network monitoring and graphing
+                    tool:</p>
+                <p><img src="./media/image3.png"
+                        alt="Cacti login page showing version 1.2.22 with username and password fields" /></p>
+
+                <p>The login page helpfully displays the exact version: <strong>Cacti 1.2.22</strong>. I attempt to log
+                    in with default credentials <code>admin/admin</code>, but this doesn't work. Since I have the
+                    specific version number, the logical next step is to search for known vulnerabilities affecting this
+                    version.</p>
+
+                <h2>Vulnerability Research - CVE-2022-46169</h2>
+                <p>After searching for vulnerabilities in Cacti 1.2.22, I discover <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2022-46169">CVE-2022-46169</a>, a critical command
+                    injection vulnerability. I find a proof-of-concept exploit on GitHub: <a
+                        href="https://github.com/ariyaadinatha/cacti-cve-2022-46169-exploit">https://github.com/ariyaadinatha/cacti-cve-2022-46169-exploit</a>
+                </p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>This vulnerability exploits a command injection flaw in the <code>/remote_agent.php</code> endpoint.
+                    The exploit works in two stages:</p>
+                <ol>
+                    <li>First, it performs a brute-force attack using nested loops to discover specific parameters that
+                        the endpoint requires for authentication bypass</li>
+                    <li>Once the correct parameters are found, it injects a reverse shell command through the vulnerable
+                        endpoint, which gets executed on the target system</li>
+                </ol>
+
+                <p>The command injection occurs because the endpoint doesn't properly sanitize user-supplied input
+                    before passing it to system commands.</p>
+
+                <h2>Initial Access - Exploiting Cacti RCE</h2>
+                <p>I execute the exploit, which automatically discovers the required parameters and sends a reverse
+                    shell payload. The exploit successfully connects back to my listener, and I gain access as the
+                    <code>www-data</code> user.</p>
+
+                <p>However, after gaining access, I notice something important - I'm inside a Docker container with the
+                    IP address <code>172.19.0.3</code>. This means I'll need to escape the container to gain access to
+                    the actual host machine.</p>
+
+                <h2>Container Enumeration - MySQL Database Access</h2>
+                <p>While exploring the container, I find MySQL credentials in the Cacti configuration file located at
+                    <code>/var/www/html/include/config.php</code>:</p>
+
+                <pre><code class="language-php">$database_type = 'mysql';
+$database_default = 'cacti';
+$database_hostname = 'db';
+$database_username = 'root';
+$database_password = 'root';
+$database_port = '3306';</code></pre>
+
+                <p>The hostname <code>db</code> indicates that MySQL is running in another container, but I should be
+                    able to access it through Docker's internal networking. I connect to the MySQL database:</p>
+
+                <pre><code class="language-bash">mysql -h db -u root -p</code></pre>
+
+                <p>After entering the password <code>root</code>, I successfully connect to the database.</p>
+
+                <h3>Extracting User Credentials</h3>
+                <p>I enumerate the database and discover a table containing user credentials with password hashes:</p>
+
+                <pre><code class="language-sql">SELECT username, password FROM user_auth;</code></pre>
+
+                <p>This query returns two users with their bcrypt password hashes:</p>
+
+                <pre><code class="language-plaintext">admin:$2y$10$IhEA.Og8vrvwueM7VEDkUes3pwc3zaBbQ/iuqMft/llx8utpR1hjC
+marcus:$2y$10$vcrYth5YcCLlZaPDj6PwqOYTw68W1.3WeKlBn70JonsdW/MhFYK4C</code></pre>
+
+                <h2>Password Cracking</h2>
+                <p>I save these hashes to a file called <code>hashes.txt</code> on my local machine. Since these are
+                    bcrypt hashes (identified by the <code>$2y$</code> prefix), I use hashcat with mode 3200 to attempt
+                    to crack them:</p>
+
+                <pre><code class="language-bash">hashcat -m 3200 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>After running for some time, hashcat successfully cracks the password for user <code>marcus</code>:
+                </p>
+
+                <pre><code class="language-plaintext">marcus:funkymonkey</code></pre>
+
+                <h2>SSH Access and User Flag</h2>
+                <p>With valid credentials, I attempt to SSH into the host machine as <code>marcus</code>:</p>
+
+                <pre><code class="language-bash">ssh marcus@10.10.11.211</code></pre>
+
+                <p>The credentials work, and I successfully log in to the host machine. I can now retrieve the user
+                    flag from <code>/home/marcus/user.txt</code>.</p>
+
+                <h2>Privilege Escalation - Docker Version Enumeration</h2>
+                <p>After gaining access to the host machine, I check for listening ports to understand what services are
+                    running:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Netstat output showing listening ports including 8080 and another internal port" /></p>
+
+                <p>Port 8080 corresponds to the Cacti application running inside the Docker container. After thorough
+                    enumeration of the system without finding obvious privilege escalation vectors, I focus on what I
+                    know is running on the machine - Docker.</p>
+
+                <p>I check the Docker version:</p>
+
+                <pre><code class="language-bash">docker --version</code></pre>
+
+                <pre><code class="language-plaintext">Docker version 20.10.5+dfsg1, build 55c4c88</code></pre>
+
+                <p>Although I cannot run <code>docker ps</code> due to permission restrictions, knowing the specific
+                    version allows me to search for vulnerabilities.</p>
+
+                <h2>Docker Vulnerability - CVE-2021-41091</h2>
+                <p>I discover that this Docker version is vulnerable to <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2021-41091">CVE-2021-41091</a>, a privilege
+                    escalation vulnerability. I find a corresponding exploit and explanation: <a
+                        href="https://github.com/UncleJ4ck/CVE-2021-41091">https://github.com/UncleJ4ck/CVE-2021-41091</a>
+                </p>
+
+                <h3>Understanding the Docker Vulnerability</h3>
+                <p>This vulnerability exists because Docker 20.10.5 doesn't assign sufficiently strict permissions to
+                    critical directories, specifically <code>/var/lib/docker/overlay2</code>. This directory contains
+                    the filesystem layers for Docker containers using the overlay2 storage driver.</p>
+
+                <p>The exploitation strategy is straightforward:</p>
+                <ol>
+                    <li>Gain root access inside the Docker container</li>
+                    <li>Set the SUID bit on <code>/bin/bash</code> within the container</li>
+                    <li>From the host machine, access the container's filesystem through
+                        <code>/var/lib/docker/overlay2</code></li>
+                    <li>Execute the SUID bash binary to gain root privileges on the host</li>
+                </ol>
+
+                <h2>Container Privilege Escalation - Capsh SUID</h2>
+                <p>First, I need to escalate privileges inside the container. From my initial <code>www-data</code>
+                    shell in the container, I search for SUID binaries:</p>
+
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+
+                <p>The search returns several SUID binaries:</p>
+
+                <pre><code class="language-plaintext">/usr/bin/gpasswd
+/usr/bin/passwd
+/usr/bin/chsh
+/usr/bin/chfn
+/usr/bin/newgrp
+/sbin/capsh
+/bin/mount
+/bin/umount
+/bin/su</code></pre>
+
+                <p>The <code>/sbin/capsh</code> binary stands out as unusual. Checking <a
+                        href="https://gtfobins.github.io/gtfobins/capsh/#suid">GTFOBins</a>, I confirm that
+                    <code>capsh</code> with SUID can be exploited for privilege escalation.</p>
+
+                <p>I execute the privilege escalation command:</p>
+
+                <pre><code class="language-bash">capsh --gid=0 --uid=0 --</code></pre>
+
+                <p>This grants me root access inside the container:</p>
+
+                <pre><code class="language-bash">root@50bca5e748b0:/var/www/html# whoami
+root</code></pre>
+
+                <h2>Setting Up SUID Bash</h2>
+                <p>Now that I'm root inside the container, I set the SUID bit on <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">chmod u+s /bin/bash</code></pre>
+
+                <p>This modification will persist in the container's filesystem, which I'll be able to access from the
+                    host machine.</p>
+
+                <h2>Accessing Container Filesystem from Host</h2>
+                <p>Back on the host machine as user <code>marcus</code>, I need to locate the container's filesystem. I
+                    use <code>findmnt</code> to list all mounted filesystems:</p>
+
+                <pre><code class="language-bash">findmnt 2>/dev/null | grep overlay2</code></pre>
+
+                <p>This reveals two overlay2 mount points:</p>
+
+                <pre><code class="language-plaintext">/var/lib/docker/overlay2/4ec09ecfa6f3a290dc6b247d7f4ff71a398d4f17060cdaf065e8bb83007effec/merged
+/var/lib/docker/overlay2/c41d5854e43bd996e128d647cb526b73d04c9ad6325201c85f73fdba372cb2f1/merged</code></pre>
+
+                <p>I need to identify which one corresponds to the Cacti container. I check both directories for the
+                    SUID bash binary I created:</p>
+
+                <pre><code class="language-bash">ls -la /var/lib/docker/overlay2/c41d5854e43bd996e128d647cb526b73d04c9ad6325201c85f73fdba372cb2f1/merged/bin/bash</code></pre>
+
+                <p>The second path contains the SUID bash binary (identified by the <code>s</code> permission bit),
+                    confirming this is the correct container filesystem.</p>
+
+                <h2>Gaining Root Access</h2>
+                <p>I navigate to the container's merged filesystem and execute the SUID bash binary with the
+                    <code>-p</code> flag to preserve the effective UID:</p>
+
+                <pre><code class="language-bash">cd /var/lib/docker/overlay2/c41d5854e43bd996e128d647cb526b73d04c9ad6325201c85f73fdba372cb2f1/merged
+./bin/bash -p</code></pre>
+
+                <p>The <code>-p</code> flag is crucial - it tells bash to run in privileged mode, maintaining the SUID
+                    permissions and giving me an effective UID of 0 (root).</p>
+
+                <pre><code class="language-bash">bash-5.1# whoami
+root</code></pre>
+
+                <p>I now have root access on the host machine and can retrieve the root flag from
+                    <code>/root/root.txt</code>.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba Cacti versión 1.2.22 en el
+                        puerto 80, vulnerable a CVE-2022-46169, una vulnerabilidad de inyección de comandos en el
+                        endpoint <code>/remote_agent.php</code>. Explotando esta vulnerabilidad, conseguí acceso inicial
+                        como usuario <code>www-data</code> dentro de un contenedor Docker.</p>
+                    <p>Una vez dentro del contenedor, descubrí credenciales de MySQL en el archivo de configuración de
+                        Cacti y me conecté a la base de datos ejecutándose en otro contenedor. Extraje hashes de
+                        contraseñas de dos usuarios y crackeé con éxito el hash del usuario <code>marcus</code> usando
+                        hashcat, lo que me permitió conectarme por SSH a la máquina host y obtener la flag de usuario.
+                    </p>
+                    <p>Para la escalada de privilegios, identifiqué que la versión de Docker (20.10.5) era vulnerable a
+                        CVE-2021-41091, lo que permite acceder a sistemas de archivos de contenedores Docker desde el
+                        host con permisos inadecuados. Dentro del contenedor, encontré el binario <code>capsh</code> con
+                        permisos SUID y lo usé para escalar a root dentro del contenedor. Luego establecí el bit SUID en
+                        <code>/bin/bash</code> dentro del contenedor, accedí al sistema de archivos del contenedor desde
+                        la máquina host como <code>marcus</code> y ejecuté la bash SUID para ganar acceso root en el
+                        host.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Cacti RCE mediante inyección de comandos (CVE-2022-46169),
+                        extracción de credenciales MySQL, cracking de contraseñas bcrypt con hashcat, abuso de permisos
+                        del filesystem overlay2 de Docker (CVE-2021-41091), escalada de privilegios con capsh SUID.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la
+                    máquina objetivo:</p>
+                <p><img src="./media/image1.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" />
+                </p>
+
+                <p>El escaneo revela que la máquina ejecuta SSH en el puerto 22 y un servicio HTTP en el puerto 80.
+                    Vamos a investigar el servicio web más a fondo.</p>
+
+                <h2>Enumeración Web - Plataforma de Monitorización Cacti</h2>
+                <p>Navegando al puerto 80, descubro una instalación de Cacti, que es una herramienta de monitorización y
+                    gráficos de red:</p>
+                <p><img src="./media/image3.png"
+                        alt="Página de login de Cacti mostrando la versión 1.2.22 con campos de usuario y contraseña" />
+                </p>
+
+                <p>La página de login muestra convenientemente la versión exacta: <strong>Cacti 1.2.22</strong>. Intento
+                    iniciar sesión con las credenciales por defecto <code>admin/admin</code>, pero no funcionan. Como
+                    tengo el número de versión específico, el siguiente paso lógico es buscar vulnerabilidades conocidas
+                    que afecten a esta versión.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2022-46169</h2>
+                <p>Tras buscar vulnerabilidades en Cacti 1.2.22, descubro <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2022-46169">CVE-2022-46169</a>, una vulnerabilidad
+                    crítica de inyección de comandos. Encuentro una prueba de concepto del exploit en GitHub: <a
+                        href="https://github.com/ariyaadinatha/cacti-cve-2022-46169-exploit">https://github.com/ariyaadinatha/cacti-cve-2022-46169-exploit</a>
+                </p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>Esta vulnerabilidad explota un fallo de inyección de comandos en el endpoint
+                    <code>/remote_agent.php</code>. El exploit funciona en dos etapas:</p>
+                <ol>
+                    <li>Primero, realiza un ataque de fuerza bruta usando bucles anidados para descubrir parámetros
+                        específicos que el endpoint requiere para el bypass de autenticación</li>
+                    <li>Una vez se encuentran los parámetros correctos, inyecta un comando de reverse shell a través del
+                        endpoint vulnerable, que se ejecuta en el sistema objetivo</li>
+                </ol>
+
+                <p>La inyección de comandos ocurre porque el endpoint no sanitiza adecuadamente la entrada proporcionada
+                    por el usuario antes de pasarla a comandos del sistema.</p>
+
+                <h2>Acceso Inicial - Explotando Cacti RCE</h2>
+                <p>Ejecuto el exploit, que automáticamente descubre los parámetros requeridos y envía un payload de
+                    reverse shell. El exploit se conecta exitosamente a mi listener y consigo acceso como usuario
+                    <code>www-data</code>.</p>
+
+                <p>Sin embargo, tras conseguir acceso, noto algo importante: estoy dentro de un contenedor Docker con la
+                    dirección IP <code>172.19.0.3</code>. Esto significa que tendré que escapar del contenedor para
+                    ganar acceso a la máquina host real.</p>
+
+                <h2>Enumeración del Contenedor - Acceso a Base de Datos MySQL</h2>
+                <p>Mientras exploro el contenedor, encuentro credenciales de MySQL en el archivo de configuración de
+                    Cacti ubicado en <code>/var/www/html/include/config.php</code>:</p>
+
+                <pre><code class="language-php">$database_type = 'mysql';
+$database_default = 'cacti';
+$database_hostname = 'db';
+$database_username = 'root';
+$database_password = 'root';
+$database_port = '3306';</code></pre>
+
+                <p>El hostname <code>db</code> indica que MySQL está ejecutándose en otro contenedor, pero debería poder
+                    acceder a él mediante la red interna de Docker. Me conecto a la base de datos MySQL:</p>
+
+                <pre><code class="language-bash">mysql -h db -u root -p</code></pre>
+
+                <p>Tras introducir la contraseña <code>root</code>, me conecto exitosamente a la base de datos.</p>
+
+                <h3>Extrayendo Credenciales de Usuario</h3>
+                <p>Enumero la base de datos y descubro una tabla que contiene credenciales de usuario con hashes de
+                    contraseñas:</p>
+
+                <pre><code class="language-sql">SELECT username, password FROM user_auth;</code></pre>
+
+                <p>Esta consulta devuelve dos usuarios con sus hashes de contraseña bcrypt:</p>
+
+                <pre><code class="language-plaintext">admin:$2y$10$IhEA.Og8vrvwueM7VEDkUes3pwc3zaBbQ/iuqMft/llx8utpR1hjC
+marcus:$2y$10$vcrYth5YcCLlZaPDj6PwqOYTw68W1.3WeKlBn70JonsdW/MhFYK4C</code></pre>
+
+                <h2>Cracking de Contraseñas</h2>
+                <p>Guardo estos hashes en un archivo llamado <code>hashes.txt</code> en mi máquina local. Como son
+                    hashes bcrypt (identificados por el prefijo <code>$2y$</code>), uso hashcat con el modo 3200 para
+                    intentar crackearlos:</p>
+
+                <pre><code class="language-bash">hashcat -m 3200 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Tras ejecutarse durante algún tiempo, hashcat crackea exitosamente la contraseña del usuario
+                    <code>marcus</code>:</p>
+
+                <pre><code class="language-plaintext">marcus:funkymonkey</code></pre>
+
+                <h2>Acceso SSH y Flag de Usuario</h2>
+                <p>Con credenciales válidas, intento conectarme por SSH a la máquina host como <code>marcus</code>:</p>
+
+                <pre><code class="language-bash">ssh marcus@10.10.11.211</code></pre>
+
+                <p>Las credenciales funcionan y me conecto exitosamente a la máquina host. Ahora puedo obtener la flag
+                    de usuario de <code>/home/marcus/user.txt</code>.</p>
+
+                <h2>Escalada de Privilegios - Enumeración de Versión de Docker</h2>
+                <p>Tras ganar acceso a la máquina host, compruebo los puertos en escucha para entender qué servicios
+                    están ejecutándose:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Salida de netstat mostrando puertos en escucha incluyendo el 8080 y otro puerto interno" />
+                </p>
+
+                <p>El puerto 8080 corresponde a la aplicación Cacti ejecutándose dentro del contenedor Docker. Tras una
+                    enumeración exhaustiva del sistema sin encontrar vectores obvios de escalada de privilegios, me
+                    centro en lo que sé que está ejecutándose en la máquina: Docker.</p>
+
+                <p>Compruebo la versión de Docker:</p>
+
+                <pre><code class="language-bash">docker --version</code></pre>
+
+                <pre><code class="language-plaintext">Docker version 20.10.5+dfsg1, build 55c4c88</code></pre>
+
+                <p>Aunque no puedo ejecutar <code>docker ps</code> debido a restricciones de permisos, conocer la versión
+                    específica me permite buscar vulnerabilidades.</p>
+
+                <h2>Vulnerabilidad de Docker - CVE-2021-41091</h2>
+                <p>Descubro que esta versión de Docker es vulnerable a <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2021-41091">CVE-2021-41091</a>, una vulnerabilidad de
+                    escalada de privilegios. Encuentro un exploit correspondiente y explicación: <a
+                        href="https://github.com/UncleJ4ck/CVE-2021-41091">https://github.com/UncleJ4ck/CVE-2021-41091</a>
+                </p>
+
+                <h3>Entendiendo la Vulnerabilidad de Docker</h3>
+                <p>Esta vulnerabilidad existe porque Docker 20.10.5 no asigna permisos suficientemente estrictos a
+                    directorios críticos, específicamente <code>/var/lib/docker/overlay2</code>. Este directorio contiene
+                    las capas del sistema de archivos para contenedores Docker usando el driver de almacenamiento
+                    overlay2.</p>
+
+                <p>La estrategia de explotación es directa:</p>
+                <ol>
+                    <li>Ganar acceso root dentro del contenedor Docker</li>
+                    <li>Establecer el bit SUID en <code>/bin/bash</code> dentro del contenedor</li>
+                    <li>Desde la máquina host, acceder al sistema de archivos del contenedor a través de
+                        <code>/var/lib/docker/overlay2</code></li>
+                    <li>Ejecutar el binario bash SUID para ganar privilegios root en el host</li>
+                </ol>
+
+                <h2>Escalada de Privilegios en el Contenedor - Capsh SUID</h2>
+                <p>Primero, necesito escalar privilegios dentro del contenedor. Desde mi shell inicial como
+                    <code>www-data</code> en el contenedor, busco binarios SUID:</p>
+
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+
+                <p>La búsqueda devuelve varios binarios SUID:</p>
+
+                <pre><code class="language-plaintext">/usr/bin/gpasswd
+/usr/bin/passwd
+/usr/bin/chsh
+/usr/bin/chfn
+/usr/bin/newgrp
+/sbin/capsh
+/bin/mount
+/bin/umount
+/bin/su</code></pre>
+
+                <p>El binario <code>/sbin/capsh</code> destaca como inusual. Comprobando en <a
+                        href="https://gtfobins.github.io/gtfobins/capsh/#suid">GTFOBins</a>, confirmo que
+                    <code>capsh</code> con SUID puede ser explotado para escalada de privilegios.</p>
+
+                <p>Ejecuto el comando de escalada de privilegios:</p>
+
+                <pre><code class="language-bash">capsh --gid=0 --uid=0 --</code></pre>
+
+                <p>Esto me otorga acceso root dentro del contenedor:</p>
+
+                <pre><code class="language-bash">root@50bca5e748b0:/var/www/html# whoami
+root</code></pre>
+
+                <h2>Configurando la Bash SUID</h2>
+                <p>Ahora que soy root dentro del contenedor, establezco el bit SUID en <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">chmod u+s /bin/bash</code></pre>
+
+                <p>Esta modificación persistirá en el sistema de archivos del contenedor, al cual podré acceder desde la
+                    máquina host.</p>
+
+                <h2>Accediendo al Sistema de Archivos del Contenedor desde el Host</h2>
+                <p>De vuelta en la máquina host como usuario <code>marcus</code>, necesito localizar el sistema de
+                    archivos del contenedor. Uso <code>findmnt</code> para listar todos los sistemas de archivos
+                    montados:</p>
+
+                <pre><code class="language-bash">findmnt 2>/dev/null | grep overlay2</code></pre>
+
+                <p>Esto revela dos puntos de montaje overlay2:</p>
+
+                <pre><code class="language-plaintext">/var/lib/docker/overlay2/4ec09ecfa6f3a290dc6b247d7f4ff71a398d4f17060cdaf065e8bb83007effec/merged
+/var/lib/docker/overlay2/c41d5854e43bd996e128d647cb526b73d04c9ad6325201c85f73fdba372cb2f1/merged</code></pre>
+
+                <p>Necesito identificar cuál corresponde al contenedor Cacti. Compruebo ambos directorios buscando el
+                    binario bash SUID que he creado:</p>
+
+                <pre><code class="language-bash">ls -la /var/lib/docker/overlay2/c41d5854e43bd996e128d647cb526b73d04c9ad6325201c85f73fdba372cb2f1/merged/bin/bash</code></pre>
+
+                <p>La segunda ruta contiene el binario bash SUID (identificado por el bit de permiso <code>s</code>),
+                    confirmando que este es el sistema de archivos del contenedor correcto.</p>
+
+                <h2>Ganando Acceso Root</h2>
+                <p>Navego al sistema de archivos merged del contenedor y ejecuto el binario bash SUID con la flag
+                    <code>-p</code> para preservar el UID efectivo:</p>
+
+                <pre><code class="language-bash">cd /var/lib/docker/overlay2/c41d5854e43bd996e128d647cb526b73d04c9ad6325201c85f73fdba372cb2f1/merged
+./bin/bash -p</code></pre>
+
+                <p>La flag <code>-p</code> es crucial: le dice a bash que se ejecute en modo privilegiado, manteniendo
+                    los permisos SUID y dándome un UID efectivo de 0 (root).</p>
+
+                <pre><code class="language-bash">bash-5.1# whoami
+root</code></pre>
+
+                <p>Ahora tengo acceso root en la máquina host y puedo obtener la flag de root de
+                    <code>/root/root.txt</code>.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

