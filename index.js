@@ -3,8 +3,8 @@ const translations = {
     en: {
         'title': 'KDW | Writeups',
         'site-title': 'KDW_LABS',
-        'intro-title': 'System.root.welcome()',
-        'intro-text': 'Documenting my progress in HTB and other platforms. These writeups are summaries made with LLMs from notes I\'ve been taking while doing the machines.',
+        'intro-title': 'root@printer:~#',
+        'intro-text': 'Documenting my progress in HTB and other platforms. These writeups are adaptations made with LLMs from notes I\'ve been taking while doing the machines.',
         'disclaimer': 'All documented processes have been performed in authorized environments.',
         'browse-title': 'ls ./writeups',
         'platform-label': 'PLATFORM',
@@ -31,8 +31,8 @@ const translations = {
     es: {
         'title': 'KDW | Writeups',
         'site-title': 'KDW_LABS',
-        'intro-title': 'System.root.welcome()',
-        'intro-text': 'Documentando mi progreso en HTB y otras plataformas. Estos writeups son resúmenes hechos con LLMs a partir de apuntes que he ido tomando mientras hacía las máquinas.',
+        'intro-title': 'root@impresora:~#',
+        'intro-text': 'Documentando mi progreso en HTB y otras plataformas. Estos writeups son adaptaciones hechas con LLMs a partir de apuntes que he ido tomando mientras hacía las máquinas.',
         'disclaimer': 'Todos los procesos documentados se han realizado en entornos autorizados.',
         'browse-title': 'ls ./writeups',
         'platform-label': 'PLATAFORMA',

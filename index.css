@@ -189,11 +189,6 @@ main {
     padding: 4rem 0;
 }
 
-/* Introduction Section */
-.intro-section {
-    margin-bottom: 2rem;
-}
-
 .intro-section h2 {
     font-family: var(--font-mono);
     color: var(--text-primary);

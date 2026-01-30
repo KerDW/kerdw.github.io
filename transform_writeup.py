@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/monitorsthree - htb medium (boolean-based sqli, cacti authenticated RCE exploit, duplicati auth bypass)/index.html"
+SOURCE_HTML = "converted_writeups/gofer - htb hard (SMB share access, Gopher + SMTP + ODT macro phishing revshell, tcpdump cap_net_admin abuse, binary exploitation, SUID binary PATH hijack)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

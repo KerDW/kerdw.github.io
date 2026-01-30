@@ -325,4 +325,42 @@ const MACHINES_DATA = [
         ],
         "folder": "monitorsthree"
     }
+,
+    {
+        "name": "yummy",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "directory traversal",
+            "sqli file write",
+            "mercurial hook abuse",
+            "rsync privesc"
+        ],
+        "folder": "yummy"
+    }
+,
+    {
+        "name": "runner",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "teamcity admin user creation & RCE",
+            "portainer privesc"
+        ],
+        "folder": "runner"
+    }
+,
+    {
+        "name": "gofer",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "SMB share access",
+            "Gopher + SMTP + ODT macro phishing revshell",
+            "tcpdump cap_net_admin abuse",
+            "binary exploitation",
+            "SUID binary PATH hijack"
+        ],
+        "folder": "gofer"
+    }
 ];

