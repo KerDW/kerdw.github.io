@@ -363,4 +363,48 @@ const MACHINES_DATA = [
         ],
         "folder": "gofer"
     }
+,
+    {
+        "name": "shared",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "cookie-induced SQLi",
+            "ipython CVE RCE",
+            "redis binary password exfiltration",
+            "redis admin file write abuse CVE privesc"
+        ],
+        "folder": "shared"
+    }
+,
+    {
+        "name": "planning",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "grafana"
+        ],
+        "folder": "planning"
+    }
+,
+    {
+        "name": "expressway",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "UDP"
+        ],
+        "folder": "expressway"
+    }
+,
+    {
+        "name": "gavel",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "bruteforce credentials",
+            "php.ini restrictions bypass"
+        ],
+        "folder": "gavel"
+    }
 ];
