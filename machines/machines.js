@@ -527,4 +527,28 @@ const MACHINES_DATA = [
         ],
         "folder": "drive"
     }
+,
+    {
+        "name": "snoopy",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "filtered path traversal with scripting",
+            "Bind DNS email vhost hijack",
+            "git patch CVE abuse",
+            "clamAV CVE XXE exploit"
+        ],
+        "folder": "snoopy"
+    }
+,
+    {
+        "name": "onlyforyou",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "cypher injection",
+            "sudo pip download"
+        ],
+        "folder": "onlyforyou"
+    }
 ];

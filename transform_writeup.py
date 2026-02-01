@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/drive - htb hard (IDOR, SUID binary analysis, BOF_ROP binary file buffer overflow)/index.html"
+SOURCE_HTML = "converted_writeups/surveillance - htb medium (Craft CMS PHP class injection RCE CVE, Zoneminder RCE CVE, Zoneminder config LD_PRELOAD env abuse)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 
