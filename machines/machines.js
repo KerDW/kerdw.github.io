@@ -227,7 +227,7 @@ const MACHINES_DATA = [
         ],
         "folder": "vessel"
     }
-,
+    ,
     {
         "name": "imagery",
         "platform": "htb",
@@ -239,7 +239,7 @@ const MACHINES_DATA = [
         ],
         "folder": "imagery"
     }
-,
+    ,
     {
         "name": "bagel",
         "platform": "htb",
@@ -250,7 +250,7 @@ const MACHINES_DATA = [
         ],
         "folder": "bagel"
     }
-,
+    ,
     {
         "name": "linkvortex",
         "platform": "htb",
@@ -262,7 +262,7 @@ const MACHINES_DATA = [
         ],
         "folder": "linkvortex"
     }
-,
+    ,
     {
         "name": "metatwo",
         "platform": "htb",
@@ -274,7 +274,7 @@ const MACHINES_DATA = [
         ],
         "folder": "metatwo"
     }
-,
+    ,
     {
         "name": "monitored",
         "platform": "htb",
@@ -287,7 +287,7 @@ const MACHINES_DATA = [
         ],
         "folder": "monitored"
     }
-,
+    ,
     {
         "name": "monitors",
         "platform": "htb",
@@ -300,7 +300,7 @@ const MACHINES_DATA = [
         ],
         "folder": "monitors"
     }
-,
+    ,
     {
         "name": "monitorstwo",
         "platform": "htb",
@@ -313,7 +313,7 @@ const MACHINES_DATA = [
         ],
         "folder": "monitorstwo"
     }
-,
+    ,
     {
         "name": "monitorsthree",
         "platform": "htb",
@@ -325,7 +325,7 @@ const MACHINES_DATA = [
         ],
         "folder": "monitorsthree"
     }
-,
+    ,
     {
         "name": "yummy",
         "platform": "htb",
@@ -338,7 +338,7 @@ const MACHINES_DATA = [
         ],
         "folder": "yummy"
     }
-,
+    ,
     {
         "name": "runner",
         "platform": "htb",
@@ -349,7 +349,7 @@ const MACHINES_DATA = [
         ],
         "folder": "runner"
     }
-,
+    ,
     {
         "name": "gofer",
         "platform": "htb",
@@ -363,7 +363,7 @@ const MACHINES_DATA = [
         ],
         "folder": "gofer"
     }
-,
+    ,
     {
         "name": "shared",
         "platform": "htb",
@@ -376,7 +376,7 @@ const MACHINES_DATA = [
         ],
         "folder": "shared"
     }
-,
+    ,
     {
         "name": "planning",
         "platform": "htb",
@@ -386,7 +386,7 @@ const MACHINES_DATA = [
         ],
         "folder": "planning"
     }
-,
+    ,
     {
         "name": "expressway",
         "platform": "htb",
@@ -396,7 +396,7 @@ const MACHINES_DATA = [
         ],
         "folder": "expressway"
     }
-,
+    ,
     {
         "name": "gavel",
         "platform": "htb",
@@ -407,7 +407,7 @@ const MACHINES_DATA = [
         ],
         "folder": "gavel"
     }
-,
+    ,
     {
         "name": "boardlight",
         "platform": "htb",
@@ -418,7 +418,7 @@ const MACHINES_DATA = [
         ],
         "folder": "boardlight"
     }
-,
+    ,
     {
         "name": "clicker",
         "platform": "htb",
@@ -432,7 +432,7 @@ const MACHINES_DATA = [
         ],
         "folder": "clicker"
     }
-,
+    ,
     {
         "name": "devvortex",
         "platform": "htb",
@@ -442,7 +442,7 @@ const MACHINES_DATA = [
         ],
         "folder": "devvortex"
     }
-,
+    ,
     {
         "name": "zipping",
         "platform": "htb",
@@ -455,7 +455,7 @@ const MACHINES_DATA = [
         ],
         "folder": "zipping"
     }
-,
+    ,
     {
         "name": "strutted",
         "platform": "htb",
@@ -466,7 +466,7 @@ const MACHINES_DATA = [
         ],
         "folder": "strutted"
     }
-,
+    ,
     {
         "name": "paper",
         "platform": "htb",
@@ -478,7 +478,7 @@ const MACHINES_DATA = [
         ],
         "folder": "paper"
     }
-,
+    ,
     {
         "name": "support (windows)",
         "platform": "htb",
@@ -490,5 +490,41 @@ const MACHINES_DATA = [
             "GenericAll abuse"
         ],
         "folder": "support (windows)"
+    }
+    ,
+    {
+        "name": "codeparttwo",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "js2py CVE",
+            "npbackup RCE"
+        ],
+        "folder": "codeparttwo"
+    }
+    ,
+    {
+        "name": "catch",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "apk credentials leakage",
+            "cachet CVE credential leakage",
+            "apk decompile + recompile",
+            "bash variable injection"
+        ],
+        "folder": "catch"
+    }
+    ,
+    {
+        "name": "drive",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "IDOR",
+            "SUID binary analysis",
+            "BOF_ROP binary file buffer overflow"
+        ],
+        "folder": "drive"
     }
 ];

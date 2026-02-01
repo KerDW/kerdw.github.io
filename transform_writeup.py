@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/support (windows) - htb easy (smb share access, exe analysis, bloodhound organization analysis, GenericAll abuse)/index.html"
+SOURCE_HTML = "converted_writeups/drive - htb hard (IDOR, SUID binary analysis, BOF_ROP binary file buffer overflow)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

