@@ -457,17 +457,6 @@ const MACHINES_DATA = [
     }
     ,
     {
-        "name": "strutted",
-        "platform": "htb",
-        "difficulty": "medium",
-        "techniques": [
-            "struts2",
-            "sudo tcpdump"
-        ],
-        "folder": "strutted"
-    }
-    ,
-    {
         "name": "paper",
         "platform": "htb",
         "difficulty": "easy",
