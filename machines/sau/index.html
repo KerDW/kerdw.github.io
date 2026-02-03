@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sau | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">sau</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running request-baskets version 1.2.1 on port 55555, which is vulnerable to CVE-2023-27163, a Server-Side Request Forgery (SSRF) vulnerability. By exploiting this SSRF flaw, I was able to access internal services not directly accessible from the internet, specifically discovering a Maltrail instance running locally on port 80.</p>
+                    
+                    <p>Using the SSRF vulnerability to proxy requests through request-baskets, I identified that Maltrail version 0.53 was running internally. This version contains an unauthenticated command injection vulnerability in the login functionality. By chaining the SSRF with the Maltrail RCE exploit, I obtained a reverse shell as the <code>puma</code> user.</p>
+                    
+                    <p>Privilege escalation was achieved by exploiting a <code>sudo</code> misconfiguration that allowed the <code>puma</code> user to execute <code>systemctl status trail.service</code> without a password. Since <code>systemctl</code> uses <code>less</code> as its pager, I was able to spawn a root shell by executing commands directly from the <code>less</code> interface, gaining full root access to the system.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> request-baskets SSRF (CVE-2023-27163), Maltrail v0.53 unauthenticated command injection RCE, systemctl/less privilege escalation via sudo misconfiguration.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with a port scan to identify open services on the target machine:</p>
+                <p><img src="./media/image1.png"
+                        alt="Nmap scan results showing open ports including SSH on port 22, HTTP on port 80 (filtered), and request-baskets on port 55555" />
+                </p>
+
+                <p>The scan reveals SSH running on port 22 and an interesting service on port 55555. Port 80 appears to be filtered, meaning it's likely accessible only from localhost. The service on port 55555 is the primary entry point for initial investigation.</p>
+
+                <h2>Web Enumeration - request-baskets Service</h2>
+                <p>Navigating to port 55555, I find a request-baskets application:</p>
+                <p><img src="./media/image2.png" alt="request-baskets web interface showing the main page" /></p>
+
+                <p>This is a simple web interface that allows creating "baskets" to collect and inspect HTTP requests. Clicking on the settings icon reveals more configuration options:</p>
+                <p><img src="./media/image3.png"
+                        alt="request-baskets configuration panel showing basket settings and options" /></p>
+
+                <p>The interface allows creating baskets with custom names. When creating a basket, I observe that the application makes a POST request to <code>/api/baskets/{basket_name}</code>. This API structure suggests there might be additional endpoints worth exploring.</p>
+
+                <h3>API Discovery</h3>
+                <p>Performing directory fuzzing on the <code>/api</code> path, I discover an interesting endpoint:</p>
+                <pre><code class="language-plaintext">http://10.10.11.224:55555/api/version</code></pre>
+
+                <p>Accessing this endpoint returns a JSON response containing valuable information, including a link to the project's GitHub repository: <a href="https://github.com/darklynx/request-baskets">https://github.com/darklynx/request-baskets</a></p>
+
+                <h2>Vulnerability Research - CVE-2023-27163</h2>
+                <p>Investigating the GitHub repository's issues, I discover a critical vulnerability: <a href="https://github.com/darklynx/request-baskets/issues/91">Issue #91</a> which describes CVE-2023-27163, a Server-Side Request Forgery (SSRF) vulnerability.</p>
+
+                <p>According to the vulnerability description:</p>
+                <blockquote>
+                    <p>"Contains a Server-Side Request Forgery (SSRF) via the component <code>/api/baskets/{name}</code>. This vulnerability allows attackers to access network resources and sensitive information via a crafted API request."</p>
+                </blockquote>
+
+                <p>The issue references a proof-of-concept exploit available at: <a href="https://github.com/entr0pie/CVE-2023-27163">https://github.com/entr0pie/CVE-2023-27163</a></p>
+
+                <h3>Understanding the SSRF Vulnerability</h3>
+                <p>The SSRF vulnerability allows me to configure a basket to forward requests to internal network resources. This means I can use request-baskets as a proxy to access services that are only accessible from localhost or the internal network, effectively bypassing network restrictions.</p>
+
+                <h2>Internal Port Scanning via SSRF</h2>
+                <p>To identify internal services, I create a Python script to automate the process of scanning internal ports through the SSRF vulnerability:</p>
+                <p><img src="./media/image4.png"
+                        alt="Python script for automated internal port scanning via SSRF, showing the code structure" />
+                </p>
+
+                <p>This script systematically creates baskets configured to forward requests to different localhost ports, then checks which ones respond successfully. Running the script reveals that ports 80 and 8338 are open internally and appear to be running the same service.</p>
+
+                <h3>Discovering Maltrail</h3>
+                <p>Using the SSRF to access the internal service on port 80, I discover it's running Maltrail, a malicious traffic detection system. The project is available at: <a href="https://github.com/stamparm/maltrail">https://github.com/stamparm/maltrail</a></p>
+
+                <p>Examining the page footer reveals the specific version:</p>
+                <pre><code class="language-plaintext">Powered by Maltrail (v0.53)</code></pre>
+
+                <p>This version information is crucial for identifying applicable exploits.</p>
+
+                <h2>Initial Access - Maltrail RCE Exploitation</h2>
+                <p>Researching vulnerabilities for Maltrail v0.53, I find an unauthenticated remote code execution vulnerability. A working exploit is available at: <a href="https://github.com/spookier/Maltrail-v0.53-Exploit">https://github.com/spookier/Maltrail-v0.53-Exploit</a></p>
+
+                <h3>Understanding the Maltrail Vulnerability</h3>
+                <p>The exploit leverages a command injection vulnerability in Maltrail's login functionality. The application fails to properly sanitize user input in the username parameter, allowing an attacker to inject arbitrary OS commands that get executed on the server.</p>
+
+                <p>The attack chain works as follows:</p>
+                <ol>
+                    <li>Use the SSRF vulnerability in request-baskets to create a proxy to the internal Maltrail service</li>
+                    <li>Send a crafted login request through the SSRF proxy containing a command injection payload</li>
+                    <li>The injected command executes on the target, establishing a reverse shell connection</li>
+                </ol>
+
+                <h3>Executing the Exploit</h3>
+                <p>First, I set up a netcat listener to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Then I execute the Maltrail exploit, pointing it at my SSRF proxy endpoint that forwards to the internal Maltrail service. The exploit successfully triggers the command injection, and I receive a reverse shell connection as the <code>puma</code> user.</p>
+
+                <p>With shell access, I can now retrieve the user flag from the <code>puma</code> user's home directory.</p>
+
+                <h3>Credential Discovery</h3>
+                <p>While exploring the system as <code>puma</code>, I examine Maltrail's configuration files and discover credentials in the users configuration:</p>
+                <pre><code class="language-plaintext">USERS
+admin:9ab3cd9d67bf49d01f6a2e33d0bd9bc804ddbe6ce1ff5d219c42624851db5dbc:0: # changeme!
+# local:9ab3cd9d67bf49d01f6a2e33d0bd9bc804ddbe6ce1ff5d219c42624851db5dbc:1000:192.168.0.0/16 # changeme!</code></pre>
+
+                <p>The comment suggests the default password is <code>changeme!</code>. I attempt to log into the Maltrail web interface with credentials <code>admin:changeme!</code>, which works, but the authenticated interface doesn't reveal any immediately useful functionality for further exploitation.</p>
+
+                <h2>Privilege Escalation - systemctl Sudo Misconfiguration</h2>
+                <p>Checking for sudo privileges available to the <code>puma</code> user:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals a significant misconfiguration:</p>
+                <pre><code class="language-plaintext">User puma may run the following commands on sau:
+    (ALL : ALL) NOPASSWD: /usr/bin/systemctl status trail.service</code></pre>
+
+                <p>The <code>puma</code> user can execute <code>systemctl status trail.service</code> with sudo privileges without requiring a password. This appears to be a limited command, but <code>systemctl</code> has a known privilege escalation vector.</p>
+
+                <h3>Understanding the systemctl Privilege Escalation</h3>
+                <p>According to <a href="https://gtfobins.github.io/gtfobins/systemctl/#sudo">GTFOBins</a>, when <code>systemctl</code> displays long output, it uses a pager (typically <code>less</code>) to display the content. The <code>less</code> pager allows executing shell commands directly from its interface by typing <code>!</code> followed by a command.</p>
+
+                <p>Since the <code>systemctl status</code> command runs with sudo privileges, the pager also runs with elevated privileges, meaning any commands executed from within <code>less</code> will also run as root.</p>
+
+                <h3>Executing the Privilege Escalation</h3>
+                <p>I execute the permitted sudo command:</p>
+                <pre><code class="language-bash">sudo /usr/bin/systemctl status trail.service</code></pre>
+
+                <p>This opens the service status in the <code>less</code> pager. From within <code>less</code>, I type:</p>
+                <pre><code class="language-plaintext">!sh</code></pre>
+
+                <p>This spawns a shell with root privileges. Verifying the escalation:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+
+                <p>The command confirms:</p>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>With root access established, I can retrieve the root flag from <code>/root/root.txt</code>, successfully completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba request-baskets versión 1.2.1 en el puerto 55555, vulnerable a CVE-2023-27163, una vulnerabilidad de Server-Side Request Forgery (SSRF). Explotando este fallo de SSRF, pude acceder a servicios internos no accesibles directamente desde Internet, descubriendo específicamente una instancia de Maltrail ejecutándose localmente en el puerto 80.</p>
+                    
+                    <p>Utilizando la vulnerabilidad SSRF para hacer proxy de peticiones a través de request-baskets, identifiqué que Maltrail versión 0.53 se estaba ejecutando internamente. Esta versión contiene una vulnerabilidad de inyección de comandos no autenticada en la funcionalidad de login. Encadenando el SSRF con el exploit RCE de Maltrail, obtuve una reverse shell como usuario <code>puma</code>.</p>
+                    
+                    <p>La escalada de privilegios se consiguió explotando una mala configuración de <code>sudo</code> que permitía al usuario <code>puma</code> ejecutar <code>systemctl status trail.service</code> sin contraseña. Como <code>systemctl</code> utiliza <code>less</code> como pager, pude lanzar una shell como root ejecutando comandos directamente desde la interfaz de <code>less</code>, obteniendo acceso root completo al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> request-baskets SSRF (CVE-2023-27163), Maltrail v0.53 RCE mediante inyección de comandos no autenticada, escalada de privilegios con systemctl/less mediante mala configuración de sudo.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de puertos para identificar servicios abiertos en la máquina objetivo:</p>
+                <p><img src="./media/image1.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22, HTTP en el puerto 80 (filtrado), y request-baskets en el puerto 55555" />
+                </p>
+
+                <p>El escaneo revela SSH ejecutándose en el puerto 22 y un servicio interesante en el puerto 55555. El puerto 80 aparece como filtrado, lo que significa que probablemente solo es accesible desde localhost. El servicio en el puerto 55555 es el punto de entrada principal para la investigación inicial.</p>
+
+                <h2>Enumeración Web - Servicio request-baskets</h2>
+                <p>Navegando al puerto 55555, encuentro una aplicación request-baskets:</p>
+                <p><img src="./media/image2.png" alt="Interfaz web de request-baskets mostrando la página principal" />
+                </p>
+
+                <p>Esta es una interfaz web simple que permite crear "baskets" para recopilar e inspeccionar peticiones HTTP. Haciendo clic en el icono de configuración se revelan más opciones:</p>
+                <p><img src="./media/image3.png"
+                        alt="Panel de configuración de request-baskets mostrando ajustes y opciones de basket" /></p>
+
+                <p>La interfaz permite crear baskets con nombres personalizados. Al crear un basket, observo que la aplicación hace una petición POST a <code>/api/baskets/{nombre_basket}</code>. Esta estructura de API sugiere que podría haber endpoints adicionales que vale la pena explorar.</p>
+
+                <h3>Descubrimiento de API</h3>
+                <p>Realizando fuzzing de directorios en la ruta <code>/api</code>, descubro un endpoint interesante:</p>
+                <pre><code class="language-plaintext">http://10.10.11.224:55555/api/version</code></pre>
+
+                <p>Accediendo a este endpoint devuelve una respuesta JSON conteniendo información valiosa, incluyendo un enlace al repositorio GitHub del proyecto: <a href="https://github.com/darklynx/request-baskets">https://github.com/darklynx/request-baskets</a></p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2023-27163</h2>
+                <p>Investigando las issues del repositorio de GitHub, descubro una vulnerabilidad crítica: <a href="https://github.com/darklynx/request-baskets/issues/91">Issue #91</a> que describe CVE-2023-27163, una vulnerabilidad de Server-Side Request Forgery (SSRF).</p>
+
+                <p>Según la descripción de la vulnerabilidad:</p>
+                <blockquote>
+                    <p>"Contiene un Server-Side Request Forgery (SSRF) a través del componente <code>/api/baskets/{name}</code>. Esta vulnerabilidad permite a los atacantes acceder a recursos de red e información sensible mediante una petición API manipulada."</p>
+                </blockquote>
+
+                <p>La issue referencia una prueba de concepto del exploit disponible en: <a href="https://github.com/entr0pie/CVE-2023-27163">https://github.com/entr0pie/CVE-2023-27163</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad SSRF</h3>
+                <p>La vulnerabilidad SSRF me permite configurar un basket para reenviar peticiones a recursos de la red interna. Esto significa que puedo usar request-baskets como proxy para acceder a servicios que solo son accesibles desde localhost o la red interna, evitando efectivamente restricciones de red.</p>
+
+                <h2>Escaneo de Puertos Internos mediante SSRF</h2>
+                <p>Para identificar servicios internos, creo un script de Python para automatizar el proceso de escaneo de puertos internos a través de la vulnerabilidad SSRF:</p>
+                <p><img src="./media/image4.png"
+                        alt="Script de Python para escaneo automatizado de puertos internos mediante SSRF, mostrando la estructura del código" />
+                </p>
+
+                <p>Este script crea sistemáticamente baskets configurados para reenviar peticiones a diferentes puertos de localhost, y luego comprueba cuáles responden exitosamente. Ejecutando el script revela que los puertos 80 y 8338 están abiertos internamente y parecen estar ejecutando el mismo servicio.</p>
+
+                <h3>Descubriendo Maltrail</h3>
+                <p>Usando el SSRF para acceder al servicio interno en el puerto 80, descubro que está ejecutando Maltrail, un sistema de detección de tráfico malicioso. El proyecto está disponible en: <a href="https://github.com/stamparm/maltrail">https://github.com/stamparm/maltrail</a></p>
+
+                <p>Examinando el pie de página se revela la versión específica:</p>
+                <pre><code class="language-plaintext">Powered by Maltrail (v0.53)</code></pre>
+
+                <p>Esta información de versión es crucial para identificar exploits aplicables.</p>
+
+                <h2>Acceso Inicial - Explotación RCE de Maltrail</h2>
+                <p>Investigando vulnerabilidades para Maltrail v0.53, encuentro una vulnerabilidad de ejecución remota de código no autenticada. Un exploit funcional está disponible en: <a href="https://github.com/spookier/Maltrail-v0.53-Exploit">https://github.com/spookier/Maltrail-v0.53-Exploit</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad de Maltrail</h3>
+                <p>El exploit aprovecha una vulnerabilidad de inyección de comandos en la funcionalidad de login de Maltrail. La aplicación no sanitiza correctamente la entrada del usuario en el parámetro de nombre de usuario, permitiendo a un atacante inyectar comandos arbitrarios del sistema operativo que se ejecutan en el servidor.</p>
+
+                <p>La cadena de ataque funciona de la siguiente manera:</p>
+                <ol>
+                    <li>Usar la vulnerabilidad SSRF en request-baskets para crear un proxy al servicio Maltrail interno</li>
+                    <li>Enviar una petición de login manipulada a través del proxy SSRF conteniendo un payload de inyección de comandos</li>
+                    <li>El comando inyectado se ejecuta en el objetivo, estableciendo una conexión de reverse shell</li>
+                </ol>
+
+                <h3>Ejecutando el Exploit</h3>
+                <p>Primero, configuro un listener de netcat para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto el exploit de Maltrail, apuntándolo a mi endpoint de proxy SSRF que reenvía al servicio Maltrail interno. El exploit desencadena exitosamente la inyección de comandos, y recibo una conexión de reverse shell como usuario <code>puma</code>.</p>
+
+                <p>Con acceso shell, ahora puedo recuperar la flag de usuario del directorio home del usuario <code>puma</code>.</p>
+
+                <h3>Descubrimiento de Credenciales</h3>
+                <p>Mientras exploro el sistema como <code>puma</code>, examino los archivos de configuración de Maltrail y descubro credenciales en la configuración de usuarios:</p>
+                <pre><code class="language-plaintext">USERS
+admin:9ab3cd9d67bf49d01f6a2e33d0bd9bc804ddbe6ce1ff5d219c42624851db5dbc:0: # changeme!
+# local:9ab3cd9d67bf49d01f6a2e33d0bd9bc804ddbe6ce1ff5d219c42624851db5dbc:1000:192.168.0.0/16 # changeme!</code></pre>
+
+                <p>El comentario sugiere que la contraseña por defecto es <code>changeme!</code>. Intento iniciar sesión en la interfaz web de Maltrail con las credenciales <code>admin:changeme!</code>, que funciona, pero la interfaz autenticada no revela ninguna funcionalidad inmediatamente útil para explotación adicional.</p>
+
+                <h2>Escalada de Privilegios - Mala Configuración de Sudo en systemctl</h2>
+                <p>Comprobando privilegios sudo disponibles para el usuario <code>puma</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela una mala configuración significativa:</p>
+                <pre><code class="language-plaintext">User puma may run the following commands on sau:
+    (ALL : ALL) NOPASSWD: /usr/bin/systemctl status trail.service</code></pre>
+
+                <p>El usuario <code>puma</code> puede ejecutar <code>systemctl status trail.service</code> con privilegios sudo sin requerir contraseña. Esto parece un comando limitado, pero <code>systemctl</code> tiene un vector de escalada de privilegios conocido.</p>
+
+                <h3>Entendiendo la Escalada de Privilegios con systemctl</h3>
+                <p>Según <a href="https://gtfobins.github.io/gtfobins/systemctl/#sudo">GTFOBins</a>, cuando <code>systemctl</code> muestra salida larga, utiliza un pager (típicamente <code>less</code>) para mostrar el contenido. El pager <code>less</code> permite ejecutar comandos de shell directamente desde su interfaz escribiendo <code>!</code> seguido de un comando.</p>
+
+                <p>Como el comando <code>systemctl status</code> se ejecuta con privilegios sudo, el pager también se ejecuta con privilegios elevados, lo que significa que cualquier comando ejecutado desde dentro de <code>less</code> también se ejecutará como root.</p>
+
+                <h3>Ejecutando la Escalada de Privilegios</h3>
+                <p>Ejecuto el comando sudo permitido:</p>
+                <pre><code class="language-bash">sudo /usr/bin/systemctl status trail.service</code></pre>
+
+                <p>Esto abre el estado del servicio en el pager <code>less</code>. Desde dentro de <code>less</code>, escribo:</p>
+                <pre><code class="language-plaintext">!sh</code></pre>
+
+                <p>Esto lanza una shell con privilegios root. Verificando la escalada:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+
+                <p>El comando confirma:</p>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>Con acceso root establecido, puedo recuperar la flag de root de <code>/root/root.txt</code>, completando exitosamente la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

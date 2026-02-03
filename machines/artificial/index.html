@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>artificial | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">artificial</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a web application on port 80 that allowed authenticated users to upload and execute TensorFlow/Keras models. By exploiting a deserialization vulnerability in older versions of Keras, I crafted a malicious <code>.h5</code> model file containing Python code that executed a reverse shell when the model was loaded, granting initial access as the <code>app</code> user.</p>
+                    
+                    <p>After gaining initial access, I discovered a SQLite database containing hashed credentials for multiple users. Using CrackStation, I cracked the hash for user <code>gael</code> and obtained the password <code>mattp005numbertwo</code>, allowing lateral movement via <code>su</code>. As <code>gael</code>, I had read permissions on a compressed backup file containing a Backrest configuration with a bcrypt-hashed password.</p>
+                    
+                    <p>Using Hashcat, I cracked the bcrypt hash to obtain the password <code>!@#$%^</code>, which provided access to the Backrest backup service running on port 9898. By creating a backup plan with a malicious pre-backup hook that executed arbitrary commands as root, I triggered a backup manually and obtained a root reverse shell, completing the privilege escalation.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> TensorFlow/Keras model deserialization vulnerability, SQLite credential extraction, bcrypt hash cracking, Backrest backup service command injection via hooks, port forwarding with Chisel.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image9.png" alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+
+                <p>The scan reveals SSH on port 22 and HTTP on port 80. I add <code>artificial.htb</code> to my <code>/etc/hosts</code> file for easier access.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Running gobuster to discover hidden paths, but it doesn't reveal anything beyond what's already visible on the website:</p>
+                <p><img src="./media/image14.png" alt="Gobuster scan results showing standard web paths" /></p>
+
+                <p>The website is relatively simple, promoting an artificial intelligence product. It includes registration and login functionality, but not much else is immediately visible. After registering an account and logging in, I'm redirected to <code>/dashboard</code>.</p>
+
+                <h2>Dashboard Analysis - Model Upload Functionality</h2>
+                <p>The dashboard presents an interesting feature - it allows users to upload their own AI models, which are then executed on the server:</p>
+                <p><img src="./media/image7.png" alt="Dashboard showing the model upload interface with example files" /></p>
+
+                <p>This is a significant security concern. Allowing users to upload and execute arbitrary model files on your infrastructure is inherently dangerous. The interface provides sample files to download, which helps understand the expected format.</p>
+
+                <p><img src="./media/image2.png" alt="Model upload interface showing file selection options" /></p>
+
+                <h3>Understanding the Model Format</h3>
+                <p>Examining the provided example files reveals important information about the expected format:</p>
+                <p><img src="./media/image12.png" alt="Sample model files showing the expected structure and format" /></p>
+
+                <p>When attempting to upload a test file, I discover that the application expects files with the <code>.h5</code> extension. Research indicates that <code>.h5</code> files are HDF5 format files commonly used to store TensorFlow/Keras machine learning models.</p>
+
+                <h2>Vulnerability Research - TensorFlow Model Deserialization</h2>
+                <p>Searching for security vulnerabilities related to TensorFlow model files, I find <a href="https://splint.gitbook.io/cyberblog/security-research/tensorflow-remote-code-execution-with-malicious-model">this excellent resource</a> that details how to achieve remote code execution through malicious TensorFlow models.</p>
+
+                <p>The vulnerability exploits the deserialization process when Keras loads model files. By crafting a malicious model, arbitrary Python code can be executed when the model is loaded.</p>
+
+                <h3>Version Considerations</h3>
+                <p>According to <a href="https://www.oligo.security/blog/tensorflow-keras-downgrade-attack-cve-2024-3660-bypass">this article</a>, Keras v3 has patched this vulnerability. However, the attack still works on older versions. Interestingly, it's possible to force a downgrade of Keras within TensorFlow to make the attack work even on systems that might have newer versions installed.</p>
+
+                <h2>Initial Access - Malicious Model Upload</h2>
+                <p>After testing various combinations of TensorFlow and Python versions, I successfully reproduce the RCE by creating a malicious <code>.h5</code> model using this code:</p>
+                <p><img src="./media/image8.png" alt="Python code showing the malicious model creation that executes arbitrary commands" /></p>
+
+                <p>This proof-of-concept demonstrates that I can execute arbitrary Python code on the target system. The model uses Keras Lambda layers with a malicious <code>__reduce__</code> method to trigger code execution during deserialization.</p>
+
+                <h3>Obtaining a Shell</h3>
+                <p>I modify the exploit code to execute a reverse shell payload instead of a simple command. After uploading this modified model to the dashboard, I successfully receive a connection as the <code>app</code> user:</p>
+                <p><img src="./media/image4.png" alt="Shell prompt showing access as the app user and listing other users including gael" /></p>
+
+                <p>Now I have shell access as <code>app</code>, and I can see there's another user on the system named <code>gael</code>.</p>
+
+                <h2>Internal Service Discovery</h2>
+                <p>Using <code>ss -tuln</code> to examine listening ports, I discover several internal services not exposed externally:</p>
+                <p><img src="./media/image15.png" alt="Output of ss -tuln showing internal ports including 9898 and 5000" /></p>
+
+                <p>Exploring the filesystem, I find an interesting directory in <code>/opt</code> called <code>backrest</code> containing a shell script. This reveals that a service called Backrest is running on port 9898, which appears to be a backup management solution.</p>
+
+                <h3>Port Forwarding with Chisel</h3>
+                <p>To access these internal services from my attacking machine, I use Chisel to set up port forwarding. First, I transfer the Chisel binary to the target machine.</p>
+
+                <p>On my attacking machine:</p>
+                <pre><code class="language-bash">./chisel server -p 1234 --reverse</code></pre>
+
+                <p>On the victim machine:</p>
+                <pre><code class="language-bash">./chisel client 10.10.14.91:1234 R:9898:127.0.0.1:9898</code></pre>
+
+                <p>Accessing the Backrest service through the forwarded port, I'm prompted for credentials:</p>
+                <p><img src="./media/image3.png" alt="Backrest login page requesting username and password" /></p>
+
+                <p>I try various common credential combinations like <code>admin/admin</code>, <code>root/root</code>, and usernames <code>app</code> and <code>gael</code> with common passwords, but none work.</p>
+
+                <p>I also forward port 5000 and discover it's running the same application exposed on port 80, as registering my test user <code>asd@asd.com</code> reports the user already exists.</p>
+
+                <h2>Credential Discovery - SQLite Database</h2>
+                <p>Exploring the filesystem further, I find a SQLite database at <code>/app/instance/users.db</code> that stores user information for the web application:</p>
+
+                <pre><code class="language-bash">sqlite3 users.db</code></pre>
+
+                <pre><code class="language-sql">sqlite> .tables
+model  user
+
+sqlite> select * from user;
+1|gael|gael@artificial.htb|c99175974b6e192936d97224638a34f8
+2|mark|mark@artificial.htb|0f3d8c76530022670f1c6029eed09ccb
+3|robert|robert@artificial.htb|b606c5f5136170f15444251665638b36
+4|royer|royer@artificial.htb|bc25b1f80f544c0ab451c02a3dca9fc6
+5|mary|mary@artificial.htb|bf041041e57f1aff3be7ea1abd6129d0
+6|admin|admin@artificial.htb|21232f297a57a5a743894a0e4a801fc3</code></pre>
+
+                <p>I extract all the password hashes and run them through CrackStation, which successfully cracks several of them. The most useful is <code>gael</code>'s password: <code>mattp005numbertwo</code>.</p>
+
+                <h2>Lateral Movement to User Gael</h2>
+                <p>Using the recovered credentials, I perform lateral movement with <code>su gael</code> and successfully obtain the user flag:</p>
+                <p><img src="./media/image1.png" alt="Terminal showing successful login as gael and user flag retrieval" /></p>
+
+                <p>Checking sudo permissions with <code>sudo -l</code> reveals that <code>gael</code> doesn't have any sudo privileges.</p>
+
+                <p>I attempt to use SSH port forwarding with gael's credentials to access the Backrest service on port 9898:</p>
+                <pre><code class="language-bash">ssh gael@10.10.11.74 -L 9898:localhost:9898</code></pre>
+
+                <p>However, gael's credentials don't work for the Backrest login.</p>
+
+                <h2>Group Membership Analysis</h2>
+                <p>Running <code>id</code> reveals that <code>gael</code> belongs to an interesting group and has read permissions on a compressed backup file:</p>
+                <p><img src="./media/image5.png" alt="Output of id command showing gael's group memberships and file permissions" /></p>
+
+                <p>Even though this specific backup file can only be fully extracted by root, having read permissions on the compressed <code>.tar.gz</code> archive allows me to examine its contents without extracting it.</p>
+
+                <h3>Extracting Configuration from Backup</h3>
+                <p>I can read files within the compressed archive and discover a Backrest configuration file that I couldn't access in the live <code>/opt/backrest</code> directory:</p>
+                <p><img src="./media/image10.png" alt="Contents of the backup archive showing the Backrest configuration file" /></p>
+
+                <p>The configuration contains a base64-encoded password. After decoding it with <code>base64 -d</code>, I obtain a bcrypt hash:</p>
+                <pre><code class="language-plaintext">$2a$10$cVGIy9VMXQd0gM5ginCmjei2kZR/ACMMkSsspbRutYP58EBZz/0QO</code></pre>
+
+                <h2>Hash Cracking - Backrest Credentials</h2>
+                <p>Bcrypt hashes are significantly more difficult to crack than simple MD5 hashes. I use Hashcat with mode 3200 (bcrypt) and the rockyou wordlist:</p>
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 hash.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>After several minutes, Hashcat successfully cracks the password. I verify the result:</p>
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 hash.txt /usr/share/wordlists/rockyou.txt --show</code></pre>
+
+                <pre><code class="language-plaintext">$2a$10$cVGIy9VMXQd0gM5ginCmjei2kZR/ACMMkSsspbRutYP58EBZz/0QO:!@#$%^</code></pre>
+
+                <p>The password is <code>!@#$%^</code>. While this password doesn't provide direct root access via <code>su</code>, I test it against the Backrest service on port 9898 and successfully authenticate.</p>
+
+                <h2>Privilege Escalation - Backrest Command Injection</h2>
+                <p>Backrest is a backup management solution that allows creating backup plans and repositories:</p>
+                <p><img src="./media/image6.png" alt="Backrest dashboard showing the interface for managing backup plans and repositories" /></p>
+
+                <p>The most interesting feature for privilege escalation is that backup plans can execute commands through hooks at various stages of the backup process.</p>
+
+                <h3>Creating a Malicious Backup Plan</h3>
+                <p>I create a new backup plan with a malicious pre-backup hook that executes arbitrary commands. The hook configuration allows executing shell commands as root since the Backrest service runs with elevated privileges:</p>
+                <p><img src="./media/image16.png" alt="Backup plan configuration showing the hook settings where commands can be executed" /></p>
+
+                <p>With this configuration, every time a backup is executed (which can be triggered manually), I achieve remote code execution as root.</p>
+
+                <h3>Testing Command Execution</h3>
+                <p>First, I test with a simple command to verify the execution works:</p>
+                <p><img src="./media/image11.png" alt="Successful command execution through the backup hook" /></p>
+
+                <p>The command executes successfully, confirming I have RCE through the backup hook mechanism.</p>
+
+                <h3>Obtaining Root Shell</h3>
+                <p>I modify the hook to execute a reverse shell payload instead of a simple command. After setting up a listener on my attacking machine and manually triggering the backup, I receive a connection as root:</p>
+                <p><img src="./media/image13.png" alt="Root shell obtained through the Backrest backup hook exploitation" /></p>
+
+                <p>I now have full root access to the system and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web en el puerto 80 que permitía a usuarios autenticados subir y ejecutar modelos de TensorFlow/Keras. Explotando una vulnerabilidad de deserialización en versiones antiguas de Keras, creé un archivo de modelo <code>.h5</code> malicioso conteniendo código Python que ejecutaba una reverse shell cuando el modelo se cargaba, obteniendo acceso inicial como usuario <code>app</code>.</p>
+                    
+                    <p>Tras conseguir el acceso inicial, descubrí una base de datos SQLite conteniendo credenciales hasheadas de múltiples usuarios. Usando CrackStation, crackeé el hash del usuario <code>gael</code> y obtuve la contraseña <code>mattp005numbertwo</code>, permitiendo movimiento lateral mediante <code>su</code>. Como <code>gael</code>, tenía permisos de lectura sobre un archivo de backup comprimido conteniendo una configuración de Backrest con una contraseña hasheada en bcrypt.</p>
+                    
+                    <p>Usando Hashcat, crackeé el hash bcrypt para obtener la contraseña <code>!@#$%^</code>, que proporcionaba acceso al servicio de backup Backrest corriendo en el puerto 9898. Creando un plan de backup con un hook malicioso de pre-backup que ejecutaba comandos arbitrarios como root, lancé un backup manualmente y obtuve una reverse shell como root, completando la escalada de privilegios.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Vulnerabilidad de deserialización de modelos TensorFlow/Keras, extracción de credenciales de SQLite, crackeo de hash bcrypt, inyección de comandos en el servicio Backrest mediante hooks, port forwarding con Chisel.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comenzando con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image9.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>artificial.htb</code> a mi archivo <code>/etc/hosts</code> para un acceso más sencillo.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Ejecutando gobuster para descubrir rutas ocultas, pero no revela nada más allá de lo que ya es visible en el sitio web:</p>
+                <p><img src="./media/image14.png" alt="Resultados del escaneo de gobuster mostrando rutas web estándar" /></p>
+
+                <p>El sitio web es relativamente simple, promocionando un producto de inteligencia artificial. Incluye funcionalidad de registro y login, pero no mucho más es inmediatamente visible. Tras registrar una cuenta e iniciar sesión, soy redirigido a <code>/dashboard</code>.</p>
+
+                <h2>Análisis del Dashboard - Funcionalidad de Subida de Modelos</h2>
+                <p>El dashboard presenta una característica interesante: permite a los usuarios subir sus propios modelos de IA, que luego son ejecutados en el servidor:</p>
+                <p><img src="./media/image7.png" alt="Dashboard mostrando la interfaz de subida de modelos con archivos de ejemplo" /></p>
+
+                <p>Esto es una preocupación de seguridad significativa. Permitir a los usuarios subir y ejecutar archivos de modelos arbitrarios en vuestra infraestructura es inherentemente peligroso. La interfaz proporciona archivos de muestra para descargar, lo que ayuda a entender el formato esperado.</p>
+
+                <p><img src="./media/image2.png" alt="Interfaz de subida de modelos mostrando opciones de selección de archivos" /></p>
+
+                <h3>Entendiendo el Formato del Modelo</h3>
+                <p>Examinando los archivos de ejemplo proporcionados se revela información importante sobre el formato esperado:</p>
+                <p><img src="./media/image12.png" alt="Archivos de modelo de muestra mostrando la estructura y formato esperado" /></p>
+
+                <p>Al intentar subir un archivo de prueba, descubro que la aplicación espera archivos con la extensión <code>.h5</code>. La investigación indica que los archivos <code>.h5</code> son archivos en formato HDF5 comúnmente usados para almacenar modelos de aprendizaje automático de TensorFlow/Keras.</p>
+
+                <h2>Investigación de Vulnerabilidades - Deserialización de Modelos TensorFlow</h2>
+                <p>Buscando vulnerabilidades de seguridad relacionadas con archivos de modelo de TensorFlow, encuentro <a href="https://splint.gitbook.io/cyberblog/security-research/tensorflow-remote-code-execution-with-malicious-model">este excelente recurso</a> que detalla cómo conseguir ejecución remota de código mediante modelos maliciosos de TensorFlow.</p>
+
+                <p>La vulnerabilidad explota el proceso de deserialización cuando Keras carga archivos de modelo. Creando un modelo malicioso, se puede ejecutar código Python arbitrario cuando el modelo es cargado.</p>
+
+                <h3>Consideraciones de Versión</h3>
+                <p>Según <a href="https://www.oligo.security/blog/tensorflow-keras-downgrade-attack-cve-2024-3660-bypass">este artículo</a>, Keras v3 ha parcheado esta vulnerabilidad. Sin embargo, el ataque aún funciona en versiones antiguas. Curiosamente, es posible forzar un downgrade de Keras dentro de TensorFlow para hacer que el ataque funcione incluso en sistemas que podrían tener versiones más nuevas instaladas.</p>
+
+                <h2>Acceso Inicial - Subida de Modelo Malicioso</h2>
+                <p>Tras probar varias combinaciones de versiones de TensorFlow y Python, consigo reproducir exitosamente el RCE creando un modelo <code>.h5</code> malicioso usando este código:</p>
+                <p><img src="./media/image8.png" alt="Código Python mostrando la creación del modelo malicioso que ejecuta comandos arbitrarios" /></p>
+
+                <p>Esta prueba de concepto demuestra que puedo ejecutar código Python arbitrario en el sistema objetivo. El modelo usa capas Lambda de Keras con un método <code>__reduce__</code> malicioso para desencadenar la ejecución de código durante la deserialización.</p>
+
+                <h3>Obteniendo una Shell</h3>
+                <p>Modifico el código del exploit para ejecutar un payload de reverse shell en lugar de un simple comando. Tras subir este modelo modificado al dashboard, recibo exitosamente una conexión como usuario <code>app</code>:</p>
+                <p><img src="./media/image4.png" alt="Prompt de shell mostrando acceso como usuario app y listando otros usuarios incluyendo gael" /></p>
+
+                <p>Ahora tengo acceso shell como <code>app</code>, y puedo ver que hay otro usuario en el sistema llamado <code>gael</code>.</p>
+
+                <h2>Descubrimiento de Servicios Internos</h2>
+                <p>Usando <code>ss -tuln</code> para examinar puertos en escucha, descubro varios servicios internos no expuestos externamente:</p>
+                <p><img src="./media/image15.png" alt="Salida de ss -tuln mostrando puertos internos incluyendo 9898 y 5000" /></p>
+
+                <p>Explorando el sistema de archivos, encuentro un directorio interesante en <code>/opt</code> llamado <code>backrest</code> conteniendo un script shell. Esto revela que un servicio llamado Backrest está corriendo en el puerto 9898, que parece ser una solución de gestión de backups.</p>
+
+                <h3>Port Forwarding con Chisel</h3>
+                <p>Para acceder a estos servicios internos desde mi máquina atacante, uso Chisel para configurar port forwarding. Primero, transfiero el binario de Chisel a la máquina objetivo.</p>
+
+                <p>En mi máquina atacante:</p>
+                <pre><code class="language-bash">./chisel server -p 1234 --reverse</code></pre>
+
+                <p>En la máquina víctima:</p>
+                <pre><code class="language-bash">./chisel client 10.10.14.91:1234 R:9898:127.0.0.1:9898</code></pre>
+
+                <p>Accediendo al servicio Backrest mediante el puerto redirigido, se me solicitan credenciales:</p>
+                <p><img src="./media/image3.png" alt="Página de login de Backrest solicitando usuario y contraseña" /></p>
+
+                <p>Pruebo varias combinaciones comunes de credenciales como <code>admin/admin</code>, <code>root/root</code>, y los nombres de usuario <code>app</code> y <code>gael</code> con contraseñas comunes, pero ninguna funciona.</p>
+
+                <p>También redirijo el puerto 5000 y descubro que está corriendo la misma aplicación expuesta en el puerto 80, ya que al registrar mi usuario de prueba <code>asd@asd.com</code> reporta que el usuario ya existe.</p>
+
+                <h2>Descubrimiento de Credenciales - Base de Datos SQLite</h2>
+                <p>Explorando más el sistema de archivos, encuentro una base de datos SQLite en <code>/app/instance/users.db</code> que almacena información de usuario para la aplicación web:</p>
+
+                <pre><code class="language-bash">sqlite3 users.db</code></pre>
+
+                <pre><code class="language-sql">sqlite> .tables
+model  user
+
+sqlite> select * from user;
+1|gael|gael@artificial.htb|c99175974b6e192936d97224638a34f8
+2|mark|mark@artificial.htb|0f3d8c76530022670f1c6029eed09ccb
+3|robert|robert@artificial.htb|b606c5f5136170f15444251665638b36
+4|royer|royer@artificial.htb|bc25b1f80f544c0ab451c02a3dca9fc6
+5|mary|mary@artificial.htb|bf041041e57f1aff3be7ea1abd6129d0
+6|admin|admin@artificial.htb|21232f297a57a5a743894a0e4a801fc3</code></pre>
+
+                <p>Extraigo todos los hashes de contraseñas y los paso por CrackStation, que exitosamente crackea varios de ellos. El más útil es la contraseña de <code>gael</code>: <code>mattp005numbertwo</code>.</p>
+
+                <h2>Movimiento Lateral al Usuario Gael</h2>
+                <p>Usando las credenciales recuperadas, realizo movimiento lateral con <code>su gael</code> y obtengo exitosamente la flag de usuario:</p>
+                <p><img src="./media/image1.png" alt="Terminal mostrando login exitoso como gael y recuperación de la flag de usuario" /></p>
+
+                <p>Comprobando permisos sudo con <code>sudo -l</code> revela que <code>gael</code> no tiene ningún privilegio sudo.</p>
+
+                <p>Intento usar SSH port forwarding con las credenciales de gael para acceder al servicio Backrest en el puerto 9898:</p>
+                <pre><code class="language-bash">ssh gael@10.10.11.74 -L 9898:localhost:9898</code></pre>
+
+                <p>Sin embargo, las credenciales de gael no funcionan para el login de Backrest.</p>
+
+                <h2>Análisis de Membresía de Grupos</h2>
+                <p>Ejecutando <code>id</code> revela que <code>gael</code> pertenece a un grupo interesante y tiene permisos de lectura sobre un archivo de backup comprimido:</p>
+                <p><img src="./media/image5.png" alt="Salida del comando id mostrando las membresías de grupo de gael y permisos de archivo" /></p>
+
+                <p>Aunque este archivo de backup específico solo puede ser completamente extraído por root, tener permisos de lectura sobre el archivo <code>.tar.gz</code> comprimido me permite examinar sus contenidos sin extraerlo.</p>
+
+                <h3>Extrayendo Configuración del Backup</h3>
+                <p>Puedo leer archivos dentro del archivo comprimido y descubro un archivo de configuración de Backrest al que no podía acceder en el directorio <code>/opt/backrest</code> en vivo:</p>
+                <p><img src="./media/image10.png" alt="Contenidos del archivo de backup mostrando el archivo de configuración de Backrest" /></p>
+
+                <p>La configuración contiene una contraseña codificada en base64. Tras decodificarla con <code>base64 -d</code>, obtengo un hash bcrypt:</p>
+                <pre><code class="language-plaintext">$2a$10$cVGIy9VMXQd0gM5ginCmjei2kZR/ACMMkSsspbRutYP58EBZz/0QO</code></pre>
+
+                <h2>Crackeo de Hash - Credenciales de Backrest</h2>
+                <p>Los hashes bcrypt son significativamente más difíciles de crackear que simples hashes MD5. Uso Hashcat con modo 3200 (bcrypt) y el wordlist rockyou:</p>
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 hash.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Después de varios minutos, Hashcat exitosamente crackea la contraseña. Verifico el resultado:</p>
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 hash.txt /usr/share/wordlists/rockyou.txt --show</code></pre>
+
+                <pre><code class="language-plaintext">$2a$10$cVGIy9VMXQd0gM5ginCmjei2kZR/ACMMkSsspbRutYP58EBZz/0QO:!@#$%^</code></pre>
+
+                <p>La contraseña es <code>!@#$%^</code>. Aunque esta contraseña no proporciona acceso root directo mediante <code>su</code>, la pruebo contra el servicio Backrest en el puerto 9898 y me autentico exitosamente.</p>
+
+                <h2>Escalada de Privilegios - Inyección de Comandos en Backrest</h2>
+                <p>Backrest es una solución de gestión de backups que permite crear planes de backup y repositorios:</p>
+                <p><img src="./media/image6.png" alt="Dashboard de Backrest mostrando la interfaz para gestionar planes de backup y repositorios" /></p>
+
+                <p>La característica más interesante para la escalada de privilegios es que los planes de backup pueden ejecutar comandos mediante hooks en varias etapas del proceso de backup.</p>
+
+                <h3>Creando un Plan de Backup Malicioso</h3>
+                <p>Creo un nuevo plan de backup con un hook malicioso de pre-backup que ejecuta comandos arbitrarios. La configuración del hook permite ejecutar comandos shell como root ya que el servicio Backrest corre con privilegios elevados:</p>
+                <p><img src="./media/image16.png" alt="Configuración del plan de backup mostrando los ajustes del hook donde se pueden ejecutar comandos" /></p>
+
+                <p>Con esta configuración, cada vez que se ejecuta un backup (que puede lanzarse manualmente), consigo ejecución remota de código como root.</p>
+
+                <h3>Probando la Ejecución de Comandos</h3>
+                <p>Primero, pruebo con un comando simple para verificar que la ejecución funciona:</p>
+                <p><img src="./media/image11.png" alt="Ejecución exitosa de comando mediante el hook de backup" /></p>
+
+                <p>El comando se ejecuta exitosamente, confirmando que tengo RCE mediante el mecanismo del hook de backup.</p>
+
+                <h3>Obteniendo Shell como Root</h3>
+                <p>Modifico el hook para ejecutar un payload de reverse shell en lugar de un simple comando. Tras configurar un listener en mi máquina atacante y lanzar manualmente el backup, recibo una conexión como root:</p>
+                <p><img src="./media/image13.png" alt="Shell root obtenida mediante la explotación del hook de backup de Backrest" /></p>
+
+                <p>Ahora tengo acceso root completo al sistema y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

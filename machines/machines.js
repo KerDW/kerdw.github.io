@@ -551,4 +551,267 @@ const MACHINES_DATA = [
         ],
         "folder": "onlyforyou"
     }
+,
+    {
+        "name": "retired",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "path traversal",
+            "mprotect ROP-BOF",
+            "symbolic link file read",
+            "binfmt_misc registration abuse"
+        ],
+        "folder": "retired"
+    }
+,
+    {
+        "name": "surveillance",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "Craft CMS PHP class injection RCE CVE",
+            "Zoneminder RCE CVE",
+            "Zoneminder config LD_PRELOAD env abuse"
+        ],
+        "folder": "surveillance"
+    }
+,
+    {
+        "name": "iclean",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "XSS",
+            "SSTI with sandbox"
+        ],
+        "folder": "iclean"
+    }
+,
+    {
+        "name": "perfection",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "ruby newline bypass ssti",
+            "password cracking"
+        ],
+        "folder": "perfection"
+    }
+,
+    {
+        "name": "unrested",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "zabbix"
+        ],
+        "folder": "unrested"
+    }
+,
+    {
+        "name": "permx",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "chamilo"
+        ],
+        "folder": "permx"
+    }
+,
+    {
+        "name": "heal",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "consul"
+        ],
+        "folder": "heal"
+    }
+,
+    {
+        "name": "conversor",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "XSLT file upload injection",
+            "needrestart python library hijacking exploit"
+        ],
+        "folder": "conversor"
+    }
+,
+    {
+        "name": "chemistry",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            ".cif CVE"
+        ],
+        "folder": "chemistry"
+    }
+,
+    {
+        "name": "canape",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "pickle deserialization"
+        ],
+        "folder": "canape"
+    }
+,
+    {
+        "name": "backend",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "api fuzzing",
+            "path traversal",
+            "JWT forging"
+        ],
+        "folder": "backend"
+    }
+,
+    {
+        "name": "ambassador",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "grafana",
+            "consul"
+        ],
+        "folder": "ambassador"
+    }
+,
+    {
+        "name": "agile",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "LFI",
+            "Werkzeug debugger PIN generation",
+            "selenium chromium hijack",
+            "sudoedit CVE abuse"
+        ],
+        "folder": "agile"
+    }
+,
+    {
+        "name": "artificial",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "tensorflow"
+        ],
+        "folder": "artificial"
+    }
+,
+    {
+        "name": "builder",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "jenkins path traversal CVE"
+        ],
+        "folder": "builder"
+    }
+,
+    {
+        "name": "caption",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "cache poisoning XSS",
+            "HTTP2 h2c request smuggling",
+            "copyparty path traversal CVE",
+            "apache thrift service command injection"
+        ],
+        "folder": "caption"
+    }
+,
+    {
+        "name": "cozyhosting",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "spring boot actuator exposure cookie stealing",
+            "http POST command injection",
+            "sudo ssh abuse privesc"
+        ],
+        "folder": "cozyhosting"
+    }
+,
+    {
+        "name": "evilcups",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "openprinting cups"
+        ],
+        "folder": "evilcups"
+    }
+,
+    {
+        "name": "outbound",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "roundcube"
+        ],
+        "folder": "outbound"
+    }
+,
+    {
+        "name": "sandworm",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "SSTI",
+            "process monitoring"
+        ],
+        "folder": "sandworm"
+    }
+,
+    {
+        "name": "sau",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "request-baskets SSRF",
+            "maltrail RCE"
+        ],
+        "folder": "sau"
+    }
+,
+    {
+        "name": "soulmate",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "crushftp",
+            "erlang ssh"
+        ],
+        "folder": "soulmate"
+    }
+,
+    {
+        "name": "titanic",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "LFI",
+            "imagick"
+        ],
+        "folder": "titanic"
+    }
+,
+    {
+        "name": "twomillion",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "vulnerable linux version overlayfs"
+        ],
+        "folder": "twomillion"
+    }
 ];

