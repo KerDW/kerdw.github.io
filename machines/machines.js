@@ -516,7 +516,7 @@ const MACHINES_DATA = [
         ],
         "folder": "drive"
     }
-,
+    ,
     {
         "name": "snoopy",
         "platform": "htb",
@@ -529,7 +529,18 @@ const MACHINES_DATA = [
         ],
         "folder": "snoopy"
     }
-,
+    ,
+
+    {
+        "name": "strutted",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "struts2",
+            "sudo tcpdump"
+        ],
+        "folder": "strutted"
+    },
     {
         "name": "onlyforyou",
         "platform": "htb",
@@ -540,7 +551,7 @@ const MACHINES_DATA = [
         ],
         "folder": "onlyforyou"
     }
-,
+    ,
     {
         "name": "retired",
         "platform": "htb",
@@ -553,7 +564,7 @@ const MACHINES_DATA = [
         ],
         "folder": "retired"
     }
-,
+    ,
     {
         "name": "surveillance",
         "platform": "htb",
@@ -565,7 +576,7 @@ const MACHINES_DATA = [
         ],
         "folder": "surveillance"
     }
-,
+    ,
     {
         "name": "iclean",
         "platform": "htb",
@@ -576,7 +587,7 @@ const MACHINES_DATA = [
         ],
         "folder": "iclean"
     }
-,
+    ,
     {
         "name": "perfection",
         "platform": "htb",
@@ -587,7 +598,7 @@ const MACHINES_DATA = [
         ],
         "folder": "perfection"
     }
-,
+    ,
     {
         "name": "unrested",
         "platform": "htb",
@@ -597,7 +608,7 @@ const MACHINES_DATA = [
         ],
         "folder": "unrested"
     }
-,
+    ,
     {
         "name": "permx",
         "platform": "htb",
@@ -607,7 +618,7 @@ const MACHINES_DATA = [
         ],
         "folder": "permx"
     }
-,
+    ,
     {
         "name": "heal",
         "platform": "htb",
@@ -617,7 +628,7 @@ const MACHINES_DATA = [
         ],
         "folder": "heal"
     }
-,
+    ,
     {
         "name": "conversor",
         "platform": "htb",
@@ -628,7 +639,7 @@ const MACHINES_DATA = [
         ],
         "folder": "conversor"
     }
-,
+    ,
     {
         "name": "chemistry",
         "platform": "htb",
@@ -638,7 +649,7 @@ const MACHINES_DATA = [
         ],
         "folder": "chemistry"
     }
-,
+    ,
     {
         "name": "canape",
         "platform": "htb",
@@ -648,7 +659,7 @@ const MACHINES_DATA = [
         ],
         "folder": "canape"
     }
-,
+    ,
     {
         "name": "backend",
         "platform": "htb",
@@ -660,7 +671,7 @@ const MACHINES_DATA = [
         ],
         "folder": "backend"
     }
-,
+    ,
     {
         "name": "ambassador",
         "platform": "htb",
@@ -671,7 +682,7 @@ const MACHINES_DATA = [
         ],
         "folder": "ambassador"
     }
-,
+    ,
     {
         "name": "agile",
         "platform": "htb",
@@ -684,7 +695,7 @@ const MACHINES_DATA = [
         ],
         "folder": "agile"
     }
-,
+    ,
     {
         "name": "artificial",
         "platform": "htb",
@@ -694,7 +705,7 @@ const MACHINES_DATA = [
         ],
         "folder": "artificial"
     }
-,
+    ,
     {
         "name": "builder",
         "platform": "htb",
@@ -704,7 +715,7 @@ const MACHINES_DATA = [
         ],
         "folder": "builder"
     }
-,
+    ,
     {
         "name": "caption",
         "platform": "htb",
@@ -717,7 +728,7 @@ const MACHINES_DATA = [
         ],
         "folder": "caption"
     }
-,
+    ,
     {
         "name": "cozyhosting",
         "platform": "htb",
@@ -729,7 +740,7 @@ const MACHINES_DATA = [
         ],
         "folder": "cozyhosting"
     }
-,
+    ,
     {
         "name": "evilcups",
         "platform": "htb",
@@ -739,7 +750,7 @@ const MACHINES_DATA = [
         ],
         "folder": "evilcups"
     }
-,
+    ,
     {
         "name": "outbound",
         "platform": "htb",
@@ -749,7 +760,7 @@ const MACHINES_DATA = [
         ],
         "folder": "outbound"
     }
-,
+    ,
     {
         "name": "sandworm",
         "platform": "htb",
@@ -760,7 +771,7 @@ const MACHINES_DATA = [
         ],
         "folder": "sandworm"
     }
-,
+    ,
     {
         "name": "sau",
         "platform": "htb",
@@ -771,7 +782,7 @@ const MACHINES_DATA = [
         ],
         "folder": "sau"
     }
-,
+    ,
     {
         "name": "soulmate",
         "platform": "htb",
@@ -782,7 +793,7 @@ const MACHINES_DATA = [
         ],
         "folder": "soulmate"
     }
-,
+    ,
     {
         "name": "titanic",
         "platform": "htb",
@@ -793,7 +804,7 @@ const MACHINES_DATA = [
         ],
         "folder": "titanic"
     }
-,
+    ,
     {
         "name": "twomillion",
         "platform": "htb",
