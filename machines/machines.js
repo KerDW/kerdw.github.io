@@ -814,4 +814,15 @@ const MACHINES_DATA = [
         ],
         "folder": "twomillion"
     }
+,
+    {
+        "name": "knife",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "php 8.1.0-dev backdoor RCE",
+            "ruby knife gtfobins"
+        ],
+        "folder": "knife"
+    }
 ];
