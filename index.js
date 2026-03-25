@@ -413,7 +413,10 @@ function searchWriteups(query) {
 
     const matches = [];
     for (const entry of SEARCH_INDEX) {
-        const text = entry.text;
+        const textObj = entry.text;
+        const text = typeof textObj === 'string' ? textObj : (textObj[currentLang] || '');
+        if (!text) continue;
+
         const lowerText = text.toLowerCase();
         const snippets = [];
         let idx = 0;
