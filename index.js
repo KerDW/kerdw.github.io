@@ -26,7 +26,14 @@ const translations = {
         'summary-title': 'Exploitation Summary',
         'active-tag': 'ACTIVE',
         'restricted-title': 'RESTRICTED CONTENT',
-        'restricted-text': 'This machine is currently active on Hack The Box. To follow the rules and maintain the challenge integrity, the full writeup is not available yet.'
+        'restricted-text': 'This machine is currently active on Hack The Box. To follow the rules and maintain the challenge integrity, the full writeup is not available yet.',
+        'fulltext-label': 'Search inside all writeups',
+        'fulltext-hint': 'Searches the full content of every writeup — not just titles or tags',
+        'fulltext-placeholder': 'Search for any string',
+        'fulltext-btn': 'Search',
+        'fulltext-searching': 'Searching all writeups...',
+        'fulltext-results': (n, q) => `${n} writeup${n !== 1 ? 's' : ''} containing "${q}"`,
+        'fulltext-none': q => `No writeups contain "${q}".`
     },
     es: {
         'title': 'KDW | Writeups',
@@ -54,7 +61,14 @@ const translations = {
         'summary-title': 'Resumen de Explotación',
         'active-tag': 'ACTIVO',
         'restricted-title': 'CONTENIDO RESTRINGIDO',
-        'restricted-text': 'Esta máquina está activa actualmente en Hack The Box. Para cumplir con las reglas y mantener la integridad del desafío, el writeup completo aún no está disponible.'
+        'restricted-text': 'Esta máquina está activa actualmente en Hack The Box. Para cumplir con las reglas y mantener la integridad del desafío, el writeup completo aún no está disponible.',
+        'fulltext-label': 'Buscar dentro de todos los writeups',
+        'fulltext-hint': 'Busca en el contenido completo de cada writeup, no solo en títulos o etiquetas',
+        'fulltext-placeholder': 'Busca cualquier cadena',
+        'fulltext-btn': 'Buscar',
+        'fulltext-searching': 'Buscando en todos los writeups...',
+        'fulltext-results': (n, q) => `${n} writeup${n !== 1 ? 's' : ''} con "${q}"`,
+        'fulltext-none': q => `Ningún writeup contiene "${q}".`
     }
 };
 
@@ -74,6 +88,7 @@ document.addEventListener('DOMContentLoaded', function () {
     setupThemeToggle();
     setupLanguageToggle();
     initializeSyntaxHighlighting();
+    setupFulltextSearch();
 });
 
 // Syntax Highlighting
@@ -342,3 +357,118 @@ function updateMachineLanguage() {
 
 // Also call it once on DOMContentLoaded
 document.addEventListener('DOMContentLoaded', updateMachineLanguage);
+
+// ─── Full-Text Writeup Search ─────────────────────────────────────────────────
+
+function setupFulltextSearch() {
+    const input = document.getElementById('fulltext-search-input');
+    const btn = document.getElementById('fulltext-search-btn');
+    const closeBtn = document.getElementById('fulltext-close-btn');
+
+    if (!input || !btn) return;
+
+    const runSearch = () => {
+        const query = input.value.trim();
+        if (query.length < 2) return;
+        searchWriteups(query);
+    };
+
+    btn.addEventListener('click', runSearch);
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
+    closeBtn && closeBtn.addEventListener('click', clearFulltextResults);
+}
+
+function clearFulltextResults() {
+    const section = document.getElementById('fulltext-results-section');
+    const container = document.getElementById('fulltext-results-container');
+    const input = document.getElementById('fulltext-search-input');
+    if (section) section.style.display = 'none';
+    if (container) container.innerHTML = '';
+    if (input) input.value = '';
+}
+
+function searchWriteups(query) {
+    const section = document.getElementById('fulltext-results-section');
+    const container = document.getElementById('fulltext-results-container');
+    const titleEl = document.getElementById('fulltext-results-title');
+
+    if (!section || !container) return;
+
+    section.style.display = 'block';
+    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    const q = query.toLowerCase();
+    const t = translations[currentLang];
+
+    // Use pre-built SEARCH_INDEX (from machines/search-index.js)
+    if (typeof SEARCH_INDEX === 'undefined' || SEARCH_INDEX.length === 0) {
+        titleEl.textContent = '';
+        container.innerHTML = '<p class="fulltext-searching-msg">Search index not available. Run generate_search_index.py first.</p>';
+        return;
+    }
+
+    // Map folder -> machine metadata
+    const machineByFolder = {};
+    machinesData.forEach(m => { machineByFolder[m.folder] = m; });
+
+    const matches = [];
+    for (const entry of SEARCH_INDEX) {
+        const text = entry.text;
+        const lowerText = text.toLowerCase();
+        const snippets = [];
+        let idx = 0;
+        let found = 0;
+
+        while ((idx = lowerText.indexOf(q, idx)) !== -1 && found < 5) {
+            const start = Math.max(0, idx - 80);
+            const end = Math.min(text.length, idx + q.length + 80);
+            let snippet = text.slice(start, end).replace(/\s+/g, ' ').trim();
+            if (start > 0) snippet = '\u2026' + snippet;
+            if (end < text.length) snippet = snippet + '\u2026';
+            snippets.push(snippet);
+            idx += q.length;
+            found++;
+        }
+
+        if (snippets.length > 0) {
+            const machine = machineByFolder[entry.folder] || {
+                name: entry.folder, folder: entry.folder, platform: '', difficulty: ''
+            };
+            matches.push({ machine, snippets });
+        }
+    }
+
+    if (matches.length === 0) {
+        titleEl.textContent = t['fulltext-none'](query);
+        container.innerHTML = '';
+        return;
+    }
+
+    titleEl.textContent = t['fulltext-results'](matches.length, query);
+
+    container.innerHTML = matches.map(({ machine, snippets }) => {
+        const snippetHtml = snippets.map(snippet => {
+            const safe = escapeHtml(snippet);
+            const safeQ = escapeHtml(query);
+            const pattern = new RegExp(safeQ.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+            const hl = safe.replace(pattern, m => `<mark class="ft-highlight">${m}</mark>`);
+            return `<div class="ft-snippet">${hl}</div>`;
+        }).join('');
+
+        const platBadge = machine.platform
+            ? `<span class="badge badge-platform">${escapeHtml(machine.platform.toUpperCase())}</span>` : '';
+        const diffBadge = machine.difficulty
+            ? `<span class="badge badge-difficulty-${machine.difficulty}">${escapeHtml(machine.difficulty)}</span>` : '';
+
+        return `
+            <div class="ft-result-card" onclick="window.location.href='machines/${machine.folder}/index.html'">
+                <div class="ft-result-header">
+                    <span class="ft-result-name">${escapeHtml(machine.name)}</span>
+                    <span class="ft-result-meta">${platBadge}${diffBadge}</span>
+                </div>
+                <div class="ft-snippets">${snippetHtml}</div>
+                <a href="machines/${machine.folder}/index.html" class="view-link">${t['view-writeup']}()</a>
+            </div>
+        `;
+    }).join('');
+}

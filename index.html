@@ -18,13 +18,26 @@
         <div class="container">
             <div class="nav-content">
                 <h1 data-i18n="site-title">Cybersecurity Writeups</h1>
-                <div class="nav-controls">
-                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
-                        <span class="theme-icon">🌙</span>
-                    </button>
-                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
-                        <span>EN</span>
-                    </button>
+                <div class="nav-right">
+                    <div class="nav-fulltext-search" id="nav-search-wrapper">
+                        <span class="nav-search-badge">grep -r</span>
+                        <input type="text" id="fulltext-search-input"
+                            placeholder="Search all writeups..."
+                            data-i18n-placeholder="fulltext-placeholder"
+                            autocomplete="off"
+                            title="Search inside all writeup content (not just titles or tags)">
+                        <button id="fulltext-search-btn" class="nav-search-btn" aria-label="Search all writeups">
+                            ↵
+                        </button>
+                    </div>
+                    <div class="nav-controls">
+                        <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                            <span class="theme-icon">🌙</span>
+                        </button>
+                        <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                            <span>EN</span>
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -73,6 +86,14 @@
             </div>
         </section>
 
+        <section id="fulltext-results-section" class="fulltext-results-section" style="display:none;">
+            <div class="fulltext-results-header">
+                <span class="fulltext-results-title" id="fulltext-results-title"></span>
+                <button id="fulltext-close-btn" class="fulltext-close-btn" aria-label="Close search results">✕ clear</button>
+            </div>
+            <div id="fulltext-results-container"></div>
+        </section>
+
         <section class="writeups">
             <div id="writeups-container">
                 <p class="placeholder" data-i18n="placeholder-text">Loading writeups... 🚀</p>
@@ -81,6 +102,7 @@
     </main>
 
     <script src="machines/machines.js"></script>
+    <script src="machines/search-index.js"></script>
     <script src="index.js"></script>
 </body>
 
