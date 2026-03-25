@@ -918,4 +918,15 @@ const MACHINES_DATA = [
         ],
         "folder": "store"
     }
+,
+    {
+        "name": "ten",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "ftp path traversal + authorized_keys injection",
+            "etcd + remco automation apache2 ErrorLog privesc"
+        ],
+        "folder": "ten"
+    }
 ];
