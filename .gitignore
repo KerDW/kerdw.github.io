@@ -1,6 +1,2 @@
 converted_writeups/
 docs/*
-.env
-*.sh
-*.py
-!generate_search_index.py
