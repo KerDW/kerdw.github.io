@@ -929,4 +929,15 @@ const MACHINES_DATA = [
         ],
         "folder": "ten"
     }
+,
+    {
+        "name": "browsed",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "chrome addon data exfiltration + arithmetic expansion RCE",
+            "world writable __pycache__ .pyc cache poisoning"
+        ],
+        "folder": "browsed"
+    }
 ];

