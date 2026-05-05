@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/browsed - htb medium (chrome addon data exfiltration + arithmetic expansion RCE, world writable __pycache__ .pyc cache poisoning)/index.html"
+SOURCE_HTML = "converted_writeups/wingdata - htb easy (wing ftp RCE CVE, python tarfile arbitrary file write CVE)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 
@@ -213,7 +213,7 @@ Remember: Return ONLY the transformed HTML, nothing else."""
     
     try:
         response = client.messages.create(
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-6",
             max_tokens=64000,
             stream=True,
             system=system_message,

