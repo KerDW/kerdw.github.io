@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/wingdata - htb easy (wing ftp RCE CVE, python tarfile arbitrary file write CVE)/index.html"
+SOURCE_HTML = "converted_writeups/carpediem - htb hard (PHP file upload webshell, socks proxy network discovery, TLS weak algorithm traffic decryption, BackdropCMS module upload RCE, cron abuse privesc, host privesc from container CVE)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

