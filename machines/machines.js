@@ -1074,4 +1074,15 @@ const MACHINES_DATA = [
         ],
         "folder": "carpediem"
     }
+,
+    {
+        "name": "helix",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "Apache nifi CVE RCE",
+            "OPC UA PLC manipulation privesc"
+        ],
+        "folder": "helix"
+    }
 ];

