@@ -1085,4 +1085,26 @@ const MACHINES_DATA = [
         ],
         "folder": "helix"
     }
+,
+    {
+        "name": "blue",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "windows) (eternalblue - MS17-010"
+        ],
+        "folder": "blue"
+    }
+,
+    {
+        "name": "kobold",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "MCPJam CVE RCE",
+            "PrivateBin LFI RCE",
+            "Arcane docker manager privesc"
+        ],
+        "folder": "kobold"
+    }
 ];

