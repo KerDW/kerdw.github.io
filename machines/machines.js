@@ -1107,4 +1107,27 @@ const MACHINES_DATA = [
         ],
         "folder": "kobold"
     }
+,
+    {
+        "name": "reactor",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "React_Next.js RCE CVE",
+            "node inspect abuse RCE privesc"
+        ],
+        "folder": "reactor"
+    }
+,
+    {
+        "name": "devhub",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "MCPJam CVE RCE",
+            "JupyterLab token exposure",
+            "API analysis and credential exposure"
+        ],
+        "folder": "devhub"
+    }
 ];
