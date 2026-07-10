@@ -1168,4 +1168,28 @@ const MACHINES_DATA = [
         ],
         "folder": "nimbus"
     }
+,
+    {
+        "name": "makesense",
+        "platform": "htb",
+        "difficulty": "medium",
+        "techniques": [
+            "Wordpress XSS admin user creation",
+            "Wordpress webshell plugin",
+            "OCR script PHP abuse privesc"
+        ],
+        "folder": "makesense"
+    }
+,
+    {
+        "name": "enigma",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "credentials leakage",
+            "OpenStamanager file upload CVE RCE",
+            "OliveTin command injection CVE RCE"
+        ],
+        "folder": "enigma"
+    }
 ];

