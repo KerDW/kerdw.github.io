@@ -1192,4 +1192,15 @@ const MACHINES_DATA = [
         ],
         "folder": "enigma"
     }
+,
+    {
+        "name": "paperwork",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "socket server command injection RCE",
+            "socket script abuse privesc"
+        ],
+        "folder": "paperwork"
+    }
 ];
